@@ -61,9 +61,19 @@ fn generate_firrtl(tr_src: &str) -> String {
         .unwrap_or_else(|e| panic!("emission failed: {e:?}"))
 }
 
-fn firrtl_to_verilog(fir: &str) -> String {
+/// `disable_opt`: a port-less module (SUBLEQ, via hierarchical-path
+/// testbenching) needs `--disable-opt`, or firtool DCEs everything since
+/// nothing is observable from outside. A module with a real output port
+/// (accumulator.tr) does not — that's the whole point of having ports.
+fn firrtl_to_verilog(fir: &str, disable_opt: bool) -> String {
     let mut child = Command::new("firtool")
-        .arg("--disable-opt")
+        // Newer firtool no longer sniffs stdin as FIRRTL by default.
+        .arg("-format=fir")
+        .args(if disable_opt {
+            &["--disable-opt"][..]
+        } else {
+            &[]
+        })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -140,7 +150,7 @@ fn subleq_runs_and_computes_the_right_answer() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/subleq.tr"))
         .unwrap();
     let fir = generate_firrtl(&src);
-    let verilog = firrtl_to_verilog(&fir);
+    let verilog = firrtl_to_verilog(&fir, true);
     let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/subleq_tb.v");
     let output = simulate(&verilog, testbench);
 
@@ -155,5 +165,49 @@ fn subleq_runs_and_computes_the_right_answer() {
     assert!(
         output.contains("mem[11]=5"),
         "mem[11] should hold 8 - 3 == 5:\n{output}"
+    );
+}
+
+/// Proves real module ports end to end: sim/accumulator_tb.v drives
+/// `inc` and reads `sum` through ordinary Verilog ports, no hierarchical
+/// peek/poke, and compilation needs no `--disable-opt` — an observable
+/// output is enough to keep firtool from DCE-ing the design.
+#[test]
+fn accumulator_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/accumulator.tr"
+    ))
+    .unwrap();
+    let (tokens, lex_errors) = lexer::lex(&src);
+    assert!(lex_errors.is_empty(), "{lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(&src, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res);
+    assert!(type_errors.is_empty(), "{type_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
+    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
+        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/accumulator_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: sum=26"),
+        "sum did not accumulate correctly:\n{output}"
     );
 }

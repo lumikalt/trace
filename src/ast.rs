@@ -193,6 +193,17 @@ pub enum Item {
         name: Name,
         ty: ExprId,
     },
+    /// `input name : ty` — external combinational signal, read-only.
+    Input {
+        name: Name,
+        ty: ExprId,
+    },
+    /// `output name : ty (= init)?` — register-backed, exposed as a port.
+    Output {
+        name: Name,
+        ty: ExprId,
+        init: Option<ExprId>,
+    },
     Rule {
         name: Name,
         effects: Vec<Effect>,
@@ -323,6 +334,16 @@ impl Ast {
             }
             Item::Fifo { name, ty } => {
                 out.push_str(&format!("{pad}fifo {name} : {}\n", self.expr_sexpr(*ty)));
+            }
+            Item::Input { name, ty } => {
+                out.push_str(&format!("{pad}input {name} : {}\n", self.expr_sexpr(*ty)));
+            }
+            Item::Output { name, ty, init } => {
+                out.push_str(&format!("{pad}output {name} : {}", self.expr_sexpr(*ty)));
+                if let Some(init) = init {
+                    out.push_str(&format!(" = {}", self.expr_sexpr(*init)));
+                }
+                out.push('\n');
             }
             Item::Rule {
                 name,

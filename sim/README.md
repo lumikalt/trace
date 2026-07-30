@@ -4,23 +4,32 @@ Hand-written Icarus Verilog testbenches that drive the Verilog `firtool`
 produces from this compiler's FIRRTL output. See `devenv.nix`'s `simulate`
 script, or `tests/sim.rs` for the automated version.
 
-## Why hierarchical paths, not ports
+- `accumulator_tb.v` drives `examples/accumulator.tr` through real
+  `input`/`output` ports (`dut.inc`, `dut.sum`) — no hierarchical paths,
+  no `--disable-opt` (see DESIGN.md's "Module ports" section).
+- `subleq_tb.v` still uses hierarchical paths (below): SUBLEQ needs to
+  load a `mem`, and there is still no port-based way to do that.
 
-The language has no `input`/`output` port concept yet (see DESIGN.md's
-SUBLEQ milestone section). An emitted module exposes only `clock` and
-`reset`, so a testbench can't load memory or observe registers through
-ordinary ports. These testbenches reach in directly instead —
-`dut.pc`, `dut.m_ext.Memory[i]` — which Icarus Verilog allows with no
-special compile flags (Verilator needs `--public`/`--public-flat-rw`
-for the same thing, which is why Icarus was picked here).
+## Why `subleq_tb.v` uses hierarchical paths, not ports
+
+SUBLEQ's `mem m : bits[16][4096]` has no port-based load path (`input`/
+`output` cover scalar `bits[w]` signals only, see DESIGN.md). Its
+emitted module also exposes no other ports today, so the testbench
+reaches in directly — `dut.pc`, `dut.m_ext.Memory[i]` — which Icarus
+Verilog allows with no special compile flags (Verilator needs
+`--public`/`--public-flat-rw` for the same thing, which is why Icarus
+was picked here).
 
 ## Why `-DSYNTHESIS` and `--disable-opt`
 
-- `firtool --disable-opt`: without any output ports, a module's entire
-  contents are unobservable from outside, so firtool's default
-  optimization passes dead-code-eliminate all of it. `--disable-opt`
-  keeps the real logic so there's something to simulate.
-- `iverilog -DSYNTHESIS`: firtool emits a debug-only register/memory
+- `firtool --disable-opt`: needed for `subleq_tb.v` only. Without any
+  output ports, a module's entire contents are unobservable from
+  outside, so firtool's default optimization passes dead-code-eliminate
+  all of it. `--disable-opt` keeps the real logic so there's something
+  to simulate. `accumulator_tb.v` doesn't need this: `sum` is a real
+  output port, so firtool already knows the logic is observable.
+- `iverilog -DSYNTHESIS`: needed for every testbench here, regardless of
+  ports. firtool emits a debug-only register/memory
   randomization block gated behind `ifndef SYNTHESIS`, using an
   `automatic`-lifetime variable declaration Icarus doesn't implement
   ("sorry: Overriding the default variable lifetime is not yet

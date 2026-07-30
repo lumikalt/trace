@@ -66,6 +66,8 @@ fn run_firtool(fir: &str, extra_args: &[&str]) -> Option<String> {
     }
 
     let mut child = Command::new("firtool")
+        // Newer firtool no longer sniffs stdin as FIRRTL by default.
+        .arg("-format=fir")
         .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -130,11 +132,38 @@ fn subleq_verilog_shows_branch_gated_by_step_s5_only() {
     // `pc`'s always-block guard must be exactly the fires_step_s5 net,
     // not e.g. an OR across several segments (which would mean the
     // conflict-derivation collapsed the wrong rules together).
+    // `regreset` also compiles to a `pc <= 16'h0;` line under the reset
+    // branch; match the derived-signal assignment specifically; a plain
+    // `.find()` on "pc <=" is order-dependent on firtool's block layout.
     let pc_line = verilog
         .lines()
-        .find(|l| l.trim_start().starts_with("pc <="))
-        .expect("expected a pc <= assignment");
+        .find(|l| l.trim_start().starts_with("pc <=") && l.contains("_GEN"))
+        .expect("expected a pc <= assignment gated by a derived signal");
     assert!(pc_line.contains("_GEN"), "{pc_line}");
+}
+
+#[test]
+fn accumulator_emits_real_ports() {
+    let fir = emit_from_source(&read_example("accumulator.tr")).expect("emission should succeed");
+
+    // A port, not internal state: no `regreset inc`, and `sum` is
+    // declared as an output port, not a bare register.
+    assert!(fir.contains("input inc : UInt<8>"));
+    assert!(fir.contains("output sum : UInt<8>"));
+    assert!(!fir.contains("regreset inc"));
+
+    // `sum` is register-backed under an internal name (an output must
+    // never be driven combinationally — see firrtl.rs's Item::Output
+    // arm) and bridged to the port by one unconditional connect.
+    assert!(fir.contains("regreset __out_sum : UInt<8>"));
+    assert!(fir.contains("connect sum, __out_sum"));
+    // The rule reads the *register*, not the port, and reads the input
+    // port directly (no register backs it).
+    assert!(fir.contains("connect __out_sum, tail(add(__out_sum, inc), 1)"));
+
+    // No `--disable-opt`: an observable output port alone must be
+    // enough to keep firtool from dead-code-eliminating the design.
+    run_firtool(&fir, &[]);
 }
 
 #[test]

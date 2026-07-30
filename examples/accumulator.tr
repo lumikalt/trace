@@ -1,0 +1,12 @@
+-- Minimal scalar in/out example: proves real module ports end to end.
+-- `inc` is read every cycle from outside; `sum` is a registered output
+-- the testbench observes through an ordinary port, not a hierarchical
+-- path — see sim/accumulator_tb.v.
+module Accumulator {
+    input inc : bits[8]
+    output sum : bits[8] = 0
+
+    rule accumulate {
+        sum := sum + inc
+    }
+}

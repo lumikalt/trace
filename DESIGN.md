@@ -405,13 +405,14 @@ Icarus Verilog testbench (`sim/subleq_tb.v`) against a small SUBLEQ program (`me
 mem[10]`, then an unconditional jump, then halt). It passes: the CPU computes `8 - 3 = 5`
 and halts at the right address, not a wrong one a mis-taken branch would reach.
 
-One honest gap the testbench works around: the language has no `input`/`output` port
-concept yet, so the emitted `Subleq` module exposes only `clock`/`reset` — nothing else
-is observable or drivable from outside. The testbench reaches in with hierarchical paths
-(`dut.pc`, `dut.m_ext.Memory[i]`) instead of real ports, which Icarus allows with no
-special flags (Verilator would need `--public`). A real ports feature is future work,
-not needed for this milestone but needed before hardware can plug into anything larger
-than a single-instance simulation.
+One honest gap the testbench works around: at the time this milestone landed, the
+language had no `input`/`output` port concept, so the emitted `Subleq` module exposed
+only `clock`/`reset` — nothing else was observable or drivable from outside. The
+testbench reaches in with hierarchical paths (`dut.pc`, `dut.m_ext.Memory[i]`) instead
+of real ports, which Icarus allows with no special flags (Verilator would need
+`--public`). Real ports landed afterward (see "Module ports" below) and retire this gap
+for scalar designs, but SUBLEQ itself still uses hierarchical paths: there is still no
+way to load a `mem` through a scalar port, so `sim/subleq_tb.v` is unchanged.
 
 Sketch, honest about v0 array rules (single-port memory → one access per tick):
 
@@ -441,6 +442,51 @@ The lowering makes the cost visible: the compiler reports the segment count and 
 saved-register bits for `a`, `b`, `c`, `va`, `r`. A banked memory (tier 3, later)
 would collapse the fetch ticks. That improvement lands without changing this source
 shape, only its schedule.
+
+## Module ports
+
+**Achieved 2026-07-30.** Two new declarations, alongside `reg`/`mem`/`fifo`:
+
+```
+input inc : bits[8]           -- external combinational signal, read-only
+output sum : bits[8] = 0      -- register-backed, exposed as a port
+```
+
+`input` is a pure wire driven from outside the module; reading one inside a rule reads
+this cycle's value, and writing one is a resolve-time error ("input ports are
+read-only"). `output` looks like a plain `reg` from inside a rule — same `:=` write,
+same effect-row treatment, same scheduling — but is also exposed as a module port.
+
+The interesting decision is that `output` is **register-backed, never combinational**.
+A combinational (Mealy) output would expose a rule's value mid-cycle, before the clock
+edge — but this whole design's core invariant is that a rule's writes are speculative
+until the clock edge (that is what makes same-cycle rollback free; see "The core
+idea"). A combinational output would leak the speculative value out of the module,
+which breaks that invariant for anyone watching from outside. So `output x` compiles to
+an ordinary internal register plus one port, connected unconditionally
+(`connect x, <internal register>`); rules read and write the register, and the outside
+world sees the committed value one cycle after it is computed. One real consequence:
+`output sum = a + b` is not expressible as a pure combinational function of two inputs —
+it is one cycle delayed, like every other piece of state in this language. Purely
+combinational modules (no state at all) are not a target for v0.
+
+```
+module Accumulator {
+    input inc : bits[8]
+    output sum : bits[8] = 0
+
+    rule accumulate {
+        sum := sum + inc
+    }
+}
+```
+
+This example (`examples/accumulator.tr`) is also the first design simulated through
+*real* Verilog ports (`sim/accumulator_tb.v`) rather than hierarchical peek/poke, and
+the first to compile with plain `firtool` — no `--disable-opt` — since an observable
+output port is enough to stop dead-code elimination from erasing the design. (SUBLEQ
+still needs `--disable-opt`, since loading its `mem` still has no port-based path; see
+the milestone section above.)
 
 ## Prior art
 

@@ -25,6 +25,10 @@ pub enum TokenKind {
     Mem,
     #[token("fifo")]
     Fifo,
+    #[token("input")]
+    Input,
+    #[token("output")]
+    Output,
     #[token("spec")]
     Spec,
     #[token("impl")]

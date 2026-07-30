@@ -62,6 +62,24 @@ fn unresolved_name_is_an_error() {
 }
 
 #[test]
+fn input_ports_are_read_only() {
+    let (_, _, errors) = run("module M {\n input x : bits[8]\n \
+         rule r {\n x := x + 1\n}\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("input port"));
+    assert!(errors[0].message.contains("read-only"));
+}
+
+#[test]
+fn output_ports_are_writable_state() {
+    let (_, res) = run_ok(
+        "module M {\n output x : bits[8] = 0\n \
+         rule r {\n x := x + 1\n}\n}\n",
+    );
+    assert!(resolved_kinds(&res).contains(&DefKind::Output));
+}
+
+#[test]
 fn duplicate_definition_is_an_error() {
     let (_, _, errors) = run("module M {\n reg a : bits[1] = 0\n fifo a : bits[1]\n}\n");
     assert_eq!(errors.len(), 1);

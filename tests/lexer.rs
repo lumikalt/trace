@@ -10,10 +10,10 @@ fn kinds(src: &str) -> Vec<TokenKind> {
 fn fifo_bridge_module() {
     let src = "\
 module FifoBridge {
-    fifo input : bits[8]
+    fifo buf : bits[8]
 
     rule transfer {
-        x := input.Deq[]      -- fails when input is empty
+        x := buf.Deq[]      -- fails when buf is empty
     }
 }
 ";
@@ -24,8 +24,7 @@ module FifoBridge {
             Fifo, Ident, Colon, Ident, LBracket, Int, RBracket, Newline, // fifo decl
             Newline, // blank line
             Rule, Ident, LBrace, Newline, // rule transfer {
-            Ident, ColonEq, Ident, Dot, Ident, LBracket, RBracket,
-            Newline, // x := input.Deq[]
+            Ident, ColonEq, Ident, Dot, Ident, LBracket, RBracket, Newline, // x := buf.Deq[]
             RBrace, Newline, // }
             RBrace, Newline, // }
         ]
@@ -81,7 +80,7 @@ fn guard_and_fallible_call() {
         vec![LParen, Ident, EqEq, Ident, RParen, Question]
     );
     assert_eq!(
-        kinds("output.Enq[x]"),
+        kinds("buf.Enq[x]"),
         vec![Ident, Dot, Ident, LBracket, Ident, RBracket]
     );
 }

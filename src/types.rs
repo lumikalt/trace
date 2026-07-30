@@ -172,6 +172,25 @@ impl<'a> TypeChecker<'a> {
                     let elem = self.eval_ty(ty, &HashMap::new());
                     self.state_tys.insert(def, Ty::Fifo(Box::new(elem)));
                 }
+                Item::Input { ty, .. } => {
+                    let ty = self.eval_ty(ty, &HashMap::new());
+                    if !matches!(ty, Ty::Bits(_) | Ty::Unknown) {
+                        let span = self.ast.item_spans[id.0 as usize].clone();
+                        self.error(span, format!("an input holds bits, not {ty}"));
+                    }
+                    self.state_tys.insert(def, ty);
+                }
+                Item::Output { ty, init, .. } => {
+                    let ty = self.eval_ty(ty, &HashMap::new());
+                    if !matches!(ty, Ty::Bits(_) | Ty::Unknown) {
+                        let span = self.ast.item_spans[id.0 as usize].clone();
+                        self.error(span, format!("an output holds bits, not {ty}"));
+                    }
+                    if let Some(init) = init {
+                        self.check_literal_fits(init, &ty);
+                    }
+                    self.state_tys.insert(def, ty);
+                }
                 _ => {}
             }
         }
@@ -751,7 +770,12 @@ impl<'a> TypeChecker<'a> {
                 );
                 Ty::Unknown
             }
-            DefKind::Reg | DefKind::Mem | DefKind::Fifo | DefKind::Module => {
+            DefKind::Reg
+            | DefKind::Mem
+            | DefKind::Fifo
+            | DefKind::Input
+            | DefKind::Output
+            | DefKind::Module => {
                 self.error(
                     self.expr_span(id),
                     format!(

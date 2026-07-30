@@ -212,6 +212,8 @@ impl<'a> Parser<'a> {
             Some(Reg) => self.parse_state_decl(Reg),
             Some(Mem) => self.parse_state_decl(Mem),
             Some(Fifo) => self.parse_state_decl(Fifo),
+            Some(Input) => self.parse_state_decl(Input),
+            Some(Output) => self.parse_state_decl(Output),
             Some(Rule) => self.parse_rule(),
             Some(Ident) => self.parse_fn(FnFlavor::Fn),
             Some(Spec) => {
@@ -225,7 +227,7 @@ impl<'a> Parser<'a> {
             Some(Schedule) => self.parse_schedule(),
             _ => {
                 self.error_here(
-                    "expected an item (module, reg, mem, fifo, rule, schedule, or a function)"
+                    "expected an item (module, reg, mem, fifo, input, output, rule, schedule, or a function)"
                         .to_string(),
                 );
                 self.sync();
@@ -269,7 +271,8 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// `reg name : ty (= init)?` / `mem name : ty` / `fifo name : ty`
+    /// `reg name : ty (= init)?` / `mem name : ty` / `fifo name : ty` /
+    /// `input name : ty` / `output name : ty (= init)?`
     fn parse_state_decl(&mut self, keyword: TokenKind) -> Option<ItemId> {
         let lo = self.cur_span().start;
         self.bump(); // keyword
@@ -287,6 +290,15 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Mem => Item::Mem { name, ty },
             TokenKind::Fifo => Item::Fifo { name, ty },
+            TokenKind::Input => Item::Input { name, ty },
+            TokenKind::Output => {
+                let init = if self.eat(TokenKind::Eq) {
+                    Some(self.parse_expr(0)?)
+                } else {
+                    None
+                };
+                Item::Output { name, ty, init }
+            }
             _ => unreachable!(),
         };
         self.expect_terminator();
@@ -473,8 +485,9 @@ impl<'a> Parser<'a> {
         Some(effects)
     }
 
-    /// Name positions accept `reg`/`mem`/`fifo` too: they are keywords only
-    /// at item-declaration position. DESIGN.md itself writes `reads {mem}`.
+    /// Name positions accept `reg`/`mem`/`fifo`/`input`/`output` too: they
+    /// are keywords only at item-declaration position. DESIGN.md itself
+    /// writes `reads {mem}`.
     fn at_name(&self) -> bool {
         matches!(
             self.peek(),
@@ -482,6 +495,8 @@ impl<'a> Parser<'a> {
                 | Some(TokenKind::Reg)
                 | Some(TokenKind::Mem)
                 | Some(TokenKind::Fifo)
+                | Some(TokenKind::Input)
+                | Some(TokenKind::Output)
         )
     }
 
@@ -621,9 +636,11 @@ impl<'a> Parser<'a> {
                 self.ast.push_expr(Expr::Ident(name), span)
             }
             // `sync`/`race` are keywords but appear in call position, and
-            // `reg`/`mem`/`fifo` are keywords only at declaration position
-            // (`mem[addr]` is an ordinary read). All become plain idents.
-            Some(Sync) | Some(Race) | Some(Reg) | Some(Mem) | Some(Fifo) => {
+            // `reg`/`mem`/`fifo`/`input`/`output` are keywords only at
+            // declaration position (`mem[addr]` is an ordinary read). All
+            // become plain idents.
+            Some(Sync) | Some(Race) | Some(Reg) | Some(Mem) | Some(Fifo) | Some(Input)
+            | Some(Output) => {
                 let tok = self.bump().unwrap();
                 let name = self.text(&tok.span).to_string();
                 self.ast.push_expr(Expr::Ident(name), tok.span)

@@ -82,10 +82,19 @@ pub fn emit(
         types,
         errors: Vec::new(),
         read_ports: HashMap::new(),
+        output_regs: HashMap::new(),
     };
 
-    let mut regs = Vec::new();
+    // `(match_name, emit_name, width, init)`. For a plain `reg`, both
+    // names are the user's; for an `output`, `match_name` is the port
+    // name (what rule bodies write) and `emit_name` is its internal
+    // backing register (see the `Item::Output` arm below).
+    let mut regs: Vec<(String, String, u64, u64)> = Vec::new();
     let mut mems = Vec::new();
+    // `(port_name, width)`.
+    let mut inputs: Vec<(String, u64)> = Vec::new();
+    // `(port_name, internal_reg_name, width)`.
+    let mut outputs: Vec<(String, String, u64)> = Vec::new();
     let mut rules: Vec<ItemId> = Vec::new();
     for id in &items {
         match ast.item(*id) {
@@ -102,7 +111,42 @@ pub fn emit(
                     Item::Reg { init: Some(e), .. } => cx.const_eval(*e).unwrap_or(0),
                     _ => 0,
                 };
-                regs.push((name.text.clone(), w, init));
+                regs.push((name.text.clone(), name.text.clone(), w, init));
+            }
+            Item::Input { name, .. } => {
+                let def = res.item_defs[id];
+                let Some(Ty::Bits(Width::Known(w))) = cx.state_width(def) else {
+                    cx.error(
+                        ast.item_spans[id.0 as usize].clone(),
+                        format!("`{}` has no concrete bit width", name.text),
+                    );
+                    continue;
+                };
+                inputs.push((name.text.clone(), w));
+            }
+            Item::Output { name, .. } => {
+                let def = res.item_defs[id];
+                let Some(Ty::Bits(Width::Known(w))) = cx.state_width(def) else {
+                    cx.error(
+                        ast.item_spans[id.0 as usize].clone(),
+                        format!("`{}` has no concrete bit width", name.text),
+                    );
+                    continue;
+                };
+                let init = match ast.item(*id) {
+                    Item::Output { init: Some(e), .. } => cx.const_eval(*e).unwrap_or(0),
+                    _ => 0,
+                };
+                // A rule-visible output is register-backed: driving it
+                // combinationally would expose a rule's speculative,
+                // pre-commit value, which breaks the "writes are
+                // speculative until the clock edge" invariant the whole
+                // scheduler is built on. So `output x` is really an
+                // ordinary register (`__out_x`) wired out to a port.
+                let internal = format!("__out_{}", name.text);
+                regs.push((name.text.clone(), internal.clone(), w, init));
+                outputs.push((name.text.clone(), internal.clone(), w));
+                cx.output_regs.insert(name.text.clone(), internal);
             }
             Item::Mem { name, .. } => {
                 let def = res.item_defs[id];
@@ -161,11 +205,26 @@ pub fn emit(
         }
     }
 
+    // Bridge each output port to its backing register; independent of
+    // whether any rule fires this cycle, so it holds even with no rules.
+    let mut port_connects = String::new();
+    for (port, internal, _) in &outputs {
+        let _ = writeln!(port_connects, "    connect {port}, {internal}");
+    }
+
     let Some(group) = sched.groups.iter().find(|g| g.module == Some(module)) else {
         if !cx.errors.is_empty() {
             return Err(cx.errors);
         }
-        return Ok(header(&mod_name.text, &regs, &mems, &HashMap::new(), ""));
+        return Ok(header(
+            &mod_name.text,
+            &regs,
+            &mems,
+            &HashMap::new(),
+            &inputs,
+            &outputs,
+            &port_connects,
+        ));
     };
 
     // Assign one reader port per static mem-read site, across all rules,
@@ -306,11 +365,11 @@ pub fn emit(
     // threaded through as a `mux`, not silently dropped for not being a
     // top-level assignment.
     let mut reg_body = String::new();
-    for (reg_name, width, _) in &regs {
+    for (match_name, emit_name, width, _) in &regs {
         let mut values: Vec<(ItemId, String)> = Vec::new();
         for rule in &rules {
             let body = rule_body(ast, *rule);
-            if let Some(v) = cx.reg_value_in_stmts(&body, reg_name, *width) {
+            if let Some(v) = cx.reg_value_in_stmts(&body, match_name, *width) {
                 values.push((*rule, v));
             }
         }
@@ -321,7 +380,7 @@ pub fn emit(
         for (rule, value) in values {
             let f = &fires_name[&rule];
             let _ = writeln!(reg_body, "    when {f} :");
-            let _ = writeln!(reg_body, "      connect {reg_name}, {value}");
+            let _ = writeln!(reg_body, "      connect {emit_name}, {value}");
         }
     }
 
@@ -335,14 +394,26 @@ pub fn emit(
     body.push_str(&mem_body);
     body.push('\n');
     body.push_str(&reg_body);
-    Ok(header(&mod_name.text, &regs, &mems, &mem_ports, &body))
+    body.push('\n');
+    body.push_str(&port_connects);
+    Ok(header(
+        &mod_name.text,
+        &regs,
+        &mems,
+        &mem_ports,
+        &inputs,
+        &outputs,
+        &body,
+    ))
 }
 
 fn header(
     name: &str,
-    regs: &[(String, u64, u64)],
+    regs: &[(String, String, u64, u64)],
     mems: &[(String, u64, u64)],
     mem_ports: &HashMap<String, (Vec<String>, Option<String>)>,
+    inputs: &[(String, u64)],
+    outputs: &[(String, String, u64)],
     body: &str,
 ) -> String {
     let mut out = String::new();
@@ -351,11 +422,17 @@ fn header(
     let _ = writeln!(out, "  public module {name} :");
     let _ = writeln!(out, "    input clock : Clock");
     let _ = writeln!(out, "    input reset : UInt<1>");
+    for (n, w) in inputs {
+        let _ = writeln!(out, "    input {n} : UInt<{w}>");
+    }
+    for (n, _, w) in outputs {
+        let _ = writeln!(out, "    output {n} : UInt<{w}>");
+    }
     out.push('\n');
-    for (n, w, init) in regs {
+    for (_, emit_name, w, init) in regs {
         let _ = writeln!(
             out,
-            "    regreset {n} : UInt<{w}>, clock, reset, UInt<{w}>({init})"
+            "    regreset {emit_name} : UInt<{w}>, clock, reset, UInt<{w}>({init})"
         );
     }
     out.push('\n');
@@ -420,11 +497,15 @@ fn find_mem_write(ast: &Ast, res: &Resolution, stmts: &[StmtId], mem_name: &str)
         .find(|s| is_mem_write_to(ast, res, *s, mem_name))
 }
 
+/// True for a plain register write OR an output write (`sum := ...`) —
+/// both are matched by the user's own name; an output's *emitted* target
+/// is its internal backing register, resolved separately (see
+/// `Emitter::output_regs`).
 fn is_ident_named(ast: &Ast, res: &Resolution, id: ExprId, name: &str) -> bool {
     matches!(ast.expr(id), Expr::Ident(_))
         && res.expr_defs.get(&id).is_some_and(|d| {
             let d = res.def(*d);
-            d.name == name && d.kind == DefKind::Reg
+            d.name == name && matches!(d.kind, DefKind::Reg | DefKind::Output)
         })
 }
 
@@ -509,6 +590,11 @@ struct Emitter<'a> {
     errors: Vec<EmitError>,
     /// Each static mem-read expression -> its assigned reader port name.
     read_ports: HashMap<ExprId, String>,
+    /// Output port name -> its internal backing register name. Reading
+    /// an output inside a rule (`sum := sum + inc`) must see the
+    /// register, not the port (a FIRRTL output port is drive-only from
+    /// inside its own module in the shape this emitter produces).
+    output_regs: HashMap<String, String>,
 }
 
 impl<'a> Emitter<'a> {
@@ -739,7 +825,10 @@ impl<'a> Emitter<'a> {
             Expr::Ident(_) => {
                 let def = self.res.expr_defs.get(&id).copied();
                 match def.map(|d| self.res.def(d).clone()) {
-                    Some(d) if matches!(d.kind, DefKind::Reg | DefKind::Local) => Ok(d.name),
+                    Some(d) if d.kind == DefKind::Output => Ok(self.output_regs[&d.name].clone()),
+                    Some(d) if matches!(d.kind, DefKind::Reg | DefKind::Local | DefKind::Input) => {
+                        Ok(d.name)
+                    }
                     _ => {
                         self.error(
                             self.ast.expr_spans[id.0 as usize].clone(),

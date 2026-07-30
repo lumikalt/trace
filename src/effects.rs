@@ -576,8 +576,14 @@ impl<'a> Checker<'a> {
                         self.check_expr(init, id, &empty, true);
                     }
                 }
-                Item::Mem { ty, .. } | Item::Fifo { ty, .. } => {
+                Item::Mem { ty, .. } | Item::Fifo { ty, .. } | Item::Input { ty, .. } => {
                     self.check_expr(ty, id, &empty, true);
+                }
+                Item::Output { ty, init, .. } => {
+                    self.check_expr(ty, id, &empty, true);
+                    if let Some(init) = init {
+                        self.check_expr(init, id, &empty, true);
+                    }
                 }
                 _ => {}
             }

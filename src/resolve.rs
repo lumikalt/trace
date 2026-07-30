@@ -29,6 +29,8 @@ pub enum DefKind {
     Reg,
     Mem,
     Fifo,
+    Input,
+    Output,
     Rule,
     Fn,
     Spec,
@@ -41,7 +43,10 @@ pub enum DefKind {
 
 impl DefKind {
     pub fn is_state(self) -> bool {
-        matches!(self, DefKind::Reg | DefKind::Mem | DefKind::Fifo)
+        matches!(
+            self,
+            DefKind::Reg | DefKind::Mem | DefKind::Fifo | DefKind::Input | DefKind::Output
+        )
     }
 
     pub fn describe(self) -> &'static str {
@@ -51,6 +56,8 @@ impl DefKind {
             DefKind::Reg => "a register",
             DefKind::Mem => "a memory",
             DefKind::Fifo => "a fifo",
+            DefKind::Input => "an input port",
+            DefKind::Output => "an output port",
             DefKind::Rule => "a rule",
             DefKind::Fn => "a function",
             DefKind::Spec => "a spec",
@@ -187,6 +194,8 @@ impl<'a> Resolver<'a> {
             Item::Reg { name, .. } => (name.clone(), DefKind::Reg),
             Item::Mem { name, .. } => (name.clone(), DefKind::Mem),
             Item::Fifo { name, .. } => (name.clone(), DefKind::Fifo),
+            Item::Input { name, .. } => (name.clone(), DefKind::Input),
+            Item::Output { name, .. } => (name.clone(), DefKind::Output),
             Item::Rule { name, .. } => (name.clone(), DefKind::Rule),
             Item::Fn { name, kind, .. } => {
                 let def_kind = match kind {
@@ -215,8 +224,14 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(*init, false);
                 }
             }
-            Item::Mem { ty, .. } | Item::Fifo { ty, .. } => {
+            Item::Mem { ty, .. } | Item::Fifo { ty, .. } | Item::Input { ty, .. } => {
                 self.resolve_expr(*ty, false);
+            }
+            Item::Output { ty, init, .. } => {
+                self.resolve_expr(*ty, false);
+                if let Some(init) = init {
+                    self.resolve_expr(*init, false);
+                }
             }
             Item::Rule { effects, body, .. } => {
                 self.check_effect_args(&effects.clone());
@@ -311,7 +326,7 @@ impl<'a> Resolver<'a> {
                     Some(def) if !self.res.def(def).kind.is_state() => self.error(
                         arg.span.clone(),
                         format!(
-                            "`{}` is {}, not state (reg, mem, or fifo)",
+                            "`{}` is {}, not state (reg, mem, fifo, input, or output)",
                             arg.text,
                             self.res.def(def).kind.describe()
                         ),
@@ -338,6 +353,15 @@ impl<'a> Resolver<'a> {
                 match self.ast.expr(lhs) {
                     Expr::Ident(text) => {
                         if let Some(def) = self.lookup(text) {
+                            if self.res.def(def).kind == DefKind::Input {
+                                self.error(
+                                    self.ast.expr_spans[lhs.0 as usize].clone(),
+                                    format!(
+                                        "cannot assign to `{text}`: it is an input port \
+                                         (inputs are read-only, driven from outside the module)"
+                                    ),
+                                );
+                            }
                             self.res.expr_defs.insert(lhs, def);
                         } else {
                             let name = Name {

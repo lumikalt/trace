@@ -269,6 +269,24 @@ module M
 }
 
 #[test]
+fn input_output_ports() {
+    let ast = parse_ok(
+        "module M {\n input inc : bits[8]\n output sum : bits[8] = 0\n\
+         rule r {\n sum := sum + inc\n}\n}\n",
+    );
+    assert_eq!(
+        ast.dump(),
+        "\
+module M
+  input inc : (index bits 8)
+  output sum : (index bits 8) = 0
+  rule r
+    (:= sum (+ sum inc))
+",
+    );
+}
+
+#[test]
 fn multi_tick_rule() {
     let ast = parse_ok("rule step <suspends> {\n a := m[pc]\n tick\n b := m[pc + 1]\n}\n");
     let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
