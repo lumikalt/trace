@@ -1,0 +1,14 @@
+-- The `suspends` lowering example from DESIGN.md, adapted to a rule
+-- (the lowering pass handles rule bodies; a standalone `suspends`
+-- function's calling convention is a separate, undecided problem).
+-- One tick, one captured value (`v`): the minimal nontrivial case.
+module Rmw {
+    mem m : bits[8][256]
+    reg addr : bits[8] = 0
+
+    rule step <suspends> {
+        v := m[addr]
+        tick
+        m[addr] := v + 1
+    }
+}

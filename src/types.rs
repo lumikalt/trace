@@ -63,6 +63,9 @@ impl std::fmt::Display for Ty {
 #[derive(Debug, Default)]
 pub struct Types {
     pub expr_tys: HashMap<ExprId, Ty>,
+    /// Type of every local (`let`/fresh `:=`) once its body's fixed point
+    /// is reached. Keyed by `DefId` since locals are declared per rule/fn.
+    pub local_tys: HashMap<DefId, Ty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,6 +320,7 @@ impl<'a> TypeChecker<'a> {
                     self.type_stmt(*stmt, &mut locals, ret_ty.as_ref());
                 }
                 self.emit = false;
+                self.types.local_tys.extend(locals);
                 return;
             }
         }

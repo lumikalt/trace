@@ -1,11 +1,12 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{effects, lexer, parser, resolve, schedule, types};
+use trace::{effects, lexer, lower, parser, resolve, schedule, types};
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let explain = args.iter().any(|a| a == "--explain-schedule");
+    let show_lower = args.iter().any(|a| a == "--lower");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: trace <file.tr> [--explain-schedule]");
+        eprintln!("usage: trace <file.tr> [--explain-schedule] [--lower]");
         return std::process::ExitCode::FAILURE;
     };
     let path = path.clone();
@@ -33,7 +34,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    if !explain {
+    if !explain && !show_lower {
         print!("{}", ast.dump());
     }
 
@@ -53,12 +54,24 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let (_, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res);
     for err in &type_errors {
         report(&path, &src, err.span.clone(), &err.message);
     }
     if !type_errors.is_empty() {
         return std::process::ExitCode::FAILURE;
+    }
+
+    if show_lower {
+        let (lowered, lower_errors) = lower::plan(&ast, &res, &fx, &ty);
+        for err in &lower_errors {
+            report(&path, &src, err.span.clone(), &err.message);
+        }
+        if !lower_errors.is_empty() {
+            return std::process::ExitCode::FAILURE;
+        }
+        print!("{}", lower::render(&ast, &src, &lowered));
+        return std::process::ExitCode::SUCCESS;
     }
 
     let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
