@@ -10,5 +10,5 @@ spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <converges, choice> {
 impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
     refines AnyGrant
 {
-    return trunc(reqs & (~reqs + 1), clog2(N))   -- placeholder priority pick
+    return prio(reqs)         -- deterministic logic; checked against the spec
 }

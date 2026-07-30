@@ -52,7 +52,13 @@ colors. Effect annotations sit in angle brackets after the signature.
 | `converges`            | total, pure, terminates       | combinational logic             |
 | `suspends`             | crosses cycle boundaries      | FSM + registers (see lowering)  |
 | `allocates`            | runs at elaboration time only | no hardware; builds the circuit |
+| `decides`              | can fail (inferred)           | guard inputs to the handshake   |
+| `choice`               | nondeterminism, spec-only     | none; model-checker free vars   |
 | `reads R` / `writes W` | state access rows             | input to the scheduler          |
+
+The policy for inferred effects (`decides` and the rows) is uniform: the compiler
+computes them; a stated effect is an interface assertion. Overstating is legal, because
+a conservative claim is sound. Understating is an error.
 
 ### `converges`: combinational logic
 
@@ -105,6 +111,42 @@ rule refill <reads {pc, mem}, writes {ir}> {
     ir := mem[pc]
 }
 ```
+
+### `decides`: fallibility
+
+Adapted from Verse's `<decides>`. Code that can fail carries `decides`: a guard `?`, a
+fifo operation, or a call to deciding code. The compiler infers it bottom-up through
+the call graph. This tracking is what makes handshake derivation compositional: a
+rule's derived ready logic is the conjunction of guards from every deciding call in
+its body, however deep.
+
+```
+Classify(x : bits[8]) : bits[2] <converges, decides> {
+    (x != 0)?                 -- fallible: aborts the calling rule's cycle
+    return clog2(x)
+}
+
+rule step {
+    class := Classify(acc)    -- rule stalls until Classify succeeds
+}
+```
+
+Context rules:
+
+- A rule body is always a failure context. Failure aborts the cycle and retries.
+  Rules never need to declare `decides`.
+- Elaboration positions are never failure contexts. There is no transaction to
+  abort. Guards and fifo ops in `allocates` bodies, state types, and initializers
+  are errors.
+
+### Verse effects not carried over
+
+Three other Verse effects were considered and folded away:
+
+- `transacts` — every rule is a transaction by construction. The effect is ambient.
+- `varies` (non-deterministic reads) — subsumed by a nonempty `reads` row.
+- `diverges` — circuit code cannot diverge inside a cycle by construction.
+  Termination of `allocates` recursion is unchecked in v0; accept this.
 
 ## `suspends`: multi-cycle code without multi-cycle rollback
 
@@ -197,8 +239,11 @@ impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
 }
 ```
 
-The `choice` effect marks spec-only code. Using `|` or `any` without it is a type
-error. Synthesizing code with it is a type error.
+The `choice` effect marks spec-only code. Only a `spec` may declare it. Using `any`
+without it is a type error. Synthesizing code with it is a type error.
+
+`|` is contextual: in an item without `choice` it is bitwise or; in a `choice` item it
+is the choice operator. One token, disambiguated by the effect, never by the parser.
 
 ## Scheduling
 

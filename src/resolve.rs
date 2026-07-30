@@ -19,7 +19,7 @@ use crate::ast::{Ast, Effect, Expr, ExprId, FnKind, Item, ItemId, Name, Stmt, St
 use crate::lexer::Span;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +77,8 @@ pub struct Resolution {
     pub expr_defs: HashMap<ExprId, DefId>,
     /// `impl` item -> the spec it refines.
     pub refines: HashMap<ItemId, DefId>,
+    /// Named item -> its definition (rules, fns, state, modules).
+    pub item_defs: HashMap<ItemId, DefId>,
 }
 
 impl Resolution {
@@ -92,9 +94,10 @@ pub struct ResolveError {
 }
 
 /// Callable names with no user definition. `sync`/`race` parse as idents;
-/// the rest are the primitive vocabulary DESIGN.md examples assume.
+/// `prio` is a priority encoder; the rest are the primitive vocabulary
+/// DESIGN.md examples assume.
 const BUILTINS: &[&str] = &[
-    "bits", "wire", "list", "any", "clog2", "pack", "trunc", "len", "sync", "race",
+    "bits", "wire", "list", "any", "clog2", "pack", "trunc", "len", "sync", "race", "prio",
 ];
 
 pub fn resolve(ast: &Ast) -> (Resolution, Vec<ResolveError>) {
@@ -195,7 +198,8 @@ impl<'a> Resolver<'a> {
             }
             Item::Schedule { .. } => return,
         };
-        self.declare(&name, kind);
+        let def = self.declare(&name, kind);
+        self.res.item_defs.insert(id, def);
     }
 
     fn resolve_item(&mut self, id: ItemId) {

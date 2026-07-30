@@ -1,5 +1,5 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{lexer, parser, resolve};
+use trace::{effects, lexer, parser, resolve};
 
 fn main() -> std::process::ExitCode {
     let Some(path) = std::env::args().nth(1) else {
@@ -32,11 +32,19 @@ fn main() -> std::process::ExitCode {
 
     print!("{}", ast.dump());
 
-    let (_, resolve_errors) = resolve::resolve(&ast);
+    let (res, resolve_errors) = resolve::resolve(&ast);
     for err in &resolve_errors {
         report(&path, &src, err.span.clone(), &err.message);
     }
     if !resolve_errors.is_empty() {
+        return std::process::ExitCode::FAILURE;
+    }
+
+    let (_, effect_errors) = effects::check(&ast, &res);
+    for err in &effect_errors {
+        report(&path, &src, err.span.clone(), &err.message);
+    }
+    if !effect_errors.is_empty() {
         return std::process::ExitCode::FAILURE;
     }
     std::process::ExitCode::SUCCESS
