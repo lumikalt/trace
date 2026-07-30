@@ -321,10 +321,16 @@ after elaboration, on the concrete circuit. Widths only grow; the pass terminate
 the fixed point.
 
 ```
-let sum = a + b           -- |sum| = max(|a|, |b|) + 1
+let sum = a + b           -- |sum| = max(|a|, |b|); modular, Chisel-style
 let prod = a * b          -- |prod| = |a| + |b|
+let idx = pc + 3          -- an int literal absorbs the other width: bits[16]
 sum := trunc(sum, 8)      -- explicit narrowing; silent truncation is an error
 ```
+
+`+` and `-` are modular: the result keeps the max operand width, so
+`pc := pc + 3` is legal. A carry-preserving grow-add (`+&`, width max+1) can come
+later as a distinct operator. The first draft gave plain `+` the max+1 rule; that
+contradicted this document's own SUBLEQ example, so modular won.
 
 Do not build one solver for both jobs. The first draft implied one mechanism; that
 was wrong.
