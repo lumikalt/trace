@@ -457,6 +457,14 @@ fn scan_expr(
 /// Render every planned lowering as a text splice over `src`: each
 /// original rule's span is replaced by its save registers, continuation
 /// register, and segment rules. Everything else in the file is untouched.
+///
+/// A `schedule` directive that names a lowered rule is regenerated too:
+/// `urgency step > refill` becomes `urgency step_s0 > step_s1 > ... >
+/// step_sN > refill` (every segment ranks above what `step` ranked
+/// above), and `conflict_free { step, x }` becomes `conflict_free
+/// { step_s0, ..., step_sN, x }`. This is regenerated from the parsed
+/// directives, not string-matched, so a name like `step2` is never
+/// confused with `step`.
 pub fn render(ast: &Ast, src: &str, lowered: &[LoweredRule]) -> String {
     let mut edits: Vec<(Span, String)> = lowered
         .iter()
@@ -465,6 +473,20 @@ pub fn render(ast: &Ast, src: &str, lowered: &[LoweredRule]) -> String {
             (span, render_rule(ast, src, lr))
         })
         .collect();
+
+    let expansions: std::collections::HashMap<&str, Vec<String>> = lowered
+        .iter()
+        .map(|lr| {
+            let segs = (0..lr.segments.len() as u64)
+                .map(|i| format!("{}_s{}", lr.rule_name, i))
+                .collect();
+            (lr.rule_name.as_str(), segs)
+        })
+        .collect();
+    if !expansions.is_empty() {
+        edits.extend(rewrite_schedules(ast, &expansions));
+    }
+
     edits.sort_by_key(|(s, _)| s.start);
     let mut out = String::new();
     let mut pos = 0;
@@ -476,6 +498,63 @@ pub fn render(ast: &Ast, src: &str, lowered: &[LoweredRule]) -> String {
     }
     out.push_str(&src[pos..]);
     out
+}
+
+fn rewrite_schedules(
+    ast: &Ast,
+    expansions: &std::collections::HashMap<&str, Vec<String>>,
+) -> Vec<(Span, String)> {
+    let mut edits = Vec::new();
+    let mut stack: Vec<ItemId> = ast.roots.clone();
+    while let Some(id) = stack.pop() {
+        match ast.item(id) {
+            Item::Module { items, .. } => stack.extend(items.iter().copied()),
+            Item::Schedule { directives } => {
+                let touches_lowered = directives.iter().any(|d| {
+                    let names = match d {
+                        crate::ast::ScheduleDirective::Urgency(ns)
+                        | crate::ast::ScheduleDirective::ConflictFree(ns) => ns,
+                    };
+                    names
+                        .iter()
+                        .any(|n| expansions.contains_key(n.text.as_str()))
+                });
+                if !touches_lowered {
+                    continue;
+                }
+                let mut out = String::from("schedule {\n");
+                for directive in directives {
+                    match directive {
+                        crate::ast::ScheduleDirective::Urgency(names) => {
+                            let flat = expand(names, expansions);
+                            out.push_str(&format!("    urgency {}\n", flat.join(" > ")));
+                        }
+                        crate::ast::ScheduleDirective::ConflictFree(names) => {
+                            let flat = expand(names, expansions);
+                            out.push_str(&format!("    conflict_free {{ {} }}\n", flat.join(", ")));
+                        }
+                    }
+                }
+                out.push_str("}\n");
+                edits.push((ast.item_spans[id.0 as usize].clone(), out));
+            }
+            _ => {}
+        }
+    }
+    edits
+}
+
+fn expand(
+    names: &[crate::ast::Name],
+    expansions: &std::collections::HashMap<&str, Vec<String>>,
+) -> Vec<String> {
+    names
+        .iter()
+        .flat_map(|n| match expansions.get(n.text.as_str()) {
+            Some(segs) => segs.clone(),
+            None => vec![n.text.clone()],
+        })
+        .collect()
 }
 
 fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {

@@ -143,6 +143,71 @@ fn subleq_structural_shape() {
 }
 
 #[test]
+fn subleq_schedule_directive_rewrites_and_only_s5_conflicts() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/subleq.tr"))
+        .unwrap();
+    let c = run(&src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let rendered = render(&c.ast, &src, &c.lowered);
+    assert!(
+        rendered
+            .contains("urgency step_s0 > step_s1 > step_s2 > step_s3 > step_s4 > step_s5 > refill")
+    );
+
+    // Full round trip, including the scheduler.
+    let (tokens, _) = lexer::lex(&rendered);
+    let (ast2, parse_errors) = parser::parse(&rendered, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}");
+    let (res2, resolve_errors) = resolve::resolve(&ast2);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+    let (fx2, effect_errors) = effects::check(&ast2, &res2);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast2, &res2, &fx2);
+    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
+
+    // Every segment writes the shared continuation register, so all
+    // C(6,2) segment pairs conflict there too — harmless, since their
+    // guards (cont == i) are mutually exclusive by construction and can
+    // never fire together regardless. The interesting fact is which
+    // pairs conflict on real state: only step_s5 (the sole writer of
+    // pc/m) should conflict with refill, not step_s0..s4.
+    let group = sched.groups.iter().find(|g| g.module.is_some()).unwrap();
+    let rule_name = |id: trace::ast::ItemId| match ast2.item(id) {
+        trace::ast::Item::Rule { name, .. } => name.text.clone(),
+        _ => unreachable!(),
+    };
+    let refill_partners: Vec<String> = group
+        .conflicts
+        .iter()
+        .filter_map(|c| {
+            let (a, b) = (rule_name(c.a), rule_name(c.b));
+            if a == "refill" {
+                Some(b)
+            } else if b == "refill" {
+                Some(a)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        refill_partners,
+        ["step_s5"],
+        "only step_s5 shares real state with refill"
+    );
+
+    let step_pairs = group
+        .conflicts
+        .iter()
+        .filter(|c| rule_name(c.a) != "refill" && rule_name(c.b) != "refill")
+        .count();
+    assert_eq!(
+        step_pairs, 15,
+        "all 6 segments should pairwise conflict on __cont_step"
+    );
+}
+
+#[test]
 fn rejects_nested_tick() {
     let src = "\
 module M {
