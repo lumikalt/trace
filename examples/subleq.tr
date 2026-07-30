@@ -7,7 +7,7 @@ module Subleq {
     reg ir : bits[16] = 0
     mem m  : bits[16][4096]
 
-    rule step <suspends> {
+    rule step <sequences> {
         a := m[pc]
         tick
         b := m[pc + 1]

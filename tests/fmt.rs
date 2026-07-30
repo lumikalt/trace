@@ -82,7 +82,7 @@ fn idempotent_on_every_shipped_example_except_the_known_continuation_case() {
 #[test]
 fn known_limitation_continuation_line_before_brace() {
     let src = "\
-impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
+impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines>
     refines AnyGrant
 {
     return prio(reqs)

@@ -11,8 +11,8 @@ pub enum TokenKind {
     #[token("\n")]
     Newline,
 
-    // Structural keywords. Effect names (converges, suspends, allocates,
-    // reads, writes, choice) and schedule-block words (urgency,
+    // Structural keywords. Effect names (combines, sequences, elaborates,
+    // reads, writes, chooses) and schedule-block words (urgency,
     // conflict_free) stay contextual identifiers — the keyword set only
     // holds words that open or shape a construct.
     #[token("module")]

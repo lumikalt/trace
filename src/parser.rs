@@ -71,7 +71,7 @@ const POSTFIX_BP: u8 = 19;
 
 /// Minimum binding power for type positions (`: ty`). Excludes comparison
 /// and range operators so the `<` of a following effect list (`: bits[1]
-/// <converges>`) is never eaten as less-than. Bracket application and
+/// <combines>`) is never eaten as less-than. Bracket application and
 /// arithmetic (`bits[N+1]`) still parse.
 const TYPE_MIN_BP: u8 = 5;
 
@@ -459,7 +459,7 @@ impl<'a> Parser<'a> {
         Some(directive)
     }
 
-    /// `<name (args)?, ...>` — e.g. `<suspends, reads {pc, mem}>`.
+    /// `<name (args)?, ...>` — e.g. `<sequences, reads {pc, mem}>`.
     /// Effect names are contextual identifiers, not keywords.
     fn parse_effects(&mut self) -> Option<Vec<Effect>> {
         let mut effects = Vec::new();

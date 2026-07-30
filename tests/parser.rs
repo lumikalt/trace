@@ -104,19 +104,19 @@ fn spawn_prefix() {
 
 #[test]
 fn rule_with_effects() {
-    let ast = parse_ok("rule step <suspends, reads {pc, mem}, writes {mem}> {\n tick\n}\n");
+    let ast = parse_ok("rule step <sequences, reads {pc, mem}, writes {mem}> {\n tick\n}\n");
     let Item::Rule { effects, body, .. } = ast.item(ast.roots[0]) else {
         panic!("expected rule");
     };
     let names: Vec<_> = effects.iter().map(|e| e.name.text.as_str()).collect();
-    assert_eq!(names, ["suspends", "reads", "writes"]);
+    assert_eq!(names, ["sequences", "reads", "writes"]);
     assert_eq!(effects[1].args, ["pc", "mem"]);
     assert_eq!(body.len(), 1);
 }
 
 #[test]
 fn function_with_signature() {
-    let ast = parse_ok("Parity(x : bits[8]) : bits[1] <converges> {\n return x[0] ^ x[1]\n}\n");
+    let ast = parse_ok("Parity(x : bits[8]) : bits[1] <combines> {\n return x[0] ^ x[1]\n}\n");
     let Item::Fn {
         name,
         kind,
@@ -133,7 +133,7 @@ fn function_with_signature() {
     assert_eq!(params.len(), 1);
     assert_eq!(ast.expr_sexpr(params[0].ty), "(index bits 8)");
     assert_eq!(ast.expr_sexpr(ret.unwrap()), "(index bits 1)");
-    assert_eq!(effects[0].name, "converges");
+    assert_eq!(effects[0].name, "combines");
     assert_eq!(body.len(), 1);
 }
 
@@ -142,11 +142,11 @@ fn spec_and_impl_refines() {
     // Multiline impl signature straight from DESIGN.md: newlines before
     // `refines` and before the body brace.
     let src = "\
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <converges, choice> {
+spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
     return 0
 }
 
-impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
+impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines>
     refines AnyGrant
 {
     return 0
@@ -164,7 +164,7 @@ impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
         panic!("expected impl, got {kind:?}");
     };
     assert_eq!(refines.text, "AnyGrant");
-    assert_eq!(effects[0].name, "converges");
+    assert_eq!(effects[0].name, "combines");
 }
 
 #[test]
@@ -288,7 +288,7 @@ module M
 
 #[test]
 fn multi_tick_rule() {
-    let ast = parse_ok("rule step <suspends> {\n a := m[pc]\n tick\n b := m[pc + 1]\n}\n");
+    let ast = parse_ok("rule step <sequences> {\n a := m[pc]\n tick\n b := m[pc + 1]\n}\n");
     let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
         panic!()
     };

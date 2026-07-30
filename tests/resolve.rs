@@ -119,7 +119,7 @@ fn let_shadowing_is_allowed() {
 #[test]
 fn signature_types_bind_implicit_params() {
     let src = "\
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <converges, choice> {
+spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
     i := any(0..N-1)
     reqs[i]?
     return i
@@ -136,7 +136,7 @@ spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <converges, choice> {
 #[test]
 fn body_names_do_not_bind_implicitly() {
     // Free names bind only in signature types, never in bodies.
-    let (_, _, errors) = run("F(x : bits[8]) : bits[8] <converges> {\n return M\n}\n");
+    let (_, _, errors) = run("F(x : bits[8]) : bits[8] <combines> {\n return M\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("cannot find `M`"));
 }
@@ -144,7 +144,7 @@ fn body_names_do_not_bind_implicitly() {
 #[test]
 fn refines_must_name_a_spec() {
     let (_, _, errors) =
-        run("impl I(x : bits[1]) : bits[1] <converges> refines Ghost {\n return x\n}\n");
+        run("impl I(x : bits[1]) : bits[1] <combines> refines Ghost {\n return x\n}\n");
     assert!(
         errors
             .iter()
@@ -152,11 +152,11 @@ fn refines_must_name_a_spec() {
     );
 
     let src = "\
-Helper(x : bits[1]) : bits[1] <converges> {
+Helper(x : bits[1]) : bits[1] <combines> {
     return x
 }
 
-impl I(x : bits[1]) : bits[1] <converges> refines Helper {
+impl I(x : bits[1]) : bits[1] <combines> refines Helper {
     return x
 }
 ";
@@ -220,7 +220,7 @@ module M {
     }
 }
 
-Helper(v : bits[8]) : bits[8] <converges> {
+Helper(v : bits[8]) : bits[8] <combines> {
     return v
 }
 ";

@@ -4,7 +4,7 @@ Syntax highlighting and formatting for `.tr` files (the `trace` HDL — see
 the repo root `DESIGN.md`).
 
 - **Syntax highlighting**: a TextMate grammar (`syntaxes/trace.tmLanguage.json`)
-  covering keywords, the contextual effect words (`converges`, `suspends`,
+  covering keywords, the contextual effect words (`combines`, `sequences`,
   `reads`, ...), builtins (`bits`, `clog2`, `prio`, ...), numbers
   (`0x`/`0b`/decimal, with `_` separators), and `--` line comments.
 - **Formatting**: "Format Document" shells out to the `trace` compiler

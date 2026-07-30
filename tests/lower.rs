@@ -212,7 +212,7 @@ fn rejects_nested_tick() {
     let src = "\
 module M {
     reg x : bits[8] = 0
-    rule r <suspends> {
+    rule r <sequences> {
         if x == 0 {
             tick
         }
@@ -230,7 +230,7 @@ fn rejects_reassignment_across_segments() {
     let src = "\
 module M {
     reg x : bits[8] = 0
-    rule r <suspends> {
+    rule r <sequences> {
         v := 1
         tick
         v := 2
@@ -252,7 +252,7 @@ fn rejects_same_segment_read_of_a_captured_value() {
 module M {
     reg x : bits[8] = 0
     reg y : bits[8] = 0
-    rule r <suspends> {
+    rule r <sequences> {
         v := 1
         y := v + 1
         tick
@@ -271,7 +271,7 @@ fn uncaptured_locals_are_left_alone() {
     let src = "\
 module M {
     reg x : bits[8] = 0
-    rule r <suspends> {
+    rule r <sequences> {
         w := 1 + 1
         x := w
         tick
@@ -288,8 +288,8 @@ module M {
 
 #[test]
 fn no_tick_no_lowering() {
-    // <suspends> with zero ticks: nothing to cut, plan skips it.
-    let c = run("rule r <suspends> {\n x := 1\n}\n");
+    // <sequences> with zero ticks: nothing to cut, plan skips it.
+    let c = run("rule r <sequences> {\n x := 1\n}\n");
     assert!(c.lowered.is_empty());
     assert!(c.errors.is_empty());
 }

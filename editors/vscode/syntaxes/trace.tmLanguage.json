@@ -47,7 +47,7 @@
     "effect-words": {
       "comment": "Contextual identifiers, not lexer keywords (see src/lexer.rs) — only meaningful inside <...> effect lists and schedule{} blocks, but a plain word-match is close enough for a simple grammar.",
       "name": "keyword.other.effect.trace",
-      "match": "\\b(converges|suspends|allocates|decides|choice|reads|writes|urgency|conflict_free)\\b"
+      "match": "\\b(combines|sequences|elaborates|fails|chooses|reads|writes|urgency|conflict_free)\\b"
     },
     "builtins": {
       "name": "support.function.builtin.trace",

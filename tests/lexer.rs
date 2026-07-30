@@ -44,7 +44,7 @@ fn comparison_and_shift_disambiguate() {
     assert_eq!(kinds("a < b"), vec![Ident, Lt, Ident]);
     assert_eq!(kinds("a >> 1"), vec![Ident, Shr, Int]);
     // Effect brackets are plain Lt/Gt; the parser owns that grammar.
-    assert_eq!(kinds("<converges>"), vec![Lt, Ident, Gt]);
+    assert_eq!(kinds("<combines>"), vec![Lt, Ident, Gt]);
 }
 
 #[test]

@@ -47,58 +47,64 @@ rule drain {
 Effects give each piece of hardware a static "color". The type checker enforces the
 colors. Effect annotations sit in angle brackets after the signature.
 
-| Effect                 | Meaning                       | Hardware                        |
-| ---------------------- | ----------------------------- | ------------------------------- |
-| `converges`            | total, pure, terminates       | combinational logic             |
-| `suspends`             | crosses cycle boundaries      | FSM + registers (see lowering)  |
-| `allocates`            | runs at elaboration time only | no hardware; builds the circuit |
-| `decides`              | can fail (inferred)           | guard inputs to the handshake   |
-| `choice`               | nondeterminism, spec-only     | none; model-checker free vars   |
-| `reads R` / `writes W` | state access rows             | input to the scheduler          |
+The effect *names* below are hardware-descriptive (`combines`, `sequences`,
+`elaborates`, `fails`, `chooses`), not Verse's own vocabulary (`converges`,
+`suspends`, `allocates`, `decides`, `choice`). The semantics are still Verse's; only
+the surface spelling changed, so the words read naturally in a hardware context
+instead of assuming familiarity with Verse.
 
-The policy for inferred effects (`decides` and the rows) is uniform: the compiler
+| Effect                 | Meaning                       | Hardware                         |
+| ----------------------- | ----------------------------- | -------------------------------- |
+| `combines`              | total, pure, terminates       | combinational logic              |
+| `sequences`             | crosses cycle boundaries      | FSM + registers (see lowering)   |
+| `elaborates`            | runs at elaboration time only | no hardware; builds the circuit  |
+| `fails`                 | can fail (inferred)           | guard inputs to the handshake    |
+| `chooses`               | nondeterminism, spec-only     | none; model-checker free vars    |
+| `reads R` / `writes W`  | state access rows             | input to the scheduler           |
+
+The policy for inferred effects (`fails` and the rows) is uniform: the compiler
 computes them; a stated effect is an interface assertion. Overstating is legal, because
 a conservative claim is sound. Understating is an error.
 
-### `converges`: combinational logic
+### `combines`: combinational logic
 
-A `converges` function cannot recurse, loop on circuit values, or suspend. It always
+A `combines` function cannot recurse, loop on circuit values, or suspend. It always
 lowers to a pure combinational expression.
 
 ```
-Parity(x : bits[8]) : bits[1] <converges> {
+Parity(x : bits[8]) : bits[1] <combines> {
     return x[0] ^ x[1] ^ x[2] ^ x[3] ^ x[4] ^ x[5] ^ x[6] ^ x[7]
 }
 ```
 
-The checker rejects circuit-value loops in `converges` code:
+The checker rejects circuit-value loops in `combines` code:
 
 ```
-Bad(x : bits[8]) : bits[8] <converges> {
+Bad(x : bits[8]) : bits[8] <combines> {
     while x != 0 { x := x >> 1 }
     -- error[E012]: loop bound depends on a circuit value.
-    -- Loops over circuit values need `<suspends>` (one iteration per cycle)
-    -- or an elaboration-time bound under `<allocates>`.
+    -- Loops over circuit values need `<sequences>` (one iteration per cycle)
+    -- or an elaboration-time bound under `<elaborates>`.
 }
 ```
 
-### `allocates`: elaboration time
+### `elaborates`: elaboration time
 
-`allocates` code runs once, before synthesis. It builds the circuit. Recursion and
+`elaborates` code runs once, before synthesis. It builds the circuit. Recursion and
 dynamic allocation are legal here and only here. This makes the Chisel confusion between
 elaboration time and circuit time (`if` vs `when`, Scala `var` in generator loops) a
 type error instead of a silent bug.
 
 ```
-AdderTree(xs : list[wire[bits[32]]]) : wire[bits[32]] <allocates> {
+AdderTree(xs : list[wire[bits[32]]]) : wire[bits[32]] <elaborates> {
     if len(xs) == 1 { return xs[0] }        -- `if` on an elab value: unrolls
     mid := len(xs) / 2
     return Add(AdderTree(xs[..mid]), AdderTree(xs[mid..]))   -- recursion: legal
 }
 ```
 
-An `if` on a circuit value inside `converges` code is a mux. An `if` on an elaboration
-value inside `allocates` code selects what to build. The effect of the scrutinee decides.
+An `if` on a circuit value inside `combines` code is a mux. An `if` on an elaboration
+value inside `elaborates` code selects what to build. The effect of the scrutinee decides.
 The user does not choose a keyword; the checker rejects mixtures that do not lower.
 
 ### `reads` / `writes` rows
@@ -112,16 +118,16 @@ rule refill <reads {pc, mem}, writes {ir}> {
 }
 ```
 
-### `decides`: fallibility
+### `fails`: fallibility
 
-Adapted from Verse's `<decides>`. Code that can fail carries `decides`: a guard `?`, a
-fifo operation, or a call to deciding code. The compiler infers it bottom-up through
-the call graph. This tracking is what makes handshake derivation compositional: a
-rule's derived ready logic is the conjunction of guards from every deciding call in
-its body, however deep.
+Adapted from Verse's `<decides>`, renamed `fails` here to read as ordinary hardware
+vocabulary. Code that can fail carries `fails`: a guard `?`, a fifo operation, or a
+call to failing code. The compiler infers it bottom-up through the call graph. This
+tracking is what makes handshake derivation compositional: a rule's derived ready
+logic is the conjunction of guards from every failing call in its body, however deep.
 
 ```
-Classify(x : bits[8]) : bits[2] <converges, decides> {
+Classify(x : bits[8]) : bits[2] <combines, fails> {
     (x != 0)?                 -- fallible: aborts the calling rule's cycle
     return clog2(x)
 }
@@ -134,9 +140,9 @@ rule step {
 Context rules:
 
 - A rule body is always a failure context. Failure aborts the cycle and retries.
-  Rules never need to declare `decides`.
+  Rules never need to declare `fails`.
 - Elaboration positions are never failure contexts. There is no transaction to
-  abort. Guards and fifo ops in `allocates` bodies, state types, and initializers
+  abort. Guards and fifo ops in `elaborates` bodies, state types, and initializers
   are errors.
 
 ### Verse effects not carried over
@@ -146,11 +152,11 @@ Three other Verse effects were considered and folded away:
 - `transacts` — every rule is a transaction by construction. The effect is ambient.
 - `varies` (non-deterministic reads) — subsumed by a nonempty `reads` row.
 - `diverges` — circuit code cannot diverge inside a cycle by construction.
-  Termination of `allocates` recursion is unchecked in v0; accept this.
+  Termination of `elaborates` recursion is unchecked in v0; accept this.
 
-## `suspends`: multi-cycle code without multi-cycle rollback
+## `sequences`: multi-cycle code without multi-cycle rollback
 
-**Resolution of the main open question from the first draft.** A `suspends` block is
+**Resolution of the main open question from the first draft.** A `sequences` block is
 sugar. It lowers to a continuation register plus one single-cycle rule per segment.
 There is no cross-cycle rollback, no checkpoint hardware, ever. The transaction is
 always one cycle. "Cycle = transaction" survives intact.
@@ -158,7 +164,7 @@ always one cycle. "Cycle = transaction" survives intact.
 The `tick` statement marks a cycle boundary. It cuts the block into segments.
 
 ```
-Rmw(addr : bits[8]) <suspends, reads {mem}, writes {mem}> {
+Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
     v := mem[addr]
     tick
     mem[addr] := v + 1
@@ -196,21 +202,21 @@ compiler reports the cost: how many segments, how many saved bits.
 
 ### `sync`, `race`, `spawn`
 
-These three constructs compose suspending code. All three lower to rules and registers.
+These three constructs compose sequenced code. All three lower to rules and registers.
 
 **`spawn`** starts a parallel FSM. It allocates a new continuation register. Spawn
-counts must be static, because dynamic allocation needs `allocates`. A spawn inside a
+counts must be static, because dynamic allocation needs `elaborates`. A spawn inside a
 circuit-value loop is a type error.
 
 **`sync`** joins parallel FSMs. It lowers to a rule guarded on the conjunction of the
 joined continuations reaching their end states.
 
-**`race`** takes the first of several suspending computations to complete. The
+**`race`** takes the first of several sequenced computations to complete. The
 competing continuations write the same result register. They become conflicting rules.
 Arbitration falls out of the ordinary scheduler; there is no separate arbiter construct.
 
 ```
-Fetch2(pc : bits[16]) <suspends> {
+Fetch2(pc : bits[16]) <sequences> {
     h1 := spawn ReadBank(bank0, pc)
     h2 := spawn ReadBank(bank1, pc + 1)
     sync(h1, h2)                        -- both reads have landed
@@ -218,31 +224,31 @@ Fetch2(pc : bits[16]) <suspends> {
 }
 ```
 
-## Choice: specification, not synthesis
+## `chooses`: specification, not synthesis
 
 The choice operator `|` and the `any` form are **not synthesizable**. They exist for
 specification and verification. Nondeterministic choice becomes a free variable in a
-model checker, like SVA `$anyseq`. Implementations are checked as refinements of choicy
-specs.
+model checker, like SVA `$anyseq`. Implementations are checked as refinements of specs
+that declare `chooses`.
 
 ```
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <converges, choice> {
+spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
     i := any(0..N-1)          -- free variable: the checker picks
     reqs[i]?                  -- constrained: the pick must be a requester
     return i
 }
 
-impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
+impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines>
     refines AnyGrant
 {
     -- deterministic logic; checked against the spec
 }
 ```
 
-The `choice` effect marks spec-only code. Only a `spec` may declare it. Using `any`
+The `chooses` effect marks spec-only code. Only a `spec` may declare it. Using `any`
 without it is a type error. Synthesizing code with it is a type error.
 
-`|` is contextual: in an item without `choice` it is bitwise or; in a `choice` item it
+`|` is contextual: in an item without `chooses` it is bitwise or; in a `chooses` item it
 is the choice operator. One token, disambiguated by the effect, never by the parser.
 
 ## Scheduling
@@ -337,14 +343,14 @@ was wrong.
 
 ## Combinational loops
 
-**Resolution of review point 5.** The `converges` effect
+**Resolution of review point 5.** The `combines` effect
 guarantees acyclicity only inside one scope, via a no-forward-reference rule. It does
 not guarantee acyclicity across module boundaries. Two internally-acyclic modules wired
 output-to-input in a cycle still form a real combinational loop.
 
 v0 position:
 
-- Enforce no-forward-reference inside `converges` scopes. Local cycles are
+- Enforce no-forward-reference inside `combines` scopes. Local cycles are
   inexpressible.
 - Do not build a whole-program cycle checker. The backend is firtool (CIRCT), and its
   `CheckCombLoops` pass already detects loops. Map its diagnostics back to source
@@ -421,7 +427,7 @@ module Subleq {
     reg pc : bits[16] = 0
     mem m  : bits[16][4096]
 
-    rule step <suspends> {
+    rule step <sequences> {
         a := m[pc]
         tick
         b := m[pc + 1]
@@ -702,7 +708,7 @@ pretty-printer's problem, which reopens the comment-loss problem it was built to
 
 No language server. No go-to-definition, hover, or inline diagnostics in the editor —
 those still come from running `trace file.tr` directly. The grammar is regex-based, so
-it highlights `reads`/`writes`/`converges`/... as effect keywords unconditionally, even
+it highlights `reads`/`writes`/`combines`/... as effect keywords unconditionally, even
 where they're used as ordinary identifiers outside an effect list; harmless for
 readability, not a correctness signal.
 

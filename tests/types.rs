@@ -123,10 +123,10 @@ module M {
 #[test]
 fn bit_select_and_slice() {
     // x[0] is bits[1]; x[7..0] is bits[8].
-    run_ok("F(x : bits[8]) : bits[1] <converges> {\n return x[0] ^ x[7]\n}\n");
-    run_ok("G(x : bits[16]) : bits[8] <converges> {\n return x[7..0]\n}\n");
+    run_ok("F(x : bits[8]) : bits[1] <combines> {\n return x[0] ^ x[7]\n}\n");
+    run_ok("G(x : bits[16]) : bits[8] <combines> {\n return x[7..0]\n}\n");
 
-    let (_, _, errors) = run("H(x : bits[16]) : bits[4] <converges> {\n return x[7..0]\n}\n");
+    let (_, _, errors) = run("H(x : bits[16]) : bits[4] <combines> {\n return x[7..0]\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("bits[8]"));
 }
@@ -136,7 +136,7 @@ fn implicit_width_params_instantiate_at_call_sites() {
     // N solves to 8, so clog2(N) = 3: assigning to bits[3] works and
     // assigning to bits[2] fails.
     let src = "\
-Enc(reqs : bits[N]) : bits[clog2(N)] <converges> {
+Enc(reqs : bits[N]) : bits[clog2(N)] <combines> {
     return prio(reqs)
 }
 
@@ -152,7 +152,7 @@ module M {
     run_ok(src);
 
     let src = "\
-Enc(reqs : bits[N]) : bits[clog2(N)] <converges> {
+Enc(reqs : bits[N]) : bits[clog2(N)] <combines> {
     return prio(reqs)
 }
 
@@ -173,7 +173,7 @@ module M {
 #[test]
 fn arg_count_checked() {
     let src = "\
-F(x : bits[8]) : bits[8] <converges> {
+F(x : bits[8]) : bits[8] <combines> {
     return x
 }
 
@@ -241,7 +241,7 @@ module M {
 #[test]
 fn generic_bodies_skip_width_checks() {
     // Inside a generic fn, widths are unknown: no false errors.
-    run_ok("Mix(a : bits[N], b : bits[N]) : bits[N] <converges> {\n return (a & b) ^ (a | b)\n}\n");
+    run_ok("Mix(a : bits[N], b : bits[N]) : bits[N] <combines> {\n return (a & b) ^ (a | b)\n}\n");
 }
 
 #[test]

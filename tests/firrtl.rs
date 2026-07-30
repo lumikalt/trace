@@ -1,7 +1,7 @@
 use trace::firrtl::{EmitError, emit};
 use trace::{effects, lexer, lower, parser, resolve, schedule, types};
 
-/// Full pipeline including suspends lowering (re-lexed/parsed once the
+/// Full pipeline including sequences lowering (re-lexed/parsed once the
 /// lowered text exists), matching what the CLI does for `--firrtl`.
 fn emit_from_source(src: &str) -> Result<String, Vec<EmitError>> {
     let (tokens, lex_errors) = lexer::lex(src);
@@ -190,14 +190,14 @@ fn port_ram_emits_addressable_memory_through_ports() {
 }
 
 #[test]
-fn errors_on_unlowered_suspends_rule() {
+fn errors_on_unlowered_sequences_rule() {
     // emit_from_source lowers automatically when lowering applies; use
     // a rule shape lowering itself rejects (nested tick) so a still-
-    // <suspends> rule with a tick reaches the emitter unlowered.
+    // <sequences> rule with a tick reaches the emitter unlowered.
     let src = "\
 module M {
     reg x : bits[1] = 0
-    rule r <suspends> {
+    rule r <sequences> {
         if x == 1 {
             tick
         }
@@ -208,7 +208,7 @@ module M {
     let err = emit_from_source(src).unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.message.contains("run suspends lowering first"))
+            .any(|e| e.message.contains("run sequences lowering first"))
     );
 }
 

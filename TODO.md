@@ -45,7 +45,7 @@ enforced somewhere in the compiler (see the cited file), not a surprise.
 
 - v0 arrays are one conflict resource each — no partial disjointness
   (Dahlia-style banking is tier 3, explicitly deferred in DESIGN.md).
-- `converges` combinational-loop checking delegates entirely to
+- `combines` combinational-loop checking delegates entirely to
   firtool's `CheckCombLoops`, which has a known blind spot around
   multi-top-module designs (CIRCT issue #1138).
 

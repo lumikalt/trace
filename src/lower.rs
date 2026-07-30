@@ -1,5 +1,5 @@
-//! `suspends` lowering: DESIGN.md's resolution of the central open
-//! question. A `suspends` rule body is sugar. `tick` cuts it into
+//! `sequences` lowering: DESIGN.md's resolution of the central open
+//! question. A `sequences` rule body is sugar. `tick` cuts it into
 //! segments; each segment becomes an ordinary single-cycle rule guarded
 //! on a continuation register. There is no cross-cycle rollback and no
 //! new runtime mechanism — only the primitives already decided (guarded
@@ -75,7 +75,7 @@ fn clog2(v: u64) -> u64 {
     }
 }
 
-/// Find every `<suspends>` rule with at least one top-level `tick` and
+/// Find every `<sequences>` rule with at least one top-level `tick` and
 /// plan its lowering. Rules that fail a v0-scope check are reported and
 /// omitted from the result; other rules still lower independently.
 pub fn plan(
@@ -91,7 +91,7 @@ pub fn plan(
         match ast.item(id).clone() {
             Item::Module { items, .. } => stack.extend(items),
             Item::Rule { name, body, .. } => {
-                if !fx.sigs.get(&id).is_some_and(|s| s.suspends) {
+                if !fx.sigs.get(&id).is_some_and(|s| s.sequences) {
                     continue;
                 }
                 if !body.iter().any(|s| matches!(ast.stmt(*s), Stmt::Tick)) {
@@ -121,7 +121,7 @@ fn plan_rule(
     if let Some(span) = find_nested_tick(ast, body) {
         errors.push(LowerError {
             span,
-            message: "`tick` must be at the top level of a suspends rule, not nested in \
+            message: "`tick` must be at the top level of a sequences rule, not nested in \
                       if/while (v0 restriction)"
                 .to_string(),
         });
@@ -129,7 +129,7 @@ fn plan_rule(
     if let Some(span) = find_unsupported_construct(ast, res, body) {
         errors.push(LowerError {
             span,
-            message: "suspends lowering does not yet support spawn/sync/race (v0 restriction)"
+            message: "sequences lowering does not yet support spawn/sync/race (v0 restriction)"
                 .to_string(),
         });
     }
@@ -181,7 +181,7 @@ fn plan_rule(
             errors.push(LowerError {
                 span: res.def(*def).span.clone(),
                 message: format!(
-                    "`{name}` is assigned in multiple segments ({}); suspends lowering \
+                    "`{name}` is assigned in multiple segments ({}); sequences lowering \
                      requires a single assignment per captured value (v0 restriction)",
                     segs.join(", ")
                 ),
@@ -206,7 +206,7 @@ fn plan_rule(
             errors.push(LowerError {
                 span: res.def(*def).span.clone(),
                 message: format!(
-                    "`{name}` has type {ty}, not a concrete `bits[w]`; suspends lowering \
+                    "`{name}` has type {ty}, not a concrete `bits[w]`; sequences lowering \
                      needs a known width to declare its save register"
                 ),
             });

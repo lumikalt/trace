@@ -18,7 +18,7 @@
 //!   write, and for the same reason: not threaded through a `mux` yet).
 //! - No calls to user `fn`/`spec`/`impl` items — needs inlining/
 //!   instantiation machinery this pass doesn't build yet.
-//! - No `<suspends>` rules: run `lower::plan`/`render` first. This pass
+//! - No `<sequences>` rules: run `lower::plan`/`render` first. This pass
 //!   only lowers "guarded atomic rule" to hardware, not "cycle-crossing
 //!   rule" to guarded atomic rules — that is `lower`'s job.
 //! - A rule's guards (`expr?`) and fifo operations (`Enq[x]`/`Deq[]`)
@@ -388,13 +388,13 @@ fn emit_module(
                 fifos.push((name.text.clone(), w));
             }
             Item::Rule { name, body, .. } => {
-                let still_suspends = fx.sigs.get(id).is_some_and(|s| s.suspends)
+                let still_sequences = fx.sigs.get(id).is_some_and(|s| s.sequences)
                     || body.iter().any(|s| matches!(ast.stmt(*s), Stmt::Tick));
-                if still_suspends {
+                if still_sequences {
                     cx.error(
                         ast.item_spans[id.0 as usize].clone(),
                         format!(
-                            "`{}` is still a <suspends> rule with `tick`; run suspends \
+                            "`{}` is still a <sequences> rule with `tick`; run sequences \
                              lowering first (lower::plan + render), then emit the result",
                             name.text
                         ),
@@ -1451,7 +1451,7 @@ impl<'a> Emitter<'a> {
                 Stmt::While { .. } => {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
-                        "a loop in an emitted rule body is not supported (suspends \
+                        "a loop in an emitted rule body is not supported (sequences \
                          lowering should have removed it before emission)"
                             .to_string(),
                     );

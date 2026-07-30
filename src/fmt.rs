@@ -13,7 +13,7 @@
 //!
 //! Known limitation, accepted rather than special-cased: a line that
 //! continues a statement without opening a bracket — DESIGN.md's
-//! multiline-signature style, `impl F(...) : ty <converges>\n    refines
+//! multiline-signature style, `impl F(...) : ty <combines>\n    refines
 //! Spec\n{` — has no bracket depth to hang an indent off, so it renders
 //! flush left instead of hand-indented. Fixing that needs real
 //! statement awareness, not brace counting; out of scope for a

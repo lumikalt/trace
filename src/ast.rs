@@ -143,7 +143,7 @@ pub enum Stmt {
     },
 }
 
-/// One effect atom from an `<...>` list: `suspends`, `reads {pc, mem}`.
+/// One effect atom from an `<...>` list: `sequences`, `reads {pc, mem}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Effect {
     pub name: Name,
@@ -156,8 +156,8 @@ pub struct Param {
     pub ty: ExprId,
 }
 
-/// `fn` vs `spec` vs `impl ... refines Spec`. Specs may use choice; impls
-/// are checked as refinements of the spec they name.
+/// `fn` vs `spec` vs `impl ... refines Spec`. Specs may declare `chooses`;
+/// impls are checked as refinements of the spec they name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FnKind {
     Fn,

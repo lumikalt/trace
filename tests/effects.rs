@@ -37,47 +37,49 @@ fn item_named(ast: &Ast, wanted: &str) -> trace::ast::ItemId {
 }
 
 #[test]
-fn tick_requires_suspends() {
+fn tick_requires_sequences() {
     let (_, _, errors) = run("rule t {\n tick\n}\n");
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("`tick` requires `<suspends>`"));
+    assert!(errors[0].message.contains("`tick` requires `<sequences>`"));
 
-    run_ok("rule t <suspends> {\n tick\n}\n");
+    run_ok("rule t <sequences> {\n tick\n}\n");
 }
 
 #[test]
-fn while_needs_suspends_or_allocates() {
+fn while_needs_sequences_or_elaborates() {
     // DESIGN.md's E012 example.
     let (_, _, errors) = run(
-        "Bad(x : bits[8]) : bits[8] <converges> {\n while x != 0 { x := x >> 1 }\n return x\n}\n",
+        "Bad(x : bits[8]) : bits[8] <combines> {\n while x != 0 { x := x >> 1 }\n return x\n}\n",
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("one iteration per cycle"));
 
-    run_ok("Ok(x : bits[8]) : bits[8] <suspends> {\n while x != 0 { x := x >> 1 }\n return x\n}\n");
+    run_ok(
+        "Ok(x : bits[8]) : bits[8] <sequences> {\n while x != 0 { x := x >> 1 }\n return x\n}\n",
+    );
 }
 
 #[test]
-fn any_requires_choice() {
-    let (_, _, errors) = run("F(x : bits[4]) : bits[2] <converges> {\n return any(0..3)\n}\n");
+fn any_requires_chooses() {
+    let (_, _, errors) = run("F(x : bits[4]) : bits[2] <combines> {\n return any(0..3)\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`any`"));
-    assert!(errors[0].message.contains("<choice>"));
+    assert!(errors[0].message.contains("<chooses>"));
 }
 
 #[test]
-fn choice_only_on_specs() {
+fn chooses_only_on_specs() {
     let (_, _, errors) =
-        run("F(x : bits[4]) : bits[2] <converges, choice> {\n return any(0..3)\n}\n");
+        run("F(x : bits[4]) : bits[2] <combines, chooses> {\n return any(0..3)\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("only a `spec`"));
 
-    run_ok("spec S(x : bits[4]) : bits[2] <converges, choice> {\n return any(0..3)\n}\n");
+    run_ok("spec S(x : bits[4]) : bits[2] <combines, chooses> {\n return any(0..3)\n}\n");
 }
 
 #[test]
 fn contradictory_colors() {
-    let (_, _, errors) = run("F(x : bits[1]) : bits[1] <converges, suspends> {\n return x\n}\n");
+    let (_, _, errors) = run("F(x : bits[1]) : bits[1] <combines, sequences> {\n return x\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("contradicts"));
 }
@@ -90,9 +92,9 @@ fn unknown_effect_name() {
 }
 
 #[test]
-fn calling_suspends_needs_suspends() {
+fn calling_sequences_needs_sequences() {
     let src = "\
-Slow(x : bits[8]) : bits[8] <suspends> {
+Slow(x : bits[8]) : bits[8] <sequences> {
     tick
     return x
 }
@@ -106,14 +108,14 @@ rule r {
     assert!(
         errors[0]
             .message
-            .contains("calling `<suspends>` function `Slow`")
+            .contains("calling `<sequences>` function `Slow`")
     );
 }
 
 #[test]
 fn specs_are_not_callable() {
     let src = "\
-spec S(x : bits[1]) : bits[1] <converges, choice> {
+spec S(x : bits[1]) : bits[1] <combines, chooses> {
     return any(0..1)
 }
 
@@ -127,27 +129,27 @@ rule r {
 }
 
 #[test]
-fn decides_infers_through_calls() {
+fn fails_infers_through_calls() {
     let src = "\
-Classify(x : bits[8]) : bits[8] <converges> {
+Classify(x : bits[8]) : bits[8] <combines> {
     (x != 0)?
     return x
 }
 
-Wrap(x : bits[8]) : bits[8] <converges> {
+Wrap(x : bits[8]) : bits[8] <combines> {
     return Classify(x)
 }
 ";
     let (ast, fx) = run_ok(src);
-    assert!(fx.sigs[&item_named(&ast, "Classify")].decides);
+    assert!(fx.sigs[&item_named(&ast, "Classify")].fails);
     assert!(
-        fx.sigs[&item_named(&ast, "Wrap")].decides,
-        "decides must propagate through the call"
+        fx.sigs[&item_named(&ast, "Wrap")].fails,
+        "fails must propagate through the call"
     );
 }
 
 #[test]
-fn fifo_ops_infer_decides_and_rows() {
+fn fifo_ops_infer_fails_and_rows() {
     let src = "\
 module M {
     fifo input : bits[8]
@@ -161,7 +163,7 @@ module M {
 ";
     let (ast, fx) = run_ok(src);
     let sig = &fx.sigs[&item_named(&ast, "drain")];
-    assert!(sig.decides, "fifo op makes the rule fallible");
+    assert!(sig.fails, "fifo op makes the rule fallible");
     assert_eq!(sig.reads.len(), 2, "input + count");
     assert_eq!(sig.writes.len(), 2, "input + count");
 }
@@ -201,15 +203,15 @@ module M {
 }
 
 #[test]
-fn recursion_requires_allocates() {
-    let (_, _, errors) = run("F(x : bits[8]) : bits[8] <converges> {\n return F(x)\n}\n");
+fn recursion_requires_elaborates() {
+    let (_, _, errors) = run("F(x : bits[8]) : bits[8] <combines> {\n return F(x)\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("recursive"));
-    assert!(errors[0].message.contains("<allocates>"));
+    assert!(errors[0].message.contains("<elaborates>"));
 
     // AdderTree-style elaboration recursion is legal.
     run_ok(
-        "G(x : bits[8]) : bits[8] <allocates> {\n if x == 0 { return 0 }\n return G(x - 1)\n}\n",
+        "G(x : bits[8]) : bits[8] <elaborates> {\n if x == 0 { return 0 }\n return G(x - 1)\n}\n",
     );
 }
 
@@ -220,8 +222,8 @@ fn guards_forbidden_at_elaboration_time() {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("elaboration time"));
 
-    // In an <allocates> body.
-    let (_, _, errors) = run("H(x : bits[8]) : bits[8] <allocates> {\n (x != 0)?\n return x\n}\n");
+    // In an <elaborates> body.
+    let (_, _, errors) = run("H(x : bits[8]) : bits[8] <elaborates> {\n (x != 0)?\n return x\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("elaboration time"));
 }

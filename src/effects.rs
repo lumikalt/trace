@@ -1,24 +1,24 @@
 //! Effect checking: enforces the hardware "colors" from DESIGN.md.
 //!
 //! Declared effects come from `<...>` lists. Two of them are inferred as
-//! well: `decides` (fallibility) and the `reads`/`writes` rows. The policy
+//! well: `fails` (fallibility) and the `reads`/`writes` rows. The policy
 //! is the same for all inferred effects: the compiler computes them; a
 //! stated effect is an interface assertion. Overstating is allowed
 //! (conservative), understating a row is an error.
 //!
 //! Construct rules enforced here:
-//! - `tick`, `spawn`, `sync`, `race` require `<suspends>`.
-//! - `while` requires `<suspends>` (one iteration per cycle) or
-//!   `<allocates>` (elaboration-time bound) — DESIGN.md's E012.
-//! - `any` requires `<choice>`; `choice` is legal only on specs.
+//! - `tick`, `spawn`, `sync`, `race` require `<sequences>`.
+//! - `while` requires `<sequences>` (one iteration per cycle) or
+//!   `<elaborates>` (elaboration-time bound) — DESIGN.md's E012.
+//! - `any` requires `<chooses>`; `chooses` is legal only on specs.
 //! - Specs are verification-only: calling one from synthesizable code is
 //!   an error.
-//! - A call requires the callee's color: calling `<suspends>` code needs
-//!   `<suspends>`, calling `<allocates>` code needs `<allocates>`.
-//! - Recursion (direct self-call) requires `<allocates>`.
-//! - Elaboration positions (state types, initializers, `<allocates>`
+//! - A call requires the callee's color: calling `<sequences>` code needs
+//!   `<sequences>`, calling `<elaborates>` code needs `<elaborates>`.
+//! - Recursion (direct self-call) requires `<elaborates>`.
+//! - Elaboration positions (state types, initializers, `<elaborates>`
 //!   bodies) are not failure contexts: guards are errors there.
-//! - Rules are always failure contexts; `decides` needs no declaration.
+//! - Rules are always failure contexts; `fails` needs no declaration.
 
 use crate::ast::{Ast, Effect, Expr, ExprId, FnKind, Item, ItemId, Stmt, StmtId};
 use crate::lexer::Span;
@@ -27,12 +27,12 @@ use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EffectSig {
-    pub converges: bool,
-    pub suspends: bool,
-    pub allocates: bool,
-    pub choice: bool,
-    /// Can fail. Declared or inferred (guards, fifo ops, deciding calls).
-    pub decides: bool,
+    pub combines: bool,
+    pub sequences: bool,
+    pub elaborates: bool,
+    pub chooses: bool,
+    /// Can fail. Declared or inferred (guards, fifo ops, failing calls).
+    pub fails: bool,
     /// State this item reads, inferred, including through calls.
     pub reads: BTreeSet<DefId>,
     /// State this item writes, inferred, including through calls.
@@ -82,7 +82,7 @@ struct Checker<'a> {
     errors: Vec<EffectError>,
 }
 
-const COLOR_EFFECTS: &[&str] = &["converges", "suspends", "allocates", "choice", "decides"];
+const COLOR_EFFECTS: &[&str] = &["combines", "sequences", "elaborates", "chooses", "fails"];
 
 impl<'a> Checker<'a> {
     fn error(&mut self, span: Span, message: String) {
@@ -135,11 +135,11 @@ impl<'a> Checker<'a> {
         for effect in self.item_effects(id).to_vec() {
             let name = effect.name.text.as_str();
             match name {
-                "converges" => sig.converges = true,
-                "suspends" => sig.suspends = true,
-                "allocates" => sig.allocates = true,
-                "choice" => sig.choice = true,
-                "decides" => sig.decides = true,
+                "combines" => sig.combines = true,
+                "sequences" => sig.sequences = true,
+                "elaborates" => sig.elaborates = true,
+                "chooses" => sig.chooses = true,
+                "fails" => sig.fails = true,
                 "reads" | "writes" => {
                     let target = if name == "reads" {
                         &mut declared_reads
@@ -155,8 +155,8 @@ impl<'a> Checker<'a> {
                     self.error(
                         effect.name.span.clone(),
                         format!(
-                            "unknown effect `{name}` (expected converges, suspends, \
-                             allocates, choice, decides, reads, or writes)"
+                            "unknown effect `{name}` (expected combines, sequences, \
+                             elaborates, chooses, fails, reads, or writes)"
                         ),
                     );
                     continue;
@@ -170,28 +170,29 @@ impl<'a> Checker<'a> {
             }
         }
         let span = self.ast.item_spans[id.0 as usize].clone();
-        if sig.converges && sig.suspends {
+        if sig.combines && sig.sequences {
             self.error(
                 span.clone(),
-                "`converges` (combinational) contradicts `suspends` (sequential)".to_string(),
+                "`combines` (combinational) contradicts `sequences` (sequential)".to_string(),
             );
         }
-        if sig.converges && sig.allocates {
+        if sig.combines && sig.elaborates {
             self.error(
                 span.clone(),
-                "`converges` (circuit) contradicts `allocates` (elaboration-time)".to_string(),
+                "`combines` (circuit) contradicts `elaborates` (elaboration-time)".to_string(),
             );
         }
-        if sig.suspends && sig.allocates {
+        if sig.sequences && sig.elaborates {
             self.error(
                 span.clone(),
-                "`allocates` code runs at elaboration time and cannot suspend".to_string(),
+                "`elaborates` code runs at elaboration time and cannot span multiple cycles"
+                    .to_string(),
             );
         }
-        if sig.choice && !self.is_spec(id) {
+        if sig.chooses && !self.is_spec(id) {
             self.error(
                 span,
-                "`choice` marks verification-only code; only a `spec` may declare it".to_string(),
+                "`chooses` marks verification-only code; only a `spec` may declare it".to_string(),
             );
         }
         self.declared_rows
@@ -199,7 +200,7 @@ impl<'a> Checker<'a> {
         self.sigs.insert(id, sig);
     }
 
-    /// Iterate `decides` and row inference to a fixed point: effects flow
+    /// Iterate `fails` and row inference to a fixed point: effects flow
     /// from callee to caller, and the call graph may be in any order.
     fn infer_fixpoint(&mut self, bodied: &[ItemId]) {
         for _ in 0..=bodied.len() {
@@ -303,15 +304,15 @@ impl<'a> Checker<'a> {
                 self.infer_expr(*rhs, sig);
             }
             Expr::Guard(inner) => {
-                sig.decides = true;
+                sig.fails = true;
                 self.infer_expr(*inner, sig);
             }
             Expr::Field { base, .. } => self.infer_expr(*base, sig),
             Expr::Bracket { callee, args } => {
                 // A fifo op (`f.Deq[]` / `f.Enq[x]`) can fail and mutates
-                // the fifo: reads + writes + decides, conservatively.
+                // the fifo: reads + writes + fails, conservatively.
                 if let Some(fifo) = self.fifo_op_target(*callee) {
-                    sig.decides = true;
+                    sig.fails = true;
                     sig.reads.insert(fifo);
                     sig.writes.insert(fifo);
                 } else {
@@ -323,7 +324,7 @@ impl<'a> Checker<'a> {
             }
             Expr::Call { callee, args } => {
                 if let Some(callee_sig) = self.callee_sig(*callee) {
-                    sig.decides |= callee_sig.decides;
+                    sig.fails |= callee_sig.fails;
                     sig.reads.extend(callee_sig.reads.iter().copied());
                     sig.writes.extend(callee_sig.writes.iter().copied());
                 }
@@ -363,7 +364,7 @@ impl<'a> Checker<'a> {
     fn check_item(&mut self, id: ItemId) {
         let sig = self.sigs[&id].clone();
         // Elaboration bodies are not failure contexts.
-        let elab = sig.allocates;
+        let elab = sig.elaborates;
         for stmt in self.item_body(id).to_vec() {
             self.check_stmt(stmt, id, &sig, elab);
         }
@@ -374,19 +375,19 @@ impl<'a> Checker<'a> {
         let span = self.ast.stmt_spans[id.0 as usize].clone();
         match self.ast.stmt(id).clone() {
             Stmt::Tick => {
-                if !sig.suspends {
+                if !sig.sequences {
                     self.error(
                         span,
-                        "`tick` requires `<suspends>` on the enclosing item".to_string(),
+                        "`tick` requires `<sequences>` on the enclosing item".to_string(),
                     );
                 }
             }
             Stmt::While { cond, body } => {
-                if !sig.suspends && !sig.allocates {
+                if !sig.sequences && !sig.elaborates {
                     self.error(
                         span,
-                        "loop needs `<suspends>` (one iteration per cycle) or an \
-                         elaboration-time bound under `<allocates>`"
+                        "loop needs `<sequences>` (one iteration per cycle) or an \
+                         elaboration-time bound under `<elaborates>`"
                             .to_string(),
                     );
                 }
@@ -436,8 +437,8 @@ impl<'a> Checker<'a> {
                 self.check_expr(inner, item, sig, elab);
             }
             Expr::Spawn(inner) => {
-                if !sig.suspends {
-                    self.error(span, "`spawn` requires `<suspends>`".to_string());
+                if !sig.sequences {
+                    self.error(span, "`spawn` requires `<sequences>`".to_string());
                 }
                 self.check_expr(inner, item, sig, elab);
             }
@@ -477,18 +478,21 @@ impl<'a> Checker<'a> {
         match callee_def.kind {
             DefKind::Builtin => match callee_def.name.as_str() {
                 "any" => {
-                    if !sig.choice {
+                    if !sig.chooses {
                         self.error(
                             span,
-                            "`any` is nondeterministic choice and requires `<choice>` \
+                            "`any` is nondeterministic choice and requires `<chooses>` \
                              (spec-only)"
                                 .to_string(),
                         );
                     }
                 }
                 "sync" | "race" => {
-                    if !sig.suspends {
-                        self.error(span, format!("`{}` requires `<suspends>`", callee_def.name));
+                    if !sig.sequences {
+                        self.error(
+                            span,
+                            format!("`{}` requires `<sequences>`", callee_def.name),
+                        );
                     }
                 }
                 _ => {}
@@ -509,11 +513,11 @@ impl<'a> Checker<'a> {
                 let Some(target) = self.def_items.get(&def).copied() else {
                     return;
                 };
-                if target == item && !sig.allocates {
+                if target == item && !sig.elaborates {
                     self.error(
                         span,
                         format!(
-                            "recursive call to `{}` requires `<allocates>` \
+                            "recursive call to `{}` requires `<elaborates>` \
                              (elaboration-time recursion only)",
                             callee_def.name
                         ),
@@ -521,20 +525,20 @@ impl<'a> Checker<'a> {
                     return;
                 }
                 let callee_sig = self.sigs[&target].clone();
-                if callee_sig.suspends && !sig.suspends {
+                if callee_sig.sequences && !sig.sequences {
                     self.error(
                         span.clone(),
                         format!(
-                            "calling `<suspends>` function `{}` requires `<suspends>`",
+                            "calling `<sequences>` function `{}` requires `<sequences>`",
                             callee_def.name
                         ),
                     );
                 }
-                if callee_sig.allocates && !sig.allocates {
+                if callee_sig.elaborates && !sig.elaborates {
                     self.error(
                         span,
                         format!(
-                            "calling `<allocates>` function `{}` requires `<allocates>`",
+                            "calling `<elaborates>` function `{}` requires `<elaborates>`",
                             callee_def.name
                         ),
                     );
@@ -573,7 +577,7 @@ impl<'a> Checker<'a> {
     fn check_elab_positions(&mut self) {
         let mut stack: Vec<ItemId> = self.ast.roots.clone();
         let empty = EffectSig {
-            allocates: true,
+            elaborates: true,
             ..EffectSig::default()
         };
         while let Some(id) = stack.pop() {
