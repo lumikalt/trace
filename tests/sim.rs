@@ -195,6 +195,35 @@ fn fifo_bridge_runs_and_backpressures() {
     );
 }
 
+/// Proves memory is fully loadable and observable through ordinary
+/// ports, no hierarchical peek/poke: sim/port_ram_tb.v writes distinct
+/// words to two addresses through `addr`/`write_data`/`write_en` and
+/// reads each back through `read_data` without aliasing. Compiles with
+/// no `--disable-opt`, like accumulator.tr: `read_data` is a real
+/// output port.
+#[test]
+fn port_ram_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/port_ram.tr"))
+        .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/port_ram_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: read_data=abcd"),
+        "expected address 5 to still hold 0xabcd:\n{output}"
+    );
+}
+
 /// Proves real module ports end to end: sim/accumulator_tb.v drives
 /// `inc` and reads `sum` through ordinary Verilog ports, no hierarchical
 /// peek/poke, and compilation needs no `--disable-opt` — an observable

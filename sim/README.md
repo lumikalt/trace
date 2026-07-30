@@ -7,9 +7,15 @@ script, or `tests/sim.rs` for the automated version.
 - `accumulator_tb.v` drives `examples/accumulator.tr` through real
   `input`/`output` ports (`dut.inc`, `dut.sum`) — no hierarchical paths,
   no `--disable-opt` (see DESIGN.md's "Module ports" section).
+- `port_ram_tb.v` drives `examples/port_ram.tr` (a `mem` fully loaded
+  and read back through real `input`/`output` ports — no hierarchical
+  paths, no `--disable-opt`; see DESIGN.md's "Port-based memory access"
+  section). This is a general capability, not a fix for SUBLEQ: it
+  loads one word per cycle on demand, not a whole program before boot.
 - `subleq_tb.v` and `fifo_bridge_tb.v` use hierarchical paths (below):
-  SUBLEQ needs to load a `mem`, and fifos are internal-only — neither
-  has a port-based way to reach them from outside.
+  SUBLEQ needs to bulk-load a whole program before its rules start
+  running, and fifos are internal-only — neither has a port-based way
+  to reach them from outside.
 
 ## Why `subleq_tb.v`/`fifo_bridge_tb.v` use hierarchical paths, not ports
 
@@ -33,9 +39,9 @@ the generated Verilog.
   only. Without any output ports, a module's entire contents are
   unobservable from outside, so firtool's default optimization passes
   dead-code-eliminate all of it. `--disable-opt` keeps the real logic so
-  there's something to simulate. `accumulator_tb.v` doesn't need this:
-  `sum` is a real output port, so firtool already knows the logic is
-  observable.
+  there's something to simulate. `accumulator_tb.v`/`port_ram_tb.v`
+  don't need this: both have a real output port, so firtool already
+  knows the logic is observable.
 - `iverilog -DSYNTHESIS`: needed for every testbench here, regardless of
   ports. firtool emits a debug-only register/memory
   randomization block gated behind `ifndef SYNTHESIS`, using an

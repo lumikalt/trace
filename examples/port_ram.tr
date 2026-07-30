@@ -1,0 +1,30 @@
+-- A single-port synchronous RAM addressed entirely through module
+-- ports: no hierarchical paths needed to load or observe its contents.
+-- This closes the general capability gap the SUBLEQ milestone worked
+-- around (examples/subleq.tr's testbench still pokes `mem` directly) —
+-- but only the general one. Loading a whole program into memory before
+-- a CPU boots is a different, harder problem (arbitrating a "load"
+-- phase against the rules that start running the moment reset clears);
+-- see DESIGN.md's "Port-based memory access" section for why SUBLEQ
+-- itself is not retrofitted to use this.
+module PortRam {
+    mem m : bits[16][256]
+
+    input addr : bits[8]
+    input write_data : bits[16]
+    input write_en : bits[1]
+    output read_data : bits[16] = 0
+
+    rule write {
+        (write_en == 1)?
+        m[addr] := write_data
+    }
+
+    rule read {
+        read_data := m[addr]
+    }
+
+    schedule {
+        urgency write > read
+    }
+}

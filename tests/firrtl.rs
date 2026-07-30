@@ -167,6 +167,29 @@ fn accumulator_emits_real_ports() {
 }
 
 #[test]
+fn port_ram_emits_addressable_memory_through_ports() {
+    let fir = emit_from_source(&read_example("port_ram.tr")).expect("emission should succeed");
+
+    // addr/write_data/write_en/read_data are all real ports; `m` stays
+    // an ordinary internal mem, addressed by the port values directly
+    // (no new mem-port machinery was needed for this — see DESIGN.md's
+    // "Port-based memory access" section).
+    assert!(fir.contains("input addr : UInt<8>"));
+    assert!(fir.contains("input write_data : UInt<16>"));
+    assert!(fir.contains("input write_en : UInt<1>"));
+    assert!(fir.contains("output read_data : UInt<16>"));
+    assert!(fir.contains("connect m.w_m.addr, addr"));
+    assert!(fir.contains("connect m.w_m.data, write_data"));
+    assert!(fir.contains("connect __out_read_data, m.r0.data"));
+
+    // `write` outranks `read` on the same cycle (explicit schedule
+    // directive), so read must never fire while write does.
+    assert!(fir.contains("node fires_read = and(UInt<1>(1), not(fires_write))"));
+
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn errors_on_unlowered_suspends_rule() {
     // emit_from_source lowers automatically when lowering applies; use
     // a rule shape lowering itself rejects (nested tick) so a still-

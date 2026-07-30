@@ -541,6 +541,60 @@ has no module ports — fifos are an internal-only construct, there is no fifo-p
 concept — so, like SUBLEQ, the testbench reaches in with hierarchical paths
 (`dut.__fifo_input_valid`, `dut.__fifo_input_data`, ...) rather than real ports.
 
+## Port-based memory access
+
+**Achieved 2026-07-30.** Loading and observing a `mem` through ordinary module ports
+needed **no new compiler machinery at all** — it falls out of `input`/`output` (already
+supported) plus an ordinary guarded write:
+
+```
+module PortRam {
+    mem m : bits[16][256]
+
+    input addr : bits[8]
+    input write_data : bits[16]
+    input write_en : bits[1]
+    output read_data : bits[16] = 0
+
+    rule write {
+        (write_en == 1)?
+        m[addr] := write_data
+    }
+
+    rule read {
+        read_data := m[addr]
+    }
+
+    schedule {
+        urgency write > read
+    }
+}
+```
+
+`write`'s guard (`write_en == 1`) is an ordinary explicit `?`, already fully supported;
+`m[addr] := write_data` is an ordinary top-level memory write, already fully supported;
+`read_data := m[addr]` is an ordinary output write whose right side happens to be a
+memory read, and output writes already accept any expression the emitter can compile.
+Nothing needed to change in `firrtl.rs` to make this compile and simulate — the
+capability was already there, just never assembled into an example. `write` outranking
+`read` (an explicit `schedule` directive, not an accident of declaration order) means a
+cycle that writes never races a same-cycle read: `read_data` correctly holds its old
+value on a write cycle rather than reading a half-committed word. `sim/port_ram_tb.v`
+proves it through real ports: two distinct addresses, written and read back without
+aliasing.
+
+**This closes the general capability, not SUBLEQ's specific gap.** SUBLEQ needs to load
+an entire *program* — a whole memory's worth of words — before the CPU's own rules
+start running, and its rules (`step`, `refill`) start firing the instant `reset`
+clears, racing any port-driven load sequence. `PortRam`'s pattern works per-word, on
+demand, with no notion of "not yet loaded" — good enough for a RAM, not for booting a
+CPU from a cold `mem`. Making that work needs a real design decision this document does
+not make yet: some kind of boot/load mode that holds `step`/`refill` off until loading
+finishes (an extra `input` gating their guards would work structurally, but *deciding*
+that shape, and whether it generalizes past SUBLEQ, is undone design work, not an
+emitter gap). `sim/subleq_tb.v` still pokes `dut.m_ext.Memory[i]` directly and is not
+changed by this section.
+
 ## Prior art
 
 - **Bluespec / bsc** — transactional-rules semantics; the production scheduler. Open
