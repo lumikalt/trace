@@ -7,27 +7,35 @@ script, or `tests/sim.rs` for the automated version.
 - `accumulator_tb.v` drives `examples/accumulator.tr` through real
   `input`/`output` ports (`dut.inc`, `dut.sum`) — no hierarchical paths,
   no `--disable-opt` (see DESIGN.md's "Module ports" section).
-- `subleq_tb.v` still uses hierarchical paths (below): SUBLEQ needs to
-  load a `mem`, and there is still no port-based way to do that.
+- `subleq_tb.v` and `fifo_bridge_tb.v` use hierarchical paths (below):
+  SUBLEQ needs to load a `mem`, and fifos are internal-only — neither
+  has a port-based way to reach them from outside.
 
-## Why `subleq_tb.v` uses hierarchical paths, not ports
+## Why `subleq_tb.v`/`fifo_bridge_tb.v` use hierarchical paths, not ports
 
 SUBLEQ's `mem m : bits[16][4096]` has no port-based load path (`input`/
-`output` cover scalar `bits[w]` signals only, see DESIGN.md). Its
-emitted module also exposes no other ports today, so the testbench
-reaches in directly — `dut.pc`, `dut.m_ext.Memory[i]` — which Icarus
-Verilog allows with no special compile flags (Verilator needs
+`output` cover scalar `bits[w]` signals only, see DESIGN.md). FifoBridge
+has no module ports at all — a `fifo` is an internal buffer, there is no
+fifo-port concept in the language. Neither module exposes anything
+beyond clock/reset, so their testbenches reach in directly — `dut.pc`,
+`dut.m_ext.Memory[i]`, `dut.__fifo_input_valid` — which Icarus Verilog
+allows with no special compile flags (Verilator needs
 `--public`/`--public-flat-rw` for the same thing, which is why Icarus
-was picked here).
+was picked here). `__fifo_<name>_valid`/`__fifo_<name>_data` are the
+internal register names firrtl.rs synthesizes for a depth-1 fifo buffer
+(see `src/firrtl.rs`'s `fifo_valid_name`/`fifo_data_name`) — firtool
+passes register names through unchanged, so they show up verbatim in
+the generated Verilog.
 
 ## Why `-DSYNTHESIS` and `--disable-opt`
 
-- `firtool --disable-opt`: needed for `subleq_tb.v` only. Without any
-  output ports, a module's entire contents are unobservable from
-  outside, so firtool's default optimization passes dead-code-eliminate
-  all of it. `--disable-opt` keeps the real logic so there's something
-  to simulate. `accumulator_tb.v` doesn't need this: `sum` is a real
-  output port, so firtool already knows the logic is observable.
+- `firtool --disable-opt`: needed for `subleq_tb.v`/`fifo_bridge_tb.v`
+  only. Without any output ports, a module's entire contents are
+  unobservable from outside, so firtool's default optimization passes
+  dead-code-eliminate all of it. `--disable-opt` keeps the real logic so
+  there's something to simulate. `accumulator_tb.v` doesn't need this:
+  `sum` is a real output port, so firtool already knows the logic is
+  observable.
 - `iverilog -DSYNTHESIS`: needed for every testbench here, regardless of
   ports. firtool emits a debug-only register/memory
   randomization block gated behind `ifndef SYNTHESIS`, using an

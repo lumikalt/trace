@@ -190,13 +190,101 @@ module M {
 }
 
 #[test]
-fn errors_on_fifo() {
-    let src = "module M {\n fifo f : bits[8]\n reg x : bits[8] = 0\n rule r {\n x := x\n }\n}\n";
+fn fifo_bridge_emits_depth_one_buffers() {
+    let fir = emit_from_source(&read_example("fifo_bridge.tr")).expect("emission should succeed");
+
+    // Each fifo is one data register plus one valid bit.
+    assert!(fir.contains("regreset __fifo_input_valid : UInt<1>"));
+    assert!(fir.contains("regreset __fifo_input_data : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_output_valid : UInt<1>"));
+    assert!(fir.contains("regreset __fifo_output_data : UInt<8>"));
+
+    // The two failure conditions DESIGN.md calls out fold into the
+    // guard: Deq needs input valid, Enq needs output not valid.
+    assert!(
+        fir.contains("node fires_transfer = and(__fifo_input_valid, not(__fifo_output_valid))")
+    );
+
+    // Deq'd data reaches Enq's argument by inlining (locals have no
+    // FIRRTL declaration of their own), and the pop/push are two
+    // independent register writes gated by the same `fires_transfer`.
+    assert!(fir.contains("connect __fifo_input_valid, UInt<1>(0)"));
+    assert!(fir.contains("connect __fifo_output_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect __fifo_output_data, __fifo_input_data"));
+
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn fifo_enq_and_deq_same_cycle_is_an_error() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    rule r {
+        x := f.Deq[]
+        f.Enq[x]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("same cycle")));
+}
+
+#[test]
+fn fifo_op_nested_in_if_is_an_error() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg cond : bits[1] = 0
+    rule r {
+        if cond == 1 {
+            f.Enq[cond]
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("nested in if/while")));
+}
+
+#[test]
+fn fifo_op_after_state_write_is_an_error() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg x : bits[8] = 0
+    rule r {
+        x := x + 1
+        f.Enq[x]
+    }
+}
+";
     let err = emit_from_source(src).unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.message.contains("does not synthesize fifo"))
+            .any(|e| e.message.contains("after a state write"))
     );
+}
+
+#[test]
+fn reassigned_local_is_an_error_not_a_silent_miscompile() {
+    // A local read between two assignments must not silently inline
+    // the *later* binding: `y` should see `r`, not `r + 1`. Rather than
+    // risk that, reassigning a local in an emitted rule is rejected.
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg r : bits[8] = 0
+    rule test {
+        x := r
+        y := x
+        x := r + 1
+        f.Enq[y]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("reassigned")));
 }
 
 #[test]

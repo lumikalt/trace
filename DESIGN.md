@@ -488,6 +488,59 @@ output port is enough to stop dead-code elimination from erasing the design. (SU
 still needs `--disable-opt`, since loading its `mem` still has no port-based path; see
 the milestone section above.)
 
+## FIFO synthesis
+
+**Achieved 2026-07-30.** `FifoBridge`, this document's opening example, now emits real
+hardware:
+
+```
+module FifoBridge {
+    fifo input  : bits[8]
+    fifo output : bits[8]
+
+    rule transfer {
+        x := input.Deq[]      -- fails when input is empty
+        output.Enq[x]         -- fails when output is full
+    }
+}
+```
+
+v0 fifos are **depth-1 buffers**: one data register plus one valid bit. `Deq[]`
+succeeds only while valid; `Enq[x]` succeeds only while *not* valid (there is no room
+for a second element). Both failure conditions fold into the rule's guard exactly like
+an explicit `?` — the compiler ANDs them into the same `fires` signal that already
+carries every other guard, so "derive ready/valid handshaking from failure" (this
+document's opening claim) now covers fifos, not just guards. One consequence stated
+honestly, not hidden: a rule cannot both `Enq` and `Deq` the *same* fifo in one cycle —
+that would require its valid bit to be 1 (for `Deq`) and 0 (for `Enq`) at once, an
+always-false guard, so the compiler rejects it outright rather than silently
+synthesizing permanently dead hardware. `Enq`/`Deq` calls must stay at a rule's top
+level, same restriction as an explicit guard, and for the same reason (a guard nested
+in `if`/`while` isn't threaded through the `fires` computation yet).
+
+Compiling `x := input.Deq[]` then `output.Enq[x]` surfaced a real, previously-latent
+gap: `x` is a local, and this is the first example where a local's value is *used*
+later in the same emitted rule, rather than only ever appearing on one side of an
+assignment. FIRRTL has no notion of a `let`-bound name — locals are wires, not
+declarations — so referencing one must *inline* its binding rather than emit an
+undeclared identifier. The emitter now tracks each rule's local bindings and resolves a
+local reference by recursively compiling whatever it was bound to (`x` compiles to
+`input`'s data register directly, `__fifo_input_data`), the same way a Verilog reader
+would mentally substitute a `let` before reading the hardware it describes. One sharp
+edge this inlining creates: a local reassigned within one rule has only one binding in
+the emitter's table, so a read between the two assignments would silently inline the
+*wrong* (later) one — a genuine miscompile, and one no current example happened to
+exercise. Reassigning a local inside an emitted rule is therefore an explicit v0 error,
+not a silent trap.
+
+`sim/fifo_bridge_tb.v` proves both halves of the claim through real simulation, not
+just a passing compile: a value placed in `input` reaches `output` unchanged one cycle
+later (the forward path), and a rule that would overflow `output` correctly stalls
+(does not fire, does not drop or overwrite `input`) until `output` drains. `FifoBridge`
+has no module ports — fifos are an internal-only construct, there is no fifo-port
+concept — so, like SUBLEQ, the testbench reaches in with hierarchical paths
+(`dut.__fifo_input_valid`, `dut.__fifo_input_data`, ...) rather than real ports.
+
 ## Prior art
 
 - **Bluespec / bsc** — transactional-rules semantics; the production scheduler. Open

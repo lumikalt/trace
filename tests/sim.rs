@@ -168,6 +168,33 @@ fn subleq_runs_and_computes_the_right_answer() {
     );
 }
 
+/// Proves fifo synthesis end to end: sim/fifo_bridge_tb.v checks both
+/// the forward path (a value placed in `input` reaches `output`
+/// unchanged) and backpressure (`transfer` stalls while `output` is
+/// still full, then fires as soon as it drains) — the two failure
+/// conditions DESIGN.md's opening example calls out by name.
+#[test]
+fn fifo_bridge_runs_and_backpressures() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/fifo_bridge.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/fifo_bridge_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves real module ports end to end: sim/accumulator_tb.v drives
 /// `inc` and reads `sum` through ordinary Verilog ports, no hierarchical
 /// peek/poke, and compilation needs no `--disable-opt` — an observable

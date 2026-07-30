@@ -7,21 +7,29 @@
 //!
 //! Scope, v0. Each is an explicit error, not a silent skip:
 //! - Exactly one `module` in the file. No submodule instancing yet.
-//! - No `fifo` state and no calls to user `fn`/`spec`/`impl` items —
-//!   both need machinery (FIFO synthesis, inlining/instantiation) this
-//!   pass doesn't build yet.
+//! - No calls to user `fn`/`spec`/`impl` items — needs inlining/
+//!   instantiation machinery this pass doesn't build yet.
 //! - No `<suspends>` rules: run `lower::plan`/`render` first. This pass
 //!   only lowers "guarded atomic rule" to hardware, not "cycle-crossing
 //!   rule" to guarded atomic rules — that is `lower`'s job.
-//! - A rule's guards (`expr?`) must all appear before any state write,
-//!   and not nested in `if`/`while`: DESIGN.md's failure = abort-the-
-//!   whole-rule only lowers to "AND all guards into one `when`" when no
-//!   write could have already committed before a guard is checked.
+//! - A rule's guards (`expr?`) and fifo operations (`Enq[x]`/`Deq[]`)
+//!   must all appear before any state write, and not nested in
+//!   `if`/`while`: DESIGN.md's failure = abort-the-whole-rule only
+//!   lowers to "AND every failure condition into one `when`" when no
+//!   write could have already committed before a failure is checked.
 //! - Expression surface: identifiers, integer literals, `+`/`-`
 //!   (modular, matching the type checker) and comparisons, memory
 //!   indexing. No calls, fields, shifts, multiply, bit-select, or
 //!   unary negate yet — exactly what the SUBLEQ and Rmw examples need,
 //!   nothing hypothetical beyond it.
+//!
+//! Fifos are depth-1 buffers: one data register plus one valid bit.
+//! `Deq[]` succeeds iff valid; `Enq[x]` succeeds iff not valid — the
+//! two failure conditions fold into the rule's guard exactly like an
+//! explicit `?`. A rule may not both `Enq` and `Deq` the same fifo:
+//! that would require valid=1 and valid=0 at once, an always-false
+//! guard, so it is rejected explicitly rather than silently synthesized
+//! as permanently dead hardware.
 //!
 //! Memories get one reader port per static read site (not one shared
 //! port): the scheduler treats read-read as free, which is only sound
@@ -83,6 +91,7 @@ pub fn emit(
         errors: Vec::new(),
         read_ports: HashMap::new(),
         output_regs: HashMap::new(),
+        locals: HashMap::new(),
     };
 
     // `(match_name, emit_name, width, init)`. For a plain `reg`, both
@@ -91,6 +100,8 @@ pub fn emit(
     // backing register (see the `Item::Output` arm below).
     let mut regs: Vec<(String, String, u64, u64)> = Vec::new();
     let mut mems = Vec::new();
+    // `(fifo_name, width)`, depth-1 buffers (see module doc comment).
+    let mut fifos: Vec<(String, u64)> = Vec::new();
     // `(port_name, width)`.
     let mut inputs: Vec<(String, u64)> = Vec::new();
     // `(port_name, internal_reg_name, width)`.
@@ -167,14 +178,33 @@ pub fn emit(
                 mems.push((name.text.clone(), w, len));
             }
             Item::Fifo { name, .. } => {
-                cx.error(
-                    ast.item_spans[id.0 as usize].clone(),
-                    format!(
-                        "`{}` is a fifo; FIRRTL emission does not synthesize fifo hardware yet \
-                         (v0 restriction)",
-                        name.text
-                    ),
-                );
+                let def = res.item_defs[id];
+                let Some(Ty::Fifo(elem)) = cx.state_width(def) else {
+                    cx.error(
+                        ast.item_spans[id.0 as usize].clone(),
+                        format!("`{}` has no concrete fifo type", name.text),
+                    );
+                    continue;
+                };
+                let Ty::Bits(Width::Known(w)) = *elem else {
+                    cx.error(
+                        ast.item_spans[id.0 as usize].clone(),
+                        format!("`{}`'s element type has no concrete width", name.text),
+                    );
+                    continue;
+                };
+                // A depth-1 buffer: one data register, one valid bit,
+                // both internally named to avoid colliding with a user
+                // identifier (same `__`-prefix convention as `__out_x`
+                // and lower.rs's `__cont_x`).
+                regs.push((
+                    fifo_valid_name(&name.text),
+                    fifo_valid_name(&name.text),
+                    1,
+                    0,
+                ));
+                regs.push((fifo_data_name(&name.text), fifo_data_name(&name.text), w, 0));
+                fifos.push((name.text.clone(), w));
             }
             Item::Rule { name, body, .. } => {
                 let still_suspends = fx.sigs.get(id).is_some_and(|s| s.suspends)
@@ -241,6 +271,8 @@ pub fn emit(
     // through a mux yet, so a nested one is an explicit error).
     for rule in &rules {
         cx.check_guard_placement(*rule);
+        cx.check_fifo_same_cycle(*rule);
+        cx.check_no_reassigned_locals(*rule);
         let body = rule_body(ast, *rule);
         if let Some(span) = find_nested_mem_write(ast, &body) {
             cx.error(
@@ -262,6 +294,7 @@ pub fn emit(
     for (rank, rule) in group.order.iter().enumerate() {
         let rule_name = item_name(ast, *rule);
         let signal = format!("fires_{rule_name}");
+        cx.enter_rule(*rule);
         let guard = cx.compile_guard(*rule);
         let mut expr = guard;
         for conflict in &group.conflicts {
@@ -350,11 +383,52 @@ pub fn emit(
         let mut ordered = writers.clone();
         ordered.sort_by_key(|r| std::cmp::Reverse(group.order.iter().position(|x| x == r)));
         for rule in ordered {
+            cx.enter_rule(rule);
             let (addr, data) = cx.write_target(rule, mem_name, *elem_width);
             let f = &fires_name[&rule];
             let _ = writeln!(mem_body, "    when {f} :");
             let _ = writeln!(mem_body, "      connect {mem_name}.{port}.addr, {addr}");
             let _ = writeln!(mem_body, "      connect {mem_name}.{port}.data, {data}");
+        }
+    }
+
+    // Fifos: depth-1 buffers. At most one rule can touch a given fifo
+    // per cycle — every fifo op reads+writes it (effects.rs), so every
+    // touching rule conflicts with every other, exactly like mem
+    // writers above; same priority-mux pattern, though only one
+    // `when` can ever actually be live per fifo.
+    let mut fifo_body = String::new();
+    for (fifo_name, width) in &fifos {
+        let mut touching: Vec<(ItemId, bool, Option<ExprId>)> = Vec::new();
+        for rule in &rules {
+            let body = rule_body(ast, *rule);
+            if let Some((is_enq, value)) = body.iter().find_map(|s| match cx.fifo_op_stmt(*s) {
+                Some((name, is_enq, value)) if &name == fifo_name => Some((is_enq, value)),
+                _ => None,
+            }) {
+                touching.push((*rule, is_enq, value));
+            }
+        }
+        if touching.is_empty() {
+            continue;
+        }
+        touching
+            .sort_by_key(|(r, _, _)| std::cmp::Reverse(group.order.iter().position(|x| x == r)));
+        let valid = fifo_valid_name(fifo_name);
+        let data = fifo_data_name(fifo_name);
+        for (rule, is_enq, value) in touching {
+            cx.enter_rule(rule);
+            let f = &fires_name[&rule];
+            let _ = writeln!(fifo_body, "    when {f} :");
+            if is_enq {
+                let value = cx
+                    .compile_expr_hinted(value.expect("Enq[] always carries a value"), Some(*width))
+                    .unwrap_or_default();
+                let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(1)");
+                let _ = writeln!(fifo_body, "      connect {data}, {value}");
+            } else {
+                let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(0)");
+            }
         }
     }
 
@@ -368,6 +442,7 @@ pub fn emit(
     for (match_name, emit_name, width, _) in &regs {
         let mut values: Vec<(ItemId, String)> = Vec::new();
         for rule in &rules {
+            cx.enter_rule(*rule);
             let body = rule_body(ast, *rule);
             if let Some(v) = cx.reg_value_in_stmts(&body, match_name, *width) {
                 values.push((*rule, v));
@@ -392,6 +467,8 @@ pub fn emit(
     body.push_str(&fires_body);
     body.push('\n');
     body.push_str(&mem_body);
+    body.push('\n');
+    body.push_str(&fifo_body);
     body.push('\n');
     body.push_str(&reg_body);
     body.push('\n');
@@ -455,6 +532,58 @@ fn header(
     out.push('\n');
     out.push_str(body);
     out
+}
+
+fn fifo_valid_name(fifo: &str) -> String {
+    format!("__fifo_{fifo}_valid")
+}
+
+fn fifo_data_name(fifo: &str) -> String {
+    format!("__fifo_{fifo}_data")
+}
+
+/// `Deq[]` succeeds iff the fifo is valid; `Enq[x]` succeeds iff it is
+/// not (depth-1: there is no room for a second element).
+fn fifo_guard_cond(fifo: &str, is_enq: bool) -> String {
+    let valid = fifo_valid_name(fifo);
+    if is_enq {
+        format!("not({valid})")
+    } else {
+        valid
+    }
+}
+
+fn is_fifo_op(ast: &Ast, res: &Resolution, expr: ExprId) -> bool {
+    let Expr::Bracket { callee, .. } = ast.expr(expr) else {
+        return false;
+    };
+    let Expr::Field { base, name } = ast.expr(*callee) else {
+        return false;
+    };
+    matches!(name.as_str(), "Enq" | "Deq")
+        && res
+            .expr_defs
+            .get(base)
+            .is_some_and(|d| res.def(*d).kind == DefKind::Fifo)
+}
+
+fn contains_fifo_op(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool {
+    match ast.stmt(stmt) {
+        Stmt::Expr(e) => is_fifo_op(ast, res, *e),
+        Stmt::Assign { rhs, .. } => is_fifo_op(ast, res, *rhs),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            then_body.iter().any(|s| contains_fifo_op(ast, res, *s))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| contains_fifo_op(ast, res, *s)))
+        }
+        Stmt::While { body, .. } => body.iter().any(|s| contains_fifo_op(ast, res, *s)),
+        _ => false,
+    }
 }
 
 fn clog2(v: u64) -> u64 {
@@ -595,6 +724,15 @@ struct Emitter<'a> {
     /// register, not the port (a FIRRTL output port is drive-only from
     /// inside its own module in the shape this emitter produces).
     output_regs: HashMap<String, String>,
+    /// The rule currently being compiled: each local's binding
+    /// expression. Locals have no FIRRTL declaration of their own —
+    /// they are wires — so a reference to one inlines (recursively
+    /// compiles) its binding instead of emitting an undeclared
+    /// identifier. Refreshed by `enter_rule` before compiling any part
+    /// of a rule; only that rule's top-level bindings are visible,
+    /// matching source scoping (a local from inside `if`/`while` cannot
+    /// be referenced outside it).
+    locals: HashMap<DefId, ExprId>,
 }
 
 impl<'a> Emitter<'a> {
@@ -660,16 +798,58 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// A guard (`expr?`) may only appear before any state write in the
-    /// same rule, and only at the top level.
+    /// `expr` is `<fifo>.Enq[x]` or `<fifo>.Deq[]` -> the fifo's name,
+    /// whether it is `Enq`, and (for `Enq`) the value argument.
+    fn fifo_op(&self, expr: ExprId) -> Option<(String, bool, Option<ExprId>)> {
+        let Expr::Bracket { callee, args } = self.ast.expr(expr) else {
+            return None;
+        };
+        let Expr::Field { base, name } = self.ast.expr(*callee) else {
+            return None;
+        };
+        let def = self.res.expr_defs.get(base)?;
+        if self.res.def(*def).kind != DefKind::Fifo {
+            return None;
+        }
+        let fifo = self.res.def(*def).name.clone();
+        match name.as_str() {
+            "Deq" => Some((fifo, false, None)),
+            "Enq" => Some((fifo, true, args.first().copied())),
+            _ => None,
+        }
+    }
+
+    /// The fifo op directly reachable from `stmt`, if any — the two
+    /// shapes DESIGN.md's examples use: `x := f.Deq[]` and a bare
+    /// `f.Enq[x]` statement.
+    fn fifo_op_stmt(&self, stmt: StmtId) -> Option<(String, bool, Option<ExprId>)> {
+        let expr = match self.ast.stmt(stmt) {
+            Stmt::Expr(e) => *e,
+            Stmt::Assign { rhs, .. } => *rhs,
+            _ => return None,
+        };
+        self.fifo_op(expr)
+    }
+
+    /// A guard (`expr?`) or fifo op (`Enq[x]`/`Deq[]`) may only appear
+    /// before any state write in the same rule, and only at the top
+    /// level — both are failure conditions that must gate the whole
+    /// rule, per the module doc comment.
     fn check_guard_placement(&mut self, rule: ItemId) {
         let body = rule_body(self.ast, rule);
         let mut seen_write = false;
         for stmt in &body {
             match self.ast.stmt(*stmt).clone() {
-                Stmt::Assign { lhs, .. } => {
+                Stmt::Assign { lhs, rhs } => {
                     if is_state_write(self.ast, self.res, lhs) {
                         seen_write = true;
+                    } else if self.fifo_op(rhs).is_some() && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a fifo operation after a state write is not yet supported \
+                             (v0 restriction): it must gate the whole rule"
+                                .to_string(),
+                        );
                     }
                 }
                 Stmt::Expr(e) => {
@@ -678,6 +858,13 @@ impl<'a> Emitter<'a> {
                             self.ast.expr_spans[e.0 as usize].clone(),
                             "a guard after a state write is not yet supported (v0 \
                              restriction): a guard must gate the whole rule"
+                                .to_string(),
+                        );
+                    } else if self.fifo_op(e).is_some() && seen_write {
+                        self.error(
+                            self.ast.expr_spans[e.0 as usize].clone(),
+                            "a fifo operation after a state write is not yet supported \
+                             (v0 restriction): it must gate the whole rule"
                                 .to_string(),
                         );
                     }
@@ -690,6 +877,108 @@ impl<'a> Emitter<'a> {
                                 .to_string(),
                         );
                     }
+                    if contains_fifo_op(self.ast, self.res, *stmt) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a fifo operation nested in if/while is not yet supported \
+                             (v0 restriction)"
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A local reassigned within one emitted rule is not supported: a
+    /// later reference to it would need to know *which* assignment it
+    /// follows (locals are inlined by binding, not by program order —
+    /// see `enter_rule`), and picking the wrong one silently compiles a
+    /// different value than the source reads. Reject it outright rather
+    /// than risk that.
+    fn check_no_reassigned_locals(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        let mut seen: std::collections::HashSet<DefId> = Default::default();
+        for stmt in &body {
+            let Stmt::Assign { lhs, .. } = self.ast.stmt(*stmt) else {
+                continue;
+            };
+            let Some(def) = self.res.expr_defs.get(lhs).copied() else {
+                continue;
+            };
+            if self.res.def(def).kind != DefKind::Local {
+                continue;
+            }
+            if !seen.insert(def) {
+                self.error(
+                    self.ast.stmt_spans[stmt.0 as usize].clone(),
+                    format!(
+                        "`{}` is reassigned in this rule; FIRRTL emission does not yet \
+                         support reassigning a local (v0 restriction: locals are \
+                         inlined at their single binding site, not read in program \
+                         order)",
+                        self.res.def(def).name
+                    ),
+                );
+            }
+        }
+    }
+
+    /// A depth-1 fifo cannot both `Enq` and `Deq` in the same cycle:
+    /// that would require its valid bit to be both 1 (for `Deq`) and 0
+    /// (for `Enq`) at once, an always-false guard. Reject it explicitly
+    /// rather than silently synthesizing permanently dead hardware.
+    fn check_fifo_same_cycle(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        let mut enqueued = std::collections::HashSet::new();
+        let mut dequeued = std::collections::HashSet::new();
+        for stmt in &body {
+            let Some((fifo, is_enq, _)) = self.fifo_op_stmt(*stmt) else {
+                continue;
+            };
+            if is_enq {
+                enqueued.insert(fifo);
+            } else {
+                dequeued.insert(fifo);
+            }
+        }
+        for fifo in enqueued.intersection(&dequeued) {
+            self.error(
+                self.ast.item_spans[rule.0 as usize].clone(),
+                format!(
+                    "this rule both enqueues and dequeues `{fifo}` in the same cycle; \
+                     not supported for a depth-1 fifo (v0 restriction): split into two \
+                     rules"
+                ),
+            );
+        }
+    }
+
+    /// This rule's local bindings, refreshed before compiling any part
+    /// of it. See the `locals` field doc comment.
+    fn enter_rule(&mut self, rule: ItemId) {
+        self.locals.clear();
+        let body = rule_body(self.ast, rule);
+        for stmt in &body {
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Assign { lhs, rhs } => {
+                    if let Some(def) = self.res.expr_defs.get(&lhs).copied()
+                        && self.res.def(def).kind == DefKind::Local
+                    {
+                        self.locals.insert(def, rhs);
+                    }
+                }
+                Stmt::Let { name, init } => {
+                    if let Some((i, _)) = self
+                        .res
+                        .defs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| d.span == name.span)
+                    {
+                        self.locals.insert(DefId(i as u32), init);
+                    }
                 }
                 _ => {}
             }
@@ -700,13 +989,23 @@ impl<'a> Emitter<'a> {
         let body = rule_body(self.ast, rule);
         let mut conds = Vec::new();
         for stmt in &body {
-            if let Stmt::Expr(e) = self.ast.stmt(*stmt)
-                && let Expr::Guard(inner) = self.ast.expr(*e)
-            {
-                conds.push(
-                    self.compile_expr(*inner)
-                        .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
-                );
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) => {
+                    if let Expr::Guard(inner) = self.ast.expr(e) {
+                        conds.push(
+                            self.compile_expr(*inner)
+                                .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
+                        );
+                    } else if let Some((fifo, is_enq, _)) = self.fifo_op(e) {
+                        conds.push(fifo_guard_cond(&fifo, is_enq));
+                    }
+                }
+                Stmt::Assign { rhs, .. } => {
+                    if let Some((fifo, is_enq, _)) = self.fifo_op(rhs) {
+                        conds.push(fifo_guard_cond(&fifo, is_enq));
+                    }
+                }
+                _ => {}
             }
         }
         conds
@@ -821,14 +1120,30 @@ impl<'a> Emitter<'a> {
             };
             return Ok(format!("{mem_name}.{port}.data"));
         }
+        if let Some((fifo, is_enq, _)) = self.fifo_op(id)
+            && !is_enq
+        {
+            return Ok(fifo_data_name(&fifo));
+        }
         match self.ast.expr(id).clone() {
             Expr::Ident(_) => {
                 let def = self.res.expr_defs.get(&id).copied();
                 match def.map(|d| self.res.def(d).clone()) {
                     Some(d) if d.kind == DefKind::Output => Ok(self.output_regs[&d.name].clone()),
-                    Some(d) if matches!(d.kind, DefKind::Reg | DefKind::Local | DefKind::Input) => {
-                        Ok(d.name)
-                    }
+                    Some(d) if d.kind == DefKind::Local => match self.locals.get(&def.unwrap()) {
+                        Some(bound) => self.compile_expr_hinted(*bound, hint),
+                        None => {
+                            self.error(
+                                self.ast.expr_spans[id.0 as usize].clone(),
+                                "cannot find this local's binding in the rule currently \
+                                 being compiled (v0 restriction: a local is only \
+                                 resolved within its own rule)"
+                                    .to_string(),
+                            );
+                            Err(())
+                        }
+                    },
+                    Some(d) if matches!(d.kind, DefKind::Reg | DefKind::Input) => Ok(d.name),
                     _ => {
                         self.error(
                             self.ast.expr_spans[id.0 as usize].clone(),
