@@ -24,6 +24,14 @@
     echo hello from $GREET
   '';
 
+  # Run the test suite with the address space capped at 4 GiB, so a
+  # runaway loop aborts fast instead of stalling the machine until the
+  # OOM killer steps in (ulimit -v takes KiB).
+  scripts.t.exec = ''
+    ulimit -v 4194304
+    exec cargo test "$@"
+  '';
+
   # https://devenv.sh/basics/
   enterShell = ''
     hello         # Run scripts directly
@@ -38,8 +46,7 @@
 
   # https://devenv.sh/tests/
   enterTest = ''
-    echo "Running tests"
-    git --version | grep --color=auto "${pkgs.git.version}"
+    t
   '';
 
   # https://devenv.sh/git-hooks/
