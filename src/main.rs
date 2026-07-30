@@ -1,11 +1,14 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{effects, lexer, parser, resolve, types};
+use trace::{effects, lexer, parser, resolve, schedule, types};
 
 fn main() -> std::process::ExitCode {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: trace <file.tr>");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let explain = args.iter().any(|a| a == "--explain-schedule");
+    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("usage: trace <file.tr> [--explain-schedule]");
         return std::process::ExitCode::FAILURE;
     };
+    let path = path.clone();
     let src = match std::fs::read_to_string(&path) {
         Ok(src) => src,
         Err(e) => {
@@ -30,7 +33,9 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    print!("{}", ast.dump());
+    if !explain {
+        print!("{}", ast.dump());
+    }
 
     let (res, resolve_errors) = resolve::resolve(&ast);
     for err in &resolve_errors {
@@ -40,7 +45,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let (_, effect_errors) = effects::check(&ast, &res);
+    let (fx, effect_errors) = effects::check(&ast, &res);
     for err in &effect_errors {
         report(&path, &src, err.span.clone(), &err.message);
     }
@@ -54,6 +59,17 @@ fn main() -> std::process::ExitCode {
     }
     if !type_errors.is_empty() {
         return std::process::ExitCode::FAILURE;
+    }
+
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    for err in &schedule_errors {
+        report(&path, &src, err.span.clone(), &err.message);
+    }
+    if !schedule_errors.is_empty() {
+        return std::process::ExitCode::FAILURE;
+    }
+    if explain {
+        print!("{}", sched.explain(&ast, &res));
     }
     std::process::ExitCode::SUCCESS
 }
