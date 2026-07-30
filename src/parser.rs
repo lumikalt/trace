@@ -6,10 +6,18 @@
 //! (or closing brace) and parsing continues, so one typo reports once.
 
 use crate::ast::{
-    Ast, BinOp, Effect, Expr, ExprId, FnKind, Item, ItemId, Param, ScheduleDirective, Stmt, StmtId,
-    UnOp,
+    Ast, BinOp, Effect, Expr, ExprId, FnKind, Item, ItemId, Name, Param, ScheduleDirective, Stmt,
+    StmtId, UnOp,
 };
 use crate::lexer::{Span, Token, TokenKind};
+
+/// Which keyword introduced a function-shaped item.
+#[derive(Clone, Copy)]
+enum FnFlavor {
+    Fn,
+    Spec,
+    Impl,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -205,18 +213,14 @@ impl<'a> Parser<'a> {
             Some(Mem) => self.parse_state_decl(Mem),
             Some(Fifo) => self.parse_state_decl(Fifo),
             Some(Rule) => self.parse_rule(),
-            Some(Ident) => self.parse_fn(FnKind::Fn),
+            Some(Ident) => self.parse_fn(FnFlavor::Fn),
             Some(Spec) => {
                 self.bump();
-                self.parse_fn(FnKind::Spec)
+                self.parse_fn(FnFlavor::Spec)
             }
             Some(Impl) => {
                 self.bump();
-                // The refines target is parsed after the signature; patch
-                // the placeholder in below.
-                self.parse_fn(FnKind::Impl {
-                    refines: String::new(),
-                })
+                self.parse_fn(FnFlavor::Impl)
             }
             Some(Schedule) => self.parse_schedule(),
             _ => {
@@ -312,7 +316,7 @@ impl<'a> Parser<'a> {
     /// Handles `fn`, `spec`, and `impl` alike; the `spec`/`impl` keyword is
     /// already consumed. Newlines may split the signature before `refines`
     /// and before the body brace, as in DESIGN.md's RoundRobin example.
-    fn parse_fn(&mut self, mut kind: FnKind) -> Option<ItemId> {
+    fn parse_fn(&mut self, flavor: FnFlavor) -> Option<ItemId> {
         let lo = self.cur_span().start;
         let name = self.expect_ident("function name")?;
         self.expect(TokenKind::LParen, "`(` after function name")
@@ -339,12 +343,18 @@ impl<'a> Parser<'a> {
             None
         };
         let effects = self.parse_effects()?;
-        if let FnKind::Impl { refines } = &mut kind {
-            self.skip_newlines();
-            self.expect(TokenKind::Refines, "`refines` after impl signature")
-                .ok()?;
-            *refines = self.expect_ident("spec name after `refines`")?;
-        }
+        let kind = match flavor {
+            FnFlavor::Fn => FnKind::Fn,
+            FnFlavor::Spec => FnKind::Spec,
+            FnFlavor::Impl => {
+                self.skip_newlines();
+                self.expect(TokenKind::Refines, "`refines` after impl signature")
+                    .ok()?;
+                FnKind::Impl {
+                    refines: self.expect_ident("spec name after `refines`")?,
+                }
+            }
+        };
         self.skip_newlines();
         let body = self.parse_block()?;
         Some(self.ast.push_item(
@@ -399,7 +409,7 @@ impl<'a> Parser<'a> {
 
     fn parse_schedule_directive(&mut self) -> Option<ScheduleDirective> {
         let name = self.expect_ident("`urgency` or `conflict_free`")?;
-        let directive = match name.as_str() {
+        let directive = match name.text.as_str() {
             "urgency" => {
                 // `urgency a > b > c` — at least two names.
                 let mut names = vec![self.expect_ident("rule name")?];
@@ -475,10 +485,13 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn expect_ident(&mut self, what: &str) -> Option<String> {
+    fn expect_ident(&mut self, what: &str) -> Option<Name> {
         if self.at_name() {
             let span = self.bump().unwrap().span;
-            Some(self.text(&span).to_string())
+            Some(Name {
+                text: self.text(&span).to_string(),
+                span,
+            })
         } else {
             self.error_here(format!("expected {what}"));
             self.sync();
@@ -682,9 +695,13 @@ impl<'a> Parser<'a> {
                     Dot => {
                         self.bump();
                         let name = self.expect_ident("field name")?;
-                        lhs = self
-                            .ast
-                            .push_expr(Expr::Field { base: lhs, name }, lo..self.prev_end);
+                        lhs = self.ast.push_expr(
+                            Expr::Field {
+                                base: lhs,
+                                name: name.text,
+                            },
+                            lo..self.prev_end,
+                        );
                         continue;
                     }
                     Question => {

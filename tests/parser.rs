@@ -108,7 +108,7 @@ fn rule_with_effects() {
     let Item::Rule { effects, body, .. } = ast.item(ast.roots[0]) else {
         panic!("expected rule");
     };
-    let names: Vec<_> = effects.iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<_> = effects.iter().map(|e| e.name.text.as_str()).collect();
     assert_eq!(names, ["suspends", "reads", "writes"]);
     assert_eq!(effects[1].args, ["pc", "mem"]);
     assert_eq!(body.len(), 1);
@@ -129,7 +129,7 @@ fn function_with_signature() {
         panic!("expected fn");
     };
     assert_eq!(*kind, trace::ast::FnKind::Fn);
-    assert_eq!(name, "Parity");
+    assert_eq!(name.text, "Parity");
     assert_eq!(params.len(), 1);
     assert_eq!(ast.expr_sexpr(params[0].ty), "(index bits 8)");
     assert_eq!(ast.expr_sexpr(ret.unwrap()), "(index bits 1)");
@@ -160,12 +160,10 @@ impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
     let Item::Fn { kind, effects, .. } = ast.item(ast.roots[1]) else {
         panic!()
     };
-    assert_eq!(
-        *kind,
-        trace::ast::FnKind::Impl {
-            refines: "AnyGrant".to_string()
-        }
-    );
+    let trace::ast::FnKind::Impl { refines } = kind else {
+        panic!("expected impl, got {kind:?}");
+    };
+    assert_eq!(refines.text, "AnyGrant");
     assert_eq!(effects[0].name, "converges");
 }
 
@@ -181,18 +179,23 @@ schedule {
     let Item::Schedule { directives } = ast.item(ast.roots[0]) else {
         panic!()
     };
+    let flat: Vec<(&str, Vec<&str>)> = directives
+        .iter()
+        .map(|d| match d {
+            trace::ast::ScheduleDirective::Urgency(ns) => {
+                ("urgency", ns.iter().map(|n| n.text.as_str()).collect())
+            }
+            trace::ast::ScheduleDirective::ConflictFree(ns) => (
+                "conflict_free",
+                ns.iter().map(|n| n.text.as_str()).collect(),
+            ),
+        })
+        .collect();
     assert_eq!(
-        directives,
-        &[
-            trace::ast::ScheduleDirective::Urgency(vec![
-                "step".to_string(),
-                "refill".to_string(),
-                "idle".to_string()
-            ]),
-            trace::ast::ScheduleDirective::ConflictFree(vec![
-                "read_port".to_string(),
-                "write_port".to_string()
-            ]),
+        flat,
+        [
+            ("urgency", vec!["step", "refill", "idle"]),
+            ("conflict_free", vec!["read_port", "write_port"]),
         ]
     );
 }

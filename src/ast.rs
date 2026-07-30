@@ -11,6 +11,26 @@ pub struct StmtId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ItemId(pub u32);
 
+/// An identifier together with its source span. Everything the resolver
+/// can report an error against carries one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Name {
+    pub text: String,
+    pub span: Span,
+}
+
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
@@ -107,7 +127,7 @@ pub enum Stmt {
         rhs: ExprId,
     },
     Let {
-        name: String,
+        name: Name,
         init: ExprId,
     },
     Tick,
@@ -126,13 +146,13 @@ pub enum Stmt {
 /// One effect atom from an `<...>` list: `suspends`, `reads {pc, mem}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Effect {
-    pub name: String,
-    pub args: Vec<String>,
+    pub name: Name,
+    pub args: Vec<Name>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
-    pub name: String,
+    pub name: Name,
     pub ty: ExprId,
 }
 
@@ -142,44 +162,44 @@ pub struct Param {
 pub enum FnKind {
     Fn,
     Spec,
-    Impl { refines: String },
+    Impl { refines: Name },
 }
 
 /// One directive in a `schedule { ... }` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleDirective {
     /// `urgency a > b > c` — descending priority.
-    Urgency(Vec<String>),
+    Urgency(Vec<Name>),
     /// `conflict_free { a, b }` — claim checked with simulation assertions.
-    ConflictFree(Vec<String>),
+    ConflictFree(Vec<Name>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Module {
-        name: String,
+        name: Name,
         items: Vec<ItemId>,
     },
     Reg {
-        name: String,
+        name: Name,
         ty: ExprId,
         init: Option<ExprId>,
     },
     Mem {
-        name: String,
+        name: Name,
         ty: ExprId,
     },
     Fifo {
-        name: String,
+        name: Name,
         ty: ExprId,
     },
     Rule {
-        name: String,
+        name: Name,
         effects: Vec<Effect>,
         body: Vec<StmtId>,
     },
     Fn {
-        name: String,
+        name: Name,
         kind: FnKind,
         params: Vec<Param>,
         ret: Option<ExprId>,
@@ -349,14 +369,12 @@ impl Ast {
                 out.push_str(&format!("{pad}schedule\n"));
                 let inner = "  ".repeat(depth + 1);
                 for directive in directives {
-                    match directive {
-                        ScheduleDirective::Urgency(names) => {
-                            out.push_str(&format!("{inner}(urgency {})\n", names.join(" ")));
-                        }
-                        ScheduleDirective::ConflictFree(names) => {
-                            out.push_str(&format!("{inner}(conflict_free {})\n", names.join(" ")));
-                        }
-                    }
+                    let (tag, names) = match directive {
+                        ScheduleDirective::Urgency(names) => ("urgency", names),
+                        ScheduleDirective::ConflictFree(names) => ("conflict_free", names),
+                    };
+                    let names = names.iter().map(|n| n.text.as_str()).collect::<Vec<_>>();
+                    out.push_str(&format!("{inner}({tag} {})\n", names.join(" ")));
                 }
             }
         }
@@ -415,9 +433,10 @@ fn effects_str(effects: &[Effect]) -> String {
         .iter()
         .map(|e| {
             if e.args.is_empty() {
-                e.name.clone()
+                e.name.text.clone()
             } else {
-                format!("{} {{{}}}", e.name, e.args.join(", "))
+                let args = e.args.iter().map(|a| a.text.as_str()).collect::<Vec<_>>();
+                format!("{} {{{}}}", e.name, args.join(", "))
             }
         })
         .collect::<Vec<_>>()
