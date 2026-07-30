@@ -47,12 +47,12 @@ rule drain {
 Effects give each piece of hardware a static "color". The type checker enforces the
 colors. Effect annotations sit in angle brackets after the signature.
 
-| Effect        | Meaning                       | Hardware                          |
-|---------------|-------------------------------|-----------------------------------|
-| `converges`   | total, pure, terminates       | combinational logic               |
-| `suspends`    | crosses cycle boundaries      | FSM + registers (see lowering)    |
-| `allocates`   | runs at elaboration time only | no hardware; builds the circuit   |
-| `reads R` / `writes W` | state access rows    | input to the scheduler            |
+| Effect                 | Meaning                       | Hardware                        |
+| ---------------------- | ----------------------------- | ------------------------------- |
+| `converges`            | total, pure, terminates       | combinational logic             |
+| `suspends`             | crosses cycle boundaries      | FSM + registers (see lowering)  |
+| `allocates`            | runs at elaboration time only | no hardware; builds the circuit |
+| `reads R` / `writes W` | state access rows             | input to the scheduler          |
 
 ### `converges`: combinational logic
 
@@ -286,7 +286,7 @@ was wrong.
 
 ## Combinational loops
 
-**Resolution of review point 5, and an honest limitation.** The `converges` effect
+**Resolution of review point 5.** The `converges` effect
 guarantees acyclicity only inside one scope, via a no-forward-reference rule. It does
 not guarantee acyclicity across module boundaries. Two internally-acyclic modules wired
 output-to-input in a cycle still form a real combinational loop.
@@ -308,8 +308,7 @@ feedback inexpressible by construction. That is a large feature. It is not v0.
 
 Front end only. **Do not write a backend.** Emit an existing IR as text.
 
-- Primary target: **FIRRTL** text (`.fir`) → `firtool` (CIRCT) → Verilog. The author
-  knows FIRRTL's shape from Chisel.
+- Primary target: **FIRRTL** text (`.fir`) → `firtool` (CIRCT) → Verilog.
 - Alternative to evaluate: **Calyx**. It is semantically closer to the rule/control
   world. Filament compiles to it.
 
@@ -344,9 +343,8 @@ logos lexer
 
 ## First milestone: SUBLEQ
 
-Port the author's existing SUBLEQ CPU (previously Chisel, Vec-based memory,
-chiseltest testbench). SUBLEQ's read-modify-write-branch step is one natural
-transaction. Target: parse → check → schedule → emit FIRRTL → firtool → simulate.
+SUBLEQ's read-modify-write-branch step is one natural transaction.
+Target: parse → check → schedule → emit FIRRTL → firtool → simulate.
 The port must demonstrate derived stall logic that the Chisel version wrote by hand.
 
 Sketch, honest about v0 array rules (single-port memory → one access per tick):
@@ -391,10 +389,3 @@ shape, only its schedule.
 - **Clash** — pure functional signals, reference point.
 - **Calyx** — IR with a control language (`seq`/`par`/`if`/`while`) separate from
   structure; candidate alternative target.
-
-## Author context
-
-The author is comfortable in Rust (especially parsers) and reads Scala. They know the
-Chisel/FIRRTL pipeline. Prior projects: a parameterized ALU and a SUBLEQ CPU in Chisel.
-Background interest: exotic ISAs (OISC, stack machines, dataflow, capability machines).
-This project grew out of a self-directed Chisel/RTL learning ladder.

@@ -1,0 +1,11 @@
+-- First example from DESIGN.md: the compiler derives all handshaking
+-- from the two failure conditions in `transfer`.
+module FifoBridge {
+    fifo input  : bits[8]
+    fifo output : bits[8]
+
+    rule transfer {
+        x := input.Deq[]      -- fails when input is empty
+        output.Enq[x]         -- fails when output is full
+    }
+}
