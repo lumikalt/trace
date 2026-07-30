@@ -3,8 +3,8 @@
 devenv.local.nix
 devenv.local.yaml
 
-# direnv
-.direnv
+# VSCode
+/.vscode
 
 # pre-commit
 .pre-commit-config.yaml
