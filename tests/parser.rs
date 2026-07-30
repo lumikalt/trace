@@ -119,6 +119,7 @@ fn function_with_signature() {
     let ast = parse_ok("Parity(x : bits[8]) : bits[1] <converges> {\n return x[0] ^ x[1]\n}\n");
     let Item::Fn {
         name,
+        kind,
         params,
         ret,
         effects,
@@ -127,12 +128,105 @@ fn function_with_signature() {
     else {
         panic!("expected fn");
     };
+    assert_eq!(*kind, trace::ast::FnKind::Fn);
     assert_eq!(name, "Parity");
     assert_eq!(params.len(), 1);
     assert_eq!(ast.expr_sexpr(params[0].ty), "(index bits 8)");
     assert_eq!(ast.expr_sexpr(ret.unwrap()), "(index bits 1)");
     assert_eq!(effects[0].name, "converges");
     assert_eq!(body.len(), 1);
+}
+
+#[test]
+fn spec_and_impl_refines() {
+    // Multiline impl signature straight from DESIGN.md: newlines before
+    // `refines` and before the body brace.
+    let src = "\
+spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <converges, choice> {
+    return 0
+}
+
+impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <converges>
+    refines AnyGrant
+{
+    return 0
+}
+";
+    let ast = parse_ok(src);
+    let Item::Fn { kind, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    assert_eq!(*kind, trace::ast::FnKind::Spec);
+    let Item::Fn { kind, effects, .. } = ast.item(ast.roots[1]) else {
+        panic!()
+    };
+    assert_eq!(
+        *kind,
+        trace::ast::FnKind::Impl {
+            refines: "AnyGrant".to_string()
+        }
+    );
+    assert_eq!(effects[0].name, "converges");
+}
+
+#[test]
+fn schedule_block() {
+    let src = "\
+schedule {
+    urgency step > refill > idle
+    conflict_free { read_port, write_port }
+}
+";
+    let ast = parse_ok(src);
+    let Item::Schedule { directives } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    assert_eq!(
+        directives,
+        &[
+            trace::ast::ScheduleDirective::Urgency(vec![
+                "step".to_string(),
+                "refill".to_string(),
+                "idle".to_string()
+            ]),
+            trace::ast::ScheduleDirective::ConflictFree(vec![
+                "read_port".to_string(),
+                "write_port".to_string()
+            ]),
+        ]
+    );
+}
+
+#[test]
+fn schedule_rejects_unknown_directive() {
+    let src = "schedule {\n priority a > b\n}\n";
+    let (tokens, _) = lexer::lex(src);
+    let (_, errors) = parser::parse(src, &tokens);
+    assert!(errors.iter().any(|e| e.message.contains("priority")));
+}
+
+#[test]
+fn all_examples_parse() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
+    let mut found = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "tr") {
+            let src = std::fs::read_to_string(&path).unwrap();
+            let (tokens, lex_errors) = lexer::lex(&src);
+            assert!(
+                lex_errors.is_empty(),
+                "lex errors in {path:?}: {lex_errors:?}"
+            );
+            let (_, errors) = parser::parse(&src, &tokens);
+            assert!(errors.is_empty(), "parse errors in {path:?}: {errors:?}");
+            found += 1;
+        }
+    }
+    assert!(
+        found >= 3,
+        "expected at least 3 example files, found {found}"
+    );
 }
 
 #[test]

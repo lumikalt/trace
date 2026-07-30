@@ -5,7 +5,10 @@
 //! Recovery: a statement- or item-level error skips to the next newline
 //! (or closing brace) and parsing continues, so one typo reports once.
 
-use crate::ast::{Ast, BinOp, Effect, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId, UnOp};
+use crate::ast::{
+    Ast, BinOp, Effect, Expr, ExprId, FnKind, Item, ItemId, Param, ScheduleDirective, Stmt, StmtId,
+    UnOp,
+};
 use crate::lexer::{Span, Token, TokenKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,10 +205,24 @@ impl<'a> Parser<'a> {
             Some(Mem) => self.parse_state_decl(Mem),
             Some(Fifo) => self.parse_state_decl(Fifo),
             Some(Rule) => self.parse_rule(),
-            Some(Ident) => self.parse_fn(),
+            Some(Ident) => self.parse_fn(FnKind::Fn),
+            Some(Spec) => {
+                self.bump();
+                self.parse_fn(FnKind::Spec)
+            }
+            Some(Impl) => {
+                self.bump();
+                // The refines target is parsed after the signature; patch
+                // the placeholder in below.
+                self.parse_fn(FnKind::Impl {
+                    refines: String::new(),
+                })
+            }
+            Some(Schedule) => self.parse_schedule(),
             _ => {
                 self.error_here(
-                    "expected an item (module, reg, mem, fifo, rule, or a function)".to_string(),
+                    "expected an item (module, reg, mem, fifo, rule, schedule, or a function)"
+                        .to_string(),
                 );
                 self.sync();
                 None
@@ -278,6 +295,7 @@ impl<'a> Parser<'a> {
         self.bump(); // rule
         let name = self.expect_ident("rule name")?;
         let effects = self.parse_effects()?;
+        self.skip_newlines();
         let body = self.parse_block()?;
         Some(self.ast.push_item(
             Item::Rule {
@@ -289,8 +307,12 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// `Name(params) (: ret)? <effects>? { body }`
-    fn parse_fn(&mut self) -> Option<ItemId> {
+    /// `Name(params) (: ret)? <effects>? (refines Spec)? { body }`
+    ///
+    /// Handles `fn`, `spec`, and `impl` alike; the `spec`/`impl` keyword is
+    /// already consumed. Newlines may split the signature before `refines`
+    /// and before the body brace, as in DESIGN.md's RoundRobin example.
+    fn parse_fn(&mut self, mut kind: FnKind) -> Option<ItemId> {
         let lo = self.cur_span().start;
         let name = self.expect_ident("function name")?;
         self.expect(TokenKind::LParen, "`(` after function name")
@@ -317,10 +339,18 @@ impl<'a> Parser<'a> {
             None
         };
         let effects = self.parse_effects()?;
+        if let FnKind::Impl { refines } = &mut kind {
+            self.skip_newlines();
+            self.expect(TokenKind::Refines, "`refines` after impl signature")
+                .ok()?;
+            *refines = self.expect_ident("spec name after `refines`")?;
+        }
+        self.skip_newlines();
         let body = self.parse_block()?;
         Some(self.ast.push_item(
             Item::Fn {
                 name,
+                kind,
                 params,
                 ret,
                 effects,
@@ -328,6 +358,80 @@ impl<'a> Parser<'a> {
             },
             lo..self.prev_end,
         ))
+    }
+
+    /// `schedule { urgency a > b \n conflict_free { a, b } }`
+    /// Directive names are contextual identifiers, not keywords.
+    fn parse_schedule(&mut self) -> Option<ItemId> {
+        let lo = self.cur_span().start;
+        self.bump(); // schedule
+        self.skip_newlines();
+        self.expect(TokenKind::LBrace, "`{` after `schedule`")
+            .ok()?;
+        let mut directives = Vec::new();
+        loop {
+            self.skip_newlines();
+            match self.peek() {
+                Some(TokenKind::RBrace) => {
+                    self.bump();
+                    break;
+                }
+                None => {
+                    self.error_here("unclosed schedule block".to_string());
+                    break;
+                }
+                _ => {
+                    let before = self.pos;
+                    if let Some(directive) = self.parse_schedule_directive() {
+                        directives.push(directive);
+                    }
+                    if self.pos == before {
+                        self.bump();
+                    }
+                }
+            }
+        }
+        Some(
+            self.ast
+                .push_item(Item::Schedule { directives }, lo..self.prev_end),
+        )
+    }
+
+    fn parse_schedule_directive(&mut self) -> Option<ScheduleDirective> {
+        let name = self.expect_ident("`urgency` or `conflict_free`")?;
+        let directive = match name.as_str() {
+            "urgency" => {
+                // `urgency a > b > c` — at least two names.
+                let mut names = vec![self.expect_ident("rule name")?];
+                while self.eat(TokenKind::Gt) {
+                    names.push(self.expect_ident("rule name after `>`")?);
+                }
+                if names.len() < 2 {
+                    self.error_here("`urgency` needs at least two rules (`a > b`)".to_string());
+                }
+                ScheduleDirective::Urgency(names)
+            }
+            "conflict_free" => {
+                self.expect(TokenKind::LBrace, "`{` after `conflict_free`")
+                    .ok()?;
+                let mut names = vec![self.expect_ident("rule name")?];
+                while self.eat(TokenKind::Comma) {
+                    names.push(self.expect_ident("rule name")?);
+                }
+                self.expect(TokenKind::RBrace, "`}` closing `conflict_free`")
+                    .ok()?;
+                ScheduleDirective::ConflictFree(names)
+            }
+            _ => {
+                self.error_here(format!(
+                    "unknown schedule directive `{name}` (expected `urgency` or `conflict_free`)"
+                ));
+                self.sync();
+                return None;
+            }
+        };
+        self.expect_terminator();
+        Some(directive)
     }
 
     /// `<name (args)?, ...>` — e.g. `<suspends, reads {pc, mem}>`.

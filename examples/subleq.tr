@@ -1,0 +1,31 @@
+-- First-milestone sketch from DESIGN.md: SUBLEQ's read-modify-write-
+-- branch step as one suspending rule. One memory access per tick in v0
+-- (whole-array conflict rule; single-port memory). step and refill both
+-- touch m, so urgency picks the winner; they are NOT conflict_free.
+module Subleq {
+    reg pc : bits[16] = 0
+    mem m  : bits[16][4096]
+
+    rule step <suspends> {
+        a := m[pc]
+        tick
+        b := m[pc + 1]
+        tick
+        c := m[pc + 2]
+        tick
+        va := m[a]
+        tick
+        r := m[b] - va       -- second operand read; one array access per tick
+        tick
+        m[b] := r
+        if r <= 0 { pc := c } else { pc := pc + 3 }
+    }
+
+    rule refill <reads {pc, m}, writes {ir}> {
+        ir := m[pc]
+    }
+
+    schedule {
+        urgency step > refill
+    }
+}

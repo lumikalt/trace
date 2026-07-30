@@ -136,6 +136,24 @@ pub struct Param {
     pub ty: ExprId,
 }
 
+/// `fn` vs `spec` vs `impl ... refines Spec`. Specs may use choice; impls
+/// are checked as refinements of the spec they name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FnKind {
+    Fn,
+    Spec,
+    Impl { refines: String },
+}
+
+/// One directive in a `schedule { ... }` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleDirective {
+    /// `urgency a > b > c` — descending priority.
+    Urgency(Vec<String>),
+    /// `conflict_free { a, b }` — claim checked with simulation assertions.
+    ConflictFree(Vec<String>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Module {
@@ -162,10 +180,14 @@ pub enum Item {
     },
     Fn {
         name: String,
+        kind: FnKind,
         params: Vec<Param>,
         ret: Option<ExprId>,
         effects: Vec<Effect>,
         body: Vec<StmtId>,
+    },
+    Schedule {
+        directives: Vec<ScheduleDirective>,
     },
 }
 
@@ -294,24 +316,47 @@ impl Ast {
             }
             Item::Fn {
                 name,
+                kind,
                 params,
                 ret,
                 effects,
                 body,
             } => {
+                let keyword = match kind {
+                    FnKind::Fn => "fn",
+                    FnKind::Spec => "spec",
+                    FnKind::Impl { .. } => "impl",
+                };
                 let params = params
                     .iter()
                     .map(|p| format!("{} : {}", p.name, self.expr_sexpr(p.ty)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                out.push_str(&format!("{pad}fn {name}({params})"));
+                out.push_str(&format!("{pad}{keyword} {name}({params})"));
                 if let Some(ret) = ret {
                     out.push_str(&format!(" : {}", self.expr_sexpr(*ret)));
                 }
                 out.push_str(&effects_str(effects));
+                if let FnKind::Impl { refines } = kind {
+                    out.push_str(&format!(" refines {refines}"));
+                }
                 out.push('\n');
                 for stmt in body {
                     self.dump_stmt(*stmt, depth + 1, out);
+                }
+            }
+            Item::Schedule { directives } => {
+                out.push_str(&format!("{pad}schedule\n"));
+                let inner = "  ".repeat(depth + 1);
+                for directive in directives {
+                    match directive {
+                        ScheduleDirective::Urgency(names) => {
+                            out.push_str(&format!("{inner}(urgency {})\n", names.join(" ")));
+                        }
+                        ScheduleDirective::ConflictFree(names) => {
+                            out.push_str(&format!("{inner}(conflict_free {})\n", names.join(" ")));
+                        }
+                    }
                 }
             }
         }
