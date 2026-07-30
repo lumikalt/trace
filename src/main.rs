@@ -1,5 +1,5 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::lexer;
+use trace::{lexer, parser};
 
 fn main() -> std::process::ExitCode {
     let Some(path) = std::env::args().nth(1) else {
@@ -14,35 +14,31 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    let (tokens, errors) = lexer::lex(&src);
-
-    for tok in &tokens {
-        let text = &src[tok.span.clone()];
-        let shown = if tok.kind == lexer::TokenKind::Newline {
-            "\\n"
-        } else {
-            text
-        };
-        println!(
-            "{:>4}..{:<4} {:?} {shown}",
-            tok.span.start, tok.span.end, tok.kind
-        );
+    let (tokens, lex_errors) = lexer::lex(&src);
+    for err in &lex_errors {
+        report(&path, &src, err.span.clone(), "unrecognized character(s)");
+    }
+    if !lex_errors.is_empty() {
+        return std::process::ExitCode::FAILURE;
     }
 
-    for err in &errors {
-        Report::build(ReportKind::Error, (path.as_str(), err.span.clone()))
-            .with_message("unrecognized character(s)")
-            .with_label(
-                Label::new((path.as_str(), err.span.clone())).with_message("not part of any token"),
-            )
-            .finish()
-            .eprint((path.as_str(), Source::from(src.as_str())))
-            .expect("failed to print diagnostic");
+    let (ast, parse_errors) = parser::parse(&src, &tokens);
+    for err in &parse_errors {
+        report(&path, &src, err.span.clone(), &err.message);
+    }
+    if !parse_errors.is_empty() {
+        return std::process::ExitCode::FAILURE;
     }
 
-    if errors.is_empty() {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
-    }
+    print!("{}", ast.dump());
+    std::process::ExitCode::SUCCESS
+}
+
+fn report(path: &str, src: &str, span: lexer::Span, message: &str) {
+    Report::build(ReportKind::Error, (path, span.clone()))
+        .with_message(message)
+        .with_label(Label::new((path, span)).with_message(message))
+        .finish()
+        .eprint((path, Source::from(src)))
+        .expect("failed to print diagnostic");
 }
