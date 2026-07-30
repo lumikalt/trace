@@ -1,0 +1,23 @@
+module Adder {
+    input a : bits[8]
+    input b : bits[8]
+    output sum : bits[8] = 0
+
+    rule add {
+        sum := a + b
+    }
+}
+
+module Top {
+    inst adder : Adder
+
+    input x : bits[8]
+    input y : bits[8]
+    output result : bits[8] = 0
+
+    rule wire {
+        adder.a := x
+        adder.b := y
+        result := adder.sum
+    }
+}

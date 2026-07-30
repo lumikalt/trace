@@ -334,7 +334,10 @@ module M {
 }
 
 #[test]
-fn errors_on_multiple_modules() {
+fn errors_on_ambiguous_top_module() {
+    // Two modules that don't instantiate each other: still an error, just
+    // reworded now that multiple modules is legal when one instantiates
+    // the other (see `emits_submodule_instance`).
     let src = "\
 module A {
     reg x : bits[1] = 0
@@ -344,5 +347,137 @@ module B {
 }
 ";
     let err = emit_from_source(src).unwrap_err();
-    assert!(err.iter().any(|e| e.message.contains("exactly one module")));
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("exactly one top module"))
+    );
+}
+
+#[test]
+fn errors_on_instantiation_cycle() {
+    let src = "\
+module A {
+    inst b : B
+}
+module B {
+    inst a : A
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("cycle")));
+}
+
+#[test]
+fn errors_on_instantiation_cycle_below_a_valid_top() {
+    // `Top` itself is uninstantiated (a valid, unambiguous top), so this
+    // exercises the DFS in `transitive_modules`/`visit_module` rather than
+    // the "zero candidates" shortcut `errors_on_instantiation_cycle`
+    // above takes before that DFS ever runs.
+    let src = "\
+module Top {
+    inst b : B
+}
+module B {
+    inst c : C
+}
+module C {
+    inst b : B
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("cycle")));
+}
+
+#[test]
+fn errors_on_nested_inst_write() {
+    let src = "\
+module Child {
+    input a : bits[8]
+    output b : bits[8] = 0
+    rule pass {
+        b := a
+    }
+}
+module Top {
+    inst c : Child
+    reg cond : bits[1] = 0
+    reg v : bits[8] = 0
+    rule r {
+        if cond == 1 {
+            c.a := v
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("instance port write nested"))
+    );
+}
+
+#[test]
+fn emits_submodule_instance() {
+    let src = read_example("submodule.tr");
+    let fir = emit_from_source(&src).unwrap();
+    assert!(fir.contains("circuit Top :"));
+    assert!(fir.contains("public module Top :"));
+    assert!(fir.contains("module Adder :") && !fir.contains("public module Adder :"));
+    assert!(fir.contains("inst adder of Adder"));
+    assert!(fir.contains("connect adder.clock, clock"));
+    assert!(fir.contains("connect adder.reset, reset"));
+    // Reading a child's output port compiles to a bare reference.
+    assert!(fir.contains("connect __out_result, adder.sum"));
+
+    let Some(verilog) = run_firtool(&fir, &["--disable-opt"]) else {
+        return;
+    };
+    assert!(verilog.contains("module Adder("));
+    assert!(verilog.contains("module Top("));
+    assert!(verilog.contains("Adder adder ("));
+}
+
+#[test]
+fn emits_multiple_instances_of_the_same_module() {
+    // Two instances of one child: distinct instance names must not
+    // collide (helpers that key by instance name, not the shared module
+    // name, are the risk this pins).
+    let src = "\
+module Adder {
+    input a : bits[8]
+    input b : bits[8]
+    output sum : bits[8] = 0
+    rule add {
+        sum := a + b
+    }
+}
+module Top {
+    inst a1 : Adder
+    inst a2 : Adder
+    input x : bits[8]
+    output r1 : bits[8] = 0
+    output r2 : bits[8] = 0
+    rule wire {
+        a1.a := x
+        a1.b := x
+        a2.a := x
+        a2.b := x
+        r1 := a1.sum
+        r2 := a2.sum
+    }
+}
+";
+    let fir = emit_from_source(src).unwrap();
+    assert!(fir.contains("inst a1 of Adder"));
+    assert!(fir.contains("inst a2 of Adder"));
+    assert!(fir.contains("connect a1.clock, clock"));
+    assert!(fir.contains("connect a2.clock, clock"));
+    assert!(fir.contains("connect __out_r1, a1.sum"));
+    assert!(fir.contains("connect __out_r2, a2.sum"));
+
+    let Some(verilog) = run_firtool(&fir, &["--disable-opt"]) else {
+        return;
+    };
+    assert!(verilog.contains("Adder a1 ("));
+    assert!(verilog.contains("Adder a2 ("));
 }

@@ -31,6 +31,8 @@ pub enum DefKind {
     Fifo,
     Input,
     Output,
+    /// A `inst name : Module` child instance.
+    Inst,
     Rule,
     Fn,
     Spec,
@@ -45,7 +47,12 @@ impl DefKind {
     pub fn is_state(self) -> bool {
         matches!(
             self,
-            DefKind::Reg | DefKind::Mem | DefKind::Fifo | DefKind::Input | DefKind::Output
+            DefKind::Reg
+                | DefKind::Mem
+                | DefKind::Fifo
+                | DefKind::Input
+                | DefKind::Output
+                | DefKind::Inst
         )
     }
 
@@ -58,6 +65,7 @@ impl DefKind {
             DefKind::Fifo => "a fifo",
             DefKind::Input => "an input port",
             DefKind::Output => "an output port",
+            DefKind::Inst => "a module instance",
             DefKind::Rule => "a rule",
             DefKind::Fn => "a function",
             DefKind::Spec => "a spec",
@@ -196,6 +204,7 @@ impl<'a> Resolver<'a> {
             Item::Fifo { name, .. } => (name.clone(), DefKind::Fifo),
             Item::Input { name, .. } => (name.clone(), DefKind::Input),
             Item::Output { name, .. } => (name.clone(), DefKind::Output),
+            Item::Inst { name, .. } => (name.clone(), DefKind::Inst),
             Item::Rule { name, .. } => (name.clone(), DefKind::Rule),
             Item::Fn { name, kind, .. } => {
                 let def_kind = match kind {
@@ -231,6 +240,21 @@ impl<'a> Resolver<'a> {
                 self.resolve_expr(*ty, false);
                 if let Some(init) = init {
                     self.resolve_expr(*init, false);
+                }
+            }
+            Item::Inst { module, .. } => {
+                self.resolve_expr(*module, false);
+                if let Some(def) = self.res.expr_defs.get(module).copied()
+                    && self.res.def(def).kind != DefKind::Module
+                {
+                    self.error(
+                        self.ast.expr_spans[module.0 as usize].clone(),
+                        format!(
+                            "`{}` is {}, not a module",
+                            self.res.def(def).name,
+                            self.res.def(def).kind.describe()
+                        ),
+                    );
                 }
             }
             Item::Rule { effects, body, .. } => {
@@ -326,7 +350,7 @@ impl<'a> Resolver<'a> {
                     Some(def) if !self.res.def(def).kind.is_state() => self.error(
                         arg.span.clone(),
                         format!(
-                            "`{}` is {}, not state (reg, mem, fifo, input, or output)",
+                            "`{}` is {}, not state (reg, mem, fifo, input, output, or inst)",
                             arg.text,
                             self.res.def(def).kind.describe()
                         ),
@@ -359,6 +383,15 @@ impl<'a> Resolver<'a> {
                                     format!(
                                         "cannot assign to `{text}`: it is an input port \
                                          (inputs are read-only, driven from outside the module)"
+                                    ),
+                                );
+                            } else if self.res.def(def).kind == DefKind::Inst {
+                                self.error(
+                                    self.ast.expr_spans[lhs.0 as usize].clone(),
+                                    format!(
+                                        "cannot assign to `{text}` directly: it is a module \
+                                         instance; write a specific port instead (`{text}.port \
+                                         := ...`)"
                                     ),
                                 );
                             }

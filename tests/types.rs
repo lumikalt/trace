@@ -258,6 +258,46 @@ fn literals_must_fit() {
 }
 
 #[test]
+fn instance_ports_check_direction_and_width() {
+    let child = "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
+                  rule r {\n b := a\n}\n}\n";
+
+    // Writing an input, reading an output: fine.
+    run_ok(&format!(
+        "{child}module Top {{\n inst c : Child\n reg v : bits[8] = 0\n \
+         rule w {{\n c.a := v\n v := c.b\n}}\n}}\n"
+    ));
+
+    // Writing an output port is backwards.
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n inst c : Child\n rule w {{\n c.b := 1\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("output port")));
+
+    // Reading an input port is backwards.
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n inst c : Child\n reg v : bits[8] = 0\n \
+         rule w {{\n v := c.a\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("input port")));
+
+    // No such port.
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n inst c : Child\n reg v : bits[8] = 0\n \
+         rule w {{\n v := c.nope\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("no port")));
+
+    // A wider value into a narrower input port needs `trunc`, same as any
+    // other state write.
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n inst c : Child\n reg v : bits[16] = 0\n \
+         rule w {{\n c.a := v\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("trunc")));
+}
+
+#[test]
 fn all_examples_type_check() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {

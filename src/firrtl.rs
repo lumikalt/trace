@@ -6,7 +6,16 @@
 //! chain by hand.
 //!
 //! Scope, v0. Each is an explicit error, not a silent skip:
-//! - Exactly one `module` in the file. No submodule instancing yet.
+//! - Modules stay flat and top-level; no lexical nesting (a `module`
+//!   declared inside another module's body is still rejected). Composition
+//!   is by name only: `inst child : Child` declares a child instance,
+//!   `child.port` reads/writes one of its ports. Exactly one top-level
+//!   module must be uninstantiated (the "top"); the rest must be reachable
+//!   from it via `inst`, with no cycle.
+//! - An instance's whole port set is one conflict resource, same
+//!   conservative model as a `mem` array — no per-port precision yet. A
+//!   port write may not nest in `if`/`while` (same restriction as a mem
+//!   write, and for the same reason: not threaded through a `mux` yet).
 //! - No calls to user `fn`/`spec`/`impl` items — needs inlining/
 //!   instantiation machinery this pass doesn't build yet.
 //! - No `<suspends>` rules: run `lower::plan`/`render` first. This pass
@@ -66,16 +75,186 @@ pub fn emit(
         .copied()
         .filter(|id| matches!(ast.item(*id), Item::Module { .. }))
         .collect();
-    if modules.len() != 1 {
+    if modules.is_empty() {
         return Err(vec![EmitError {
             span: 0..0,
-            message: format!(
-                "FIRRTL emission needs exactly one module in the file (v0 restriction), found {}",
-                modules.len()
-            ),
+            message: "FIRRTL emission needs at least one module in the file".to_string(),
         }]);
     }
-    let module = modules[0];
+
+    // A top-level module's own `DefId` -> its `ItemId`, so an `inst`'s
+    // resolved target def can be turned back into the module item it names.
+    let item_of_module_def: HashMap<DefId, ItemId> = modules
+        .iter()
+        .filter_map(|id| res.item_defs.get(id).map(|d| (*d, *id)))
+        .collect();
+
+    // "The top" is whichever top-level module nobody instantiates. A file
+    // with no `inst` at all still works exactly as before: with zero
+    // instantiation edges, every module is a candidate, so exactly one
+    // module means exactly one candidate.
+    let mut instantiated: std::collections::HashSet<ItemId> = std::collections::HashSet::new();
+    for &m in &modules {
+        instantiated.extend(inst_targets(ast, res, m, &item_of_module_def));
+    }
+    let tops: Vec<ItemId> = modules
+        .iter()
+        .copied()
+        .filter(|m| !instantiated.contains(m))
+        .collect();
+    let top = match tops.as_slice() {
+        [top] => *top,
+        [] => {
+            return Err(vec![EmitError {
+                span: 0..0,
+                message: "FIRRTL emission needs exactly one top module (one that no \
+                          other module instantiates), but every module here is \
+                          instantiated by another; that means a cycle (a module \
+                          cannot instantiate itself, even indirectly)"
+                    .to_string(),
+            }]);
+        }
+        _ => {
+            let names: Vec<&str> = tops.iter().map(|m| module_name(ast, *m)).collect();
+            return Err(vec![EmitError {
+                span: 0..0,
+                message: format!(
+                    "FIRRTL emission needs exactly one top module (one that no other \
+                     module instantiates); found {} unrelated candidates: {} (v0 \
+                     restriction — instantiate one from another with `inst`, or \
+                     remove the ones you don't need)",
+                    tops.len(),
+                    names.join(", ")
+                ),
+            }]);
+        }
+    };
+
+    let to_emit = match transitive_modules(ast, res, top, &item_of_module_def) {
+        Ok(order) => order,
+        Err(e) => return Err(vec![e]),
+    };
+
+    let mut blocks = Vec::new();
+    let mut all_errors = Vec::new();
+    for &m in &to_emit {
+        match emit_module(ast, res, fx, types, sched, m, m == top, &item_of_module_def) {
+            Ok(text) => blocks.push(text),
+            Err(errs) => all_errors.extend(errs),
+        }
+    }
+    if !all_errors.is_empty() {
+        return Err(all_errors);
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "FIRRTL version 4.0.0");
+    let _ = writeln!(out, "circuit {} :", module_name(ast, top));
+    for block in blocks {
+        out.push_str(&block);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// The modules a module `m` directly instantiates via `inst`.
+fn inst_targets(
+    ast: &Ast,
+    res: &Resolution,
+    m: ItemId,
+    item_of_module_def: &HashMap<DefId, ItemId>,
+) -> Vec<ItemId> {
+    let Item::Module { items, .. } = ast.item(m) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| match ast.item(*it) {
+            Item::Inst { module, .. } => res
+                .expr_defs
+                .get(module)
+                .and_then(|d| item_of_module_def.get(d))
+                .copied(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every module reachable from `top` via `inst`, `top` included. A cycle
+/// in the instantiation graph is an error — a real hardware hierarchy
+/// cannot contain itself, even indirectly.
+fn transitive_modules(
+    ast: &Ast,
+    res: &Resolution,
+    top: ItemId,
+    item_of_module_def: &HashMap<DefId, ItemId>,
+) -> Result<Vec<ItemId>, EmitError> {
+    let mut order = Vec::new();
+    let mut done: std::collections::HashSet<ItemId> = std::collections::HashSet::new();
+    let mut on_path: Vec<ItemId> = Vec::new();
+    visit_module(
+        ast,
+        res,
+        top,
+        item_of_module_def,
+        &mut order,
+        &mut done,
+        &mut on_path,
+    )?;
+    Ok(order)
+}
+
+fn visit_module(
+    ast: &Ast,
+    res: &Resolution,
+    m: ItemId,
+    item_of_module_def: &HashMap<DefId, ItemId>,
+    order: &mut Vec<ItemId>,
+    done: &mut std::collections::HashSet<ItemId>,
+    on_path: &mut Vec<ItemId>,
+) -> Result<(), EmitError> {
+    if on_path.contains(&m) {
+        return Err(EmitError {
+            span: ast.item_spans[m.0 as usize].clone(),
+            message: format!(
+                "module instantiation forms a cycle at `{}`: a module cannot \
+                 instantiate itself, even indirectly",
+                module_name(ast, m)
+            ),
+        });
+    }
+    if !done.insert(m) {
+        return Ok(());
+    }
+    on_path.push(m);
+    for target in inst_targets(ast, res, m, item_of_module_def) {
+        visit_module(ast, res, target, item_of_module_def, order, done, on_path)?;
+    }
+    on_path.pop();
+    order.push(m);
+    Ok(())
+}
+
+fn module_name(ast: &Ast, m: ItemId) -> &str {
+    match ast.item(m) {
+        Item::Module { name, .. } => &name.text,
+        _ => "?",
+    }
+}
+
+/// Emit one module's FIRRTL text (its `public module`/`module` line, ports,
+/// declarations, and body) — everything except the `circuit` wrapper,
+/// which the caller writes once for the whole file.
+fn emit_module(
+    ast: &Ast,
+    res: &Resolution,
+    fx: &Effects,
+    types: &Types,
+    sched: &Schedule,
+    module: ItemId,
+    is_public: bool,
+    item_of_module_def: &HashMap<DefId, ItemId>,
+) -> Result<String, Vec<EmitError>> {
     let Item::Module {
         name: mod_name,
         items,
@@ -106,6 +285,8 @@ pub fn emit(
     let mut inputs: Vec<(String, u64)> = Vec::new();
     // `(port_name, internal_reg_name, width)`.
     let mut outputs: Vec<(String, String, u64)> = Vec::new();
+    // `(inst_name, target_module's_firrtl_name, inst_def)`.
+    let mut instances: Vec<(String, String, DefId)> = Vec::new();
     let mut rules: Vec<ItemId> = Vec::new();
     for id in &items {
         match ast.item(*id) {
@@ -222,12 +403,33 @@ pub fn emit(
                 }
                 rules.push(*id);
             }
+            Item::Inst {
+                name,
+                module: module_expr,
+            } => {
+                let def = res.item_defs[id];
+                let target_item = res
+                    .expr_defs
+                    .get(module_expr)
+                    .and_then(|d| item_of_module_def.get(d));
+                let Some(&target_item) = target_item else {
+                    // Already reported by resolve.rs (unknown name or not
+                    // a module).
+                    continue;
+                };
+                instances.push((
+                    name.text.clone(),
+                    module_name(ast, target_item).to_string(),
+                    def,
+                ));
+            }
             Item::Fn { .. } | Item::Schedule { .. } => {}
             Item::Module { name, .. } => {
                 cx.error(
                     ast.item_spans[id.0 as usize].clone(),
                     format!(
-                        "nested module `{}` is not supported (v0 restriction)",
+                        "nested module `{}` is not supported (v0 restriction): modules \
+                         stay flat and top-level; use `inst` to compose them instead",
                         name.text
                     ),
                 );
@@ -242,19 +444,16 @@ pub fn emit(
         let _ = writeln!(port_connects, "    connect {port}, {internal}");
     }
 
-    let Some(group) = sched.groups.iter().find(|g| g.module == Some(module)) else {
-        if !cx.errors.is_empty() {
-            return Err(cx.errors);
-        }
-        return Ok(header(
-            &mod_name.text,
-            &regs,
-            &mems,
-            &HashMap::new(),
-            &inputs,
-            &outputs,
-            &port_connects,
-        ));
+    // A module with no rules at all gets no `GroupSchedule` (schedule.rs
+    // skips empty groups); treat that the same as an empty one rather
+    // than special-casing it, so a rule-less module with only instances
+    // (wired entirely by default connects) still emits correctly.
+    let group = sched.groups.iter().find(|g| g.module == Some(module));
+    let empty_order: Vec<ItemId> = Vec::new();
+    let empty_conflicts: Vec<crate::schedule::Conflict> = Vec::new();
+    let (order, conflicts) = match group {
+        Some(g) => (&g.order, &g.conflicts),
+        None => (&empty_order, &empty_conflicts),
     };
 
     // Assign one reader port per static mem-read site, across all rules,
@@ -266,9 +465,10 @@ pub fn emit(
     }
 
     // Guards must all precede any state write, and not be nested.
-    // Memory writes must stay top-level (register writes may nest in
-    // if/else — SUBLEQ's branch does — but mem writes aren't threaded
-    // through a mux yet, so a nested one is an explicit error).
+    // Memory writes and instance-port writes must stay top-level
+    // (register writes may nest in if/else — SUBLEQ's branch does — but
+    // neither is threaded through a mux yet, so a nested one is an
+    // explicit error).
     for rule in &rules {
         cx.check_guard_placement(*rule);
         cx.check_fifo_same_cycle(*rule);
@@ -282,6 +482,15 @@ pub fn emit(
                     .to_string(),
             );
         }
+        if let Some(span) = find_nested_inst_write(ast, res, &body) {
+            cx.error(
+                span,
+                "an instance port write nested in if/while is not yet supported in \
+                 FIRRTL emission (v0 restriction); only a register write may be \
+                 conditional"
+                    .to_string(),
+            );
+        }
     }
     if !cx.errors.is_empty() {
         return Err(cx.errors);
@@ -291,13 +500,13 @@ pub fn emit(
     // non-exempted, conflicting rule that itself fires.
     let mut fires_name: HashMap<ItemId, String> = HashMap::new();
     let mut fires_body = String::new();
-    for (rank, rule) in group.order.iter().enumerate() {
+    for (rank, rule) in order.iter().enumerate() {
         let rule_name = item_name(ast, *rule);
         let signal = format!("fires_{rule_name}");
         cx.enter_rule(*rule);
         let guard = cx.compile_guard(*rule);
         let mut expr = guard;
-        for conflict in &group.conflicts {
+        for conflict in conflicts {
             if conflict.exempted {
                 continue;
             }
@@ -309,7 +518,7 @@ pub fn emit(
                 None
             };
             let Some(other) = other else { continue };
-            let other_rank = group.order.iter().position(|r| *r == other).unwrap();
+            let other_rank = order.iter().position(|r| *r == other).unwrap();
             if other_rank < rank {
                 let other_signal = &fires_name[&other];
                 expr = format!("and({expr}, not({other_signal}))");
@@ -381,7 +590,7 @@ pub fn emit(
         // last-connect); only one writer's fires can be true at once
         // among non-exempted conflicting writers.
         let mut ordered = writers.clone();
-        ordered.sort_by_key(|r| std::cmp::Reverse(group.order.iter().position(|x| x == r)));
+        ordered.sort_by_key(|r| std::cmp::Reverse(order.iter().position(|x| x == r)));
         for rule in ordered {
             cx.enter_rule(rule);
             let (addr, data) = cx.write_target(rule, mem_name, *elem_width);
@@ -412,8 +621,7 @@ pub fn emit(
         if touching.is_empty() {
             continue;
         }
-        touching
-            .sort_by_key(|(r, _, _)| std::cmp::Reverse(group.order.iter().position(|x| x == r)));
+        touching.sort_by_key(|(r, _, _)| std::cmp::Reverse(order.iter().position(|x| x == r)));
         let valid = fifo_valid_name(fifo_name);
         let data = fifo_data_name(fifo_name);
         for (rule, is_enq, value) in touching {
@@ -451,11 +659,71 @@ pub fn emit(
         if values.is_empty() {
             continue;
         }
-        values.sort_by_key(|(r, _)| std::cmp::Reverse(group.order.iter().position(|x| x == r)));
+        values.sort_by_key(|(r, _)| std::cmp::Reverse(order.iter().position(|x| x == r)));
         for (rule, value) in values {
             let f = &fires_name[&rule];
             let _ = writeln!(reg_body, "    when {f} :");
             let _ = writeln!(reg_body, "      connect {emit_name}, {value}");
+        }
+    }
+
+    // Instances: `clock`/`reset` are ordinary input ports on any FIRRTL
+    // module, so they need driving just like any other instance input —
+    // unconditionally, not gated by a rule (an instance's own body needs
+    // them on every cycle, not just cycles where the parent happens to
+    // touch one of its other ports). Every other input port defaults to
+    // 0, then the (at most one) firing rule that writes it overrides via
+    // last-connect, same priority-mux pattern as a mem writer. Output
+    // ports need no wiring here: reading `inst.port` compiles straight to
+    // the FIRRTL reference `inst.port` (see `compile_expr_hinted`).
+    let mut instance_decls = String::new();
+    let mut instance_body = String::new();
+    for (inst_name, target_name, inst_def) in &instances {
+        let _ = writeln!(instance_decls, "    inst {inst_name} of {target_name}");
+        let _ = writeln!(instance_body, "    connect {inst_name}.clock, clock");
+        let _ = writeln!(instance_body, "    connect {inst_name}.reset, reset");
+        let ports = types
+            .instance_module
+            .get(inst_def)
+            .and_then(|m| types.module_ports.get(m))
+            .cloned()
+            .unwrap_or_default();
+        for (port_name, kind, ty) in &ports {
+            if *kind == DefKind::Input {
+                let w = port_bit_width(ty).unwrap_or(1);
+                let _ = writeln!(
+                    instance_body,
+                    "    connect {inst_name}.{port_name}, UInt<{w}>(0)"
+                );
+            }
+        }
+        let mut writers: Vec<(ItemId, Vec<(String, String)>)> = Vec::new();
+        for rule in &rules {
+            cx.enter_rule(*rule);
+            let body = rule_body(ast, *rule);
+            let writes = find_inst_port_writes(ast, res, &body, inst_name);
+            if writes.is_empty() {
+                continue;
+            }
+            let mut compiled = Vec::new();
+            for (port_name, value) in writes {
+                let w = ports
+                    .iter()
+                    .find(|(n, _, _)| n == &port_name)
+                    .and_then(|(_, _, t)| port_bit_width(t))
+                    .unwrap_or(1);
+                let v = cx.compile_expr_hinted(value, Some(w)).unwrap_or_default();
+                compiled.push((port_name, v));
+            }
+            writers.push((*rule, compiled));
+        }
+        writers.sort_by_key(|(r, _)| std::cmp::Reverse(order.iter().position(|x| x == r)));
+        for (rule, conns) in writers {
+            let f = &fires_name[&rule];
+            let _ = writeln!(instance_body, "    when {f} :");
+            for (port_name, v) in conns {
+                let _ = writeln!(instance_body, "      connect {inst_name}.{port_name}, {v}");
+            }
         }
     }
 
@@ -466,6 +734,8 @@ pub fn emit(
     let mut body = String::new();
     body.push_str(&fires_body);
     body.push('\n');
+    body.push_str(&instance_body);
+    body.push('\n');
     body.push_str(&mem_body);
     body.push('\n');
     body.push_str(&fifo_body);
@@ -473,30 +743,40 @@ pub fn emit(
     body.push_str(&reg_body);
     body.push('\n');
     body.push_str(&port_connects);
-    Ok(header(
+    Ok(module_block(
         &mod_name.text,
+        is_public,
         &regs,
         &mems,
         &mem_ports,
         &inputs,
         &outputs,
+        &instance_decls,
         &body,
     ))
 }
 
-fn header(
+fn port_bit_width(ty: &Ty) -> Option<u64> {
+    match ty {
+        Ty::Bits(Width::Known(w)) => Some(*w),
+        _ => None,
+    }
+}
+
+fn module_block(
     name: &str,
+    is_public: bool,
     regs: &[(String, String, u64, u64)],
     mems: &[(String, u64, u64)],
     mem_ports: &HashMap<String, (Vec<String>, Option<String>)>,
     inputs: &[(String, u64)],
     outputs: &[(String, String, u64)],
+    instance_decls: &str,
     body: &str,
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "FIRRTL version 4.0.0");
-    let _ = writeln!(out, "circuit {name} :");
-    let _ = writeln!(out, "  public module {name} :");
+    let kw = if is_public { "public module" } else { "module" };
+    let _ = writeln!(out, "  {kw} {name} :");
     let _ = writeln!(out, "    input clock : Clock");
     let _ = writeln!(out, "    input reset : UInt<1>");
     for (n, w) in inputs {
@@ -506,6 +786,10 @@ fn header(
         let _ = writeln!(out, "    output {n} : UInt<{w}>");
     }
     out.push('\n');
+    out.push_str(instance_decls);
+    if !instance_decls.is_empty() {
+        out.push('\n');
+    }
     for (_, emit_name, w, init) in regs {
         let _ = writeln!(
             out,
@@ -703,6 +987,97 @@ fn find_any_mem_write_deep(ast: &Ast, stmts: &[StmtId]) -> Option<StmtId> {
                     .and_then(|b| find_any_mem_write_deep(ast, b))
             }),
             Stmt::While { body, .. } => find_any_mem_write_deep(ast, body),
+            _ => None,
+        };
+        if nested.is_some() {
+            return nested;
+        }
+    }
+    None
+}
+
+/// Top-level `inst_name.port := value` writes in a rule body (nesting is
+/// rejected separately by `find_nested_inst_write`; a rule may write
+/// several ports of the same instance, one `when` block per firing rule).
+fn find_inst_port_writes(
+    ast: &Ast,
+    res: &Resolution,
+    stmts: &[StmtId],
+    inst_name: &str,
+) -> Vec<(String, ExprId)> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        if let Stmt::Assign { lhs, rhs } = ast.stmt(*stmt)
+            && let Expr::Field { base, name } = ast.expr(*lhs)
+            && is_ident_named_inst(ast, res, *base, inst_name)
+        {
+            out.push((name.clone(), *rhs));
+        }
+    }
+    out
+}
+
+fn is_ident_named_inst(ast: &Ast, res: &Resolution, id: ExprId, name: &str) -> bool {
+    matches!(ast.expr(id), Expr::Ident(_))
+        && res.expr_defs.get(&id).is_some_and(|d| {
+            let d = res.def(*d);
+            d.name == name && d.kind == DefKind::Inst
+        })
+}
+
+/// Same restriction as `find_nested_mem_write`, for instance port writes:
+/// not threaded through a `mux` yet, so a nested one is an explicit error.
+fn find_nested_inst_write(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<Span> {
+    for stmt in stmts {
+        match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(s) = find_any_inst_write_deep(ast, res, then_body) {
+                    return Some(ast.stmt_spans[s.0 as usize].clone());
+                }
+                if let Some(s) = else_body
+                    .as_deref()
+                    .and_then(|b| find_any_inst_write_deep(ast, res, b))
+                {
+                    return Some(ast.stmt_spans[s.0 as usize].clone());
+                }
+            }
+            Stmt::While { body, .. } => {
+                if let Some(s) = find_any_inst_write_deep(ast, res, body) {
+                    return Some(ast.stmt_spans[s.0 as usize].clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_any_inst_write_deep(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<StmtId> {
+    for stmt in stmts {
+        if let Stmt::Assign { lhs, .. } = ast.stmt(*stmt)
+            && let Expr::Field { base, .. } = ast.expr(*lhs)
+            && res
+                .expr_defs
+                .get(base)
+                .is_some_and(|d| res.def(*d).kind == DefKind::Inst)
+        {
+            return Some(*stmt);
+        }
+        let nested = match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => find_any_inst_write_deep(ast, res, then_body).or_else(|| {
+                else_body
+                    .as_deref()
+                    .and_then(|b| find_any_inst_write_deep(ast, res, b))
+            }),
+            Stmt::While { body, .. } => find_any_inst_write_deep(ast, res, body),
             _ => None,
         };
         if nested.is_some() {
@@ -1125,6 +1500,16 @@ impl<'a> Emitter<'a> {
         {
             return Ok(fifo_data_name(&fifo));
         }
+        // `inst.port` reading a child's output port: a plain combinational
+        // reference, always valid (the child drives it unconditionally),
+        // no gating needed — direction is already checked by types.rs.
+        if let Expr::Field { base, name } = self.ast.expr(id).clone()
+            && let Some(def) = self.res.expr_defs.get(&base)
+            && self.res.def(*def).kind == DefKind::Inst
+        {
+            let inst_name = self.res.def(*def).name.clone();
+            return Ok(format!("{inst_name}.{name}"));
+        }
         match self.ast.expr(id).clone() {
             Expr::Ident(_) => {
                 let def = self.res.expr_defs.get(&id).copied();
@@ -1240,6 +1625,10 @@ fn is_state_write(ast: &Ast, res: &Resolution, lhs: ExprId) -> bool {
         Expr::Bracket { callee, .. } => res
             .expr_defs
             .get(callee)
+            .is_some_and(|d| res.def(*d).kind.is_state()),
+        Expr::Field { base, .. } => res
+            .expr_defs
+            .get(base)
             .is_some_and(|d| res.def(*d).kind.is_state()),
         _ => false,
     }

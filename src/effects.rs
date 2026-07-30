@@ -276,6 +276,15 @@ impl<'a> Checker<'a> {
                     self.infer_expr(*arg, sig);
                 }
             }
+            // `inst.port := v` — writes the whole instance (v0's
+            // conflict model is per-instance, not per-port).
+            Expr::Field { base, .. } => {
+                if let Some(def) = self.state_def(*base) {
+                    sig.writes.insert(def);
+                } else {
+                    self.infer_expr(*base, sig);
+                }
+            }
             _ => self.infer_expr(id, sig),
         }
     }
@@ -584,6 +593,9 @@ impl<'a> Checker<'a> {
                     if let Some(init) = init {
                         self.check_expr(init, id, &empty, true);
                     }
+                }
+                Item::Inst { module, .. } => {
+                    self.check_expr(module, id, &empty, true);
                 }
                 _ => {}
             }

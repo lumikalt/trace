@@ -5,11 +5,16 @@ enforced somewhere in the compiler (see the cited file), not a surprise.
 
 ## Emission (`src/firrtl.rs`)
 
-- One `module` per file — no submodule instancing/composition.
+- Submodules compose by name only (`inst child : Child`, flat top-level
+  modules); no lexical nesting, no per-port conflict precision (a whole
+  instance is one resource, same as an array), and an instance port write
+  can't nest in `if`/`while` (same restriction as a mem write).
 - No calls to user `fn`/`spec`/`impl` from synthesizable rules (needs
   inlining or instantiation).
 - Expression surface is narrow: idents, ints, `+`/`-`, comparisons, mem
-  indexing. No shifts, multiply, bit-select, unary negate, field access.
+  indexing, and `instance.port` (reads only; writes only as a whole
+  statement's LHS). No shifts, multiply, bit-select, unary negate, or any
+  other field access.
 - Memory writes can't nest in `if`/`while` (register writes can, via a
   `mux`; mem writes are still top-level-only).
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax

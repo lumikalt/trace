@@ -214,6 +214,7 @@ impl<'a> Parser<'a> {
             Some(Fifo) => self.parse_state_decl(Fifo),
             Some(Input) => self.parse_state_decl(Input),
             Some(Output) => self.parse_state_decl(Output),
+            Some(Inst) => self.parse_state_decl(Inst),
             Some(Rule) => self.parse_rule(),
             Some(Ident) => self.parse_fn(FnFlavor::Fn),
             Some(Spec) => {
@@ -272,7 +273,8 @@ impl<'a> Parser<'a> {
     }
 
     /// `reg name : ty (= init)?` / `mem name : ty` / `fifo name : ty` /
-    /// `input name : ty` / `output name : ty (= init)?`
+    /// `input name : ty` / `output name : ty (= init)?` /
+    /// `inst name : Module`
     fn parse_state_decl(&mut self, keyword: TokenKind) -> Option<ItemId> {
         let lo = self.cur_span().start;
         self.bump(); // keyword
@@ -299,6 +301,7 @@ impl<'a> Parser<'a> {
                 };
                 Item::Output { name, ty, init }
             }
+            TokenKind::Inst => Item::Inst { name, module: ty },
             _ => unreachable!(),
         };
         self.expect_terminator();
@@ -497,6 +500,7 @@ impl<'a> Parser<'a> {
                 | Some(TokenKind::Fifo)
                 | Some(TokenKind::Input)
                 | Some(TokenKind::Output)
+                | Some(TokenKind::Inst)
         )
     }
 

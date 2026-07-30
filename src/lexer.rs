@@ -29,6 +29,8 @@ pub enum TokenKind {
     Input,
     #[token("output")]
     Output,
+    #[token("inst")]
+    Inst,
     #[token("spec")]
     Spec,
     #[token("impl")]

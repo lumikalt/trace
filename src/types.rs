@@ -68,6 +68,14 @@ pub struct Types {
     pub local_tys: HashMap<DefId, Ty>,
     /// Declared type of every reg/mem/fifo, keyed by its `DefId`.
     pub state_tys: HashMap<DefId, Ty>,
+    /// Every module's port list: `(port name, Input or Output, type)`.
+    /// Keyed by the module's own `DefId`, not just modules that happen to
+    /// be instantiated — `inst` may reference any top-level module.
+    pub module_ports: HashMap<DefId, Vec<(String, DefKind, Ty)>>,
+    /// An `inst` def -> the module `DefId` it instantiates. A separate
+    /// side table rather than a `Ty` variant: an instance isn't a scalar
+    /// value, only its ports are.
+    pub instance_module: HashMap<DefId, DefId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +99,7 @@ pub fn check(ast: &Ast, res: &Resolution) -> (Types, Vec<TypeError>) {
         emit: false,
     };
     checker.collect_state();
+    checker.collect_module_ports();
     checker.check_all();
     (checker.types, checker.errors)
 }
@@ -196,6 +205,58 @@ impl<'a> TypeChecker<'a> {
         }
         self.emit = false;
         self.types.state_tys = self.state_tys.clone();
+    }
+
+    /// Every module's port list (its direct `input`/`output` children) and
+    /// every `inst`'s target module, keyed off `state_tys` already built
+    /// by `collect_state`. Must run after it.
+    fn collect_module_ports(&mut self) {
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            let Item::Module { items, .. } = self.ast.item(id).clone() else {
+                continue;
+            };
+            if let Some(&module_def) = self.res.item_defs.get(&id) {
+                let mut ports = Vec::new();
+                for item_id in &items {
+                    match self.ast.item(*item_id) {
+                        Item::Input { .. } | Item::Output { .. } => {
+                            if let Some(&def) = self.res.item_defs.get(item_id) {
+                                let kind = self.res.def(def).kind;
+                                let ty = self.state_tys.get(&def).cloned().unwrap_or(Ty::Unknown);
+                                ports.push((self.res.def(def).name.clone(), kind, ty));
+                            }
+                        }
+                        Item::Inst { module, .. } => {
+                            if let (Some(&inst_def), Some(&target_def)) = (
+                                self.res.item_defs.get(item_id),
+                                self.res.expr_defs.get(module),
+                            ) {
+                                self.types.instance_module.insert(inst_def, target_def);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.types.module_ports.insert(module_def, ports);
+            }
+            stack.extend(items.iter().copied());
+        }
+    }
+
+    /// `base` names a module instance -> the module `DefId` it instantiates.
+    fn instance_module_of(&self, base: ExprId) -> Option<DefId> {
+        let def = *self.res.expr_defs.get(&base)?;
+        self.types.instance_module.get(&def).copied()
+    }
+
+    fn find_port(&self, module_def: DefId, name: &str) -> Option<(DefKind, Ty)> {
+        self.types
+            .module_ports
+            .get(&module_def)?
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, k, t)| (*k, t.clone()))
     }
 
     /// Evaluate a type expression. `env` carries solved implicit params.
@@ -454,6 +515,39 @@ impl<'a> TypeChecker<'a> {
                     ),
                 }
             }
+            Expr::Field { base, name } => {
+                if let Some(module_def) = self.instance_module_of(base) {
+                    // `base` is a valid instance reference in this
+                    // `.port` position, not a bare value use — do not
+                    // route through the generic Ident type check, which
+                    // rejects a standalone instance reference.
+                    self.types.expr_tys.insert(base, Ty::Unknown);
+                    match self.find_port(module_def, &name) {
+                        Some((DefKind::Input, port_ty)) => {
+                            self.check_assignable(
+                                &rhs_ty,
+                                &port_ty,
+                                self.expr_span(rhs),
+                                "instance port write",
+                            );
+                            self.check_literal_fits(rhs, &port_ty);
+                        }
+                        Some((_, _)) => self.error(
+                            self.expr_span(lhs),
+                            format!(
+                                "cannot write `{name}`: it is an output port on this \
+                                 instance (only input ports can be written)"
+                            ),
+                        ),
+                        None => self.error(
+                            self.expr_span(lhs),
+                            format!("this instance has no port `{name}`"),
+                        ),
+                    }
+                } else {
+                    self.type_expr(lhs, locals);
+                }
+            }
             _ => {
                 self.type_expr(lhs, locals);
             }
@@ -544,6 +638,18 @@ impl<'a> TypeChecker<'a> {
                 }
                 match self.res.def(def).kind {
                     DefKind::ImplicitParam => Ty::Int,
+                    DefKind::Inst => {
+                        self.error(
+                            self.expr_span(id),
+                            format!(
+                                "cannot use instance `{}` as a value; access one of its \
+                                 ports (`{}.port`)",
+                                self.res.def(def).name,
+                                self.res.def(def).name
+                            ),
+                        );
+                        Ty::Unknown
+                    }
                     _ => Ty::Unknown,
                 }
             }
@@ -566,10 +672,34 @@ impl<'a> TypeChecker<'a> {
                 self.type_binop(op, l, r, id)
             }
             Expr::Guard(inner) => self.type_expr(inner, locals),
-            Expr::Field { base, .. } => {
-                self.type_expr(base, locals);
-                // Fields on handles (spawn results) are untyped in v0.
-                Ty::Unknown
+            Expr::Field { base, name } => {
+                if let Some(module_def) = self.instance_module_of(base) {
+                    self.types.expr_tys.insert(base, Ty::Unknown);
+                    match self.find_port(module_def, &name) {
+                        Some((DefKind::Output, port_ty)) => port_ty,
+                        Some((_, _)) => {
+                            self.error(
+                                self.expr_span(id),
+                                format!(
+                                    "cannot read `{name}`: it is an input port on this \
+                                     instance (only output ports can be read)"
+                                ),
+                            );
+                            Ty::Unknown
+                        }
+                        None => {
+                            self.error(
+                                self.expr_span(id),
+                                format!("this instance has no port `{name}`"),
+                            );
+                            Ty::Unknown
+                        }
+                    }
+                } else {
+                    self.type_expr(base, locals);
+                    // Fields on handles (spawn results) are untyped in v0.
+                    Ty::Unknown
+                }
             }
             Expr::Spawn(inner) => {
                 self.type_expr(inner, locals);

@@ -204,6 +204,13 @@ pub enum Item {
         ty: ExprId,
         init: Option<ExprId>,
     },
+    /// `inst name : Module` — a child module instance. `module` is an
+    /// identifier expression naming a sibling top-level `module`, not a
+    /// `bits[...]` type; ports are accessed as `name.port`.
+    Inst {
+        name: Name,
+        module: ExprId,
+    },
     Rule {
         name: Name,
         effects: Vec<Effect>,
@@ -344,6 +351,12 @@ impl Ast {
                     out.push_str(&format!(" = {}", self.expr_sexpr(*init)));
                 }
                 out.push('\n');
+            }
+            Item::Inst { name, module } => {
+                out.push_str(&format!(
+                    "{pad}inst {name} : {}\n",
+                    self.expr_sexpr(*module)
+                ));
             }
             Item::Rule {
                 name,

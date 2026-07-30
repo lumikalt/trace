@@ -267,3 +267,35 @@ fn accumulator_runs_through_real_ports() {
         "sum did not accumulate correctly:\n{output}"
     );
 }
+
+/// Proves submodule instantiation end to end: sim/submodule_tb.v drives
+/// `Top`'s `x`/`y` and reads `result` through ordinary ports — `Top`
+/// `inst`-instantiates `Adder` and wires its ports (`adder.a := x`,
+/// `result := adder.sum`), so this is also the first proof that reading a
+/// child's output port and writing a child's input port compile to real,
+/// working hardware, not just FIRRTL text firtool happens to accept.
+#[test]
+fn submodule_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/submodule.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/submodule_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=50"),
+        "result did not settle at 20 + 30:\n{output}"
+    );
+}

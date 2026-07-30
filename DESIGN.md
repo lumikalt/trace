@@ -595,6 +595,88 @@ that shape, and whether it generalizes past SUBLEQ, is undone design work, not a
 emitter gap). `sim/subleq_tb.v` still pokes `dut.m_ext.Memory[i]` directly and is not
 changed by this section.
 
+## Submodule instantiation
+
+**Achieved 2026-07-30.** Modules stay flat and top-level — no lexical nesting — and
+compose by name:
+
+```
+module Adder {
+    input a : bits[8]
+    input b : bits[8]
+    output sum : bits[8] = 0
+
+    rule add {
+        sum := a + b
+    }
+}
+
+module Top {
+    inst adder : Adder
+
+    input x : bits[8]
+    input y : bits[8]
+    output result : bits[8] = 0
+
+    rule wire {
+        adder.a := x
+        adder.b := y
+        result := adder.sum
+    }
+}
+```
+
+`inst name : Module` declares a child instance, parsed by the same `name : type-expr`
+grammar as `reg`/`mem`/`fifo`/`input`/`output` — `Module` is just an identifier in that
+slot instead of a `bits[...]` shape. A port is accessed as `instance.port`, reusing the
+existing `.field` expression the parser already had (previously only used for fifo's
+`Enq`/`Deq`): `adder.a := x` writes a child's input port, `result := adder.sum` reads a
+child's output port. Writing an output port or reading an input port is a resolve-time
+type error, not a wiring mistake that only shows up as broken hardware.
+
+Two design choices carried over deliberately from elsewhere in this document:
+
+- **Conflict model.** An instance's whole port set is one conflict resource, the same
+  conservative model v0 arrays already use ("Arrays and aliasing" above) — no per-port
+  precision yet. Two rules that touch different ports of the same instance still
+  conflict; only one can drive it per cycle. This reuses the scheduler unchanged: an
+  `inst` def is just another kind of state, so a port write/read infers a write/read of
+  the instance's `DefId` exactly like a mem index does for the whole array.
+- **No nested writes.** A port write must stay at a rule's top level, same restriction
+  as a memory write and for the same reason: neither is threaded through a `mux` yet.
+
+The interesting part was emission, not the front end. Resolution, effect inference, and
+scheduling needed only small, structurally obvious additions (a new `DefKind::Inst`, a
+`Field`-write case alongside the existing `Bracket`-write case) because a "module" was
+already just an item like any other — a flat file with several top-level modules and no
+`inst` between them typed and scheduled correctly *before* this section existed, one
+`GroupSchedule` per module already, since `schedule.rs`'s module-scoping recursion
+predates this work. FIRRTL emission is the one place a module was still hard-assumed
+singular. It now works in two passes: first, find *the top* — the one top-level module
+nobody else instantiates (ambiguous otherwise: zero candidates means a cycle, more than
+one means unrelated designs sharing a file, both explicit errors) — then walk the `inst`
+graph out from it, emitting every reachable module once, with a cycle in that graph
+(a module instantiating itself, even indirectly, which has no hardware meaning) caught
+before it can recurse forever. Each module keeps its own `Emitter`, independent of any
+other module being emitted alongside it.
+
+The one genuinely new wiring rule: a FIRRTL instance's `clock`/`reset` are input ports
+like any other, and FIRRTL requires every instance input driven on every path — so they
+connect unconditionally (`connect adder.clock, clock`), not gated by whichever rule
+happens to be driving the instance's other ports this cycle. Every other input port
+defaults to 0, then the (at most one) firing rule that writes it overrides via
+last-connect, the same priority-mux pattern a mem writer already uses. Reading an output
+port needs no wiring at all: `adder.sum` compiles straight to the FIRRTL reference
+`adder.sum` — the child drives it unconditionally, so there is nothing to gate.
+
+`sim/submodule_tb.v` proves it through real simulation and makes the latency honest: a
+child's `output` is one cycle behind its inputs (same as any `output`), and the parent's
+own `output result := adder.sum` is a *second* register hop behind that — `result`
+reflects `x`/`y` two cycles after they are driven, not one. This is the same "state is
+never combinational" rule as "Module ports" above, just compounding once per hop through
+the hierarchy: a real, honestly-modeled consequence of composition, not a hidden
+surprise.
+
 ## Tooling
 
 **Editor support added 2026-07-30**, `editors/vscode/`: TextMate-grammar syntax

@@ -80,6 +80,30 @@ fn output_ports_are_writable_state() {
 }
 
 #[test]
+fn inst_resolves_to_a_module_and_ports_are_fields() {
+    let (_, res) = run_ok(
+        "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
+         rule r {\n b := a\n}\n}\n\
+         module Top {\n inst c : Child\n reg v : bits[8] = 0\n \
+         rule w {\n c.a := v\n v := c.b\n}\n}\n",
+    );
+    assert!(resolved_kinds(&res).contains(&DefKind::Inst));
+}
+
+#[test]
+fn inst_target_must_be_a_module() {
+    let (_, _, errors) = run("reg NotAModule : bits[1] = 0\nmodule M {\n inst x : NotAModule\n}\n");
+    assert!(errors.iter().any(|e| e.message.contains("not a module")));
+}
+
+#[test]
+fn inst_cannot_be_assigned_directly() {
+    let (_, _, errors) = run("module Child {\n input a : bits[8]\n}\n\
+         module Top {\n inst c : Child\n rule w {\n c := c\n}\n}\n");
+    assert!(errors.iter().any(|e| e.message.contains("module instance")));
+}
+
+#[test]
 fn duplicate_definition_is_an_error() {
     let (_, _, errors) = run("module M {\n reg a : bits[1] = 0\n fifo a : bits[1]\n}\n");
     assert_eq!(errors.len(), 1);
