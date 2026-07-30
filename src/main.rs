@@ -1,12 +1,13 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{effects, lexer, lower, parser, resolve, schedule, types};
+use trace::{effects, firrtl, lexer, lower, parser, resolve, schedule, types};
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let explain = args.iter().any(|a| a == "--explain-schedule");
     let show_lower = args.iter().any(|a| a == "--lower");
+    let show_firrtl = args.iter().any(|a| a == "--firrtl");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: trace <file.tr> [--explain-schedule] [--lower]");
+        eprintln!("usage: trace <file.tr> [--explain-schedule] [--lower] [--firrtl]");
         return std::process::ExitCode::FAILURE;
     };
     let path = path.clone();
@@ -34,7 +35,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    if !explain && !show_lower {
+    if !explain && !show_lower && !show_firrtl {
         print!("{}", ast.dump());
     }
 
@@ -83,6 +84,17 @@ fn main() -> std::process::ExitCode {
     }
     if explain {
         print!("{}", sched.explain(&ast, &res));
+    }
+    if show_firrtl {
+        match firrtl::emit(&ast, &res, &fx, &ty, &sched) {
+            Ok(text) => print!("{text}"),
+            Err(errs) => {
+                for err in &errs {
+                    report(&path, &src, err.span.clone(), &err.message);
+                }
+                return std::process::ExitCode::FAILURE;
+            }
+        }
     }
     std::process::ExitCode::SUCCESS
 }

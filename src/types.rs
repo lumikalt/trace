@@ -66,6 +66,8 @@ pub struct Types {
     /// Type of every local (`let`/fresh `:=`) once its body's fixed point
     /// is reached. Keyed by `DefId` since locals are declared per rule/fn.
     pub local_tys: HashMap<DefId, Ty>,
+    /// Declared type of every reg/mem/fifo, keyed by its `DefId`.
+    pub state_tys: HashMap<DefId, Ty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +176,7 @@ impl<'a> TypeChecker<'a> {
             }
         }
         self.emit = false;
+        self.types.state_tys = self.state_tys.clone();
     }
 
     /// Evaluate a type expression. `env` carries solved implicit params.

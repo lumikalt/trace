@@ -347,7 +347,7 @@ fn find_unsupported_in_expr(ast: &Ast, res: &Resolution, id: ExprId) -> Option<S
 }
 
 /// Direct expression children the parser can produce, one level.
-fn sub_exprs(ast: &Ast, id: ExprId) -> Vec<ExprId> {
+pub(crate) fn sub_exprs(ast: &Ast, id: ExprId) -> Vec<ExprId> {
     match ast.expr(id).clone() {
         Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => vec![],
         Expr::Unary { operand, .. } => vec![operand],
