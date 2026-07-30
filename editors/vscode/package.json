@@ -1,0 +1,51 @@
+{
+  "name": "trace-hdl",
+  "displayName": "trace",
+  "description": "Syntax highlighting and formatting for the trace HDL (.tr files)",
+  "version": "0.1.0",
+  "publisher": "trace-hdl",
+  "private": true,
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:trace"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "trace",
+        "aliases": [
+          "trace",
+          "Trace HDL"
+        ],
+        "extensions": [
+          ".tr"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "trace",
+        "scopeName": "source.trace",
+        "path": "./syntaxes/trace.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "trace",
+      "properties": {
+        "trace.formatterPath": {
+          "type": "string",
+          "default": "trace",
+          "description": "Path to the trace compiler binary, used for \"Format Document\" (runs `<path> - --fmt`). Must resolve on PATH by default — e.g. via `cargo install --path .` in the repo root, or by launching VS Code from inside `devenv shell`."
+        }
+      }
+    }
+  }
+}

@@ -50,3 +50,15 @@ enforced somewhere in the compiler (see the cited file), not a surprise.
   wiring for the hierarchical-path testbenches).
 - `firtool`/`iverilog` CLI behavior has already drifted once this project
   (firtool 1.147.0 needed `-format=fir` for stdin); no version pin yet.
+
+## Editor tooling (`editors/vscode/`)
+
+- No language server: no go-to-definition, hover, or inline diagnostics —
+  only `trace file.tr` on the command line catches real errors.
+- Grammar is regex-based (TextMate): highlights `reads`/`writes`/effect
+  words unconditionally, even used as plain identifiers outside `<...>`.
+- Formatter is a reindenter, not a pretty-printer, by deliberate choice
+  (see DESIGN.md's "Tooling" section) — known gap: a multiline signature
+  before `refines`/`{` renders flush left (`tests/fmt.rs` pins this).
+- Not published to a marketplace; local install only (see the extension's
+  own README).

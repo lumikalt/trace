@@ -1,0 +1,74 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "trace",
+  "scopeName": "source.trace",
+  "fileTypes": ["tr"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#declarations-with-name" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#effect-words" },
+    { "include": "#builtins" },
+    { "include": "#calls" },
+    { "include": "#operators" },
+    { "include": "#punctuation" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.double-dash.trace",
+      "match": "--.*$"
+    },
+    "numbers": {
+      "name": "constant.numeric.trace",
+      "match": "\\b(0x[0-9A-Fa-f][0-9A-Fa-f_]*|0b[01][01_]*|[0-9][0-9_]*)\\b"
+    },
+    "declarations-with-name": {
+      "comment": "module/rule NAME — highlighted as a unit so the declared name reads as a type/function, not a plain identifier.",
+      "match": "\\b(module|rule)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.trace" },
+        "2": { "name": "entity.name.function.trace" }
+      }
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.trace",
+          "match": "\\b(if|else|while|return|tick|spawn|sync|race)\\b"
+        },
+        {
+          "name": "keyword.declaration.trace",
+          "match": "\\b(module|rule|reg|mem|fifo|input|output|spec|impl|refines|schedule|let)\\b"
+        }
+      ]
+    },
+    "effect-words": {
+      "comment": "Contextual identifiers, not lexer keywords (see src/lexer.rs) — only meaningful inside <...> effect lists and schedule{} blocks, but a plain word-match is close enough for a simple grammar.",
+      "name": "keyword.other.effect.trace",
+      "match": "\\b(converges|suspends|allocates|decides|choice|reads|writes|urgency|conflict_free)\\b"
+    },
+    "builtins": {
+      "name": "support.function.builtin.trace",
+      "match": "\\b(bits|wire|list|any|clog2|pack|trunc|len|prio)\\b"
+    },
+    "calls": {
+      "comment": "identifier( — covers both calls and fn/spec/impl declarations, which have no leading keyword in this language.",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+      "name": "entity.name.function.trace"
+    },
+    "operators": {
+      "name": "keyword.operator.trace",
+      "match": ":=|==|!=|<=|>=|<<|>>|\\.\\.|[:=<>.?|^&+\\-*/%~!]"
+    },
+    "punctuation": {
+      "name": "punctuation.trace",
+      "match": "[{}\\[\\](),;]"
+    },
+    "identifiers": {
+      "name": "variable.other.trace",
+      "match": "[A-Za-z_][A-Za-z0-9_]*"
+    }
+  }
+}

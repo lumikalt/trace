@@ -595,6 +595,35 @@ that shape, and whether it generalizes past SUBLEQ, is undone design work, not a
 emitter gap). `sim/subleq_tb.v` still pokes `dut.m_ext.Memory[i]` directly and is not
 changed by this section.
 
+## Tooling
+
+**Editor support added 2026-07-30**, `editors/vscode/`: TextMate-grammar syntax
+highlighting for `.tr`, plus "Format Document" wired to `trace - --fmt` (the compiler
+formats its own stdin and writes to stdout — no separate tool, no drift between what
+the CLI and the editor consider correctly formatted).
+
+The formatter (`src/fmt.rs`) is a **reindenter, not a pretty-printer**, and that is a
+deliberate choice, not a shortcut taken for lack of time. `--` comments are trivia the
+lexer discards outright (see "The effect system" intro / lexer.rs) — there is no token
+that carries a comment's text or position forward. A pretty-printer that rebuilds
+source from the AST would therefore have nowhere to put a comment back and would
+silently delete every one in the file on first format. Reindenting instead — walk the
+token stream only for brace/paren/bracket depth, rewrite each source line's leading
+whitespace to match, touch nothing else — never looks at comments at all, so it can
+never lose one. The tradeoff is real and documented at the point it bites: a line that
+continues a statement without opening a bracket (a multiline `impl ... refines Spec`
+signature, this document's own `RoundRobin` example) has no depth to hang an indent
+off, so it renders flush left even where the source hand-indents it (`tests/fmt.rs`
+pins this as a known, accepted limitation rather than a bug to chase). Fixing that
+properly needs statement-level awareness a brace counter doesn't have — a real
+pretty-printer's problem, which reopens the comment-loss problem it was built to avoid.
+
+No language server. No go-to-definition, hover, or inline diagnostics in the editor —
+those still come from running `trace file.tr` directly. The grammar is regex-based, so
+it highlights `reads`/`writes`/`converges`/... as effect keywords unconditionally, even
+where they're used as ordinary identifiers outside an effect list; harmless for
+readability, not a correctness signal.
+
 ## Prior art
 
 - **Bluespec / bsc** — transactional-rules semantics; the production scheduler. Open

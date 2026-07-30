@@ -1,21 +1,41 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{effects, firrtl, lexer, lower, parser, resolve, schedule, types};
+use trace::{effects, firrtl, fmt, lexer, lower, parser, resolve, schedule, types};
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let explain = args.iter().any(|a| a == "--explain-schedule");
     let show_lower = args.iter().any(|a| a == "--lower");
     let show_firrtl = args.iter().any(|a| a == "--firrtl");
-    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: trace <file.tr> [--explain-schedule] [--lower] [--firrtl]");
+    let show_fmt = args.iter().any(|a| a == "--fmt");
+    let write_fmt = args.iter().any(|a| a == "--write" || a == "-w");
+    let Some(path) = args
+        .iter()
+        .find(|a| !a.starts_with('-') || a.as_str() == "-")
+    else {
+        eprintln!(
+            "usage: trace <file.tr | -> [--explain-schedule] [--lower] [--firrtl] \
+             [--fmt [--write]]"
+        );
         return std::process::ExitCode::FAILURE;
     };
     let path = path.clone();
-    let src = match std::fs::read_to_string(&path) {
-        Ok(src) => src,
-        Err(e) => {
-            eprintln!("trace: cannot read {path}: {e}");
-            return std::process::ExitCode::FAILURE;
+    let stdin = path == "-";
+    let src = if stdin {
+        let mut buf = String::new();
+        match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+            Ok(_) => buf,
+            Err(e) => {
+                eprintln!("trace: cannot read stdin: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match std::fs::read_to_string(&path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("trace: cannot read {path}: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
         }
     };
 
@@ -33,6 +53,19 @@ fn main() -> std::process::ExitCode {
     }
     if !parse_errors.is_empty() {
         return std::process::ExitCode::FAILURE;
+    }
+
+    if show_fmt {
+        let formatted = fmt::format(&src, &tokens);
+        if write_fmt && !stdin {
+            if let Err(e) = std::fs::write(&path, &formatted) {
+                eprintln!("trace: cannot write {path}: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        } else {
+            print!("{formatted}");
+        }
+        return std::process::ExitCode::SUCCESS;
     }
 
     if !explain && !show_lower && !show_firrtl {
