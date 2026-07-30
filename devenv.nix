@@ -5,7 +5,7 @@
   env.GREET = "devenv";
 
   # https://devenv.sh/packages/
-  packages = [ pkgs.git pkgs.circt pkgs.iverilog ];
+  packages = [ pkgs.circt pkgs.iverilog ];
 
   # https://devenv.sh/languages/
   languages.rust = {
@@ -22,6 +22,16 @@
   # https://devenv.sh/scripts/
   scripts.hello.exec = ''
     echo hello from $GREET
+  '';
+
+  # `trace` on PATH inside the shell, always reflecting the latest
+  # source — no separate build step to remember, no stale binary if you
+  # forget to rebuild after an edit. `-q` keeps cargo's own
+  # "Compiling.../Finished" progress lines off stdout (real compile
+  # errors still print), so `trace file.tr --firrtl` etc. stay pipeable.
+  # This is what editors/vscode's formatter shells out to by default.
+  scripts.trace.exec = ''
+    exec cargo run -q -- "$@"
   '';
 
   # Run the test suite with the address space capped at 4 GiB, so a
@@ -56,8 +66,6 @@
 
   # https://devenv.sh/basics/
   enterShell = ''
-    hello         # Run scripts directly
-    git --version # Use packages
   '';
 
   # https://devenv.sh/tasks/
