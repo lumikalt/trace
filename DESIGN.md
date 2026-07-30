@@ -394,9 +394,24 @@ logos lexer
 
 ## First milestone: SUBLEQ
 
-SUBLEQ's read-modify-write-branch step is one natural transaction.
-Target: parse → check → schedule → emit FIRRTL → firtool → simulate.
+**Achieved 2026-07-30.** SUBLEQ's read-modify-write-branch step is one natural
+transaction. Target: parse → check → schedule → emit FIRRTL → firtool → simulate.
 The port must demonstrate derived stall logic that the Chisel version wrote by hand.
+
+Every stage runs on `examples/subleq.tr` today, ending in a real simulation, not just a
+compile: `devenv shell -- simulate subleq` (or `tests/sim.rs`) lowers the file, emits
+FIRRTL, runs it through `firtool`, and simulates the resulting Verilog with a hand-written
+Icarus Verilog testbench (`sim/subleq_tb.v`) against a small SUBLEQ program (`mem[11] -=
+mem[10]`, then an unconditional jump, then halt). It passes: the CPU computes `8 - 3 = 5`
+and halts at the right address, not a wrong one a mis-taken branch would reach.
+
+One honest gap the testbench works around: the language has no `input`/`output` port
+concept yet, so the emitted `Subleq` module exposes only `clock`/`reset` — nothing else
+is observable or drivable from outside. The testbench reaches in with hierarchical paths
+(`dut.pc`, `dut.m_ext.Memory[i]`) instead of real ports, which Icarus allows with no
+special flags (Verilator would need `--public`). A real ports feature is future work,
+not needed for this milestone but needed before hardware can plug into anything larger
+than a single-instance simulation.
 
 Sketch, honest about v0 array rules (single-port memory → one access per tick):
 

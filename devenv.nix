@@ -5,7 +5,7 @@
   env.GREET = "devenv";
 
   # https://devenv.sh/packages/
-  packages = [ pkgs.git pkgs.circt ];
+  packages = [ pkgs.git pkgs.circt pkgs.iverilog ];
 
   # https://devenv.sh/languages/
   languages.rust = {
@@ -30,6 +30,28 @@
   scripts.t.exec = ''
     ulimit -v 4194304
     exec cargo test "$@"
+  '';
+
+  # Run a .tr file all the way to a passing/failing simulation: lower ->
+  # emit FIRRTL -> firtool -> Verilog -> iverilog/vvp against a
+  # hand-written testbench at sim/<name>_tb.v. `-DSYNTHESIS` skips
+  # firtool's debug-only register-randomization boilerplate, which uses
+  # an `automatic`-lifetime construct Icarus doesn't support; skipping
+  # it is safe since our registers are all properly reset regardless.
+  scripts.simulate.exec = ''
+    set -euo pipefail
+    if [ -z "''${1:-}" ]; then
+      echo "usage: simulate <name>   (expects examples/<name>.tr and sim/<name>_tb.v)" >&2
+      exit 1
+    fi
+    name="$1"
+    dir=$(mktemp -d)
+    trap 'rm -rf "$dir"' EXIT
+    cargo run -q -- "examples/$name.tr" --lower > "$dir/lowered.tr"
+    cargo run -q -- "$dir/lowered.tr" --firrtl > "$dir/design.fir"
+    firtool --disable-opt "$dir/design.fir" -o "$dir/design.v"
+    iverilog -g2012 -DSYNTHESIS -o "$dir/sim" "sim/''${name}_tb.v" "$dir/design.v"
+    vvp "$dir/sim"
   '';
 
   # https://devenv.sh/basics/
