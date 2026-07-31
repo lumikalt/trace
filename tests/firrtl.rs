@@ -1212,9 +1212,28 @@ module M {
 
 #[test]
 fn call_to_an_unsynthesizable_builtin_is_still_an_error() {
-    // `prio` is the one synthesizable builtin (see the `prio_*` tests
-    // below); the rest (`trunc` here) remain an explicit, separate gap —
-    // this pins that the two don't get conflated.
+    // `prio` and `trunc` are the two synthesizable builtins (see the
+    // `prio_*`/`trunc_*` tests); the rest (`pack` here) remain an
+    // explicit, separate gap — this pins that they don't get conflated.
+    let src = "\
+module M {
+    input a : bits[8]
+    input b : bits[8]
+    output result : bits[16] = 0
+    rule r {
+        result := pack(a, b)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("calling the builtin `pack` is not yet supported")
+    }));
+}
+
+#[test]
+fn trunc_takes_the_low_bits() {
     let src = "\
 module M {
     input a : bits[16]
@@ -1224,11 +1243,33 @@ module M {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(err.iter().any(|e| {
-        e.message
-            .contains("calling the builtin `trunc` is not yet supported")
-    }));
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, bits(a, 7, 0)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn trunc_inlines_through_a_user_fn_that_wraps_it() {
+    // Like `prio`, a call to `trunc` doesn't disqualify its enclosing
+    // callee from inlining the way a call to another user `fn`/`impl`
+    // still does.
+    let src = "\
+module M {
+    input a : bits[16]
+    output result : bits[8] = 0
+
+    Narrow(x : bits[16]) : bits[8] <combines> {
+        return trunc(x, 8)
+    }
+
+    rule r {
+        result := Narrow(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, bits(a, 7, 0)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

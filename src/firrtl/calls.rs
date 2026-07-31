@@ -334,18 +334,47 @@ impl<'a> Emitter<'a> {
         let def = *self.res.expr_defs.get(&callee).expect("checked by caller");
         match self.res.def(def).name.as_str() {
             "prio" => self.compile_prio(id, args, hint),
+            "trunc" => self.compile_trunc(id, args, hint),
             name => {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
                     format!(
                         "calling the builtin `{name}` is not yet supported in FIRRTL \
                          emission (v0 restriction: only `prio` — a fixed-priority \
-                         encoder — is synthesizable today)"
+                         encoder — and `trunc` — bit truncation — are synthesizable \
+                         today)"
                     ),
                 );
                 Err(())
             }
         }
+    }
+
+    /// `trunc(value, width)`: the low `width` bits of `value` — exactly
+    /// `bits(value, width-1, 0)`, the same FIRRTL `bits` primop
+    /// `compile_bit_select` already uses for `x[hi..lo]`, just reached
+    /// through a different spelling. `width` must be const-evaluable
+    /// (types.rs's own restriction, `type_builtin_call`'s `"trunc"` arm:
+    /// a non-const width types as `Bits(Width::Unknown)`, which
+    /// `width_of` rejects with its own explicit error) — no separate
+    /// check needed here.
+    fn compile_trunc(
+        &mut self,
+        id: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let [value, _width] = args else {
+            self.error(
+                span,
+                "`trunc` takes exactly two arguments: (value, width)".to_string(),
+            );
+            return Err(());
+        };
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let value_str = self.compile_expr(*value)?;
+        Ok(format!("bits({value_str}, {}, 0)", w.saturating_sub(1)))
     }
 
     /// `prio(reqs)`: a fixed-priority encoder over `reqs`'s bits — the

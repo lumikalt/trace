@@ -1062,6 +1062,40 @@ miss: a single bit set, two bits set with the lower one expected to win (a real 
 not just "the only bit happens to be the answer"), all bits set (lowest still wins),
 and the all-zero fallback.
 
+**`trunc`, the second synthesizable builtin, added 2026-07-31.** Unlike `prio`,
+`trunc(value, width)` needed no semantics decision — it's unambiguous truncation to the
+low `width` bits, already exercised in `tests/types.rs` (`a := trunc(b, 8)`, fixing a
+"needs `trunc`" width-mismatch error) even before this pass gave it an emission path.
+`compile_trunc` builds exactly `bits(value, width-1, 0)` — the SAME FIRRTL `bits`
+primop `compile_bit_select` already emits for `x[hi..lo]`, just reached through a
+different spelling; `width` is guaranteed const-evaluable by types.rs's own `"trunc"`
+typing rule before firrtl.rs ever sees it (a non-const width types as
+`Bits(Width::Unknown)`, which the existing `width_of` already rejects with its own
+explicit error — no new check needed). Like `prio`, a call to `trunc` doesn't
+disqualify its enclosing callee from inlining, for the same reason (`expr_contains_
+call`/`body_contains_call` only count a callee resolving to `DefKind::Fn`/`Impl`).
+
+This pass also settled the shape of the OTHER remaining builtins, closing the "clog2/
+trunc/pack/len remain type-only" TODO line's ambiguity rather than just chipping at it
+one builtin at a time: `clog2`/`len` type as `Ty::Int`, a compile-time-only type (bit-
+width computation in a type position, or a list's length during elaboration) — every
+real use in the repo is compile-time, so giving them a RUNTIME hardware meaning would
+mean inventing semantics with no grounding anywhere in the design, a fundamentally
+different kind of gap than `prio` (which had a real spec-level purpose, `arbiter.tr`'s
+refinement, to confirm an encoding against) or `trunc` (unambiguous by construction).
+`pack` (concatenation, well-defined) is real but its only documented use
+(`Fetch2`'s `pack(h1.result, h2.result)`, above) lives inside a `<sequences>`/spawn
+body — synthesizing it for plain rule bodies is possible but wouldn't serve that
+actual use case until spawn/sync/race get a synthesis path of their own, a separate
+and larger gap (TODO.md's own "Language features with no synthesis path yet"
+section). Scoped this way with Lumi via AskUserQuestion before writing any code,
+rather than assuming "close the whole TODO line" meant treating all four builtins as
+one uniform task.
+
+`examples/call_trunc.tr` proves it through real firtool and Icarus simulation,
+deliberately feeding a value (`0xBEEF`) whose low and high bytes differ, so truncating
+to the wrong end would show up as a wrong answer (`0xEF`, not `0xBE`).
+
 ## Tooling
 
 **Editor support added 2026-07-30**, `editors/vscode/`: TextMate-grammar syntax

@@ -1,0 +1,8 @@
+module Top {
+    input a : bits[16]
+    output result : bits[8] = 0
+
+    rule narrow {
+        result := trunc(a, 8)
+    }
+}
