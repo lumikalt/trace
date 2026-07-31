@@ -8,12 +8,18 @@
 //! a partial order; declaration order breaks ties. A cyclic urgency
 //! specification is an error.
 //!
-//! `conflict_free { a, b }` exempts a pair from scheduling separation.
-//! The claim is recorded here (`Conflict::exempted`), not trusted: `Emitter`
-//! (firrtl/module.rs) emits a FIRRTL `assert` for every exempted pair,
-//! checking the two rules never both fire the same cycle. Claiming
-//! conflict-freedom for a pair that does not conflict is legal
-//! overstatement.
+//! Two annotations exempt a pair from the derived scheduling separation,
+//! named to match Bluespec's own vocabulary (this project's cited
+//! scheduling reference) rather than either sounding like the other:
+//! `mutually_exclusive { a, b }` claims the two rules never both fire
+//! the same cycle — checked, `Emitter` (firrtl/module.rs) emits a
+//! FIRRTL `assert` for it. `conflict_free { a, b }` claims it's safe
+//! for both to fire the same cycle (e.g. genuinely separate ports on
+//! one resource) — trusted, NOT checked: v0 has no way to prove or
+//! check address disjointness (that's the tier-3 banked-array proof
+//! DESIGN.md defers), so there is nothing sound to assert for this one;
+//! only the derived stall is waived. Claiming either for a pair that
+//! does not conflict is legal overstatement.
 //!
 //! Rules conflict only within their own scope (module body or top level):
 //! state is scope-local, so cross-scope conflicts cannot exist.
@@ -30,6 +36,25 @@ pub enum ConflictKind {
     ReadWrite,
 }
 
+/// Whether (and how) a conflicting pair's derived stall was waived by a
+/// schedule annotation — see this module's own doc comment for what
+/// each claims and whether it's checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exemption {
+    /// No annotation; the derived stall applies.
+    None,
+    /// `mutually_exclusive { a, b }` — checked via a simulation assertion.
+    MutuallyExclusive,
+    /// `conflict_free { a, b }` — trusted, unchecked in v0.
+    ConflictFree,
+}
+
+impl Exemption {
+    pub fn is_exempted(self) -> bool {
+        self != Exemption::None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Conflict {
     pub a: ItemId,
@@ -37,8 +62,8 @@ pub struct Conflict {
     /// The shared state driving the conflict.
     pub on: Vec<DefId>,
     pub kind: ConflictKind,
-    /// Claimed conflict-free; separation waived, assertion owed.
-    pub exempted: bool,
+    /// Which claim, if any, waived the derived stall between this pair.
+    pub exemption: Exemption,
     /// The rule that fires when both are ready (more urgent).
     pub winner: ItemId,
 }
@@ -65,9 +90,20 @@ pub struct ScheduleError {
     pub message: String,
 }
 
-pub fn schedule(ast: &Ast, _res: &Resolution, fx: &Effects) -> (Schedule, Vec<ScheduleError>) {
+/// The span covering an exemption directive's whole name list, from the
+/// first name to the last — used to underline `conflict_free { a, b }`
+/// (not just one name in it) when the pair turns out to be a WriteWrite
+/// conflict.
+fn directive_span(names: &[crate::ast::Name]) -> Span {
+    let start = names.first().map_or(0, |n| n.span.start);
+    let end = names.last().map_or(start, |n| n.span.end);
+    start..end
+}
+
+pub fn schedule(ast: &Ast, res: &Resolution, fx: &Effects) -> (Schedule, Vec<ScheduleError>) {
     let mut scheduler = Scheduler {
         ast,
+        res,
         fx,
         out: Schedule::default(),
         errors: Vec::new(),
@@ -78,6 +114,7 @@ pub fn schedule(ast: &Ast, _res: &Resolution, fx: &Effects) -> (Schedule, Vec<Sc
 
 struct Scheduler<'a> {
     ast: &'a Ast,
+    res: &'a Resolution,
     fx: &'a Effects,
     out: Schedule,
     errors: Vec<ScheduleError>,
@@ -116,7 +153,7 @@ impl<'a> Scheduler<'a> {
 
         // Directives.
         let mut edges: Vec<(ItemId, ItemId)> = Vec::new();
-        let mut exempt_sets: Vec<BTreeSet<ItemId>> = Vec::new();
+        let mut exempt_sets: Vec<(Exemption, BTreeSet<ItemId>, Span)> = Vec::new();
         for sched in &schedules {
             let Item::Schedule { directives } = self.ast.item(*sched) else {
                 continue;
@@ -134,12 +171,21 @@ impl<'a> Scheduler<'a> {
                             edges.push((*hi, *lo));
                         }
                     }
+                    ScheduleDirective::MutuallyExclusive(names) => {
+                        let set: BTreeSet<ItemId> = names
+                            .iter()
+                            .filter_map(|n| by_name.get(n.text.as_str()).copied())
+                            .collect();
+                        let span = directive_span(names);
+                        exempt_sets.push((Exemption::MutuallyExclusive, set, span));
+                    }
                     ScheduleDirective::ConflictFree(names) => {
                         let set: BTreeSet<ItemId> = names
                             .iter()
                             .filter_map(|n| by_name.get(n.text.as_str()).copied())
                             .collect();
-                        exempt_sets.push(set);
+                        let span = directive_span(names);
+                        exempt_sets.push((Exemption::ConflictFree, set, span));
                     }
                 }
             }
@@ -172,21 +218,58 @@ impl<'a> Scheduler<'a> {
                     ConflictKind::WriteWrite
                 };
                 let on: Vec<DefId> = ww
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .chain(rw)
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                let exempted = exempt_sets
+                let matched = exempt_sets
                     .iter()
-                    .any(|set| set.contains(a) && set.contains(b));
+                    .find(|(_, set, _)| set.contains(a) && set.contains(b));
+                let exemption = matched.map_or(Exemption::None, |(kind, _, _)| *kind);
+                // `conflict_free` ("safe to fire concurrently") has no
+                // meaning for a WriteWrite conflict in v0's emission
+                // model: there is one shared writer port/connect target,
+                // not two independent ones to be disjoint on, so both
+                // rules firing the same cycle would be a silent
+                // last-connect race with no way to check or arbitrate it
+                // (see DESIGN.md's "Scheduling" section). Reject outright
+                // rather than let it compile to a footgun; `mutually_
+                // exclusive` is the correct annotation for a write-write
+                // pair claimed to never actually coincide.
+                if exemption == Exemption::ConflictFree && kind == ConflictKind::WriteWrite {
+                    let span = matched.unwrap().2.clone();
+                    // Report only the genuinely both-written state (`ww`),
+                    // not the full `on` set -- a mixed conflict (e.g. `a`
+                    // writes {x,y}, `b` writes {x}, reads {y}) is still
+                    // WriteWrite overall (on `x`), but `on` also includes
+                    // `y`, which only one side writes; naming it here
+                    // would misattribute a read-write hazard as a
+                    // write-write one.
+                    let ww_names: Vec<&str> =
+                        ww.iter().map(|d| self.res.def(*d).name.as_str()).collect();
+                    self.errors.push(ScheduleError {
+                        span,
+                        message: format!(
+                            "`conflict_free` claims rule {} and rule {} are safe to fire the \
+                             SAME cycle, but they both write shared state ({}) -- v0 has only \
+                             one writer port/connect target per resource, so this would be a \
+                             silent, unarbitrated race, not a safe concurrent access; use \
+                             `mutually_exclusive` instead if they truly never coincide",
+                            self.rule_name(*a),
+                            self.rule_name(*b),
+                            ww_names.join(", "),
+                        ),
+                    });
+                }
                 let winner = if rank[a] <= rank[b] { *a } else { *b };
                 conflicts.push(Conflict {
                     a: *a,
                     b: *b,
                     on,
                     kind,
-                    exempted,
+                    exemption,
                     winner,
                 });
             }
@@ -283,16 +366,22 @@ impl Schedule {
                     "  rule {a} conflicts with rule {b}: {kind} {{{}}}\n",
                     on.join(", ")
                 ));
-                if c.exempted {
-                    out.push_str(
-                        "    claimed conflict_free: no stall derived (checked in simulation)\n",
-                    );
-                } else {
-                    let loser = if c.winner == c.a { b } else { a };
-                    let winner = rule_name(ast, c.winner);
-                    out.push_str(&format!(
-                        "    derived stall: {loser} fires only when {winner} is blocked or idle\n"
-                    ));
+                match c.exemption {
+                    Exemption::MutuallyExclusive => out.push_str(
+                        "    claimed mutually_exclusive: no stall derived (checked in \
+                         simulation)\n",
+                    ),
+                    Exemption::ConflictFree => out.push_str(
+                        "    claimed conflict_free: no stall derived (trusted, not checked)\n",
+                    ),
+                    Exemption::None => {
+                        let loser = if c.winner == c.a { b } else { a };
+                        let winner = rule_name(ast, c.winner);
+                        out.push_str(&format!(
+                            "    derived stall: {loser} fires only when {winner} is blocked or \
+                             idle\n"
+                        ));
+                    }
                 }
             }
         }

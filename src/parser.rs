@@ -466,7 +466,8 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// `schedule { urgency a > b \n conflict_free { a, b } }`
+    /// `schedule { urgency a > b \n mutually_exclusive { a, b } \n
+    /// conflict_free { c, d } }`
     /// Directive names are contextual identifiers, not keywords.
     fn parse_schedule(&mut self) -> Option<ItemId> {
         let lo = self.cur_span().start;
@@ -504,7 +505,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_schedule_directive(&mut self) -> Option<ScheduleDirective> {
-        let name = self.expect_ident("`urgency` or `conflict_free`")?;
+        let name = self.expect_ident("`urgency`, `mutually_exclusive`, or `conflict_free`")?;
         let directive = match name.text.as_str() {
             "urgency" => {
                 // `urgency a > b > c` — at least two names.
@@ -516,6 +517,17 @@ impl<'a> Parser<'a> {
                     self.error_here("`urgency` needs at least two rules (`a > b`)".to_string());
                 }
                 ScheduleDirective::Urgency(names)
+            }
+            "mutually_exclusive" => {
+                self.expect(TokenKind::LBrace, "`{` after `mutually_exclusive`")
+                    .ok()?;
+                let mut names = vec![self.expect_ident("rule name")?];
+                while self.eat(TokenKind::Comma) {
+                    names.push(self.expect_ident("rule name")?);
+                }
+                self.expect(TokenKind::RBrace, "`}` closing `mutually_exclusive`")
+                    .ok()?;
+                ScheduleDirective::MutuallyExclusive(names)
             }
             "conflict_free" => {
                 self.expect(TokenKind::LBrace, "`{` after `conflict_free`")
@@ -530,7 +542,8 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 self.error_here(format!(
-                    "unknown schedule directive `{name}` (expected `urgency` or `conflict_free`)"
+                    "unknown schedule directive `{name}` (expected `urgency`, \
+                     `mutually_exclusive`, or `conflict_free`)"
                 ));
                 self.sync();
                 return None;

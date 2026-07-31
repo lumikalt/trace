@@ -819,19 +819,22 @@ fn mem_write_branch_runs_through_real_ports() {
 }
 
 #[test]
-fn conflict_free_check_runs_through_real_ports() {
+fn mutually_exclusive_check_runs_through_real_ports() {
     if !tool_available("firtool") || !tool_available("iverilog") {
         eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
         return;
     }
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/examples/conflict_free_check.tr"
+        "/examples/mutually_exclusive_check.tr"
     ))
     .unwrap();
     let fir = generate_firrtl(&src);
     let verilog = firrtl_to_verilog(&fir, false);
-    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/conflict_free_check_tb.v");
+    let testbench = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sim/mutually_exclusive_check_tb.v"
+    );
     let output = simulate(&verilog, testbench);
 
     // The whole point of this test: the compiler-inserted assertion must
@@ -847,7 +850,7 @@ fn conflict_free_check_runs_through_real_ports() {
         panic!("testbench did not print its own \"{marker}\" marker:\n{output}")
     });
     let (safe_window, rest) = output.split_at(split);
-    let violation_message = "conflict_free claim violated: rule set_a and rule set_b both \
+    let violation_message = "mutually_exclusive claim violated: rule set_a and rule set_b both \
                               fired the same cycle";
     assert!(
         !safe_window.contains(violation_message),
@@ -856,5 +859,31 @@ fn conflict_free_check_runs_through_real_ports() {
     assert!(
         rest.contains(violation_message),
         "assertion did NOT fire during the deliberately-violated window (dead check):\n{output}"
+    );
+}
+
+#[test]
+fn conflict_free_mem_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/conflict_free_mem.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/conflict_free_mem_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: read_data=3333"),
+        "conflict-free-mem results did not match expectations:\n{output}"
     );
 }

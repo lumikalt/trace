@@ -461,10 +461,10 @@ fn scan_expr(
 /// A `schedule` directive that names a lowered rule is regenerated too:
 /// `urgency step > refill` becomes `urgency step_s0 > step_s1 > ... >
 /// step_sN > refill` (every segment ranks above what `step` ranked
-/// above), and `conflict_free { step, x }` becomes `conflict_free
-/// { step_s0, ..., step_sN, x }`. This is regenerated from the parsed
-/// directives, not string-matched, so a name like `step2` is never
-/// confused with `step`.
+/// above), and `mutually_exclusive { step, x }`/`conflict_free { step,
+/// x }` become `mutually_exclusive`/`conflict_free { step_s0, ...,
+/// step_sN, x }`. This is regenerated from the parsed directives, not
+/// string-matched, so a name like `step2` is never confused with `step`.
 pub fn render(ast: &Ast, src: &str, lowered: &[LoweredRule]) -> String {
     let mut edits: Vec<(Span, String)> = lowered
         .iter()
@@ -513,6 +513,7 @@ fn rewrite_schedules(
                 let touches_lowered = directives.iter().any(|d| {
                     let names = match d {
                         crate::ast::ScheduleDirective::Urgency(ns)
+                        | crate::ast::ScheduleDirective::MutuallyExclusive(ns)
                         | crate::ast::ScheduleDirective::ConflictFree(ns) => ns,
                     };
                     names
@@ -528,6 +529,13 @@ fn rewrite_schedules(
                         crate::ast::ScheduleDirective::Urgency(names) => {
                             let flat = expand(names, expansions);
                             out.push_str(&format!("    urgency {}\n", flat.join(" > ")));
+                        }
+                        crate::ast::ScheduleDirective::MutuallyExclusive(names) => {
+                            let flat = expand(names, expansions);
+                            out.push_str(&format!(
+                                "    mutually_exclusive {{ {} }}\n",
+                                flat.join(", ")
+                            ));
                         }
                         crate::ast::ScheduleDirective::ConflictFree(names) => {
                             let flat = expand(names, expansions);

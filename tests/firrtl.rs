@@ -1986,11 +1986,56 @@ module M {
 }
 
 #[test]
-fn conflict_free_claim_emits_a_simulation_assertion() {
-    // `conflict_free { a, b }` waives the derived mutual-exclusion stall
-    // between two conflicting rules -- the claim is recorded, not
+fn mutually_exclusive_claim_emits_a_simulation_assertion() {
+    // `mutually_exclusive { a, b }` waives the derived mutual-exclusion
+    // stall between two conflicting rules -- the claim is recorded, not
     // trusted (DESIGN.md's "Scheduling" tier 2): the compiler must
     // insert a real check, not just silently accept the annotation.
+    let src = "\
+module M {
+    reg a : bits[8] = 0
+    reg b : bits[8] = 0
+    input we_a : bits[1]
+    input we_b : bits[1]
+
+    rule set_a {
+        (we_a == 1)?
+        a := b
+    }
+
+    rule set_b {
+        (we_b == 1)?
+        b := a
+    }
+
+    schedule {
+        urgency set_a > set_b
+        mutually_exclusive { set_a, set_b }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "assert(clock, not(and(fires_set_a, fires_set_b)), not(reset), \
+         \"mutually_exclusive claim violated: rule set_a and rule set_b both fired the same \
+         cycle\") : mutually_exclusive_check_0"
+    ));
+    // No derived stall between an exempted pair -- unlike a non-exempted
+    // conflict, neither rule's `fires_*` should reference the other's.
+    assert!(!fir.contains("not(fires_set_a)"));
+    assert!(!fir.contains("not(fires_set_b)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn conflict_free_claim_waives_the_stall_but_emits_no_assertion() {
+    // `conflict_free { a, b }` claims the OPPOSITE thing
+    // `mutually_exclusive` does: safe to fire concurrently, not
+    // never-both-fire. It still waives the derived stall (same as
+    // `mutually_exclusive`), but v0 has no way to prove or check address
+    // disjointness (DESIGN.md's tier-3 proof, deferred), so there is
+    // nothing sound to assert -- unlike `mutually_exclusive`, this must
+    // emit NO assertion at all, not an inverted or placeholder one.
     let src = "\
 module M {
     reg a : bits[8] = 0
@@ -2015,13 +2060,8 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains(
-        "assert(clock, not(and(fires_set_a, fires_set_b)), not(reset), \"conflict_free claim \
-         violated: rule set_a and rule set_b both fired the same cycle\") : \
-         conflict_free_check_0"
-    ));
-    // No derived stall between an exempted pair -- unlike a non-exempted
-    // conflict, neither rule's `fires_*` should reference the other's.
+    assert!(!fir.contains("assert("));
+    // Still no derived stall between the exempted pair.
     assert!(!fir.contains("not(fires_set_a)"));
     assert!(!fir.contains("not(fires_set_b)"));
     run_firtool(&fir, &[]);

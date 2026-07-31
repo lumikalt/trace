@@ -188,7 +188,18 @@ pub enum FnKind {
 pub enum ScheduleDirective {
     /// `urgency a > b > c` — descending priority.
     Urgency(Vec<Name>),
-    /// `conflict_free { a, b }` — claim checked with simulation assertions.
+    /// `mutually_exclusive { a, b }` — claims the two rules never both
+    /// fire the same cycle; checked with a simulation assertion. Named
+    /// to match Bluespec's own vocabulary (this project's cited
+    /// scheduling reference), where `conflict_free` means something
+    /// different — see `ConflictFree` below.
+    MutuallyExclusive(Vec<Name>),
+    /// `conflict_free { a, b }` — claims it's safe for both to fire the
+    /// same cycle (e.g. genuinely separate ports on one resource).
+    /// Trusted, NOT checked: v0 has no way to prove or check address
+    /// disjointness (that's the tier-3 banked-array proof DESIGN.md
+    /// defers), so unlike `MutuallyExclusive` there is no assertion to
+    /// insert here — only the derived stall is waived.
     ConflictFree(Vec<Name>),
 }
 
@@ -424,6 +435,9 @@ impl Ast {
                 for directive in directives {
                     let (tag, names) = match directive {
                         ScheduleDirective::Urgency(names) => ("urgency", names),
+                        ScheduleDirective::MutuallyExclusive(names) => {
+                            ("mutually_exclusive", names)
+                        }
                         ScheduleDirective::ConflictFree(names) => ("conflict_free", names),
                     };
                     let names = names.iter().map(|n| n.text.as_str()).collect::<Vec<_>>();

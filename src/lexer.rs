@@ -13,8 +13,8 @@ pub enum TokenKind {
 
     // Structural keywords. Effect names (combines, sequences, elaborates,
     // reads, writes, chooses) and schedule-block words (urgency,
-    // conflict_free) stay contextual identifiers — the keyword set only
-    // holds words that open or shape a construct.
+    // mutually_exclusive, conflict_free) stay contextual identifiers —
+    // the keyword set only holds words that open or shape a construct.
     #[token("module")]
     Module,
     #[token("rule")]

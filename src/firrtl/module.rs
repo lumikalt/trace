@@ -13,7 +13,7 @@ use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Stmt, StmtId};
 use crate::effects::Effects;
 use crate::resolve::{DefId, DefKind, Resolution};
-use crate::schedule::Schedule;
+use crate::schedule::{Exemption, Schedule};
 use crate::types::{Ty, Types, Width};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -268,7 +268,7 @@ pub(crate) fn emit_module(
         let guard = cx.compile_guard(*rule);
         let mut expr = guard;
         for conflict in conflicts {
-            if conflict.exempted {
+            if conflict.exemption.is_exempted() {
                 continue;
             }
             let other = if conflict.a == *rule {
@@ -289,16 +289,20 @@ pub(crate) fn emit_module(
         fires_name.insert(*rule, signal);
     }
 
-    // `conflict_free`-exempted pairs get no derived stall above — the
-    // claim is recorded, not trusted (DESIGN.md's "Scheduling" tier 2):
-    // check it at simulation time instead, by asserting the two rules
-    // never actually fire the same cycle. `enable` is gated on `not(reset)`
-    // since a rule's own guard may read state that hasn't settled to its
-    // real reset value yet on the reset cycle itself, and a spurious
-    // fires-both during reset would be a false claim violation, not a
-    // real one.
+    // Both exemption kinds waive the derived stall above (loop just
+    // finished). Only `mutually_exclusive` gets a runtime check here —
+    // it claims the two rules never both fire, which is checkable by
+    // asserting exactly that. `conflict_free` claims the OPPOSITE thing
+    // (safe to fire together) and stays trusted, not checked: v0 has no
+    // way to prove or check address disjointness (DESIGN.md's tier-3
+    // proof, deferred), so there is nothing sound to assert for it —
+    // see this module's own doc comment and schedule.rs's `Exemption`.
+    // `enable` is gated on `not(reset)` since a rule's own guard may
+    // read state that hasn't settled to its real reset value yet on the
+    // reset cycle itself, and a spurious fires-both during reset would
+    // be a false claim violation, not a real one.
     for (i, conflict) in conflicts.iter().enumerate() {
-        if !conflict.exempted {
+        if conflict.exemption != Exemption::MutuallyExclusive {
             continue;
         }
         let a_name = item_name(ast, conflict.a);
@@ -307,9 +311,9 @@ pub(crate) fn emit_module(
         let b_fires = &fires_name[&conflict.b];
         let _ = writeln!(
             fires_body,
-            "    assert(clock, not(and({a_fires}, {b_fires})), not(reset), \"conflict_free \
+            "    assert(clock, not(and({a_fires}, {b_fires})), not(reset), \"mutually_exclusive \
              claim violated: rule {a_name} and rule {b_name} both fired the same cycle\") : \
-             conflict_free_check_{i}"
+             mutually_exclusive_check_{i}"
         );
     }
 

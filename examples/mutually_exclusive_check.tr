@@ -1,0 +1,35 @@
+-- `mutually_exclusive { set_a, set_b }` claims these two rules -- which
+-- DO conflict per the static read/write analysis (`set_a` writes `a`
+-- while reading `b`; `set_b` writes `b` while reading `a`) -- never
+-- actually fire the same cycle, waiving the derived mutual-exclusion
+-- stall the scheduler would otherwise insert between them. The
+-- compiler doesn't trust that claim blindly (DESIGN.md's "Scheduling"
+-- tier 2): it inserts a FIRRTL `assert` checking `we_a`/`we_b` are
+-- never both 1 the same cycle. This is the CHECKED annotation -- the
+-- opposite claim, "safe to fire concurrently," is `conflict_free`
+-- (trusted, unchecked in v0; see DESIGN.md). See
+-- sim/mutually_exclusive_check_tb.v, which drives both a cycle where
+-- the claim genuinely holds (no assertion fires) and one where it's
+-- deliberately violated (the assertion DOES fire, confirming the check
+-- is real, not dead code that always passes).
+module MutuallyExclusiveCheck {
+    output a : bits[8] = 0
+    output b : bits[8] = 0
+    input we_a : bits[1]
+    input we_b : bits[1]
+
+    rule set_a {
+        (we_a == 1)?
+        a := b
+    }
+
+    rule set_b {
+        (we_b == 1)?
+        b := a
+    }
+
+    schedule {
+        urgency set_a > set_b
+        mutually_exclusive { set_a, set_b }
+    }
+}

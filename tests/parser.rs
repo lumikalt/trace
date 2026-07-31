@@ -198,6 +198,7 @@ fn schedule_block() {
     let src = "\
 schedule {
     urgency step > refill > idle
+    mutually_exclusive { set_a, set_b }
     conflict_free { read_port, write_port }
 }
 ";
@@ -211,6 +212,10 @@ schedule {
             trace::ast::ScheduleDirective::Urgency(ns) => {
                 ("urgency", ns.iter().map(|n| n.text.as_str()).collect())
             }
+            trace::ast::ScheduleDirective::MutuallyExclusive(ns) => (
+                "mutually_exclusive",
+                ns.iter().map(|n| n.text.as_str()).collect(),
+            ),
             trace::ast::ScheduleDirective::ConflictFree(ns) => (
                 "conflict_free",
                 ns.iter().map(|n| n.text.as_str()).collect(),
@@ -221,6 +226,7 @@ schedule {
         flat,
         [
             ("urgency", vec!["step", "refill", "idle"]),
+            ("mutually_exclusive", vec!["set_a", "set_b"]),
             ("conflict_free", vec!["read_port", "write_port"]),
         ]
     );

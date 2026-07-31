@@ -273,35 +273,73 @@ urgency: step_s1 > refill     (declaration order; no annotation given)
 derived stall: refill fires only when step_s1 is blocked or idle
 ```
 
-**Tier 2: annotations (v0).** When the default is wrong, the user shapes it. The
-compiler checks `conflict_free` claims with inserted simulation assertions. It does not
-trust them blindly. The claim itself is "these two rules never actually fire the same
-cycle" — e.g. two writers whose enable conditions the user knows are mutually exclusive
-in practice, even though the static read/write analysis (which can't see into a guard's
-runtime value) flags them as conflicting:
+**Tier 2: annotations (v0).** When the default is wrong, the user shapes it with one of
+TWO directives, deliberately kept as separate keywords rather than one overloaded
+annotation because they claim OPPOSITE things:
+
+- **`mutually_exclusive { a, b }`** claims the two rules never actually fire the same
+  cycle — e.g. two writers whose enable conditions the user knows are mutually exclusive
+  in practice, even though the static read/write analysis (which can't see into a
+  guard's runtime value) flags them as conflicting. **Checked**, not trusted blindly:
+  the compiler inserts a simulation assertion for it.
+- **`conflict_free { a, b }`** claims it's safe for both to fire the SAME cycle — e.g. a
+  memory with independent read/write address ports, where a same-cycle read and write to
+  different addresses genuinely don't hazard. **Trusted, NOT checked**: v0 has no way to
+  prove or check address disjointness (that's exactly the tier-3 banked-array proof this
+  document defers), so there's nothing sound to assert here — only the derived stall is
+  waived.
+
+  **This claim is only ever coherent for a ReadWrite conflict, never a WriteWrite one —
+  v0's emission model gives no meaning to "safe to fire concurrently" when both rules
+  write the SAME resource, so `conflict_free` on a WriteWrite pair is a compile-time
+  error, not just a documented footgun.** A memory has one shared writer port; a
+  register has one connect target — two rules that both write it, marked `conflict_free`
+  and both firing the same cycle, would produce two `when fires_a: connect x, ...` /
+  `when fires_b: connect x, ...` blocks with no arbitration between them: a silent
+  FIRRTL last-connect race, whichever happens to emit last winning, with no assertion, no
+  derived stall, and no diagnostic — confirmed by emitting exactly this case BEFORE the
+  guard below existed. `mutually_exclusive` is the correct annotation for a write-write
+  pair that's claimed to never actually coincide — it stays SAFE even if the claim turns
+  out false, since the assertion fires; `conflict_free` has no such fallback for
+  WriteWrite, by construction, in v0. `schedule.rs`'s `group` rejects `conflict_free` on
+  a WriteWrite conflict outright (pointing at the directive's own span, naming both
+  rules and the shared state, suggesting `mutually_exclusive`) rather than silently
+  compiling the race — this is a deliberate, narrow exception to this design's usual
+  "overstating a claim is legal" stance (still true for `mutually_exclusive`, and for
+  `conflict_free` on a genuine ReadWrite pair that happens not to actually conflict at
+  runtime), justified because there is no possible correct meaning for this specific
+  combination to overstate, not merely an unlikely one. `tests/schedule.rs`'s
+  `conflict_free_rejects_a_writewrite_conflict` /
+  `conflict_free_exempts_a_readwrite_conflict` pin both sides of the line.
 
 ```
 schedule {
     urgency writer_a > writer_b
-    conflict_free { writer_a, writer_b }   -- claim: never both fire; checked in simulation
+    mutually_exclusive { writer_a, writer_b }   -- claim: never both fire; checked in simulation
+    conflict_free { reader, writer }            -- claim: safe to fire together; trusted, unchecked
 }
 ```
 
-This is deliberately NOT "these two may safely fire concurrently" (e.g. a dual-port
-memory's independent read/write) — v0 has no way to prove or check anything about what
-happens WHEN both fire (address disjointness is exactly the tier-3 banked-array proof
-this document defers), so "safe to coincide" would have nothing soundly checkable behind
-it in v0. "Never coincide" is the only reading with a real, insertable runtime check.
-Confirmed with Lumi via AskUserQuestion before finalizing the assertion's polarity,
-since the two readings assert opposite things and this document's own wording could be
-misread either way.
+Named to match Bluespec's own vocabulary (this project's cited scheduling reference)
+rather than invent new terms for the same two ideas bsc already has words for.
+**This wasn't the first naming tried.** The feature initially shipped as a single
+`conflict_free` directive meaning "never both fire" (the `mutually_exclusive` reading
+above) — the natural-sounding name for "no conflict happens." Lumi asked for the
+concurrent-safe case to be added as well, which surfaced the clash directly: Bluespec's
+own `conflict_free` attribute conventionally means the OPPOSITE of what had just been
+built (safe-to-fire-concurrently, not never-both-fire) — confirmed with Lumi (who is
+Bluespec-fluent) before touching any code, since this was a naming/semantics call only
+they could make, not something to resolve from recollection alone. Realigned: the
+just-shipped checked directive was renamed `mutually_exclusive`, and `conflict_free`
+was repurposed to mean the concurrent-safe, trusted case — matching bsc rather than
+leaving a plausible-but-backwards name in place next to a newly-added correct one.
 
-**The tier-2 assertion itself, ACHIEVED 2026-07-31.** For each `conflict_free`-exempted
-pair, `emit_module` (module.rs) emits a FIRRTL `assert` right after the pair's own
-`fires_*` nodes:
+**`mutually_exclusive`'s assertion, ACHIEVED 2026-07-31.** For each
+`mutually_exclusive`-exempted pair, `emit_module` (module.rs) emits a FIRRTL `assert`
+right after the pair's own `fires_*` nodes:
 
 ```
-assert(clock, not(and(fires_a, fires_b)), not(reset), "conflict_free claim violated: rule a and rule b both fired the same cycle") : conflict_free_check_0
+assert(clock, not(and(fires_a, fires_b)), not(reset), "mutually_exclusive claim violated: rule a and rule b both fired the same cycle") : mutually_exclusive_check_0
 ```
 
 The claim being checked is exactly "these two rules never both fire the same cycle" —
@@ -316,17 +354,38 @@ concurrent `assert ... else $error(...)`, and — unlike some SVA constructs —
 violated cycle and staying silent otherwise (confirmed both ways, not just the
 happy path).
 
-`examples/conflict_free_check.tr` + `sim/conflict_free_check_tb.v` prove both directions
-through real firtool + Icarus simulation: a window where the claim genuinely holds
-(`we_a`/`we_b` never both 1) produces no assertion failure, and a window that
+`examples/mutually_exclusive_check.tr` + `sim/mutually_exclusive_check_tb.v` prove both
+directions through real firtool + Icarus simulation: a window where the claim genuinely
+holds (`we_a`/`we_b` never both 1) produces no assertion failure, and a window that
 deliberately violates it (both 1 the same cycle) DOES — the second half is the important
 proof, confirming the check is a real, live assertion rather than dead code that always
 happens to pass. `tests/firrtl.rs`'s
-`conflict_free_claim_emits_a_simulation_assertion` pins the exact emitted text and
+`mutually_exclusive_claim_emits_a_simulation_assertion` pins the exact emitted text and
 additionally confirms an exempted pair gets NO derived-stall reference to the other's
 `fires_*` signal (unlike a non-exempted conflict, whose lower-urgency rule's own `fires_*`
 does reference the other's) — the annotation genuinely waives the stall rather than
 silently keeping it around.
+
+**`conflict_free`, ACHIEVED 2026-08-01, added right after the rename above.** Waives the
+derived stall exactly like `mutually_exclusive`, but emits NO assertion — there is
+nothing sound to check in v0 (see above). `tests/firrtl.rs`'s
+`conflict_free_claim_waives_the_stall_but_emits_no_assertion` pins both halves of that:
+no `assert(` text at all, and still no derived-stall reference between the pair.
+
+The real value of letting both rules fire the same cycle only shows up with a genuine
+end-to-end proof, not just "no assertion, no stall" — `examples/conflict_free_mem.tr`
+gives `write`/`read` independent address ports on one `mem` and marks them
+`conflict_free`, unlike `examples/port_ram.tr`'s `urgency write > read`, which forces
+`read` to stall on any cycle `write` fires. `sim/conflict_free_mem_tb.v` proves `read`
+never stalls here: it changes `read_addr` to a freshly-written address on the SAME cycle
+a write to a THIRD, unrelated address is also firing, and checks `read_data` reflects the
+new address's value immediately — a `mutually_exclusive`- or `urgency`-derived stall
+would instead have left `read_data` showing the previous address's stale value for that
+cycle, needing an extra non-writing cycle to "catch up." Confirmed this distinction is
+real, not just asserted: the identical testbench was run once more against the same
+design but with `urgency write > read` substituted for `conflict_free { write, read }`,
+and it FAILED in exactly that way — proof the test discriminates the two behaviors
+rather than passing regardless of which annotation is used.
 
 **Tier 3: provable disjointness (later, not v0).** Dahlia-style banked and affine array
 types would let the compiler prove two accesses disjoint and drop the conflict. This is

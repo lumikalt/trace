@@ -379,6 +379,7 @@ impl<'a> Resolver<'a> {
                     .iter()
                     .flat_map(|d| match d {
                         crate::ast::ScheduleDirective::Urgency(ns) => ns.clone(),
+                        crate::ast::ScheduleDirective::MutuallyExclusive(ns) => ns.clone(),
                         crate::ast::ScheduleDirective::ConflictFree(ns) => ns.clone(),
                     })
                     .collect();

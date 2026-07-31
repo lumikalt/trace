@@ -1,0 +1,35 @@
+-- `conflict_free { write, read }` claims it's safe for `write` and
+-- `read` to fire the SAME cycle -- unlike `port_ram.tr`, which forces
+-- `read` to stall whenever `write` fires (`urgency write > read`) so
+-- `read_data` never races a same-cycle write. This memory has
+-- independent write/read address ports, so a write and a read to
+-- DIFFERENT addresses are genuinely safe to happen concurrently -- the
+-- claim `conflict_free` makes is trusted, not checked (v0 has no way to
+-- prove or check address disjointness; see DESIGN.md's "Scheduling").
+-- `read` never stalls here, even on a cycle where `write` also fires --
+-- see sim/conflict_free_mem_tb.v, which proves `read_data` tracks a
+-- NEW `read_addr` on the very same cycle a write is happening
+-- elsewhere, rather than needing an extra non-writing cycle to "catch
+-- up" the way port_ram.tr's forced stall would.
+module ConflictFreeMem {
+    mem m : bits[16][256]
+
+    input write_addr : bits[8]
+    input write_data : bits[16]
+    input write_en : bits[1]
+    input read_addr : bits[8]
+    output read_data : bits[16] = 0
+
+    rule write {
+        (write_en == 1)?
+        m[write_addr] := write_data
+    }
+
+    rule read {
+        read_data := m[read_addr]
+    }
+
+    schedule {
+        conflict_free { write, read }
+    }
+}

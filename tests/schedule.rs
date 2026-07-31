@@ -1,6 +1,6 @@
 use trace::ast::{Ast, Item};
 use trace::resolve::Resolution;
-use trace::schedule::{ConflictKind, Schedule, ScheduleError, schedule};
+use trace::schedule::{ConflictKind, Exemption, Schedule, ScheduleError, schedule};
 use trace::{effects, lexer, parser, resolve};
 
 fn run(src: &str) -> (Ast, Resolution, Schedule, Vec<ScheduleError>) {
@@ -41,7 +41,7 @@ fn subleq_schedule() {
     assert_eq!(group.conflicts.len(), 1);
     let c = &group.conflicts[0];
     assert_eq!(rule_name(&ast, c.winner), "step");
-    assert!(!c.exempted);
+    assert_eq!(c.exemption, Exemption::None);
     let on: Vec<&str> = c.on.iter().map(|d| res.def(*d).name.as_str()).collect();
     assert!(
         on.contains(&"m"),
@@ -93,7 +93,68 @@ module M {
 }
 
 #[test]
-fn conflict_free_exempts() {
+fn mutually_exclusive_exempts() {
+    let src = "\
+module M {
+    reg a : bits[8] = 0
+    rule p {
+        a := a + 1
+    }
+    rule q {
+        a := a + 2
+    }
+    schedule {
+        mutually_exclusive { p, q }
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::MutuallyExclusive);
+}
+
+#[test]
+fn conflict_free_exempts_a_readwrite_conflict() {
+    // `conflict_free` claims the OPPOSITE thing `mutually_exclusive`
+    // does (safe to fire concurrently, not never-both-fire) -- both
+    // waive the derived stall, but schedule.rs must keep them distinct
+    // so firrtl/module.rs knows which one (if either) to check. Only
+    // meaningful for a ReadWrite conflict (see
+    // `conflict_free_rejects_a_writewrite_conflict` below) -- `p` writes
+    // `a`, `q` reads it.
+    let src = "\
+module M {
+    reg a : bits[8] = 0
+    reg b : bits[8] = 0
+    rule p {
+        a := a + 1
+    }
+    rule q {
+        b := a
+    }
+    schedule {
+        conflict_free { p, q }
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].kind, ConflictKind::ReadWrite);
+    assert_eq!(group.conflicts[0].exemption, Exemption::ConflictFree);
+}
+
+#[test]
+fn conflict_free_rejects_a_writewrite_conflict() {
+    // v0's emission model has one shared writer port/connect target per
+    // resource, not two independent ones a WriteWrite pair could be
+    // safely concurrent on -- `conflict_free` here would silently
+    // compile to an unarbitrated last-connect race with no assertion
+    // and no derived stall. Must be a real error, not accepted with a
+    // footgun left in the emitted hardware.
     let src = "\
 module M {
     reg a : bits[8] = 0
@@ -108,11 +169,13 @@ module M {
     }
 }
 ";
-    let (_, _, sched, errors) = run(src);
-    assert!(errors.is_empty());
-    let group = &sched.groups[0];
-    assert_eq!(group.conflicts.len(), 1);
-    assert!(group.conflicts[0].exempted);
+    let (_, _, _, errors) = run(src);
+    assert!(!errors.is_empty());
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("mutually_exclusive"))
+    );
 }
 
 #[test]
