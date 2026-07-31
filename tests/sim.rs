@@ -299,3 +299,34 @@ fn submodule_runs_through_real_ports() {
         "result did not settle at 20 + 30:\n{output}"
     );
 }
+
+/// Proves the widened expression surface (multiply, bitwise, static
+/// shift, unary negate/complement, bit-select/slice) end to end:
+/// sim/alu_tb.v picks a = 0xE3/b = 0x07 specifically because a's high
+/// and low bits differ, so a shl/shr mix-up or a truncated (rather than
+/// widening) multiply would show up as a wrong value, not just a design
+/// firtool happens to accept.
+#[test]
+fn alu_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/alu.tr")).unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/alu_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains(
+            "final: prod=635 band=3 bor=e7 bxor=e4 shl3=18 shr3=1c nega=1d nota=1c lo4=3 bit7=1"
+        ),
+        "final ALU outputs did not match expectations:\n{output}"
+    );
+}

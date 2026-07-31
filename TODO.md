@@ -1,8 +1,5 @@
 # TODO
 
-Known gaps, not commitments. Each is an explicit v0 restriction already
-enforced somewhere in the compiler (see the cited file), not a surprise.
-
 ## Emission (`src/firrtl.rs`)
 
 - Submodules compose by name only (`inst child : Child`, flat top-level
@@ -11,10 +8,12 @@ enforced somewhere in the compiler (see the cited file), not a surprise.
   can't nest in `if`/`while` (same restriction as a mem write).
 - No calls to user `fn`/`spec`/`impl` from synthesizable rules (needs
   inlining or instantiation).
-- Expression surface is narrow: idents, ints, `+`/`-`, comparisons, mem
-  indexing, and `instance.port` (reads only; writes only as a whole
-  statement's LHS). No shifts, multiply, bit-select, unary negate, or any
-  other field access.
+- Expression surface still excludes: calls, other field access, `/`/`%`,
+  dynamic-amount shifts (shift amount must be a literal), computed
+  bit-select/slice bounds (must be literal), and logical `!` (only `~`
+  and unary `-` are supported). `instance.port` is reads only; writes
+  only as a whole statement's LHS. See `examples/alu.tr` for what's
+  covered: `*`, `&`/`|`/`^`, `<<`/`>>`, unary `-`/`~`, `x[i]`/`x[hi..lo]`.
 - Memory writes can't nest in `if`/`while` (register writes can, via a
   `mux`; mem writes are still top-level-only).
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax

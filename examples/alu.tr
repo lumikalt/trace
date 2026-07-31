@@ -1,0 +1,33 @@
+-- Exercises the widened FIRRTL expression surface end to end: multiply
+-- (widening, no truncation), the three bitwise ops, static shifts
+-- (truncating shl, zero-padding shr), unary negate/complement, and
+-- bit-select/slice — see sim/alu_tb.v for the values chosen to catch a
+-- shl/shr mix-up or a truncated multiply.
+module Alu {
+    input a : bits[8]
+    input b : bits[8]
+
+    output prod : bits[16] = 0
+    output band : bits[8] = 0
+    output bor : bits[8] = 0
+    output bxor : bits[8] = 0
+    output shl3 : bits[8] = 0
+    output shr3 : bits[8] = 0
+    output nega : bits[8] = 0
+    output nota : bits[8] = 0
+    output lo4 : bits[4] = 0
+    output bit7 : bits[1] = 0
+
+    rule compute {
+        prod := a * b
+        band := a & b
+        bor := a | b
+        bxor := a ^ b
+        shl3 := a << 3
+        shr3 := a >> 3
+        nega := -a
+        nota := ~a
+        lo4 := a[3..0]
+        bit7 := a[7]
+    }
+}

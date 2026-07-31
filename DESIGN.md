@@ -683,6 +683,65 @@ never combinational" rule as "Module ports" above, just compounding once per hop
 the hierarchy: a real, honestly-modeled consequence of composition, not a hidden
 surprise.
 
+## Expression surface
+
+**Widened 2026-07-30.** FIRRTL emission's expression surface used to be idents,
+integer literals, `+`/`-`, comparisons, and memory reads — enough for SUBLEQ and
+Rmw, nothing more. It now also covers multiply, the three bitwise ops, static
+(literal-amount) shifts, unary negate/complement, and bit-select/slice:
+
+```
+module Alu {
+    input a : bits[8]
+    input b : bits[8]
+
+    output prod : bits[16] = 0   -- a * b
+    output shl3 : bits[8] = 0    -- a << 3
+    output shr3 : bits[8] = 0    -- a >> 3
+    output lo4 : bits[4] = 0     -- a[3..0]
+
+    rule compute {
+        prod := a * b
+        shl3 := a << 3
+        shr3 := a >> 3
+        lo4 := a[3..0]
+    }
+}
+```
+
+`examples/alu.tr` exercises the whole set; `sim/alu_tb.v` picks operand values whose
+high and low bits differ, so a shl/shr mix-up or a truncated (instead of widening)
+multiply shows up as a wrong output value, not just a design firtool happens to
+accept.
+
+Two width rules already existed in the type checker (`types.rs`) and just needed a
+FIRRTL primop that matched them:
+
+- **Multiply doesn't truncate when both sides are `bits`** — the checker sums their
+  widths (`a * b` on two `bits[8]`s is `bits[16]`), and FIRRTL's `mul` primop already
+  produces exactly that sum, so `prod := a * b` compiles straight to `mul(a, b)`, no
+  `tail` needed. Multiplying by a bare literal is different: the checker keeps the
+  *other* operand's width instead of summing (`x * 3` on `bits[8]` stays `bits[8]`),
+  but `mul` itself still sums both compiled widths — so that case needs a `tail` to
+  drop back down, the same idea as `add`/`sub`'s carry-bit truncation but by a
+  variable amount instead of a constant 1.
+- **Shifts keep the left operand's width**, matching Verilog's fixed-width `<<`/`>>`
+  rather than FIRRTL's own `shl`/`shr` (which grow/shrink the width so no bits are
+  lost). `shl3 := a << 3` compiles to `tail(shl(a, 3), 3)` — shift up, then drop the
+  high bits that fell off; `shr3 := a >> 3` compiles to `pad(shr(a, 3), 8)` — shift
+  down (discarding the low bits), then zero-pad back up to the original width. Only a
+  literal shift amount is supported (v0 restriction): FIRRTL's `shl`/`shr` need a
+  static amount, and a dynamic-amount `dshl`/`dshr` isn't wired up yet.
+
+Bit-select and slice (`x[i]`, `x[hi..lo]`) compile to FIRRTL's `bits(x, hi, lo)`
+primop, which also needs static bounds — so, like shifts, only literal-integer
+indices are supported; a computed bound is a v0 restriction, not something the type
+checker would otherwise reject (it happily types a dynamic single-bit select as
+`bits[1]`). Unary `-` compiles to `tail(sub(UInt<w>(0), x), 1)` (two's-complement
+negate, wrapping within the operand's own width, same convention as `+`/`-`); unary
+`~` compiles straight to FIRRTL's `not`. Logical `!` is deliberately left out this
+pass — see TODO.md.
+
 ## Tooling
 
 **Editor support added 2026-07-30**, `editors/vscode/`: TextMate-grammar syntax

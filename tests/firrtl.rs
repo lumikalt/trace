@@ -481,3 +481,141 @@ module Top {
     assert!(verilog.contains("Adder a1 ("));
     assert!(verilog.contains("Adder a2 ("));
 }
+
+#[test]
+fn alu_emits_widened_expression_surface() {
+    let fir = emit_from_source(&read_example("alu.tr")).expect("emission should succeed");
+
+    // Widening multiply: both operands are bits (not a literal), so
+    // types.rs already sums their widths — no `tail` truncation needed.
+    assert!(fir.contains("connect __out_prod, mul(a, b)"));
+    assert!(fir.contains("connect __out_band, and(a, b)"));
+    assert!(fir.contains("connect __out_bor, or(a, b)"));
+    assert!(fir.contains("connect __out_bxor, xor(a, b)"));
+    // Static shift: `shl` grows width by the shift amount, `shr` shrinks
+    // it; both get brought back to the left operand's own width.
+    assert!(fir.contains("connect __out_shl3, tail(shl(a, 3), 3)"));
+    assert!(fir.contains("connect __out_shr3, pad(shr(a, 3), 8)"));
+    assert!(fir.contains("connect __out_nega, tail(sub(UInt<8>(0), a), 1)"));
+    assert!(fir.contains("connect __out_nota, not(a)"));
+    assert!(fir.contains("connect __out_lo4, bits(a, 3, 0)"));
+    assert!(fir.contains("connect __out_bit7, bits(a, 7, 7)"));
+
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn multiply_by_a_literal_truncates_back_to_the_declared_width() {
+    // Unlike alu.tr's bits*bits multiply (which widens), a bits*literal
+    // multiply keeps the checker's declared width (types.rs's mixed
+    // Bits/Int rule) — `mul` itself still sums both compiled operand
+    // widths, so this needs a `tail` to drop back down, same idea as
+    // `add`/`sub`'s carry-bit truncation but a variable amount (8 bits
+    // here, not a constant 1).
+    let src = "\
+module M {
+    input x : bits[8]
+    output y : bits[8] = 0
+    rule r {
+        y := x * 3
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_y, tail(mul(x, UInt<8>(3)), 8)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn shift_by_a_non_literal_amount_is_an_error() {
+    let src = "\
+module M {
+    input x : bits[8]
+    input n : bits[8]
+    output y : bits[8] = 0
+    rule r {
+        y := x << n
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("shift amount must be a literal"))
+    );
+}
+
+#[test]
+fn bit_select_with_computed_bounds_is_an_error() {
+    let src = "\
+module M {
+    input x : bits[8]
+    input i : bits[8]
+    output y : bits[1] = 0
+    rule r {
+        y := x[i]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("bounds must be literal integers"))
+    );
+}
+
+#[test]
+fn reversed_slice_bounds_are_an_error_not_invalid_firrtl() {
+    // types.rs's width formula (`hi.abs_diff(lo) + 1`) accepts either
+    // bound order, but FIRRTL's `bits` primop needs hi >= lo — without
+    // this check `x[0..3]` would emit `bits(x, 0, 3)`, which firtool
+    // rejects with no span back into the .tr source.
+    let src = "\
+module M {
+    input x : bits[8]
+    output y : bits[4] = 0
+    rule r {
+        y := x[0..3]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("hi >= lo")));
+}
+
+#[test]
+fn logical_not_is_an_error_not_a_silent_bitwise_not() {
+    // `!` (UnOp::Not) is deliberately left unimplemented this pass —
+    // only `~` (BitNot) and unary `-` (Neg) are supported — so it must
+    // error, not silently fall through to some other emission.
+    let src = "\
+module M {
+    input x : bits[8]
+    output y : bits[8] = 0
+    rule r {
+        y := !x
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("logical `!`")));
+}
+
+#[test]
+fn div_and_rem_are_still_errors() {
+    let src = "\
+module M {
+    input x : bits[8]
+    input y : bits[8]
+    output z : bits[8] = 0
+    rule r {
+        z := x / y
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("div and rem are not supported"))
+    );
+}
