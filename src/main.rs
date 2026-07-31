@@ -132,11 +132,74 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// Splits a trailing hint clause (`"...; use \`trunc(value, 8)\`"`) off a
+/// diagnostic message, so `report` can show the main text above the
+/// source snippet and the hint once, near the underlined span, instead
+/// of repeating the whole message in both places. Only a `"; use "`
+/// clause counts as a hint — most error messages chain several `"; "`
+/// clauses of ordinary explanation (v0-restriction detail, etc.), not a
+/// "here's what to do" suggestion, so this deliberately doesn't split
+/// on every semicolon.
+fn split_hint(message: &str) -> (&str, Option<&str>) {
+    match message.rfind("; use ") {
+        Some(idx) => (&message[..idx], Some(&message[idx + 2..])),
+        None => (message, None),
+    }
+}
+
 fn report(path: &str, src: &str, span: lexer::Span, message: &str) {
-    Report::build(ReportKind::Error, (path, span.clone()))
-        .with_message(message)
-        .with_label(Label::new((path, span)).with_message(message))
+    let (main, hint) = split_hint(message);
+    // Without an attached message, ariadne draws no underline at all —
+    // so the no-hint case still needs a label message to point at the
+    // span; only when there's a hint to show instead does the label
+    // switch to that (avoiding the "full message twice" duplication),
+    // rather than always falling back to repeating `main`.
+    let label = Label::new((path, span.clone())).with_message(hint.unwrap_or(main));
+    Report::build(ReportKind::Error, (path, span))
+        .with_message(main)
+        .with_label(label)
         .finish()
         .eprint((path, Source::from(src)))
         .expect("failed to print diagnostic");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_hint;
+
+    #[test]
+    fn splits_a_trailing_use_hint() {
+        let (main, hint) = split_hint(
+            "state write would silently truncate bits[16] to bits[8]; use `trunc(value, 8)`",
+        );
+        assert_eq!(
+            main,
+            "state write would silently truncate bits[16] to bits[8]"
+        );
+        assert_eq!(hint, Some("use `trunc(value, 8)`"));
+    }
+
+    #[test]
+    fn leaves_a_message_with_no_hint_intact() {
+        let (main, hint) = split_hint("this call is not yet supported in FIRRTL emission");
+        assert_eq!(main, "this call is not yet supported in FIRRTL emission");
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn does_not_treat_an_ordinary_semicolon_clause_as_a_hint() {
+        // "; not supported for a depth-1 fifo ... : split into two rules"
+        // is ordinary explanatory detail, not a "use X" suggestion — the
+        // whole thing stays the main message.
+        let (main, hint) = split_hint(
+            "this rule both enqueues and dequeues `f` in the same cycle; not supported \
+             for a depth-1 fifo (v0 restriction): split into two rules",
+        );
+        assert_eq!(
+            main,
+            "this rule both enqueues and dequeues `f` in the same cycle; not supported \
+             for a depth-1 fifo (v0 restriction): split into two rules"
+        );
+        assert_eq!(hint, None);
+    }
 }
