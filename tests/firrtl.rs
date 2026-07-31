@@ -794,7 +794,12 @@ module M {
 }
 
 #[test]
-fn call_to_a_branching_function_is_an_error() {
+fn call_to_a_function_with_a_non_tail_if_is_still_too_complex_to_inline() {
+    // An `if` before the trailing `return` (not itself the final
+    // statement) isn't the tail-branching shape `compile_callee_body`
+    // recurses into -- it's just a `let`-shaped slot with an `if` in
+    // it, which is rejected the same as any other non-`let` leading
+    // statement.
     let src = "\
 Pick(x : bits[8]) : bits[8] <combines> {
     if x > 10 {
@@ -815,6 +820,85 @@ module M {
         err.iter()
             .any(|e| e.message.contains("too complex to inline"))
     );
+}
+
+#[test]
+fn call_inlines_a_function_with_an_if_else_branching_return() {
+    let src = "\
+Max(a : bits[8], b : bits[8]) : bits[8] <combines> {
+    if a > b {
+        return a
+    } else {
+        return b
+    }
+}
+module M {
+    input x : bits[8]
+    input y : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := Max(x, y)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("mux(gt(x, y), x, y)"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_to_a_function_with_a_tail_if_and_no_else_is_an_error() {
+    let src = "\
+Pick(x : bits[8]) : bits[8] <combines> {
+    if x > 10 {
+        return x
+    }
+}
+module M {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := Pick(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("must have an `else`"))
+    );
+}
+
+#[test]
+fn call_inlines_a_function_with_lets_inside_branches_that_do_not_leak_out() {
+    // Each branch's own `let` is bound/restored around that branch's
+    // recursive compile -- this pins that a `let` with the SAME name in
+    // both branches doesn't collide (each `Let` statement has its own
+    // DefId regardless of the shared name), and that compiling the
+    // `else` branch after the `then` branch doesn't see the `then`
+    // branch's local still bound.
+    let src = "\
+Pick(a : bits[8], b : bits[8]) : bits[8] <combines> {
+    if a > b {
+        let winner = a
+        return winner
+    } else {
+        let winner = b
+        return winner
+    }
+}
+module M {
+    input x : bits[8]
+    input y : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := Pick(x, y)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("mux(gt(x, y), x, y)"));
+    run_firtool(&fir, &["--disable-opt"]);
 }
 
 #[test]

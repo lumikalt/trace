@@ -30,9 +30,11 @@
 //!   through a `mux`, same as a register write).
 //! - A call to a user `fn`/`impl` is inlined at its call site (FIRRTL has
 //!   no call concept). Restricted to a callee whose body is zero or more
-//!   `let` bindings then one trailing `return <expr>` — no branches,
-//!   state writes, guards/fifo ops, or further calls (which also rules
-//!   out recursion: a callee that cannot call anything can never call
+//!   `let` bindings then either a trailing `return <expr>` or an
+//!   `if`/`else` whose branches both recurse into that same shape
+//!   (mandatory `else`, folded into a `mux`) — no state writes,
+//!   guards/fifo ops, or further calls anywhere (which also rules out
+//!   recursion: a callee that cannot call anything can never call
 //!   itself). A `spec` call cannot reach this pass at all (effects.rs
 //!   already rejects it outside spec-only code); a builtin call (e.g.
 //!   `prio`) is a separate, still-unsupported gap.
@@ -1597,9 +1599,9 @@ impl<'a> Emitter<'a> {
                             self.ast.expr_spans[id.0 as usize].clone(),
                             "this call is not yet supported in FIRRTL emission (v0 \
                              restriction: only a call to a user `fn`/`impl` with a \
-                             simple body — `let` bindings then a single trailing \
-                             `return`, no branches, no state writes, no nested calls — \
-                             can be inlined; builtin calls like `prio` are not yet \
+                             simple body — `let` bindings, `if`/`else` branches, and a \
+                             trailing `return`, no state writes, no nested calls — can \
+                             be inlined; builtin calls like `prio` are not yet \
                              synthesizable)"
                                 .to_string(),
                         );
@@ -1682,19 +1684,22 @@ impl<'a> Emitter<'a> {
     ///   possible failure (a guard inside the body would already set
     ///   this) — effects.rs's already-merged signature answers all three
     ///   in one check, including through the callee's own calls;
-    /// - body shape: zero or more `let` bindings, then exactly one
-    ///   trailing `return <expr>` — no branches, no state writes (a
-    ///   redundant but cheaper check than the signature one above), no
-    ///   further calls (sidesteps recursion entirely: a function whose
-    ///   own body cannot call anything can never call itself, directly
-    ///   or through a cycle).
+    /// - body shape: zero or more `let` bindings, then either a trailing
+    ///   `return <expr>` or an `if`/`else` whose branches both recurse
+    ///   into this same shape (mandatory `else` — every reachable path
+    ///   must produce a value, folded into a `mux` by
+    ///   `compile_callee_body`), no state writes (a redundant but
+    ///   cheaper check than the signature one above), no further calls
+    ///   anywhere in the tree (sidesteps recursion entirely: a function
+    ///   whose own body cannot call anything can never call itself,
+    ///   directly or through a cycle).
     ///
     /// Width correctness for a generic callee (`bits[N]` params): this
     /// call expression's own OUTER width (`id`, already instantiated to
     /// a concrete number by types.rs's call-site solver) is used as the
-    /// hint threaded into the callee's return expression — never the
+    /// hint threaded into every branch's return expression — never the
     /// callee's own internal, still-generic `types.expr_tys` entry for
-    /// its return expression, which was only ever checked once, that
+    /// its return expression(s), which were only ever checked once, that
     /// generically, independent of any particular call site.
     fn compile_call(
         &mut self,
@@ -1763,11 +1768,69 @@ impl<'a> Emitter<'a> {
             return Err(());
         }
 
-        let Some((&last, lets)) = fn_body.split_last() else {
+        // Bind params into `self.locals`, saving whatever was there before
+        // (from an enclosing call to this SAME function, if any) so it can
+        // be restored once this call is fully compiled. Without this,
+        // `Avg(Avg(x, y), z)` would silently miscompile: `Avg`'s param
+        // DefIds are shared across every call to `Avg`, so compiling the
+        // outer call's first argument (which recurses into the inner
+        // `Avg(x, y)` call) would rebind them out from under the outer
+        // call before it gets to compile its second argument — a real,
+        // observed silent drop of `z`, not a hypothetical. Save/restore
+        // makes this properly reentrant regardless of how deep or
+        // indirect the nesting is (as an argument, or via a `let` whose
+        // value is a call), not just the syntactically-nested case.
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            if let Some((i, _)) = self
+                .res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == param.name.span)
+            {
+                let def = DefId(i as u32);
+                saved.push((def, self.locals.insert(def, *arg)));
+            }
+        }
+
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let result = self.compile_callee_body(&fn_body, w, &span);
+
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
+            }
+        }
+        result
+    }
+
+    /// Compiles a callee's body (or an `if`/`else` branch of one, which
+    /// has the identical shape) to a single value: zero or more `let`
+    /// bindings, then either a trailing `return <expr>` or an `if`/`else`
+    /// whose branches both recurse into this same shape. An `if` with no
+    /// `else` is rejected — every reachable path must produce a value,
+    /// there's no such thing as a "held" return the way an unwritten
+    /// register path holds its own feedback. Each branch's `let`s are
+    /// bound/restored around that branch's own recursive call, so they
+    /// never leak into a sibling branch or the caller.
+    fn compile_callee_body(
+        &mut self,
+        stmts: &[StmtId],
+        hint: u64,
+        span: &Span,
+    ) -> Result<String, ()> {
+        let Some((&last, lets)) = stmts.split_last() else {
             self.error(
-                span,
-                "calling a function with an empty body is not yet supported in FIRRTL \
-                 emission (v0 restriction)"
+                span.clone(),
+                "calling a function with an empty body (or an empty `if`/`else` \
+                 branch) is not yet supported in FIRRTL emission (v0 restriction: \
+                 every branch must end with `return`)"
                     .to_string(),
             );
             return Err(());
@@ -1777,33 +1840,22 @@ impl<'a> Emitter<'a> {
             .all(|s| matches!(self.ast.stmt(*s), Stmt::Let { .. }))
         {
             self.error(
-                span,
+                span.clone(),
                 "this function's body is too complex to inline (v0 restriction: only \
-                 `let` bindings followed by a single trailing `return` are supported \
-                 — no branches, state writes, or fifo/guard operations)"
+                 `let` bindings, `if`/`else` branches, and a trailing `return` are \
+                 supported — no state writes, loops, or fifo/guard operations)"
                     .to_string(),
             );
             return Err(());
         }
-        let Stmt::Return(Some(ret_expr)) = self.ast.stmt(last).clone() else {
+        if lets.iter().any(|s| {
+            let Stmt::Let { init, .. } = self.ast.stmt(*s) else {
+                unreachable!()
+            };
+            expr_contains_call(self.ast, *init)
+        }) {
             self.error(
-                span,
-                "this function's body must end with `return <expr>` to be inlined \
-                 (v0 restriction)"
-                    .to_string(),
-            );
-            return Err(());
-        };
-        if expr_contains_call(self.ast, ret_expr)
-            || lets.iter().any(|s| {
-                let Stmt::Let { init, .. } = self.ast.stmt(*s) else {
-                    unreachable!()
-                };
-                expr_contains_call(self.ast, *init)
-            })
-        {
-            self.error(
-                span,
+                span.clone(),
                 "this function's body calls another function or builtin, which is not \
                  yet supported for inlining (v0 restriction: a called function's own \
                  body must not itself call anything, which also rules out recursion)"
@@ -1812,19 +1864,6 @@ impl<'a> Emitter<'a> {
             return Err(());
         }
 
-        // Bind params/lets into `self.locals`, saving whatever was there
-        // before (from an enclosing call to this SAME function, if any)
-        // so it can be restored once this call's return expression is
-        // fully compiled. Without this, `Avg(Avg(x, y), z)` would
-        // silently miscompile: `Avg`'s param DefIds are shared across
-        // every call to `Avg`, so compiling the outer call's first
-        // argument (which recurses into the inner `Avg(x, y)` call)
-        // would rebind them out from under the outer call before it
-        // gets to compile its second argument — a real, observed silent
-        // drop of `z`, not a hypothetical. Save/restore makes this
-        // properly reentrant regardless of how deep or indirect the
-        // nesting is (as an argument, or via a `let` whose value is a
-        // call), not just the syntactically-nested case.
         let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
         for s in lets {
             let Stmt::Let { name, init } = self.ast.stmt(*s) else {
@@ -1841,21 +1880,76 @@ impl<'a> Emitter<'a> {
                 saved.push((def, self.locals.insert(def, *init)));
             }
         }
-        for (param, arg) in params.iter().zip(args.iter()) {
-            if let Some((i, _)) = self
-                .res
-                .defs
-                .iter()
-                .enumerate()
-                .find(|(_, d)| d.span == param.name.span)
-            {
-                let def = DefId(i as u32);
-                saved.push((def, self.locals.insert(def, *arg)));
-            }
-        }
 
-        let w = hint.unwrap_or_else(|| self.width_of(id));
-        let result = self.compile_expr_hinted(ret_expr, Some(w));
+        let result = match self.ast.stmt(last).clone() {
+            Stmt::Return(Some(ret_expr)) => {
+                if expr_contains_call(self.ast, ret_expr) {
+                    self.error(
+                        span.clone(),
+                        "this function's body calls another function or builtin, \
+                         which is not yet supported for inlining (v0 restriction: a \
+                         called function's own body must not itself call anything, \
+                         which also rules out recursion)"
+                            .to_string(),
+                    );
+                    Err(())
+                } else {
+                    self.compile_expr_hinted(ret_expr, Some(hint))
+                }
+            }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body: Some(else_body),
+            } => {
+                if expr_contains_call(self.ast, cond) {
+                    self.error(
+                        span.clone(),
+                        "this function's body calls another function or builtin, \
+                         which is not yet supported for inlining (v0 restriction: a \
+                         called function's own body must not itself call anything, \
+                         which also rules out recursion)"
+                            .to_string(),
+                    );
+                    Err(())
+                } else {
+                    match (
+                        self.compile_callee_body(&then_body, hint, span),
+                        self.compile_callee_body(&else_body, hint, span),
+                    ) {
+                        (Ok(t), Ok(e)) => {
+                            let cond_str = self
+                                .compile_expr(cond)
+                                .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                            Ok(format!("mux({cond_str}, {t}, {e})"))
+                        }
+                        _ => Err(()),
+                    }
+                }
+            }
+            Stmt::If {
+                else_body: None, ..
+            } => {
+                self.error(
+                    span.clone(),
+                    "an `if` inside an inlined function's body must have an `else` \
+                     (v0 restriction: every reachable path must produce a value, \
+                     there is no way to \"hold\" a return the way an unwritten \
+                     register path holds its own feedback)"
+                        .to_string(),
+                );
+                Err(())
+            }
+            _ => {
+                self.error(
+                    span.clone(),
+                    "this function's body must end with `return <expr>`, or an \
+                     `if`/`else` whose branches both do (v0 restriction)"
+                        .to_string(),
+                );
+                Err(())
+            }
+        };
 
         for (def, prev) in saved.into_iter().rev() {
             match prev {

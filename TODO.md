@@ -3,19 +3,21 @@
 ## Emission (`src/firrtl.rs`)
 
 - A call to a user `fn`/`impl` inlines only when its body is `let`
-  bindings then a single trailing `return` — no branches, state writes,
-  guards/fifo ops, or further calls (so a called function's own body
-  calling another function, including indirect recursion, is rejected
-  outright rather than actually needing a recursion check: nothing in
-  the restricted shape can call anything). Builtin calls (`prio`, etc.)
-  are a separate, still-unsupported gap. See `examples/call.tr`.
-  If richer callee bodies (branches, multiple state-touching statements)
-  are added later: recheck resolve.rs's module-boundary state check
-  (`check_module_boundary`) against a `fn`/`impl` nested inside a module
-  that reads/writes that module's own state — today irrelevant (the
-  restricted shape can't write state at all), but a state-writing callee
-  would need the boundary re-validated at the CALL site's module, not
-  just the callee's declaration site.
+  bindings then a trailing `return`, or an `if`/`else` (mandatory
+  `else`) whose branches both recurse into that same shape, folded into
+  a `mux` — no state writes, guards/fifo ops, or further calls anywhere
+  (so a called function's own body calling another function, including
+  indirect recursion, is rejected outright rather than actually needing
+  a recursion check: nothing in the restricted shape can call
+  anything). Builtin calls (`prio`, etc.) are a separate, still-
+  unsupported gap. See `examples/call.tr`, `examples/call_branch.tr`.
+  If a state-writing callee is added later: recheck resolve.rs's
+  module-boundary state check (`check_module_boundary`) against a
+  `fn`/`impl` nested inside a module that reads/writes that module's
+  own state — today irrelevant (the restricted shape can't write state
+  at all), but a state-writing callee would need the boundary
+  re-validated at the CALL site's module, not just the callee's
+  declaration site.
 - Expression surface still excludes: other field access, `/`/`%`,
   dynamic-amount shifts (shift amount must be a literal), computed
   bit-select/slice bounds (must be literal), and logical `!` (only `~`

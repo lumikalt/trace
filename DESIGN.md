@@ -822,17 +822,41 @@ locals`, previously only accepting `DefKind::Local`, now also accepts `DefKind::
 — no new substitution machinery needed, just widening an existing kind check.
 
 v0 restricts the callee to a body the inliner can splice with zero ambiguity: zero or
-more `let` bindings, then exactly one trailing `return <expr>`. Everything else about a
-richer function — branches, state writes, guards, fifo ops, a call to yet another
-function — is an explicit error, not silently dropped or partially inlined. The last
+more `let` bindings, then either exactly one trailing `return <expr>` or an `if`/`else`
+whose branches both recurse into that same shape. Everything else about a richer
+function — state writes, guards, fifo ops, a call to yet another function — is an
+explicit error, not silently dropped or partially inlined. The no-further-calls
 restriction is worth spelling out: a callee whose own body cannot call anything can
 never call itself, directly or through a cycle, so recursion needs no separate check —
 it's ruled out by construction, for free, by the same restriction that keeps inlining
 simple. A builtin call (`prio`, etc.) is a different, still-unsupported gap — nothing
 about builtin-call synthesis is implied by this work.
 
-A second correctness subtlety, caught by advisor review before shipping, not by any test
-failure: `Emitter::locals` is keyed by `DefId`, and every call to the SAME function
+**Branching callee bodies, added 2026-07-31** (the followup this TODO bullet flagged for
+itself when the base feature shipped): `Max(a, b) { if a > b { return a } else { return b
+} }` now inlines. `compile_call` delegates the whole body to a new recursive
+`compile_callee_body(stmts, hint, span)`: the tail statement is either a `return <expr>`
+or an `if`/`else`, and each branch recurses into that identical shape, folding into
+`mux(<cond>, <then-value>, <else-value>)` — the same threading pattern the register- and
+instance-port-write paths already use for if/else-nested writes (`reg_value_in_stmts`,
+`inst_port_value_in_stmts`), reused here for a *return* value instead of a write target.
+The `else` is mandatory, unlike a register or port write's optional-branch-holds-the-old-
+value fallback: a function's return has no prior value to fall back on, every reachable
+path through the callee must produce one, or the call is rejected outright (`an if`
+without `else` in tail position, or an `if` anywhere before the tail, both error rather
+than silently picking a default). Each branch's own `let`s bind and restore around that
+branch's own recursive call — sequenced, not concurrent, so the `else` branch never sees
+the `then` branch's locals still bound, even when both branches declare a `let` with the
+same name (each `Let` statement gets its own `DefId` regardless of shared spelling).
+Scope deliberately excludes state-writing callees in this pass — extending to those needs
+`check_module_boundary` re-validated at the call site's module (see the pass's own
+followup note in TODO.md), a separate, larger change not needed for a purely
+value-computing branch. `examples/call_branch.tr` proves both branches pick correctly
+through real firtool and Icarus simulation.
+
+A second correctness subtlety, caught by deliberately constructing and running the
+"obviously risky" case before declaring the feature done, not by any test failure or
+user report: `Emitter::locals` is keyed by `DefId`, and every call to the SAME function
 reuses that function's one set of parameter `DefId`s. Binding params without saving what
 was there before is unsound the moment one call nests inside another call to the SAME
 function — `Avg(Avg(x, y), z)` — because compiling the outer call's first argument
@@ -856,11 +880,11 @@ alike) — so the inliner threads the call's own already-concrete width down int
 callee's return expression as an explicit hint, and never falls back to the callee's
 own (possibly-generic) width for it.
 
-`examples/call.tr` proves it through real firtool and Icarus simulation, deliberately
-choosing operands (`200 + 100`) that overflow `bits[8]` inside the callee's own `let
-sum = a + b` — `(200 + 100) mod 256 = 44`, then `>> 1 = 22` — so an inlined call reusing
-the wrong (e.g. widened) semantics for its own internal arithmetic would show up as a
-wrong answer, not just "firtool accepted it."
+`examples/call.tr` proves the base (branch-free) feature through real firtool and Icarus
+simulation, deliberately choosing operands (`200 + 100`) that overflow `bits[8]` inside
+the callee's own `let sum = a + b` — `(200 + 100) mod 256 = 44`, then `>> 1 = 22` — so an
+inlined call reusing the wrong (e.g. widened) semantics for its own internal arithmetic
+would show up as a wrong answer, not just "firtool accepted it."
 
 ## Tooling
 
