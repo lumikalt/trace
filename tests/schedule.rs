@@ -203,6 +203,116 @@ fn explain_names_the_derived_stall() {
 }
 
 #[test]
+fn different_instance_ports_do_not_conflict() {
+    // Two rules writing DIFFERENT ports of the same instance must not
+    // conflict: v0's conflict model is per-port, not per-instance (unlike
+    // a mem array, a port name is static/lexical, so no runtime
+    // disjointness proof is needed to tell them apart).
+    let src = "\
+module Child {
+    input a : bits[8]
+    input b : bits[8]
+    output c : bits[8] = 0
+    rule pass {
+        c := a
+    }
+}
+module Top {
+    inst x : Child
+    reg v : bits[8] = 0
+    reg w : bits[8] = 0
+    rule write_a {
+        x.a := v
+    }
+    rule write_b {
+        x.b := w
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = sched
+        .groups
+        .iter()
+        .find(|g| g.order.len() == 2)
+        .expect("Top's group");
+    assert!(group.conflicts.is_empty());
+}
+
+#[test]
+fn same_instance_port_conflicts() {
+    // Two rules writing the SAME port of the same instance still
+    // conflict, and the conflict names the port (`x.a`), not the whole
+    // instance.
+    let src = "\
+module Child {
+    input a : bits[8]
+    output c : bits[8] = 0
+    rule pass {
+        c := a
+    }
+}
+module Top {
+    inst x : Child
+    reg v : bits[8] = 0
+    reg w : bits[8] = 0
+    rule write_v {
+        x.a := v
+    }
+    rule write_w {
+        x.a := w
+    }
+}
+";
+    let (_, res, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = sched
+        .groups
+        .iter()
+        .find(|g| g.order.len() == 2)
+        .expect("Top's group");
+    assert_eq!(group.conflicts.len(), 1);
+    let on: Vec<&str> = group.conflicts[0]
+        .on
+        .iter()
+        .map(|d| res.def(*d).name.as_str())
+        .collect();
+    assert_eq!(on, ["x.a"]);
+}
+
+#[test]
+fn writing_a_port_and_reading_a_different_port_do_not_conflict() {
+    let src = "\
+module Child {
+    input a : bits[8]
+    output c : bits[8] = 0
+    rule pass {
+        c := a
+    }
+}
+module Top {
+    inst x : Child
+    reg v : bits[8] = 0
+    reg out : bits[8] = 0
+    rule write_a {
+        x.a := v
+    }
+    rule read_c {
+        out := x.c
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = sched
+        .groups
+        .iter()
+        .find(|g| g.order.len() == 2)
+        .expect("Top's group");
+    assert!(group.conflicts.is_empty());
+}
+
+#[test]
 fn separate_modules_do_not_conflict() {
     let src = "\
 module A {

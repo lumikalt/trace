@@ -277,10 +277,12 @@ impl<'a> Checker<'a> {
                     self.infer_expr(*arg, sig);
                 }
             }
-            // `inst.port := v` — writes the whole instance (v0's
-            // conflict model is per-instance, not per-port).
+            // `inst.port := v` — writes that one port's own resource
+            // (resolve.rs synthesizes one per `(inst, port)` pair), not
+            // the whole instance: two rules writing different ports of
+            // the same instance don't conflict.
             Expr::Field { base, .. } => {
-                if let Some(def) = self.state_def(*base) {
+                if let Some(def) = self.state_def(id) {
                     sig.writes.insert(def);
                 } else {
                     self.infer_expr(*base, sig);
@@ -307,7 +309,15 @@ impl<'a> Checker<'a> {
                 sig.fails = true;
                 self.infer_expr(*inner, sig);
             }
-            Expr::Field { base, .. } => self.infer_expr(*base, sig),
+            // `inst.port` read — that port's own resource (see the write
+            // arm in `infer_write` for why this isn't the whole instance).
+            Expr::Field { base, .. } => {
+                if let Some(def) = self.state_def(id) {
+                    sig.reads.insert(def);
+                } else {
+                    self.infer_expr(*base, sig);
+                }
+            }
             Expr::Bracket { callee, args } => {
                 // A fifo op (`f.Deq[]` / `f.Enq[x]`) can fail and mutates
                 // the fifo: reads + writes + fails, conservatively.

@@ -359,3 +359,34 @@ fn submodule_cond_runs_through_real_ports() {
         "result did not settle back at 0 once sel deselected the write:\n{output}"
     );
 }
+
+/// Proves per-port conflict precision through real simulation, not just
+/// the derived schedule: `write_a` and `write_b` are two SEPARATE rules,
+/// each driving a different port of the same instance. Under the old
+/// whole-instance conflict model they'd conflict and only one would ever
+/// fire; result=12 (not 5) is the direct evidence both fired this cycle.
+#[test]
+fn submodule_multi_port_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/submodule_multi_port.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/submodule_multi_port_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=12"),
+        "both ports' writes should land the same cycle (5 + 7 = 12):\n{output}"
+    );
+}

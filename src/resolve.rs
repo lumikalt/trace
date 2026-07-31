@@ -33,6 +33,10 @@ pub enum DefKind {
     Output,
     /// A `inst name : Module` child instance.
     Inst,
+    /// One specific port of an `inst`, e.g. `c.a` — synthesized on first
+    /// reference (see `Resolver::inst_port_def`) so that two rules
+    /// touching different ports of the same instance don't conflict.
+    InstPort,
     Rule,
     Fn,
     Spec,
@@ -53,6 +57,7 @@ impl DefKind {
                 | DefKind::Input
                 | DefKind::Output
                 | DefKind::Inst
+                | DefKind::InstPort
         )
     }
 
@@ -66,6 +71,7 @@ impl DefKind {
             DefKind::Input => "an input port",
             DefKind::Output => "an output port",
             DefKind::Inst => "a module instance",
+            DefKind::InstPort => "a module instance port",
             DefKind::Rule => "a rule",
             DefKind::Fn => "a function",
             DefKind::Spec => "a spec",
@@ -121,6 +127,7 @@ pub fn resolve(ast: &Ast) -> (Resolution, Vec<ResolveError>) {
         res: Resolution::default(),
         errors: Vec::new(),
         scopes: vec![HashMap::new()],
+        inst_ports: HashMap::new(),
     };
     for name in BUILTINS {
         let id = resolver.new_def(name, DefKind::Builtin, 0..0);
@@ -135,6 +142,11 @@ struct Resolver<'a> {
     res: Resolution,
     errors: Vec<ResolveError>,
     scopes: Vec<HashMap<String, DefId>>,
+    /// (inst, port name) -> the synthesized `InstPort` resource for it,
+    /// memoized so every `c.a` in the file shares one `DefId` (needed for
+    /// effects.rs's conflict-set intersection to see them as the same
+    /// resource).
+    inst_ports: HashMap<(DefId, String), DefId>,
 }
 
 impl<'a> Resolver<'a> {
@@ -149,6 +161,21 @@ impl<'a> Resolver<'a> {
 
     fn error(&mut self, span: Span, message: String) {
         self.errors.push(ResolveError { span, message });
+    }
+
+    /// The `InstPort` resource for `inst`'s `port`, allocating one on
+    /// first reference and reusing it for every later `inst.port` in the
+    /// file (see `inst_ports`'s doc comment for why that sharing matters).
+    fn inst_port_def(&mut self, inst: DefId, port: &str) -> DefId {
+        if let Some(&def) = self.inst_ports.get(&(inst, port.to_string())) {
+            return def;
+        }
+        let base = self.res.def(inst);
+        let full_name = format!("{}.{port}", base.name);
+        let span = base.span.clone();
+        let def = self.new_def(&full_name, DefKind::InstPort, span);
+        self.inst_ports.insert((inst, port.to_string()), def);
+        def
     }
 
     fn lookup(&self, text: &str) -> Option<DefId> {
@@ -468,8 +495,20 @@ impl<'a> Resolver<'a> {
                 self.resolve_expr(rhs, in_type);
             }
             Expr::Guard(inner) => self.resolve_expr(inner, in_type),
-            // Field names are structural; only the base resolves here.
-            Expr::Field { base, .. } => self.resolve_expr(base, in_type),
+            // Field names are structural; only the base resolves against
+            // scope. When the base is an `inst`, the field access itself
+            // also gets a resource: `c.a` and `c.b` must stay distinct
+            // conflict-wise, so a rule writing one doesn't stall a rule
+            // writing the other (see `inst_port_def`).
+            Expr::Field { base, name } => {
+                self.resolve_expr(base, in_type);
+                if let Some(&base_def) = self.res.expr_defs.get(&base)
+                    && self.res.def(base_def).kind == DefKind::Inst
+                {
+                    let port_def = self.inst_port_def(base_def, &name);
+                    self.res.expr_defs.insert(id, port_def);
+                }
+            }
             Expr::Call { callee, args } | Expr::Bracket { callee, args } => {
                 self.resolve_expr(callee, in_type);
                 for arg in args {

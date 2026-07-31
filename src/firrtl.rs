@@ -12,10 +12,13 @@
 //!   `child.port` reads/writes one of its ports. Exactly one top-level
 //!   module must be uninstantiated (the "top"); the rest must be reachable
 //!   from it via `inst`, with no cycle.
-//! - An instance's whole port set is one conflict resource, same
-//!   conservative model as a `mem` array — no per-port precision yet. A
-//!   port write may nest in `if`/`else` (threaded through a `mux`, same
-//!   as a register write).
+//! - Each instance port is its own conflict resource (resolve.rs
+//!   synthesizes one per `(inst, port)` pair): two rules touching
+//!   different ports of the same instance don't conflict, unlike a `mem`
+//!   array's still-whole-array conservative model — a port name is
+//!   static/lexical, so no runtime disjointness proof is needed to tell
+//!   two ports apart. A port write may nest in `if`/`else` (threaded
+//!   through a `mux`, same as a register write).
 //! - No calls to user `fn`/`spec`/`impl` items — needs inlining/
 //!   instantiation machinery this pass doesn't build yet.
 //! - No `<sequences>` rules: run `lower::plan`/`render` first. This pass

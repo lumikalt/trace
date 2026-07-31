@@ -91,6 +91,29 @@ fn inst_resolves_to_a_module_and_ports_are_fields() {
 }
 
 #[test]
+fn inst_port_accesses_share_one_resource() {
+    // `c.a`'s two occurrences must resolve to the SAME synthesized
+    // `InstPort` def (effects.rs's conflict-set intersection depends on
+    // this: two rules touching the same port need to land on one DefId,
+    // not two distinct ones that happen to share a name).
+    let (ast, res) = run_ok(
+        "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
+         rule r {\n b := a\n}\n}\n\
+         module Top {\n inst c : Child\n reg v : bits[8] = 0\n reg w : bits[8] = 0\n \
+         rule p {\n c.a := v\n}\n rule q {\n c.a := w\n}\n}\n",
+    );
+    let field_exprs: Vec<trace::ast::ExprId> = (0..ast.exprs.len())
+        .map(|i| trace::ast::ExprId(i as u32))
+        .filter(|id| matches!(ast.expr(*id), trace::ast::Expr::Field { name, .. } if name == "a"))
+        .collect();
+    assert_eq!(field_exprs.len(), 2, "expected two `c.a` field exprs");
+    let defs: Vec<_> = field_exprs.iter().map(|id| res.expr_defs[id]).collect();
+    assert_eq!(defs[0], defs[1], "both `c.a` accesses must share one def");
+    assert_eq!(res.def(defs[0]).kind, DefKind::InstPort);
+    assert_eq!(res.def(defs[0]).name, "c.a");
+}
+
+#[test]
 fn inst_target_must_be_a_module() {
     let (_, _, errors) = run("reg NotAModule : bits[1] = 0\nmodule M {\n inst x : NotAModule\n}\n");
     assert!(errors.iter().any(|e| e.message.contains("not a module")));

@@ -1,0 +1,29 @@
+module Child {
+    input a : bits[8]
+    input b : bits[8]
+    output c : bits[8] = 0
+
+    rule pass {
+        c := a + b
+    }
+}
+
+module Top {
+    inst x : Child
+
+    input va : bits[8]
+    input vb : bits[8]
+    output result : bits[8] = 0
+
+    rule write_a {
+        x.a := va
+    }
+
+    rule write_b {
+        x.b := vb
+    }
+
+    rule read {
+        result := x.c
+    }
+}

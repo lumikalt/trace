@@ -642,12 +642,16 @@ type error, not a wiring mistake that only shows up as broken hardware.
 
 Two design choices carried over deliberately from elsewhere in this document:
 
-- **Conflict model.** An instance's whole port set is one conflict resource, the same
-  conservative model v0 arrays already use ("Arrays and aliasing" above) — no per-port
-  precision yet. Two rules that touch different ports of the same instance still
-  conflict; only one can drive it per cycle. This reuses the scheduler unchanged: an
-  `inst` def is just another kind of state, so a port write/read infers a write/read of
-  the instance's `DefId` exactly like a mem index does for the whole array.
+- **Conflict model.** Unlike a v0 array ("Arrays and aliasing" above, still one whole-array
+  resource), each instance port is its own conflict resource (**achieved 2026-07-31**):
+  two rules writing different ports of the same instance don't conflict, and can fire the
+  same cycle. This is a much easier case than array-index disjointness — a port name is
+  static and lexical, known at resolve time, so telling two ports apart needs no runtime
+  proof (Dahlia-style banking, tier 3) at all. resolve.rs synthesizes one resource `DefId`
+  per `(inst, port)` pair the first time it's referenced (memoized, so every `c.a` in the
+  file shares one), and effects.rs's read/write-row inference for `inst.port` uses that
+  resource instead of the instance's own `DefId` — the scheduler itself is unchanged,
+  since a conflict is still just "two rules' rows share a `DefId`."
 - **Nested writes.** A port write may live inside `if`/`else`, threaded through a `mux`
   exactly like a register write (**achieved 2026-07-31**) — an unwritten path falls back
   to the port's unconditional `UInt(0)` default rather than holding a stale value, since
