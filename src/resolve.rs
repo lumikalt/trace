@@ -224,19 +224,19 @@ impl<'a> Resolver<'a> {
     fn declare(&mut self, name: &Name, kind: DefKind) -> DefId {
         let id = self.new_def(&name.text, kind, name.span.clone());
         let scope = self.scopes.last_mut().unwrap();
-        if let Some(prev) = scope.get(&name.text).copied() {
-            if !matches!(kind, DefKind::Local | DefKind::ImplicitParam) {
-                let prev_kind = self.res.def(prev).kind;
-                self.error(
-                    name.span.clone(),
-                    format!(
-                        "`{}` is already defined in this scope as {}",
-                        name.text,
-                        prev_kind.describe()
-                    ),
-                );
-                return id;
-            }
+        if let Some(prev) = scope.get(&name.text).copied()
+            && !matches!(kind, DefKind::Local | DefKind::ImplicitParam)
+        {
+            let prev_kind = self.res.def(prev).kind;
+            self.error(
+                name.span.clone(),
+                format!(
+                    "`{}` is already defined in this scope as {}",
+                    name.text,
+                    prev_kind.describe()
+                ),
+            );
+            return id;
         }
         self.scopes
             .last_mut()

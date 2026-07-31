@@ -691,9 +691,7 @@ impl<'a> Parser<'a> {
             }
         };
 
-        loop {
-            let Some(kind) = self.peek() else { break };
-
+        while let Some(kind) = self.peek() {
             // Postfix operators bind tightest.
             if POSTFIX_BP >= min_bp {
                 match kind {

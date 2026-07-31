@@ -497,13 +497,11 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                "sync" | "race" => {
-                    if !sig.sequences {
-                        self.error(
-                            span,
-                            format!("`{}` requires `<sequences>`", callee_def.name),
-                        );
-                    }
+                "sync" | "race" if !sig.sequences => {
+                    self.error(
+                        span,
+                        format!("`{}` requires `<sequences>`", callee_def.name),
+                    );
                 }
                 _ => {}
             },

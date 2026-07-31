@@ -22,6 +22,11 @@ use std::fmt::Write as _;
 /// Emit one module's FIRRTL text (its `public module`/`module` line, ports,
 /// declarations, and body) — everything except the `circuit` wrapper,
 /// which the caller writes once for the whole file.
+// `ast`/`res`/`fx`/`types`/`sched` is the same five-pass-result bundle
+// threaded through every stage of this pipeline (see `emit`, `lower::plan`,
+// etc.) — bundling them into a struct here alone would be inconsistent
+// with that established convention, not an improvement.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_module(
     ast: &Ast,
     res: &Resolution,
@@ -532,6 +537,10 @@ pub(crate) fn port_bit_width(ty: &Ty) -> Option<u64> {
     }
 }
 
+// Nine genuinely distinct pieces of one module's assembled text, each
+// used once here; a bundling struct would exist solely to satisfy this
+// lint at this one call site, not to clarify anything.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn module_block(
     name: &str,
     is_public: bool,
