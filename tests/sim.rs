@@ -69,6 +69,20 @@ fn firrtl_to_verilog(fir: &str, disable_opt: bool) -> String {
     let mut child = Command::new("firtool")
         // Newer firtool no longer sniffs stdin as FIRRTL by default.
         .arg("-format=fir")
+        // Icarus compatibility, same spirit as `-DSYNTHESIS` below: a
+        // cross-width intermediate (e.g. one `div`/`rem` operand zero-
+        // extended to match the other's width before the primop runs)
+        // otherwise lowers to an `automatic logic` declared INSIDE an
+        // `always` block, which Icarus's `-g2012` rejects ("Overriding
+        // the default variable lifetime is not yet supported") — first
+        // hit by examples/div_rem.tr's differing-width case, since every
+        // earlier example only ever crossed an always block with same-
+        // width operands. This flag makes firtool lower the identical
+        // intermediate to a plain top-level `wire` instead — same
+        // design, Icarus-compatible Verilog — so it's applied
+        // unconditionally rather than threaded through as a per-caller
+        // flag.
+        .arg("-lowering-options=disallowLocalVariables")
         .args(if disable_opt {
             &["--disable-opt"][..]
         } else {
@@ -683,5 +697,32 @@ fn infer_reg_ty_runs_through_real_ports() {
     assert!(
         output.contains("final: sum=16 hi=ff00"),
         "sum/hi did not settle at 16/ff00:\n{output}"
+    );
+}
+
+/// Proves `/`/`%` end to end: `a` (bits[8]) = 200, `b` (bits[4]) = 13,
+/// deliberately different widths so both the pad and no-pad branches of
+/// compile_binop's Div/Rem arms actually run, not just the equal-width
+/// case tests/firrtl.rs's unit tests already pin.
+#[test]
+fn div_rem_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/div_rem.tr"))
+        .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/div_rem_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: q1=15 q2=0 r1=5 r2=13"),
+        "q1/q2/r1/r2 did not settle at 15/0/5/13 (200/13, 13/200, 200%13, 13%200):\n{output}"
     );
 }

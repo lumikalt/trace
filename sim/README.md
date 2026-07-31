@@ -51,6 +51,19 @@ the generated Verilog.
   safe: it only removes pre-reset debug randomization, and every
   register here is a `regreset` that's properly synchronously reset
   regardless.
+- `firtool -lowering-options=disallowLocalVariables`: the SAME Icarus
+  limitation (no `automatic`-lifetime locals), a DIFFERENT source of
+  them — first hit by `div_rem_tb.v`. A cross-width `div`/`rem`
+  operand (one side zero-extended to match the other before the primop
+  runs) can lower to an `automatic logic` declared INSIDE an `always`
+  block rather than a top-level `wire`; this flag makes firtool always
+  choose the top-level-`wire` form instead. `--disable-opt` alone
+  happens to dodge this for `div_rem.tr` specifically (confirmed by
+  testing both ways), but the two flags don't conflict and this one is
+  cheap insurance against the same class of gap in a future
+  differently-shaped example — added to `devenv.nix`'s `simulate`
+  script and `tests/sim.rs`'s `firrtl_to_verilog` unconditionally,
+  rather than only where it happened to be strictly required.
 
 ## If firtool renames `m_ext`/`Memory`
 

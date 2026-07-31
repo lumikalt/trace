@@ -803,22 +803,65 @@ module M {
 }
 
 #[test]
-fn div_and_rem_are_still_errors() {
+fn div_and_rem_of_equal_width_operands_need_no_pad() {
+    // FIRRTL's own `div`/`rem` primops don't share `add`/`sub`/`mul`'s
+    // "always needs a trim" shape: `div(a, b)`'s width is exactly the
+    // DIVIDEND's own width (confirmed against real firtool, not assumed
+    // from the spec text alone), so when both operands are already the
+    // checker's target width (equal here), no `pad` wrapper is needed at
+    // all -- unlike `rem`, which is `min(w(a), w(b))` and so needs a pad
+    // even when the operands ARE equal width, since FIRRTL only zero-
+    // extends up from `min`, never keeps the full width automatically.
     let src = "\
 module M {
     input x : bits[8]
     input y : bits[8]
-    output z : bits[8] = 0
-    rule r {
-        z := x / y
+    output q : bits[8] = 0
+    output r : bits[8] = 0
+    rule rule1 {
+        q := x / y
+        r := x % y
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(
-        err.iter()
-            .any(|e| e.message.contains("div and rem are not supported"))
-    );
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_q, div(x, y)"));
+    assert!(fir.contains("connect __out_r, rem(x, y)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn div_and_rem_of_differing_width_operands_pad_up_to_the_wider_target() {
+    // `b : bits[4]`, `a : bits[8]` -- the checker's target width for
+    // `b / a` and `b % a` is `max(4, 8) = 8`, but FIRRTL's own `div`
+    // width is the DIVIDEND's width (4 here, not 8) and `rem`'s is
+    // `min(4, 8) = 4` -- both narrower than the target, so both need an
+    // explicit `pad` up to 8. `a / b` is the mirror case: FIRRTL's div
+    // width (8, `a`'s own width as dividend) already equals the target,
+    // so no pad there, while `a % b`'s `rem` width (`min(8,4)=4`) still
+    // needs padding up to 8 even though the DIVIDEND already matches.
+    let src = "\
+module M {
+    input a : bits[8]
+    input b : bits[4]
+    output q1 : bits[8] = 0
+    output q2 : bits[8] = 0
+    output r1 : bits[8] = 0
+    output r2 : bits[8] = 0
+    rule rule1 {
+        q1 := a / b
+        q2 := b / a
+        r1 := a % b
+        r2 := b % a
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_q1, div(a, b)"));
+    assert!(fir.contains("connect __out_q2, pad(div(b, a), 8)"));
+    assert!(fir.contains("connect __out_r1, pad(rem(a, b), 8)"));
+    assert!(fir.contains("connect __out_r2, pad(rem(b, a), 8)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

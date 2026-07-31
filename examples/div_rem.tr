@@ -1,0 +1,22 @@
+-- `/` and `%` -- FIRRTL's own `div`/`rem` primops. `a` (bits[8]) and `b`
+-- (bits[4]) are deliberately DIFFERENT widths: `a / b`'s FIRRTL div width
+-- already matches the checker's target (8, the dividend's own width), no
+-- pad needed; `b / a`, `a % b`, and `b % a` all need an explicit `pad` up
+-- to 8, since FIRRTL's div/rem widths (dividend width, and min-of-both,
+-- respectively) are narrower than the target whenever the operands
+-- differ. See sim/div_rem_tb.v.
+module Top {
+    input a : bits[8]
+    input b : bits[4]
+    output q1 : bits[8] = 0
+    output q2 : bits[8] = 0
+    output r1 : bits[8] = 0
+    output r2 : bits[8] = 0
+
+    rule compute {
+        q1 := a / b
+        q2 := b / a
+        r1 := a % b
+        r2 := b % a
+    }
+}

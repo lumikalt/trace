@@ -48,6 +48,16 @@
   # firtool's debug-only register-randomization boilerplate, which uses
   # an `automatic`-lifetime construct Icarus doesn't support; skipping
   # it is safe since our registers are all properly reset regardless.
+  # `-lowering-options=disallowLocalVariables` is the same Icarus-
+  # compatibility idea applied to a DIFFERENT source of `automatic`
+  # locals: a cross-width intermediate (e.g. one `div`/`rem` operand
+  # zero-extended to match the other's width) can lower to an
+  # `automatic logic` declared INSIDE an `always` block instead of a
+  # top-level `wire`, hit by examples/div_rem.tr's differing-width case
+  # with tests/sim.rs's own (non---disable-opt) firtool invocation — see
+  # sim/README.md. Harmless here too even when `--disable-opt` alone
+  # already avoids it (confirmed empirically): same design, just a
+  # `wire` instead of an `automatic logic` either way.
   scripts.simulate.exec = ''
     set -euo pipefail
     if [ -z "''${1:-}" ]; then
@@ -59,7 +69,7 @@
     trap 'rm -rf "$dir"' EXIT
     cargo run -q -- "examples/$name.tr" --lower > "$dir/lowered.tr"
     cargo run -q -- "$dir/lowered.tr" --firrtl > "$dir/design.fir"
-    firtool --disable-opt "$dir/design.fir" -o "$dir/design.v"
+    firtool --disable-opt -lowering-options=disallowLocalVariables "$dir/design.fir" -o "$dir/design.v"
     iverilog -g2012 -DSYNTHESIS -o "$dir/sim" "sim/''${name}_tb.v" "$dir/design.v"
     vvp "$dir/sim"
   '';

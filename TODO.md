@@ -78,21 +78,38 @@
   `examples/call_branch.tr`, `examples/call_writes.tr`,
   `examples/call_prio.tr`, `examples/call_trunc.tr`,
   `examples/call_pack.tr`, `examples/call_nested.tr`.
-- Expression surface still excludes: other field access, `/`/`%`,
-  dynamic-amount shifts (shift amount must be a literal), computed
-  bit-select/slice bounds (must be literal), and logical `!` (only `~`
-  and unary `-` are supported). `instance.port` is reads only; writes
-  only as a whole statement's LHS. See `examples/alu.tr` for what's
-  covered: `*`, `&`/`|`/`^`, `<<`/`>>`, unary `-`/`~`, `x[i]`/`x[hi..lo]`.
-  Verilog-style sized literals (`8'd6`/`8'hFF`/`8'b1010`/`8'6`) are also
-  supported, typing directly as `bits[width]` rather than absorbing a
-  width from context the way a bare integer literal does — overflow
-  against their own declared width is a compile error, not silent
-  truncation. See `examples/sized_literal.tr`. `reg`/`output` may omit
-  `: ty` when initialized with a sized literal (`reg a = 8'd6`), which
-  infers `bits[width]` from the literal — only a literal initializer
-  works (`reg a = 8'd6 + 1` or `reg a = 6` still need an explicit type).
-  See `examples/infer_reg_ty.tr`.
+- Expression surface still excludes:
+  - Field access other than `instance.port` (which is reads only; writes
+    only as a whole statement's LHS).
+  - Dynamic-amount shifts (the shift amount must be a literal).
+  - Computed bit-select/slice bounds (`x[hi..lo]` bounds must be literal).
+  - Logical `!` (only `~` and unary `-` are supported).
+
+  `/` and `%` are now supported (`compile_binop`'s `Div`/`Rem` arms) —
+  FIRRTL's own `div`/`rem` primops don't share `add`/`sub`/`mul`'s "always
+  needs a trim" shape: `div(a, b)`'s width is exactly the DIVIDEND's own
+  width (confirmed against real firtool, not assumed from the spec text),
+  `rem(a, b)`'s is `min(w(a), w(b))` — both always ≤ the checker's own
+  target width (`max(w(a), w(b))`), so only ever a `pad` UP is needed,
+  never a truncating `tail`. See `examples/div_rem.tr` +
+  `sim/div_rem_tb.v`, deliberately using DIFFERENT-width operands (`a :
+  bits[8]`, `b : bits[4]`) so both the pad and no-pad cases run for real,
+  not just the equal-width case. This surfaced an Icarus-only gap
+  unrelated to div/rem's own correctness: a cross-width intermediate can
+  lower to an `automatic logic` declared inside an `always` block, which
+  Icarus's `-g2012` rejects — worked around with firtool's own
+  `-lowering-options=disallowLocalVariables` (see sim/README.md).
+
+  See `examples/alu.tr` for what's covered: `*`, `&`/`|`/`^`, `<<`/`>>`,
+  unary `-`/`~`, `x[i]`/`x[hi..lo]`. Verilog-style sized literals
+  (`8'd6`/`8'hFF`/`8'b1010`/`8'6`) are also supported, typing directly as
+  `bits[width]` rather than absorbing a width from context the way a bare
+  integer literal does — overflow against their own declared width is a
+  compile error, not silent truncation. See `examples/sized_literal.tr`.
+  `reg`/`output` may omit `: ty` when initialized with a sized literal
+  (`reg a = 8'd6`), which infers `bits[width]` from the literal — only a
+  literal initializer works (`reg a = 8'd6 + 1` or `reg a = 6` still need
+  an explicit type). See `examples/infer_reg_ty.tr`.
 - Memory writes can't nest in `if`/`while` (register writes can, via a
   `mux`; mem writes are still top-level-only).
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax

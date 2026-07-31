@@ -268,7 +268,14 @@ impl<'a> Emitter<'a> {
         // here except Mul, handled below).
         let hint = if matches!(
             op,
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
         ) {
             known_width(self.types, id)
         } else if matches!(self.ast.expr(lhs), Expr::Int(_)) {
@@ -308,6 +315,49 @@ impl<'a> Emitter<'a> {
                     _ => format!("mul({l}, {r})"),
                 }
             }
+            // FIRRTL's own `div`/`rem` primops don't width like `mul`'s
+            // clean "sum, then trim the excess" rule — confirmed against
+            // real firtool (a `node`, not an explicitly-widthed output, to
+            // see the primop's OWN inferred width rather than a `connect`'s
+            // silent truncate/extend): `div(a, b)` is exactly `w(a)` (the
+            // DIVIDEND's width, UInt semantics — never `max`/sum), `rem(a,
+            // b)` is `min(w(a), w(b))`. Both are always <= the checker's
+            // own target width (`max(w(a), w(b))`, the same mixed-operand
+            // rule every other op here shares), so only ever a `pad` UP is
+            // needed, never a `tail` trim down like `add`/`sub`/`mul`.
+            BinOp::Div => {
+                let wl = if matches!(self.ast.expr(lhs), Expr::Int(_)) {
+                    hint
+                } else {
+                    known_width(self.types, lhs)
+                }
+                .unwrap_or(1);
+                let target = known_width(self.types, id).unwrap_or(wl);
+                match target.checked_sub(wl) {
+                    Some(pad) if pad > 0 => format!("pad(div({l}, {r}), {target})"),
+                    _ => format!("div({l}, {r})"),
+                }
+            }
+            BinOp::Rem => {
+                let wl = if matches!(self.ast.expr(lhs), Expr::Int(_)) {
+                    hint
+                } else {
+                    known_width(self.types, lhs)
+                }
+                .unwrap_or(1);
+                let wr = if matches!(self.ast.expr(rhs), Expr::Int(_)) {
+                    hint
+                } else {
+                    known_width(self.types, rhs)
+                }
+                .unwrap_or(1);
+                let firrtl_w = wl.min(wr);
+                let target = known_width(self.types, id).unwrap_or(firrtl_w);
+                match target.checked_sub(firrtl_w) {
+                    Some(pad) if pad > 0 => format!("pad(rem({l}, {r}), {target})"),
+                    _ => format!("rem({l}, {r})"),
+                }
+            }
             BinOp::BitAnd => format!("and({l}, {r})"),
             BinOp::BitOr => format!("or({l}, {r})"),
             BinOp::BitXor => format!("xor({l}, {r})"),
@@ -321,7 +371,7 @@ impl<'a> Emitter<'a> {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
                     "this operator is not yet supported in FIRRTL emission (v0 \
-                     restriction: div and rem are not supported)"
+                     restriction)"
                         .to_string(),
                 );
                 return Err(());

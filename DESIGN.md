@@ -863,6 +863,40 @@ has an `= init` for a type to be inferred from.
 written by any rule) holds its `0xFF00` reset value forever — both observed directly,
 not inferred from "it compiled."
 
+**`/` and `%`, added 2026-07-31** (Lumi's pick off TODO.md's expression-surface sublist,
+recommended as the most mechanical remaining gap — no new design decision needed, unlike
+logical `!`'s bit-vs-whole-value ambiguity). Types.rs already typed both (the same
+`max(w(a), w(b))` default rule `+`/`-`/bitwise share); the only gap was firrtl.rs's
+`compile_binop` rejecting them outright. Turned out NOT to share `mul`'s "sum, then trim
+the excess" shape, and I didn't trust memory of the FIRRTL spec text for this — confirmed
+empirically against real firtool first, using a `node` (not a `connect` into an
+explicitly-widthed output, which would silently mask the primop's own width behind an
+implicit truncate/extend): `div(a, b)`'s own width is exactly the DIVIDEND's width
+(`w(a)`, UInt semantics), `rem(a, b)`'s is `min(w(a), w(b))` — both always ≤ the checker's
+own target width, so `compile_binop`'s new `Div`/`Rem` arms only ever need a `pad` UP
+(never a truncating `tail` down the way `add`/`sub`/`mul` do).
+
+`examples/div_rem.tr` deliberately uses DIFFERENT-width operands (`a : bits[8]`, `b :
+bits[4]`) so both directions run for real: `a / b` needs no pad (FIRRTL's div width
+already equals the target, 8, since `a` is the wider dividend), `b / a` and both `%`
+directions do (FIRRTL's own width is narrower than the checker's target whenever the
+operands differ). **This surfaced a genuine Icarus-only simulation gap, unrelated to
+div/rem's own correctness — caught by running the real testbench, not assumed from the
+unit tests passing:** a cross-width intermediate (one operand zero-extended to match the
+other's width before the primop runs) can lower to an `automatic logic` declared INSIDE
+an `always` block rather than a top-level `wire` — a NEW source of the same "Icarus
+doesn't implement `automatic`-lifetime overrides" limitation `-DSYNTHESIS` already works
+around for firtool's debug randomization block (see sim/README.md), never previously hit
+because every earlier example only ever crossed an always block with same-width
+operands. Worked around with firtool's own `-lowering-options=disallowLocalVariables`
+flag (forces the top-level-`wire` form always), added unconditionally to both
+`tests/sim.rs`'s `firrtl_to_verilog` and `devenv.nix`'s `simulate` script — confirmed
+harmless where not strictly needed (semantically a no-op, wire vs. automatic-local
+choice only) and confirmed BOTH paths actually pass end to end, not just the automated
+suite: `simulate div_rem` (the documented, user-facing command) and `cargo test` both
+report the correct `q1=15 q2=0 r1=5 r2=13` (`a=200, b=13`: `200/13=15`, `13/200=0`,
+`200%13=5`, `13%200=13`).
+
 ## Calling a function from a rule
 
 **Achieved 2026-07-31.** A rule may call a user `fn`/`impl` (not `spec` — those stay
