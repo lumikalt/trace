@@ -14,8 +14,8 @@
 //!   from it via `inst`, with no cycle.
 //! - An instance's whole port set is one conflict resource, same
 //!   conservative model as a `mem` array — no per-port precision yet. A
-//!   port write may not nest in `if`/`while` (same restriction as a mem
-//!   write, and for the same reason: not threaded through a `mux` yet).
+//!   port write may nest in `if`/`else` (threaded through a `mux`, same
+//!   as a register write).
 //! - No calls to user `fn`/`spec`/`impl` items — needs inlining/
 //!   instantiation machinery this pass doesn't build yet.
 //! - No `<sequences>` rules: run `lower::plan`/`render` first. This pass
@@ -467,10 +467,10 @@ fn emit_module(
     }
 
     // Guards must all precede any state write, and not be nested.
-    // Memory writes and instance-port writes must stay top-level
-    // (register writes may nest in if/else — SUBLEQ's branch does — but
-    // neither is threaded through a mux yet, so a nested one is an
-    // explicit error).
+    // Memory writes must stay top-level (not threaded through a mux yet).
+    // Register writes and instance-port writes may nest in if/else —
+    // SUBLEQ's branch does, for a register — both are threaded through a
+    // mux (see `reg_value_in_stmts`/`inst_port_value_in_stmts`).
     for rule in &rules {
         cx.check_guard_placement(*rule);
         cx.check_fifo_same_cycle(*rule);
@@ -480,16 +480,8 @@ fn emit_module(
             cx.error(
                 span,
                 "a memory write nested in if/while is not yet supported in FIRRTL \
-                 emission (v0 restriction); only a register write may be conditional"
-                    .to_string(),
-            );
-        }
-        if let Some(span) = find_nested_inst_write(ast, res, &body) {
-            cx.error(
-                span,
-                "an instance port write nested in if/while is not yet supported in \
-                 FIRRTL emission (v0 restriction); only a register write may be \
-                 conditional"
+                 emission (v0 restriction); only a register or instance port write \
+                 may be conditional"
                     .to_string(),
             );
         }
@@ -699,32 +691,34 @@ fn emit_module(
                 );
             }
         }
-        let mut writers: Vec<(ItemId, Vec<(String, String)>)> = Vec::new();
-        for rule in &rules {
-            cx.enter_rule(*rule);
-            let body = rule_body(ast, *rule);
-            let writes = find_inst_port_writes(ast, res, &body, inst_name);
-            if writes.is_empty() {
+        // Same priority-mux pattern as a register (see `reg_value_in_stmts`):
+        // an if/else-nested port write threads through a `mux`, falling back
+        // to the unconditional `UInt(0)` default above on any path that
+        // doesn't write it.
+        for (port_name, kind, ty) in &ports {
+            if *kind != DefKind::Input {
                 continue;
             }
-            let mut compiled = Vec::new();
-            for (port_name, value) in writes {
-                let w = ports
-                    .iter()
-                    .find(|(n, _, _)| n == &port_name)
-                    .and_then(|(_, _, t)| port_bit_width(t))
-                    .unwrap_or(1);
-                let v = cx.compile_expr_hinted(value, Some(w)).unwrap_or_default();
-                compiled.push((port_name, v));
+            let w = port_bit_width(ty).unwrap_or(1);
+            let mut values: Vec<(ItemId, String)> = Vec::new();
+            for rule in &rules {
+                cx.enter_rule(*rule);
+                let body = rule_body(ast, *rule);
+                if let Some(v) = cx.inst_port_value_in_stmts(&body, inst_name, port_name, w) {
+                    values.push((*rule, v));
+                }
             }
-            writers.push((*rule, compiled));
-        }
-        writers.sort_by_key(|(r, _)| std::cmp::Reverse(order.iter().position(|x| x == r)));
-        for (rule, conns) in writers {
-            let f = &fires_name[&rule];
-            let _ = writeln!(instance_body, "    when {f} :");
-            for (port_name, v) in conns {
-                let _ = writeln!(instance_body, "      connect {inst_name}.{port_name}, {v}");
+            if values.is_empty() {
+                continue;
+            }
+            values.sort_by_key(|(r, _)| std::cmp::Reverse(order.iter().position(|x| x == r)));
+            for (rule, value) in values {
+                let f = &fires_name[&rule];
+                let _ = writeln!(instance_body, "    when {f} :");
+                let _ = writeln!(
+                    instance_body,
+                    "      connect {inst_name}.{port_name}, {value}"
+                );
             }
         }
     }
@@ -998,95 +992,12 @@ fn find_any_mem_write_deep(ast: &Ast, stmts: &[StmtId]) -> Option<StmtId> {
     None
 }
 
-/// Top-level `inst_name.port := value` writes in a rule body (nesting is
-/// rejected separately by `find_nested_inst_write`; a rule may write
-/// several ports of the same instance, one `when` block per firing rule).
-fn find_inst_port_writes(
-    ast: &Ast,
-    res: &Resolution,
-    stmts: &[StmtId],
-    inst_name: &str,
-) -> Vec<(String, ExprId)> {
-    let mut out = Vec::new();
-    for stmt in stmts {
-        if let Stmt::Assign { lhs, rhs } = ast.stmt(*stmt)
-            && let Expr::Field { base, name } = ast.expr(*lhs)
-            && is_ident_named_inst(ast, res, *base, inst_name)
-        {
-            out.push((name.clone(), *rhs));
-        }
-    }
-    out
-}
-
 fn is_ident_named_inst(ast: &Ast, res: &Resolution, id: ExprId, name: &str) -> bool {
     matches!(ast.expr(id), Expr::Ident(_))
         && res.expr_defs.get(&id).is_some_and(|d| {
             let d = res.def(*d);
             d.name == name && d.kind == DefKind::Inst
         })
-}
-
-/// Same restriction as `find_nested_mem_write`, for instance port writes:
-/// not threaded through a `mux` yet, so a nested one is an explicit error.
-fn find_nested_inst_write(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<Span> {
-    for stmt in stmts {
-        match ast.stmt(*stmt) {
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                if let Some(s) = find_any_inst_write_deep(ast, res, then_body) {
-                    return Some(ast.stmt_spans[s.0 as usize].clone());
-                }
-                if let Some(s) = else_body
-                    .as_deref()
-                    .and_then(|b| find_any_inst_write_deep(ast, res, b))
-                {
-                    return Some(ast.stmt_spans[s.0 as usize].clone());
-                }
-            }
-            Stmt::While { body, .. } => {
-                if let Some(s) = find_any_inst_write_deep(ast, res, body) {
-                    return Some(ast.stmt_spans[s.0 as usize].clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn find_any_inst_write_deep(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<StmtId> {
-    for stmt in stmts {
-        if let Stmt::Assign { lhs, .. } = ast.stmt(*stmt)
-            && let Expr::Field { base, .. } = ast.expr(*lhs)
-            && res
-                .expr_defs
-                .get(base)
-                .is_some_and(|d| res.def(*d).kind == DefKind::Inst)
-        {
-            return Some(*stmt);
-        }
-        let nested = match ast.stmt(*stmt) {
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => find_any_inst_write_deep(ast, res, then_body).or_else(|| {
-                else_body
-                    .as_deref()
-                    .and_then(|b| find_any_inst_write_deep(ast, res, b))
-            }),
-            Stmt::While { body, .. } => find_any_inst_write_deep(ast, res, body),
-            _ => None,
-        };
-        if nested.is_some() {
-            return nested;
-        }
-    }
-    None
 }
 
 struct Emitter<'a> {
@@ -1442,6 +1353,68 @@ impl<'a> Emitter<'a> {
                         .and_then(|b| self.reg_value_in_stmts(b, reg_name, width));
                     if then_val.is_some() || else_val.is_some() {
                         let hold = current.clone().unwrap_or_else(|| reg_name.to_string());
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        let cond_str = self
+                            .compile_expr(cond)
+                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
+                Stmt::While { .. } => {
+                    self.error(
+                        self.ast.stmt_spans[stmt.0 as usize].clone(),
+                        "a loop in an emitted rule body is not supported (sequences \
+                         lowering should have removed it before emission)"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        current
+    }
+
+    /// Same threading as `reg_value_in_stmts`, for an instance's input
+    /// port: an if/else-nested write folds into a `mux`. A register's
+    /// unwritten path holds its own feedback; a port has no state of its
+    /// own, so its unwritten path falls back to the literal `UInt(0)`
+    /// already connected unconditionally before any rule's `when` block.
+    fn inst_port_value_in_stmts(
+        &mut self,
+        stmts: &[StmtId],
+        inst_name: &str,
+        port_name: &str,
+        width: u64,
+    ) -> Option<String> {
+        let mut current: Option<String> = None;
+        for stmt in stmts {
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Assign { lhs, rhs } => {
+                    if let Expr::Field { base, name } = self.ast.expr(lhs).clone()
+                        && name == port_name
+                        && is_ident_named_inst(self.ast, self.res, base, inst_name)
+                    {
+                        current = Some(
+                            self.compile_expr_hinted(rhs, Some(width))
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_val =
+                        self.inst_port_value_in_stmts(&then_body, inst_name, port_name, width);
+                    let else_val = else_body.as_ref().and_then(|b| {
+                        self.inst_port_value_in_stmts(b, inst_name, port_name, width)
+                    });
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current
+                            .clone()
+                            .unwrap_or_else(|| format!("UInt<{width}>(0)"));
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
                         let cond_str = self

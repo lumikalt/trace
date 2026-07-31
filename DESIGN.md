@@ -648,8 +648,11 @@ Two design choices carried over deliberately from elsewhere in this document:
   conflict; only one can drive it per cycle. This reuses the scheduler unchanged: an
   `inst` def is just another kind of state, so a port write/read infers a write/read of
   the instance's `DefId` exactly like a mem index does for the whole array.
-- **No nested writes.** A port write must stay at a rule's top level, same restriction
-  as a memory write and for the same reason: neither is threaded through a `mux` yet.
+- **Nested writes.** A port write may live inside `if`/`else`, threaded through a `mux`
+  exactly like a register write (**achieved 2026-07-31**) — an unwritten path falls back
+  to the port's unconditional `UInt(0)` default rather than holding a stale value, since
+  a port (unlike a register) has no state of its own. A memory write still can't nest:
+  that restriction remains.
 
 The interesting part was emission, not the front end. Resolution, effect inference, and
 scheduling needed only small, structurally obvious additions (a new `DefKind::Inst`, a

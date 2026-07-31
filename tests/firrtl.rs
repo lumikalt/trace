@@ -389,7 +389,41 @@ module C {
 }
 
 #[test]
-fn errors_on_nested_inst_write() {
+fn nested_inst_write_threads_through_a_mux() {
+    // An instance port write living inside if/else must reach the port as
+    // a mux, not be silently dropped for not being a top-level assignment
+    // (same claim as `subleq_emits_and_compiles`'s `pc` mux, for a port).
+    let src = "\
+module Child {
+    input a : bits[8]
+    output b : bits[8] = 0
+    rule pass {
+        b := a
+    }
+}
+module Top {
+    inst c : Child
+    reg cond : bits[1] = 0
+    reg v : bits[8] = 0
+    rule r {
+        if cond == 1 {
+            c.a := v
+        } else {
+            c.a := 1
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect c.a, mux(eq(cond, UInt<1>(1)), v, UInt<8>(1))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn inst_write_on_only_one_side_of_an_if_falls_back_to_the_default() {
+    // Written on only the `if` branch: the `else` path must fall back to
+    // the port's unconditional `UInt(0)` default, not hold a stale value
+    // (a port has no memory of its own, unlike a register).
     let src = "\
 module Child {
     input a : bits[8]
@@ -409,11 +443,9 @@ module Top {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(
-        err.iter()
-            .any(|e| e.message.contains("instance port write nested"))
-    );
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect c.a, mux(eq(cond, UInt<1>(1)), v, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

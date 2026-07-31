@@ -330,3 +330,32 @@ fn alu_runs_through_real_ports() {
         "final ALU outputs did not match expectations:\n{output}"
     );
 }
+
+/// Proves an instance port write nested in if/else reaches the child as a
+/// mux, not a stale or dropped value: the `else` path must produce 0, not
+/// whatever `x` happened to be left at.
+#[test]
+fn submodule_cond_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/submodule_cond.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/submodule_cond_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=0"),
+        "result did not settle back at 0 once sel deselected the write:\n{output}"
+    );
+}

@@ -4,8 +4,8 @@
 
 - Submodules compose by name only (`inst child : Child`, flat top-level
   modules); no lexical nesting, no per-port conflict precision (a whole
-  instance is one resource, same as an array), and an instance port write
-  can't nest in `if`/`while` (same restriction as a mem write).
+  instance is one resource, same as an array). An instance port write may
+  nest in `if`/`else` (threaded through a `mux`, same as a register write).
 - No calls to user `fn`/`spec`/`impl` from synthesizable rules (needs
   inlining or instantiation).
 - Expression surface still excludes: calls, other field access, `/`/`%`,

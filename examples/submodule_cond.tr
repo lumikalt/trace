@@ -1,0 +1,25 @@
+module Child {
+    input a : bits[8]
+    output b : bits[8] = 0
+
+    rule pass {
+        b := a
+    }
+}
+
+module Top {
+    inst c : Child
+
+    input sel : bits[1]
+    input x : bits[8]
+    output result : bits[8] = 0
+
+    rule wire {
+        if sel == 1 {
+            c.a := x
+        } else {
+            c.a := 0
+        }
+        result := c.b
+    }
+}
