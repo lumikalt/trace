@@ -5,50 +5,19 @@
 //! entry point (here, and writes.rs's write-hunt) goes through: effect
 //! coloring, the call-site module boundary, a call-CYCLE check
 //! (`find_call_cycle` — a callee may itself call another callee, just
-//! not one that transitively calls back to itself), and a guard
-//! against a NESTED call writing state (a callee called from inside
-//! another callee's own body may only be a pure value computation —
-//! see mod.rs's module doc comment for why). `compile_callee_body`
-//! builds the callee's return value; `compile_prio` is the one
-//! synthesizable builtin, a fixed-priority `mux` chain.
+//! not one that transitively calls back to itself), and — reused from
+//! checks.rs, since it's already generic over any statement list, not
+//! rule-specific — `check_writing_call_positions_in` against THIS
+//! callee's own body, so a writing call inside it sits in a position
+//! `callee_reg_write`/`callee_port_write` (writes.rs) can actually find.
+//! `compile_callee_body` builds the callee's return value; `compile_prio`
+//! is the one synthesizable builtin, a fixed-priority `mux` chain.
 
 use super::Emitter;
 use super::writes::item_name;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
-
-/// True if a callee's own body (or one of its `if`/`else` branches)
-/// contains a call used as a BARE STATEMENT (`Inner(x)` on its own
-/// line, its return value thrown away) anywhere — the one call shape
-/// neither of the two ways a callee's body gets walked can handle
-/// safely today: `compile_callee_body` (the return-value walk) already
-/// rejects any non-`Let`/`Assign` statement before the tail, so it can
-/// never reach one; `callee_reg_write`/`callee_port_write` (the
-/// write-hunt walk, one level into a callee's own body) have no
-/// `Stmt::Expr` arm at all and would otherwise silently skip right over
-/// it — so a state write reachable ONLY through a bare nested call
-/// would vanish from the emitted hardware with no error, the same bug
-/// class as this session's earlier state-writing-callee gaps. A call
-/// used as a VALUE (a `let`'s init, the tail return expression, or a
-/// state write's own RHS) is unaffected — only a call whose return
-/// value is discarded is restricted here.
-fn body_has_bare_call_statement(ast: &Ast, stmts: &[StmtId]) -> bool {
-    stmts.iter().any(|s| match ast.stmt(*s) {
-        Stmt::Expr(e) => matches!(ast.expr(*e), Expr::Call { .. }),
-        Stmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            body_has_bare_call_statement(ast, then_body)
-                || else_body
-                    .as_deref()
-                    .is_some_and(|b| body_has_bare_call_statement(ast, b))
-        }
-        _ => false,
-    })
-}
 
 /// Every `fn`/`impl` item directly called anywhere within `stmts` — a
 /// `let`'s init, the tail return expression, a state write's RHS, an
@@ -198,15 +167,15 @@ impl<'a> Emitter<'a> {
     ///   `compile_callee_body`), no state writes (a redundant but
     ///   cheaper check than the signature one above);
     /// - a callee's own body MAY call another `fn`/`impl` (composition is
-    ///   allowed), used as a value — never as a bare statement, a
-    ///   separate check below — as long as it doesn't transitively call
+    ///   allowed), as a value OR a bare statement, and MAY itself write
+    ///   state that way too — as long as it doesn't transitively call
     ///   back to itself (`find_call_cycle`, a genuine cycle, direct or
-    ///   indirect, would unroll forever) and doesn't itself write state
-    ///   (a nested call may only be a pure value computation —
-    ///   `callee_reg_write`/`callee_port_write`, the write-hunt one
-    ///   level into a callee's own body, don't yet recurse a second
-    ///   level to find a write buried behind ANOTHER call — v0
-    ///   restriction, not a silent drop, see the guard below).
+    ///   indirect, would unroll forever) and any writing call sits in a
+    ///   position `check_writing_call_positions_in` allows (a bare
+    ///   statement or the whole RHS of `:=` — checked here, against
+    ///   THIS callee's own body, the same restriction the rule level
+    ///   already enforces, so `callee_reg_write`/`callee_port_write`'s
+    ///   own second-level recursion always has something to find).
     ///
     /// Width correctness for a generic callee (`bits[N]` params): this
     /// call expression's own OUTER width (`id`, already instantiated to
@@ -330,57 +299,27 @@ impl<'a> Emitter<'a> {
             return Err(());
         }
         // A callee may compose (call another callee) for its RETURN
-        // value, but a call NESTED in fn_item's OWN body may not itself
-        // write state: unlike the top-level write-hunt
-        // (`call_writes_reg`/`call_writes_port`, which starts from a
-        // RULE and finds the callee's own direct writes),
-        // `callee_reg_write`/`callee_port_write` don't recurse a second
-        // level into a nested call's own body — so a write reachable
-        // only that way would silently vanish from the emitted hardware
-        // rather than erroring, the same bug class as this session's
-        // earlier state-writing-callee gaps. `direct_callees` finds
-        // every call textually inside `body` (a `let`'s init, the
-        // return expression, a write's RHS, a bare statement) so this
-        // catches the nested call regardless of where in the body it
-        // appears — precise about WHICH one, since it comes with the
-        // call's own span, not just `fn_item`'s.
-        for (callee_item, callee_expr) in direct_callees(self.ast, self.res, &body) {
-            if self
-                .fx
-                .sigs
-                .get(&callee_item)
-                .is_some_and(|s| !s.writes.is_empty())
-            {
-                self.error(
-                    self.ast.expr_spans[callee_expr.0 as usize].clone(),
-                    format!(
-                        "`{}` writes state, so calling it from inside another \
-                         function's body is not yet supported (v0 restriction: a \
-                         nested call may only be a pure value computation — call \
-                         it directly from a rule instead)",
-                        item_name(self.ast, callee_item),
-                    ),
-                );
-                return Err(());
-            }
-        }
-        // A call used only for its own effect (a bare statement, return
-        // value discarded) anywhere in THIS callee's own body is a
-        // separate, narrower restriction than the guard above: even a
-        // call to a perfectly pure function in this shape is rejected,
-        // not because composing it is unsafe, but because nothing
-        // currently walks INTO it to find out whether it's safe — see
-        // `body_has_bare_call_statement`'s own doc comment for exactly
-        // which two walks can't see it.
-        if body_has_bare_call_statement(self.ast, &body) {
-            self.error(
-                span,
-                "this function's body calls another function as a bare statement \
-                 (its return value unused) — not yet supported for inlining (v0 \
-                 restriction: a nested call may only be used as a value — a `let` \
-                 binding, the return expression, or a state write's right-hand side)"
-                    .to_string(),
-            );
+        // value, AS a bare statement (for its side effect alone), OR to
+        // write state — but a state-writing nested call is only found
+        // by `callee_reg_write`/`callee_port_write` (the write-hunt one
+        // level into a callee's own body) in the SAME two positions the
+        // top-level write-hunt already requires: a bare statement, or
+        // the whole RHS of `:=`. Reusing `check_writing_call_positions_
+        // in` here (already fully generic over any `&[StmtId]`, not
+        // rule-specific despite its name) extends that SAME restriction
+        // to `fn_item`'s OWN body — a writing call nested in a `let`, an
+        // argument, or a larger expression INSIDE this callee is
+        // rejected here just as it already is at the rule level, rather
+        // than silently vanishing because nothing walks that deep.
+        // `check_writing_call_positions_in` only ever records errors
+        // (the same fire-and-forget style module.rs's own per-rule call
+        // uses) rather than returning a Result, so a before/after count
+        // is how `validate_call` notices a bad position was found and
+        // bails out here instead of proceeding to splice a callee whose
+        // body it just flagged as broken.
+        let errors_before = self.errors.len();
+        self.check_writing_call_positions_in(&body);
+        if self.errors.len() > errors_before {
             return Err(());
         }
         Ok((fn_item, params, body))
@@ -580,33 +519,42 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         };
-        if !rest
-            .iter()
-            .all(|s| matches!(self.ast.stmt(*s), Stmt::Let { .. } | Stmt::Assign { .. }))
-        {
+        if !rest.iter().all(|s| match self.ast.stmt(*s) {
+            Stmt::Let { .. } | Stmt::Assign { .. } => true,
+            // A bare-statement CALL (its return value unused, e.g. for a
+            // side-effecting write) is allowed; nothing else bare — a
+            // guard or fifo op would already have set `sig.fails`,
+            // rejected by `validate_call` before this ever runs, so
+            // this is deliberately narrower than "any Expr statement".
+            Stmt::Expr(e) => matches!(self.ast.expr(*e), Expr::Call { .. }),
+            _ => false,
+        }) {
             self.error(
                 span.clone(),
                 "this function's body is too complex to inline for its RETURN value \
-                 (v0 restriction: only `let` bindings and state writes may come \
-                 before a trailing `return`, or a trailing `if`/`else` whose \
-                 branches both end that way — an `if`/`else` anywhere else, a loop, \
-                 or a fifo/guard operation is not supported here). Called as a bare \
-                 statement, with its return value unused, a conditional write like \
-                 this one IS still supported — see `callee_reg_write`/\
-                 `callee_port_write`, a separate walk that doesn't share this \
-                 restriction"
+                 (v0 restriction: only `let` bindings, state writes, and bare-\
+                 statement calls may come before a trailing `return`, or a trailing \
+                 `if`/`else` whose branches both end that way — an `if`/`else` \
+                 anywhere else, a loop, or a fifo/guard operation is not supported \
+                 here). Called as a bare statement, with its return value unused, a \
+                 conditional write like this one IS still supported — see \
+                 `callee_reg_write`/`callee_port_write`, a separate walk that \
+                 doesn't share this restriction"
                     .to_string(),
             );
             return Err(());
         }
-        // A leading `Assign` is a state WRITE, a side effect this walk (which
-        // only ever builds the RETURN value) doesn't care about — its own
-        // value is found separately, by `callee_reg_write`/`callee_port_write`
-        // when some register's/port's own write-threading walk reaches this
-        // same call. (Whether this body calls anything at all was already
-        // checked once, for the WHOLE body, by `validate_call` — the single
-        // choke point every inlining entry point goes through, so this
-        // doesn't need its own per-statement check.)
+        // A leading `Assign` (a direct state write) or bare-statement
+        // `Expr` (a call, possibly writing state transitively) is a
+        // side effect this walk — which only ever builds the RETURN
+        // value — doesn't care about: its own value/write is found
+        // separately, by `callee_reg_write`/`callee_port_write`, when
+        // some register's/port's own write-threading walk reaches this
+        // same statement. `validate_call`'s own
+        // `check_writing_call_positions_in` call already confirmed any
+        // writing call in this body sits in one of the two positions
+        // that walk actually looks in, so nothing here needs to
+        // re-check that.
 
         let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
         for s in rest {

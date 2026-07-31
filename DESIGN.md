@@ -1237,39 +1237,56 @@ this check in practice — effects.rs already requires `<elaborates>` for it, an
 exercised by INDIRECT/mutual recursion (`A` calls `B` calls `A`, neither self-recursive),
 which effects.rs's own (direct-only) recursion check doesn't catch.
 
-**A nested call may not itself write state — checked structurally, not dynamically,
-against the SAME false-positive risk.** `validate_call` walks `direct_callees` for the
-function being validated and rejects if any of them has a non-empty (already
-call-graph-merged) `sig.writes` — precise about WHICH nested call, since `direct_callees`
-carries each call's own `ExprId` for the error span. This is deliberately conservative,
-not because composing a state-writing function is unsafe in principle, but because
-nothing walks into it to make it SAFE yet: `callee_reg_write`/`callee_port_write` (the
-write-hunt one level into a callee's own body) don't recurse a second level into a nested
-call's own body, so a write reachable only that way would silently vanish from the
-emitted hardware — the same bug class as this session's earlier state-writing-callee
-gaps (`a_write_transitively_reached_through_a_bare_statement_call_is_an_error`, now
-caught earlier and more precisely by this same check). The guard is narrow, not "any
-writing function with a nested call is suspect": a state-writing callee may still call a
-PURE helper for its own write's value (`Bump(x) { v := Helper(x)  return x }`) — `Helper`'s
-empty `sig.writes` never trips the guard, pinned by
-`a_state_writing_callee_may_still_call_a_pure_helper`.
+**A nested call MAY itself write state, and MAY be used as a bare statement — lifted
+2026-07-31, closing the two restrictions the paragraphs above once described as
+deferred.** The guard that used to reject any nested call to a state-writing function
+outright (`direct_callees` + a `sig.writes` check in `validate_call`) is gone; in its
+place, `validate_call` reuses `check_writing_call_positions_in` (checks.rs) — the SAME
+walk that already restricts a RULE body's writing calls to a bare statement or the whole
+RHS of `:=` — against the callee's OWN body too. That's the actual fix, not a relaxation:
+a writing call still has to sit in one of those two positions, because those are the only
+two shapes `call_writes_reg`/`call_writes_port` (writes.rs) know how to find. What changed
+is that the write now gets FOUND there, at any depth, instead of being rejected outright.
+`callee_reg_write`/`callee_port_write` (the write-hunt one level into a callee's own body)
+now recurse a second time — for a bare-statement `Stmt::Expr` or a non-matching
+`Stmt::Assign`'s RHS, they call back into `call_writes_reg`/`call_writes_port`, the SAME
+functions that originally only handled rule-level writes — making the recursion mutual and
+arbitrarily deep: a write threads through any number of nested calls, not just one level.
+`compile_callee_body`'s return-value walk was widened symmetrically: a bare-statement
+`Stmt::Expr` is now allowed before the tail `return`, but ONLY if it's itself an
+`Expr::Call` — a bare guard or fifo op is still rejected, since those already set
+`sig.fails`, caught by `validate_call` before this walk ever runs. The narrow case the old
+guard carved out on purpose — a state-writing callee calling a PURE helper for its own
+write's value (`Bump(x) { v := Helper(x)  return x }`) — still works, now for the more
+general reason rather than a special-cased exemption; still pinned by
+`a_state_writing_callee_may_still_call_a_pure_helper`. Proof of the full capability:
+`examples/call_nested_writes.tr` — `compute` calls `Outer` (bare statement), which calls
+`Inner` (also a bare statement), which writes `v_out` — two levels of call between the
+rule and the actual write, landing at `v_out = a + 1`, verified through real firtool +
+Icarus simulation (`sim/call_nested_writes_tb.v`,
+`call_nested_writes_runs_through_real_ports`). The position restriction itself is still
+real and still enforced, just now precise about WHERE it's checked: a nested call used as
+a `let`'s init (not a bare statement or the whole RHS of `:=`) is still an explicit error,
+pinned by `a_nested_call_used_as_a_let_value_that_writes_state_is_still_an_error`.
 
-**A nested call used as a BARE STATEMENT (return value discarded) is a separate,
-narrower restriction, unconditional regardless of purity.** Neither of the two ways a
-callee's body gets walked can safely see into this shape: the return-value walk
-(`compile_callee_body`) already rejects any non-`Let`/`Assign` statement before the tail,
-so it can never even reach one; the write-hunt walk has no `Stmt::Expr` match arm at all
-and would otherwise silently skip right past it. Rather than teach either walk to handle
-it (a bare call's purpose can only be a state-writing side effect, which needs the SAME
-second-level write-hunt recursion the guard above is standing in for), it's rejected
-outright — `body_has_bare_call_statement`, a purely structural check with no
-call-order dependency either.
-
-**What's still deferred, explicitly, not silently:** a nested call that writes state
-(needs `callee_reg_write`/`callee_port_write` taught to recurse a second level — the
-actual write-threading work, not just a validation guard) and a nested bare-statement
-call (needs both walks widened to accept it, plus the write-hunt teaching above to make
-it useful). Both are real, scoped-out follow-ups, not forgotten — see TODO.md.
+**A duplicate-diagnostic bug surfaced by this change, caught before commit, fixed at the
+error-collection layer.** `validate_call` is a multiply-invoked choke point: for a call
+used as BOTH a value and a write source (`result := Outer(w)`, where `Outer` reads/writes
+`w`), it runs once via the return-value path (`compile_call`) and again via the write-hunt
+path (`call_writes_reg`, hunting for `w`'s own write) — and after this change, both paths
+independently run `check_writing_call_positions_in` against the identical callee body,
+each pushing the identical error. The same multiplicity affects every other error
+`validate_call` can emit (the cycle check, the module-boundary check, the
+`sequences`/`elaborates`/`fails` bans) whenever a call site is validated through more than
+one path — not something new to this feature, just newly exercised by it. Fixed at the
+single choke point every error passes through: `Emitter::error` (mod.rs) now dedups by
+`(span, message)` before pushing, since `EmitError` already derives `PartialEq`/`Eq` — one
+change covers the whole class rather than teaching each caller to notice it's already
+validated a given call. Pinned by strengthening two existing tests from `.any(...)` to
+`assert_eq!(err.len(), 1, ...)`:
+`a_nested_call_used_as_a_let_value_that_writes_state_is_still_an_error` (the
+value-and-write-source shape that actually reproduced it) and
+`an_indirect_call_cycle_is_a_clean_error_not_a_hang`.
 
 **A latent width-hint gap this feature newly makes reachable, not something it needs to
 fix:** a nested call inside a GENERIC (`bits[N]`) callee body, reached through a binop

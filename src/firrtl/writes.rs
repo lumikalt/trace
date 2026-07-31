@@ -4,9 +4,14 @@
 //! reached only through a call (`call_writes_reg`/`call_writes_port`)
 //! recurses into the callee's own body (`callee_reg_write`/
 //! `callee_port_write`) with its params bound, mirroring the same
-//! mux-threading one level deeper — see mod.rs's module doc comment for
-//! the "only a bare statement or the whole RHS of `:=`" restriction this
-//! all assumes (enforced separately, by checks.rs). Also home to
+//! mux-threading one level deeper — and `callee_reg_write`/
+//! `callee_port_write` themselves call back into `call_writes_reg`/
+//! `call_writes_port` for a bare statement or a non-matching write's
+//! RHS, so a write threads through an arbitrarily deep chain of nested
+//! calls, not just one level — see mod.rs's module doc comment for the
+//! "only a bare statement or the whole RHS of `:=`" restriction this
+//! all assumes (enforced separately, by checks.rs, against every
+//! callee body a call reaches, not just rule bodies). Also home to
 //! `enter_rule` (refreshes a rule's local bindings) and the small
 //! width-resolution helpers (`width_of`, `concrete_width_of`) most of
 //! this file's own methods lean on.
@@ -310,7 +315,15 @@ impl<'a> Emitter<'a> {
     /// `enter_rule`, but this walk can start mid-rule, inside a
     /// DIFFERENT item's body, which `enter_rule` never sees). Ignores
     /// `Return` entirely — the return value is a wholly separate walk
-    /// (`compile_callee_body`), independent of this one.
+    /// (`compile_callee_body`), independent of this one. Recurses a
+    /// SECOND level into a nested call via `call_writes_reg` — a bare
+    /// statement (`Inner(x)`) or an assign whose RHS is a call that
+    /// doesn't match `reg_name` itself but transitively writes it
+    /// (`v := Inner(x)` where `Inner` writes `reg_name`, not `v`) — the
+    /// same two positions `check_writing_call_positions_in` already
+    /// confirmed (in `validate_call`) are the only ones a writing call
+    /// can legally occupy inside this body, so nothing else needs a
+    /// symmetric arm here.
     pub(crate) fn callee_reg_write(
         &mut self,
         stmts: &[StmtId],
@@ -333,11 +346,20 @@ impl<'a> Emitter<'a> {
                         saved.push((def, self.locals.insert(def, init)));
                     }
                 }
-                Stmt::Assign { lhs, rhs } if is_ident_named(self.ast, self.res, lhs, reg_name) => {
-                    current = Some(
-                        self.compile_expr_hinted(rhs, Some(width))
-                            .unwrap_or_default(),
-                    );
+                Stmt::Assign { lhs, rhs } => {
+                    if is_ident_named(self.ast, self.res, lhs, reg_name) {
+                        current = Some(
+                            self.compile_expr_hinted(rhs, Some(width))
+                                .unwrap_or_default(),
+                        );
+                    } else if let Some(v) = self.call_writes_reg(rhs, reg_name, width) {
+                        current = Some(v);
+                    }
+                }
+                Stmt::Expr(e) => {
+                    if let Some(v) = self.call_writes_reg(e, reg_name, width) {
+                        current = Some(v);
+                    }
                 }
                 Stmt::If {
                     cond,
@@ -509,7 +531,9 @@ impl<'a> Emitter<'a> {
 
     /// `callee_reg_write`'s counterpart for an instance port, with a
     /// port's own unwritten-path fallback (`UInt<{width}>(0)`, not a
-    /// register's "hold my own feedback").
+    /// register's "hold my own feedback"). Recurses a second level into
+    /// a nested call via `call_writes_port`, same reasoning as
+    /// `callee_reg_write`'s own doc comment.
     pub(crate) fn callee_port_write(
         &mut self,
         stmts: &[StmtId],
@@ -542,6 +566,14 @@ impl<'a> Emitter<'a> {
                             self.compile_expr_hinted(rhs, Some(width))
                                 .unwrap_or_default(),
                         );
+                    } else if let Some(v) = self.call_writes_port(rhs, inst_name, port_name, width)
+                    {
+                        current = Some(v);
+                    }
+                }
+                Stmt::Expr(e) => {
+                    if let Some(v) = self.call_writes_port(e, inst_name, port_name, width) {
+                        current = Some(v);
                     }
                 }
                 Stmt::If {

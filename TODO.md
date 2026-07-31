@@ -14,24 +14,31 @@
   compiling" stack — that approach false-positived on `Avg(Avg(x, y),
   z)`, a rule calling `Avg` twice, once nested as an argument, since
   lazily substituting the argument looks identical to real recursion
-  from inside `compile_callee_body`'s own call order). Two things
-  still make a nested call an explicit error, not supported yet: (1) a
-  nested call that itself writes state — `callee_reg_write`/
-  `callee_port_write` (the write-hunt one level into a callee's own
-  body) don't yet recurse a SECOND level into a nested call's own body
-  to find a write buried behind it; (2) a nested call used as a bare
-  statement (its return value discarded) — neither the return-value
-  walk (`compile_callee_body`, which already rejects any non-`Let`/
-  `Assign` statement before the tail) nor the write-hunt walk can see
-  into that shape at all. A state write reaches the emitted hardware
-  only when the call site is a bare statement or the whole RHS of `:=`
-  — nested any deeper (an argument, a `let`, `Bump(a) + 1`) is a
-  clean, explicit error, since `call_writes_reg`/`call_writes_port`
-  (firrtl.rs) only ever look for a write in those two positions. A
-  callee whose write is conditional (`if`/`else`) is only inlinable as
-  a bare statement — if its return value is ALSO used, the `if`/`else`
-  must be in TAIL position (own separate walk, `compile_callee_body`,
-  stricter shape than the write-hunt walk). A call's own state-reaching
+  from inside `compile_callee_body`'s own call order). A nested call
+  MAY itself write state, and MAY be used as a bare statement (its
+  return value discarded) rather than only as a value: a state-writing
+  call still has to sit in one of the two positions
+  `call_writes_reg`/`call_writes_port` (writes.rs) actually look for —
+  a bare statement, or the whole RHS of `:=` — but that restriction is
+  now enforced identically at every level a call chain reaches, not
+  just the rule that starts it (`check_writing_call_positions_in`,
+  checks.rs, reused by `validate_call` against a callee's own body),
+  and the write itself threads through arbitrarily many nested calls
+  via `callee_reg_write`/`callee_port_write`'s own recursion back into
+  `call_writes_reg`/`call_writes_port` for a bare-statement or
+  matching-RHS nested call. `compile_callee_body`'s return-value walk
+  allows a bare-statement call (for its side effect) alongside `let`/
+  state-write statements before the tail — anything else bare (a
+  guard, a fifo op) is still rejected. Nested any deeper than those two
+  positions (an argument, a `let`, `Bump(a) + 1`) is still a clean,
+  explicit error. Proof: `examples/call_nested_writes.tr` +
+  `sim/call_nested_writes_tb.v`, two levels of nested bare-statement
+  calls landing a write at `v_out = a + 1`, verified through real
+  firtool + Icarus simulation. A callee whose write is conditional
+  (`if`/`else`) is only inlinable as a bare statement — if its return
+  value is ALSO used, the `if`/`else` must be in TAIL position (own
+  separate walk, `compile_callee_body`, stricter shape than the
+  write-hunt walk). A call's own state-reaching
   reads/writes (transitively, through the whole call graph) are
   checked against the CALL site's module, not just the callee's
   declaration site (`validate_call` in firrtl.rs, uses

@@ -1034,6 +1034,12 @@ module M {
 }
 ";
     let err = emit_from_source(src).unwrap_err();
+    assert_eq!(
+        err.len(),
+        1,
+        "a single call site should only ever be validated-and-erred once, \
+         even if validate_call runs it through more than one path: {err:?}"
+    );
     assert!(
         err.iter()
             .any(|e| e.message.contains("call cycle: A -> B -> A"))
@@ -1041,12 +1047,26 @@ module M {
 }
 
 #[test]
-fn a_nested_call_used_as_a_value_that_writes_state_is_an_error() {
+fn a_nested_call_used_as_a_let_value_that_writes_state_is_still_an_error() {
     // `Inner` writes `w`; `Outer` uses `Inner`'s return value inside a
-    // `let`. The write is invisible to both the return-value walk (which
-    // only cares about values) and the write-hunt walk (which doesn't
-    // recurse a second level into a nested call yet) -- rejected
-    // outright rather than silently dropped.
+    // `let`, not a bare statement or the whole RHS of `:=`.
+    // `check_writing_call_positions_in` (checks.rs) restricts a
+    // writing call to those two positions inside a callee's own body,
+    // same as it already does at the rule level — `callee_reg_write`
+    // only ever looks for a write there, so anywhere else would
+    // silently drop it if this check didn't reject it outright first.
+    //
+    // `Outer(w)` is also the regression shape for a real duplicate-
+    // diagnostic bug: `validate_call` runs once for `Outer`'s return
+    // value (`result := ...`) and again for `w`'s own write-hunt
+    // (`call_writes_reg`, since `Outer`'s merged signature writes `w`),
+    // and both paths independently ran `check_writing_call_positions_in`
+    // against the identical body, each pushing the identical error —
+    // asserting `err.len() == 1` (not just `.any(...)`) is what would
+    // have caught it; `Emitter::error` (mod.rs) now dedups by
+    // `(span, message)` at the single choke point every error goes
+    // through, fixing this for every error `validate_call` can emit,
+    // not just this one.
     let src = "\
 module M {
     reg w : bits[8] = 0
@@ -1067,10 +1087,53 @@ module M {
 }
 ";
     let err = emit_from_source(src).unwrap_err();
+    assert_eq!(
+        err.len(),
+        1,
+        "validate_call runs once for Outer's return value and again for w's \
+         write-hunt; without dedup this pushes the identical error twice: {err:?}"
+    );
     assert!(
         err.iter()
-            .any(|e| e.message.contains("writes state") && e.message.contains("Inner"))
+            .any(|e| e.message.contains("may only appear as a whole statement"))
     );
+}
+
+#[test]
+fn a_nested_writing_call_used_as_a_bare_statement_threads_its_write_through() {
+    // `Outer` calls `Inner` (which writes `v`) as a bare statement, its
+    // own return value unused -- `Inner`'s allowed position, mirroring
+    // the top-level "a rule may call a writing function as a bare
+    // statement" feature one level deeper. Regression test for a real
+    // bug caught while building this: passing `Outer(v)` (feeding `v`'s
+    // OWN current value back in) makes the write a no-op by
+    // construction (`v := v`), indistinguishable from a dropped write —
+    // `a` (a real input, not `v` itself) is what actually proves the
+    // write landed.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Inner(x : bits[8]) : bits[8] <combines, writes {v}> {
+        v := x
+        return x
+    }
+    Outer(x : bits[8]) : bits[8] <combines, writes {v}> {
+        Inner(x)
+        return x + 1
+    }
+
+    rule compute {
+        result := Outer(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, a"));
+    assert!(fir.contains("connect __out_result, tail(add(a, UInt<8>(1)), 1)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]
@@ -1105,17 +1168,15 @@ module M {
 }
 
 #[test]
-fn a_nested_bare_statement_call_is_an_error_even_when_pure() {
-    // `Inner(x)` inside `Outer`'s body, as a bare statement (return
-    // value discarded): the shape neither walk can see into today —
-    // rejected outright even though `Inner` is pure here and writes
-    // nothing (a state-writing nested call in this shape would ALSO hit
-    // the write guard above, so this test deliberately uses a pure
-    // callee to isolate the bare-statement check specifically) — see
-    // `body_has_bare_call_statement`'s own doc comment.
+fn a_pure_nested_bare_statement_call_compiles_away_harmlessly() {
+    // `Inner(x)` inside `Outer`'s body, as a bare statement, its return
+    // value discarded, and `Inner` is pure (writes nothing) -- a no-op
+    // by construction (nothing observes it, nothing it does persists),
+    // so it's allowed and simply contributes nothing to the emitted
+    // hardware: `result` depends only on `Outer`'s own `return x + 1`.
     let src = "\
 module M {
-    reg v : bits[8] = 0
+    input a : bits[8]
     output result : bits[8] = 0
 
     Inner(x : bits[8]) : bits[8] <combines> {
@@ -1127,12 +1188,13 @@ module M {
     }
 
     rule r {
-        result := Outer(v)
+        result := Outer(a)
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(err.iter().any(|e| e.message.contains("bare statement")));
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, tail(add(a, UInt<8>(1)), 1)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]
@@ -1376,19 +1438,16 @@ module M {
 }
 
 #[test]
-fn a_write_transitively_reached_through_a_bare_statement_call_is_an_error() {
-    // Regression test for a real silent miscompile caught before this
-    // shipped: `Outer` (called as a bare statement, its return value
-    // unused) itself calls `Inner`, which writes `w`. `effects.rs`
-    // merges `Outer`'s signature to include `w` in its writes, so
-    // `schedule.rs` correctly believes the rule writes `w` — but
-    // `callee_reg_write` (the write-hunt one level into a callee's own
-    // body) doesn't recurse a second level into `Inner`'s own body, so
-    // it would silently find no direct `w :=` and emit no connection at
-    // all. Now caught earlier: `validate_call`'s nested-write guard sees
-    // `Inner` (used as `v`'s write value inside `Outer`'s own body)
-    // itself writes state, and rejects the call outright rather than
-    // letting the write vanish.
+fn a_write_transitively_reached_through_a_bare_statement_call_threads_through() {
+    // Regression test for a real silent miscompile caught before
+    // callee-calling-callee shipped: `Outer` (called as a bare
+    // statement, its return value unused) itself writes `v` from
+    // `Inner`'s return value (`v := Inner(x)`, the whole-RHS position),
+    // and `Inner` ALSO writes `w` directly. `effects.rs` merges
+    // `Outer`'s signature to include `w`, so `schedule.rs` correctly
+    // believes the rule writes `w` -- proving BOTH `v` and `w` actually
+    // land in the emitted hardware, not just that `w`'s write no longer
+    // silently vanishes.
     let src = "\
 module M {
     reg v : bits[8] = 0
@@ -1407,11 +1466,10 @@ module M {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(
-        err.iter()
-            .any(|e| e.message.contains("writes state") && e.message.contains("Inner"))
-    );
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, a"));
+    assert!(fir.contains("connect w, a"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

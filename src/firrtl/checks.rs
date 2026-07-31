@@ -195,7 +195,12 @@ impl<'a> Emitter<'a> {
     /// let it happen: walk every expression reachable from this rule,
     /// and for every `Expr::Call` found that isn't one of the two
     /// allowed positions, error if its callee's (merged) signature
-    /// writes anything.
+    /// writes anything. `check_writing_call_positions_in` (below) is
+    /// already fully generic over any `&[StmtId]`, not rule-specific
+    /// despite this wrapper's name — `calls.rs`'s `validate_call` reuses
+    /// it directly against a CALLEE's own body too, so the identical
+    /// restriction applies at every level a call reaches, not just the
+    /// rule that starts the chain.
     pub(crate) fn check_writing_call_positions(&mut self, rule: ItemId) {
         let body = rule_body(self.ast, rule);
         self.check_writing_call_positions_in(&body);

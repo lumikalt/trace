@@ -35,21 +35,24 @@
 //!   that same shape (mandatory `else`, folded into a `mux`) — no loops
 //!   or guards/fifo ops anywhere in the callee. A callee's own body MAY
 //!   call another `fn`/`impl` (composition, not just a leaf value
-//!   computation), used as a value — a `let`'s init, the return
-//!   expression, or a state write's own RHS, never as a bare statement
-//!   (`calls.rs`'s `body_has_bare_call_statement`, a shape nothing walks
-//!   into yet) — as long as it doesn't form a call CYCLE, direct or
-//!   indirect (a STATIC property of which functions' own bodies name
-//!   which others, `find_call_cycle`) and the nested call doesn't itself
-//!   write state (v0 restriction, not a silent drop: the write-hunt one
-//!   level into a callee's own body doesn't yet recurse a second level
-//!   to find a write buried behind ANOTHER call). A state write only
-//!   reaches the emitted hardware when the call site is a bare
-//!   statement or the whole RHS of `:=`
-//!   (`check_writing_call_positions` rejects it anywhere else,
-//!   explicitly, rather than silently dropping it); a conditional write
-//!   is only inlinable that way too if the return value is ALSO used
-//!   (the `if`/`else` must then be in TAIL position, same restriction as
+//!   computation), used as a `let`'s init, the return expression, a
+//!   state write's own RHS, or a bare statement (its return value
+//!   discarded — useful for a state-writing side effect alone) — as
+//!   long as it doesn't form a call CYCLE, direct or indirect (a STATIC
+//!   property of which functions' own bodies name which others,
+//!   `find_call_cycle`). A state write, whether the callee's own direct
+//!   write or one reached transitively through a nested call, only
+//!   reaches the emitted hardware when it sits in a bare statement or
+//!   the whole RHS of `:=` — `check_writing_call_positions` enforces
+//!   this at BOTH the rule level and (via `validate_call`, its single
+//!   choke point) every callee body a call reaches, rejecting anywhere
+//!   else explicitly (a `let`, an argument, a larger expression) rather
+//!   than silently dropping the write; `callee_reg_write`/
+//!   `callee_port_write` (the write-hunt into a callee's own body) then
+//!   recurse into exactly those same two positions to actually find it,
+//!   arbitrarily many calls deep. A conditional write is only inlinable
+//!   as a bare statement — if its return value is ALSO used, the
+//!   `if`/`else` must then be in TAIL position (same restriction as
 //!   the return-value-only case). A `spec` call cannot reach this pass
 //!   at all (effects.rs already rejects it outside spec-only code). A
 //!   call to the builtin `prio` (a fixed-priority encoder) is separately
@@ -338,8 +341,20 @@ struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
+    /// A single call site can be validated more than once — `validate_call`
+    /// runs once for a call's return value (`compile_call`) and again for
+    /// each register/port whose write-hunt reaches it (`call_writes_reg`/
+    /// `call_writes_port`) — so any error it emits (a bad write position,
+    /// a call cycle, a module-boundary violation, ...) would otherwise be
+    /// pushed once per path, all with the identical span and message.
+    /// Deduping here, at the single choke point every `error` call goes
+    /// through, covers that whole class in one place rather than each
+    /// caller re-deriving "have I already validated this."
     pub(crate) fn error(&mut self, span: Span, message: String) {
-        self.errors.push(EmitError { span, message });
+        let err = EmitError { span, message };
+        if !self.errors.contains(&err) {
+            self.errors.push(err);
+        }
     }
 
     pub(crate) fn state_width(&self, def: DefId) -> Option<Ty> {
