@@ -81,8 +81,18 @@
 - Expression surface still excludes:
   - Field access other than `instance.port` (which is reads only; writes
     only as a whole statement's LHS).
-  - Dynamic-amount shifts (the shift amount must be a literal).
   - Computed bit-select/slice bounds (`x[hi..lo]` bounds must be literal).
+
+  Dynamic-amount shifts are now supported — `x << n`/`x >> n` compile to
+  FIRRTL's `dshl`/`dshr` when `n` isn't a compile-time constant.
+  `dshl(a, b)`'s width is `w(a) + 2^w(b) - 1` (confirmed against real
+  firtool) — the exponential term is `b`'s own WIDTH, a static quantity,
+  so the amount to `tail` back down to `w(a)` is still a compile-time
+  constant; `dshr`, unlike static `shr`, never shrinks at all, so needs
+  no `pad`/`tail` wrapper. See `examples/dynamic_shift.tr` +
+  `sim/dynamic_shift_tb.v`, which drive two different `n` values against
+  the same `x` and cross-check both against `alu.tr`'s already-proven
+  static `<<3`/`>>3` values.
 
   `!` is now supported, as a real, distinct operator from `~`, not a
   parse-time alias — both compile to the identical FIRRTL `not` primop,

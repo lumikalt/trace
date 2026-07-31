@@ -726,3 +726,35 @@ fn div_rem_runs_through_real_ports() {
         "q1/q2/r1/r2 did not settle at 15/0/5/13 (200/13, 13/200, 200%13, 13%200):\n{output}"
     );
 }
+
+/// Proves dynamic-amount `<<`/`>>` end to end: `x` (0xE3) stays fixed
+/// while `n` changes between two different values across two cycles,
+/// proving the shift amount is genuinely read at runtime, not baked in
+/// at synthesis time. Both results at each `n` match the exact values
+/// alu.tr's static `<<3`/`>>3` already proved correct, confirming the
+/// dynamic path computes the identical answer a literal shift would.
+#[test]
+fn dynamic_shift_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/dynamic_shift.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/dynamic_shift_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: n3 shl=18 shr=1c; n5 shl=60 shr=7"),
+        "dynamic shift results did not match expectations:\n{output}"
+    );
+}

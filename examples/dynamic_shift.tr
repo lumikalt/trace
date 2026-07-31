@@ -1,0 +1,19 @@
+-- `<<`/`>>` where the shift amount is a runtime expression, not a
+-- literal. FIRRTL's `dshl`/`dshr` primops handle this directly; the
+-- width story differs from a static shift though (see DESIGN.md's
+-- "Dynamic-amount shifts" section) -- `dshl` grows by `2^w(n) - 1` and
+-- needs trimming back to `x`'s own width, `dshr` never grows at all.
+-- `sim/dynamic_shift_tb.v` drives TWO different `n` values against the
+-- same `x`, proving this is genuinely dynamic per-cycle behavior, not a
+-- shift amount baked in at synthesis time.
+module Top {
+    input x : bits[8]
+    input n : bits[3]
+    output shl_out : bits[8] = 0
+    output shr_out : bits[8] = 0
+
+    rule compute {
+        shl_out := x << n
+        shr_out := x >> n
+    }
+}

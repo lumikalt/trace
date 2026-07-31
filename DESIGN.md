@@ -778,9 +778,9 @@ FIRRTL primop that matched them:
   rather than FIRRTL's own `shl`/`shr` (which grow/shrink the width so no bits are
   lost). `shl3 := a << 3` compiles to `tail(shl(a, 3), 3)` — shift up, then drop the
   high bits that fell off; `shr3 := a >> 3` compiles to `pad(shr(a, 3), 8)` — shift
-  down (discarding the low bits), then zero-pad back up to the original width. Only a
-  literal shift amount is supported (v0 restriction): FIRRTL's `shl`/`shr` need a
-  static amount, and a dynamic-amount `dshl`/`dshr` isn't wired up yet.
+  down (discarding the low bits), then zero-pad back up to the original width. This is
+  the STATIC (literal-amount) case; a dynamic (runtime) shift amount is also supported
+  now — see "Dynamic-amount shifts" below.
 
 Bit-select and slice (`x[i]`, `x[hi..lo]`) compile to FIRRTL's `bits(x, hi, lo)`
 primop, which also needs static bounds — so, like shifts, only literal-integer
@@ -972,6 +972,41 @@ examples, and this feature is, by construction, indistinguishable from that spel
 everywhere past the parser, the same reasoning `!` used to skip a redundant sim proof.
 `editors/vscode/syntaxes/trace.tmLanguage.json`'s keyword list was updated alongside the
 lexer change, per the standing "kept in sync by hand" note in that file.
+
+**Dynamic-amount shifts, added 2026-07-31.** `<<`/`>>` no longer require a literal
+shift amount — `x << n`/`x >> n` compile straight to FIRRTL's `dshl`/`dshr` primops
+when `n` isn't a compile-time constant. types.rs needed no changes at all: its
+`Shl | Shr => Ty::Bits(a)` rule (keep the left operand's own width, matching Verilog's
+fixed-width `<<`/`>>`) already applied uniformly regardless of whether the right operand
+was a literal — the v0 restriction lived entirely in firrtl.rs's `compile_shift`, which
+simply errored instead of emitting anything for a non-constant amount. `compile_shift`
+now tries `const_eval` first (the existing static path, unchanged) and falls through to
+`dshl`/`dshr` only when that fails.
+
+The width story is genuinely different from the static case, and NOT assumed from the
+FIRRTL spec text — confirmed against real firtool with a `node` (not a `connect` into an
+explicitly-widthed output, which would silently mask the primop's own width behind an
+implicit truncate/extend, the same probe methodology `/`/`%` used): `dshl(a, b)` grows to
+`w(a) + 2^w(b) - 1` — the exponential term is `b`'s own WIDTH (a static quantity fixed at
+compile time, bounding the largest shift amount `b` could possibly hold), not `b`'s
+VALUE, which is what's actually dynamic. That means the amount to `tail` back down to
+`w(a)` (`2^w(b) - 1`) is itself a compile-time constant, computed the identical way the
+static case's constant drop amount already is — `x << n` with `n : bits[3]` compiles to
+`tail(dshl(x, n), 7)` (`2^3 - 1 = 7`). `dshr`, confirmed the same way, does NOT grow OR
+shrink — it's already exactly `w(a)`, so `x >> n` compiles to bare `dshr(x, n)`, no
+`pad`/`tail` wrapper at all, unlike every other shift/mul/div/rem case in this section.
+A wide shift-amount operand produces a correspondingly wide (if wasteful) `dshl`
+intermediate before `tail` trims it back down — not restricted, matching this emitter's
+general "compile what's asked, don't second-guess hardware size" stance elsewhere (v0
+arrays, memory depth, etc. aren't capped either).
+
+`examples/dynamic_shift.tr` + `sim/dynamic_shift_tb.v` prove it through real firtool +
+Icarus simulation, deliberately driving TWO different `n` values (3, then 5) against the
+same fixed `x = 0xE3` across two cycles — proving the shift amount is genuinely read at
+runtime, not a constant baked in at synthesis time the way a static `<< 3` would be. Both
+results at each `n` are cross-checked against `alu_tb.v`'s own already-proven static
+`<<3`/`>>3` values (0x18/0x1c) — confirming the dynamic path computes the identical
+answer a literal shift already does, not just "firtool accepted it."
 
 ## Calling a function from a rule
 

@@ -378,33 +378,58 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// Static (literal-amount) shifts only — FIRRTL's `shl`/`shr` need a
-    /// constant, and a dynamic-amount `dshl`/`dshr` isn't wired up yet
-    /// (v0 restriction). `shl` grows the width by the shift amount and
-    /// `shr` shrinks it, but types.rs keeps the left operand's width for
-    /// both, matching Verilog's fixed-width `<<`/`>>` — so both are
-    /// brought back to that width: `shl` by dropping the high bits that
-    /// fell off, `shr` by zero-padding back up.
+    /// Both static (literal-amount) and dynamic (runtime-amount) shifts.
+    /// types.rs keeps the LEFT operand's width for `<<`/`>>` either way
+    /// (matching Verilog's fixed-width shift semantics, not FIRRTL's own
+    /// `shl`/`dshl`/`dshr`, which each grow or shrink) — so every case
+    /// below ends by bringing the FIRRTL primop's own result back to
+    /// `w`, the same shape whether the amount is known at compile time
+    /// or not.
+    ///
+    /// Static: `shl` grows the width BY the (literal) shift amount,
+    /// `shr` shrinks it by that same amount — brought back to `w` by
+    /// dropping the high bits that fell off (`shl`) or zero-padding back
+    /// up (`shr`).
+    ///
+    /// Dynamic: FIRRTL's `dshl(a, b)`/`dshr(a, b)` widths were confirmed
+    /// against real firtool, not assumed from the spec text (a `node`,
+    /// not a `connect` into an explicitly-widthed output, to see the
+    /// primop's own inferred width): `dshl` grows to `w(a) + 2^w(b) - 1`
+    /// — the exponential term is `b`'s own WIDTH determining the largest
+    /// shift amount it could possibly hold, a STATIC quantity even
+    /// though `b`'s VALUE is dynamic, so the amount to `tail` back down
+    /// to `w` (`2^w(b) - 1`) is still a compile-time constant, computed
+    /// the identical way the static case's constant drop amount is.
+    /// `dshr`, unlike static `shr`, does NOT shrink at all — it's
+    /// already exactly `w(a)`, so no `pad`/`tail` is needed there, only
+    /// for `dshl`. A wide shift-amount operand (`b`) produces a
+    /// correspondingly wide (if wasteful) `dshl` intermediate before the
+    /// `tail` trims it back down — not restricted here, the same
+    /// "compile what's asked" stance the rest of this emitter takes
+    /// toward hardware size.
     pub(crate) fn compile_shift(
         &mut self,
         op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
     ) -> Result<String, ()> {
-        let Some(n) = self.const_eval(rhs) else {
-            self.error(
-                self.ast.expr_spans[rhs.0 as usize].clone(),
-                "shift amount must be a literal integer in FIRRTL emission (v0 \
-                 restriction: no variable-amount shifts)"
-                    .to_string(),
-            );
-            return Err(());
-        };
         let w = self.width_of(lhs);
         let l = self.compile_expr_hinted(lhs, Some(w))?;
+        if let Some(n) = self.const_eval(rhs) {
+            return Ok(match op {
+                BinOp::Shl => format!("tail(shl({l}, {n}), {n})"),
+                BinOp::Shr => format!("pad(shr({l}, {n}), {w})"),
+                _ => unreachable!("compile_shift only called for Shl/Shr"),
+            });
+        }
+        let rw = self.width_of(rhs);
+        let r = self.compile_expr_hinted(rhs, Some(rw))?;
         Ok(match op {
-            BinOp::Shl => format!("tail(shl({l}, {n}), {n})"),
-            BinOp::Shr => format!("pad(shr({l}, {n}), {w})"),
+            BinOp::Shl => {
+                let grown = (1u64 << rw) - 1;
+                format!("tail(dshl({l}, {r}), {grown})")
+            }
+            BinOp::Shr => format!("dshr({l}, {r})"),
             _ => unreachable!("compile_shift only called for Shl/Shr"),
         })
     }

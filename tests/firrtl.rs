@@ -770,22 +770,32 @@ module M {
 }
 
 #[test]
-fn shift_by_a_non_literal_amount_is_an_error() {
+fn dynamic_shift_grows_then_trims_shl_but_shr_needs_no_adjustment() {
+    // FIRRTL's own widths (confirmed against real firtool, not assumed):
+    // `dshl(a, b)` grows to `w(a) + 2^w(b) - 1` (the exponential term is
+    // `b`'s own WIDTH, a static quantity, bounding the largest possible
+    // shift amount `b` could hold) -- trimmed back to `x`'s declared
+    // width (8) by dropping exactly `2^w(n) - 1` bits, `2^3 - 1 = 7`
+    // here since `n : bits[3]`. `dshr`, unlike static `shr`, does NOT
+    // shrink at all -- it's already exactly `w(a)`, so no `pad`/`tail`
+    // wrapper is needed there, unlike every other shift/mul/div/rem case
+    // in this file.
     let src = "\
 module M {
     input x : bits[8]
-    input n : bits[8]
-    output y : bits[8] = 0
+    input n : bits[3]
+    output shl_out : bits[8] = 0
+    output shr_out : bits[8] = 0
     rule r {
-        y := x << n
+        shl_out := x << n
+        shr_out := x >> n
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(
-        err.iter()
-            .any(|e| e.message.contains("shift amount must be a literal"))
-    );
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_shl_out, tail(dshl(x, n), 7)"));
+    assert!(fir.contains("connect __out_shr_out, dshr(x, n)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]
