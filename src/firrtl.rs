@@ -42,8 +42,11 @@
 //!   is only inlinable that way too if the return value is ALSO used
 //!   (the `if`/`else` must then be in TAIL position, same restriction as
 //!   the return-value-only case). A `spec` call cannot reach this pass
-//!   at all (effects.rs already rejects it outside spec-only code); a
-//!   builtin call (e.g. `prio`) is a separate, still-unsupported gap.
+//!   at all (effects.rs already rejects it outside spec-only code). A
+//!   call to the builtin `prio` (a fixed-priority encoder) is separately
+//!   supported too, as a `mux` chain, and — unlike a call to another
+//!   user `fn`/`impl` — doesn't disqualify a callee from inlining; every
+//!   other builtin remains an explicit, still-unsupported gap.
 //! - No `<sequences>` rules: run `lower::plan`/`render` first. This pass
 //!   only lowers "guarded atomic rule" to hardware, not "cycle-crossing
 //!   rule" to guarded atomic rules — that is `lower`'s job.
@@ -1037,56 +1040,72 @@ fn is_ident_named_inst(ast: &Ast, res: &Resolution, id: ExprId, name: &str) -> b
         })
 }
 
-/// Whether any `Expr::Call` appears anywhere in `id`'s subtree — used to
-/// reject a callee whose own body calls something else (see
-/// `Emitter::compile_call`'s doc comment for why that rules out
-/// recursion too, not just deep inlining).
-fn expr_contains_call(ast: &Ast, id: ExprId) -> bool {
+/// Whether any call to a user `fn`/`impl` appears anywhere in `id`'s
+/// subtree — used to reject a callee whose own body calls something
+/// else (see `Emitter::compile_call`'s doc comment for why that rules
+/// out recursion too, not just deep inlining). A call to a BUILTIN
+/// (`prio`, etc.) does NOT count: a builtin has no body of its own to
+/// (re)inline, so it carries none of the reentrancy/recursion risk this
+/// check exists to rule out — see `Emitter::compile_builtin_call`. Its
+/// own arguments are still walked, though: `prio(SomeUserFn(x))` must
+/// still disqualify on `SomeUserFn`.
+fn expr_contains_call(ast: &Ast, res: &Resolution, id: ExprId) -> bool {
     match ast.expr(id) {
-        Expr::Call { .. } => true,
-        Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => false,
-        Expr::Unary { operand, .. } => expr_contains_call(ast, *operand),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_contains_call(ast, *lhs) || expr_contains_call(ast, *rhs)
+        Expr::Call { callee, args } => {
+            let is_user_call = res
+                .expr_defs
+                .get(callee)
+                .is_some_and(|d| matches!(res.def(*d).kind, DefKind::Fn | DefKind::Impl));
+            is_user_call || args.iter().any(|a| expr_contains_call(ast, res, *a))
         }
-        Expr::Guard(inner) | Expr::Spawn(inner) => expr_contains_call(ast, *inner),
-        Expr::Field { base, .. } => expr_contains_call(ast, *base),
+        Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => false,
+        Expr::Unary { operand, .. } => expr_contains_call(ast, res, *operand),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_contains_call(ast, res, *lhs) || expr_contains_call(ast, res, *rhs)
+        }
+        Expr::Guard(inner) | Expr::Spawn(inner) => expr_contains_call(ast, res, *inner),
+        Expr::Field { base, .. } => expr_contains_call(ast, res, *base),
         Expr::Bracket { callee, args } => {
-            expr_contains_call(ast, *callee) || args.iter().any(|a| expr_contains_call(ast, *a))
+            expr_contains_call(ast, res, *callee)
+                || args.iter().any(|a| expr_contains_call(ast, res, *a))
         }
     }
 }
 
 /// True if a callee's own body (or one of its `if`/`else` branches, same
-/// shape) contains a call ANYWHERE — a `let`/`return` expression, a
-/// write's RHS, an `if`'s condition, nested arbitrarily deep through
-/// its own `if`/`else`. `validate_call` runs this ONCE, on the whole
-/// body, as the single choke point every inlining entry point
-/// (`compile_call`'s return-value splice, `call_writes_reg`/
-/// `call_writes_port`'s write-hunt) goes through — so a call buried
-/// only reachable through the write-hunt path (a bare-statement call
-/// whose return value nothing ever asks for) still gets this checked,
-/// not just the return-value path `compile_callee_body` walks.
-fn body_contains_call(ast: &Ast, stmts: &[StmtId]) -> bool {
+/// shape) contains a call to a user `fn`/`impl` ANYWHERE — a
+/// `let`/`return` expression, a write's RHS, an `if`'s condition, nested
+/// arbitrarily deep through its own `if`/`else` (a call to a BUILTIN
+/// does not count — see `expr_contains_call`). `validate_call` runs
+/// this ONCE, on the whole body, as the single choke point every
+/// inlining entry point (`compile_call`'s return-value splice,
+/// `call_writes_reg`/`call_writes_port`'s write-hunt) goes through — so
+/// a call buried only reachable through the write-hunt path (a
+/// bare-statement call whose return value nothing ever asks for) still
+/// gets this checked, not just the return-value path
+/// `compile_callee_body` walks.
+fn body_contains_call(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> bool {
     stmts.iter().any(|s| match ast.stmt(*s) {
-        Stmt::Let { init, .. } => expr_contains_call(ast, *init),
-        Stmt::Assign { lhs, rhs } => expr_contains_call(ast, *lhs) || expr_contains_call(ast, *rhs),
-        Stmt::Return(Some(e)) => expr_contains_call(ast, *e),
+        Stmt::Let { init, .. } => expr_contains_call(ast, res, *init),
+        Stmt::Assign { lhs, rhs } => {
+            expr_contains_call(ast, res, *lhs) || expr_contains_call(ast, res, *rhs)
+        }
+        Stmt::Return(Some(e)) => expr_contains_call(ast, res, *e),
         Stmt::Return(None) | Stmt::Tick => false,
-        Stmt::Expr(e) => expr_contains_call(ast, *e),
+        Stmt::Expr(e) => expr_contains_call(ast, res, *e),
         Stmt::If {
             cond,
             then_body,
             else_body,
         } => {
-            expr_contains_call(ast, *cond)
-                || body_contains_call(ast, then_body)
+            expr_contains_call(ast, res, *cond)
+                || body_contains_call(ast, res, then_body)
                 || else_body
                     .as_ref()
-                    .is_some_and(|b| body_contains_call(ast, b))
+                    .is_some_and(|b| body_contains_call(ast, res, b))
         }
         Stmt::While { cond, body } => {
-            expr_contains_call(ast, *cond) || body_contains_call(ast, body)
+            expr_contains_call(ast, res, *cond) || body_contains_call(ast, res, body)
         }
     })
 }
@@ -1956,6 +1975,37 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// `width_of`, but first follows `id` through `self.locals`
+    /// substitution — a local, or a called function's parameter, has no
+    /// width of its own worth trusting when its callee's body was only
+    /// ever type-checked once, generically (see `compile_call`'s doc
+    /// comment on the `bits[N]`-generic-callee width subtlety: `N` is
+    /// never concretely resolved in a generic callee's OWN
+    /// `types.expr_tys` entries). Following the chain lands on whatever
+    /// expression it's ultimately bound to — back in some concrete call
+    /// site's own context, not a generic callee body — which has a
+    /// real, instantiated width. Needed anywhere a callee-body
+    /// expression's width is used for something OTHER than the callee's
+    /// own return value (which `compile_call`/`compile_callee_body`
+    /// already hint explicitly): e.g. `prio`'s argument, whose width
+    /// (`N`) differs from the call's own output width (`clog2(N)`), so
+    /// the existing hint can't stand in for it.
+    fn concrete_width_of(&mut self, mut id: ExprId) -> u64 {
+        while let Expr::Ident(_) = self.ast.expr(id) {
+            let Some(def) = self.res.expr_defs.get(&id).copied() else {
+                break;
+            };
+            if !matches!(self.res.def(def).kind, DefKind::Local | DefKind::Param) {
+                break;
+            }
+            let Some(&bound) = self.locals.get(&def) else {
+                break;
+            };
+            id = bound;
+        }
+        self.width_of(id)
+    }
+
     /// Top-level entry: no width hint, so a bare literal falls back to
     /// its own (usually absent) type. Prefer `compile_expr_hinted` from
     /// any caller that knows the width the literal should take on —
@@ -2050,15 +2100,15 @@ impl<'a> Emitter<'a> {
                     .map(|d| self.res.def(*d).kind)
                 {
                     Some(DefKind::Fn | DefKind::Impl) => self.compile_call(id, callee, &args, hint),
+                    Some(DefKind::Builtin) => self.compile_builtin_call(id, callee, &args, hint),
                     _ => {
                         self.error(
                             self.ast.expr_spans[id.0 as usize].clone(),
                             "this call is not yet supported in FIRRTL emission (v0 \
                              restriction: only a call to a user `fn`/`impl` with a \
                              simple body — `let` bindings, `if`/`else` branches, and a \
-                             trailing `return`, no state writes, no nested calls — can \
-                             be inlined; builtin calls like `prio` are not yet \
-                             synthesizable)"
+                             trailing `return`, no nested user-function calls — can be \
+                             inlined; or a call to the builtin `prio`)"
                                 .to_string(),
                         );
                         Err(())
@@ -2264,7 +2314,7 @@ impl<'a> Emitter<'a> {
         // vanish from the emitted hardware, with `effects.rs` still
         // correctly (and now misleadingly) telling schedule.rs that the
         // rule writes `w`.
-        if body_contains_call(self.ast, &body) {
+        if body_contains_call(self.ast, self.res, &body) {
             self.error(
                 span,
                 "this function's body calls another function or builtin, which is not \
@@ -2327,6 +2377,69 @@ impl<'a> Emitter<'a> {
             }
         }
         result
+    }
+
+    /// A builtin has no body to splice (unlike a user `fn`/`impl`) — each
+    /// one needs its own hand-written FIRRTL construction. `prio` is the
+    /// only one synthesizable today; the rest (`bits`/`wire`/`list`/`any`
+    /// never reach here at all — `bits[N]` is a type-position construct,
+    /// `any` is spec/`chooses`-only, both handled entirely by types.rs/
+    /// effects.rs before emission — and `clog2`/`trunc`/`pack`/`len` are
+    /// real gaps but have no in-repo caller yet) fall through to an
+    /// explicit error.
+    fn compile_builtin_call(
+        &mut self,
+        id: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let def = *self.res.expr_defs.get(&callee).expect("checked by caller");
+        match self.res.def(def).name.as_str() {
+            "prio" => self.compile_prio(id, args, hint),
+            name => {
+                self.error(
+                    self.ast.expr_spans[id.0 as usize].clone(),
+                    format!(
+                        "calling the builtin `{name}` is not yet supported in FIRRTL \
+                         emission (v0 restriction: only `prio` — a fixed-priority \
+                         encoder — is synthesizable today)"
+                    ),
+                );
+                Err(())
+            }
+        }
+    }
+
+    /// `prio(reqs)`: a fixed-priority encoder over `reqs`'s bits — the
+    /// LOWEST set bit wins (bit 0 highest priority), matching the
+    /// classic fixed-priority-arbiter convention. `reqs == 0` returns
+    /// `0`, a defined but not-meaningful value; gating on `reqs != 0`
+    /// (when that matters) is the CALLER's job, the same way a `fails`
+    /// precondition is established by the caller, not the failing
+    /// primop itself. Built as a right-nested `mux` chain, checked from
+    /// bit 0 outward (bit 0's `mux` is OUTERMOST, so it wins ties):
+    /// `mux(bit0, 0, mux(bit1, 1, mux(bit2, 2, ... UInt(0))))`.
+    fn compile_prio(
+        &mut self,
+        id: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let Some(&reqs) = args.first() else {
+            self.error(span, "`prio` takes exactly one argument".to_string());
+            return Err(());
+        };
+        let n = self.concrete_width_of(reqs);
+        let reqs_str = self.compile_expr(reqs)?;
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let mut acc = format!("UInt<{w}>(0)");
+        for i in (0..n).rev() {
+            let bit = format!("bits({reqs_str}, {i}, {i})");
+            acc = format!("mux({bit}, UInt<{w}>({i}), {acc})");
+        }
+        Ok(acc)
     }
 
     /// Compiles a callee's body (or an `if`/`else` branch of one, which

@@ -20,10 +20,25 @@
   than the write-hunt walk). A call's own state-reaching reads/writes
   (transitively, through the whole call graph) are checked against the
   CALL site's module, not just the callee's declaration site
-  (`validate_call` in firrtl.rs, uses `Resolution::def_owner`). Builtin
-  calls (`prio`, etc.) are a separate, still-unsupported gap — nothing
-  about builtin-call synthesis is implied by any of this. See
-  `examples/call.tr`, `examples/call_branch.tr`, `examples/call_writes.tr`.
+  (`validate_call` in firrtl.rs, uses `Resolution::def_owner`). Of the
+  builtins, only `prio` (a fixed-priority encoder) is synthesizable,
+  as a `mux` chain (`compile_prio`) — it doesn't disqualify a callee
+  from inlining the way a call to another user `fn`/`impl` still does.
+  `clog2`/`trunc`/`pack`/`len` remain type-only: type-checked, but
+  rejected with an explicit "not yet supported" error the moment one
+  is actually called from synthesizable code (no in-repo caller
+  exercises this today). `bits`/`wire`/`list`/`any`/`sync`/`race`
+  aren't this kind of gap at all — type-position constructs, a
+  spec/`chooses`-only construct, or (`sync`/`race`) a separate
+  FSM/spawn-sequencing gap already rejected in `lower.rs`. A generic
+  callee parameter's own width (`bits[N]`) is only resolvable, inside
+  the callee's body, for its OWN return value (hint-threaded) or by
+  following it through `self.locals` back to a concrete call-site
+  expression (`concrete_width_of`, used by `compile_prio`'s argument
+  today) — anywhere else a callee-body expression's width is needed
+  independent of the return value, this same gap can resurface. See
+  `examples/call.tr`, `examples/call_branch.tr`, `examples/call_writes.tr`,
+  `examples/call_prio.tr`.
 - Expression surface still excludes: other field access, `/`/`%`,
   dynamic-amount shifts (shift amount must be a literal), computed
   bit-select/slice bounds (must be literal), and logical `!` (only `~`

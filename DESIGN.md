@@ -994,6 +994,74 @@ and returning a value) through real firtool and Icarus simulation, observing BOT
 through real ports so a wrong value on EITHER side would fail the testbench, not just
 "firtool accepted it."
 
+**`prio`, the one synthesizable builtin, added 2026-07-31** (the calls TODO bullet's
+last remaining item — the user asked to go for both remaining sub-items, state-writing
+callees and builtin calls, together; this is the second, landed as its own commit on
+its own recon per the state-writing-callees section's own guidance not to conflate two
+differently-shaped features). Every other builtin (`bits`, `wire`, `list`, `any`,
+`clog2`, `pack`, `trunc`, `len`, `sync`, `race`) is either a type-position construct
+resolved entirely in types.rs before any expression is ever "called" (`bits[N]`), a
+spec/`chooses`-only construct that can't reach synthesizable code at all (`any`), a
+separate FSM/spawn-sequencing gap already rejected by `lower.rs` (`sync`/`race`), or a
+real gap with no in-repo caller yet (`clog2`/`trunc`/`pack`/`len` — type-checked
+identically to `prio`, but nothing in the repo actually calls one from synthesizable
+code today, so they stay an explicit "not yet supported" error rather than a designed
+feature). `prio` is the one exception: it has a real, in-repo consumer
+(`examples/arbiter.tr`'s `RoundRobin`, refining a `spec AnyGrant` that names it a
+nondeterministic choice `any` must be narrowed to a real requester) and a documented
+intent — "priority encoder" — but, before this pass, no documented ENCODING. Every
+existing test only checked `prio`'s TYPE (`bits[N] -> bits[clog2(N)]`), never its
+actual returned value for a given input. That's a real gap in a repo whose stated
+practice is verifying claims by running code: there was no code to run.
+
+**Semantics, decided here, not invented in isolation** (confirmed with Lumi before
+writing any emission code, since this becomes permanent source-of-truth the moment
+it's implemented): `prio(reqs)` is a FIXED-priority encoder — the LOWEST set bit in
+`reqs` wins (bit 0 is highest priority), and `reqs == 0` returns `0`, a defined but
+not-meaningful value; gating on `reqs != 0` (when that matters) is the CALLER's job,
+the same way a `fails` precondition is established by the caller, not the failing
+primop itself. Note the naming trap in `arbiter.tr`: the impl is called `RoundRobin`,
+but `prio` does NOT rotate — it's a legal refinement of `AnyGrant` (any set bit is a
+valid pick, and the lowest one always is one), just a fixed-priority one, not an
+actually-rotating one. The name predates this implementation and is a pre-existing
+misnomer, not a claim about `prio`'s behavior.
+
+Built as a right-nested `mux` chain, bit 0 outermost so it's checked (and wins) first:
+`mux(bit0, 0, mux(bit1, 1, mux(bit2, 2, ... UInt(0))))` (`compile_prio`). Unlike a call
+to a user `fn`/`impl`, a call to `prio` does NOT disqualify its enclosing callee from
+inlining (`expr_contains_call`/`body_contains_call`, the shared "does this body call
+anything else" check `validate_call` runs for every entry point, now only counts a call
+whose callee resolves to `DefKind::Fn`/`Impl` — a builtin has no body of its own to
+(re)inline, so it carries none of the reentrancy/recursion risk that check exists to
+rule out). A call NESTED INSIDE a builtin's own argument still counts, though:
+`prio(SomeUserFn(x))` still disqualifies on `SomeUserFn`, pinned by
+`nested_user_call_inside_a_builtins_argument_still_disqualifies` (tests/firrtl.rs).
+
+One correctness subtlety, caught by actually trying `examples/call_prio.tr`'s generic
+`RoundRobin(reqs : bits[N])` shape (matching `arbiter.tr`'s own signature) rather than
+only a concrete-width version: `prio`'s argument's OWN width, looked up directly via
+`types.expr_tys`, is unreliable inside a callee body for the same reason noted above for
+implicit-width params — the callee's body is type-checked exactly once, generically,
+independent of any call site, so `N` is never concretely resolved there. This differs
+from the RETURN-value width subtlety already documented above: THAT one is solved by
+`compile_call` threading the call's own already-concrete OUTER width down as an explicit
+hint — but `prio`'s output width (`clog2(N)`) and its input width (`N`) are different
+quantities, so the existing hint can't stand in for the argument's width too. New fix,
+`concrete_width_of`: follows the argument expression through `self.locals` substitution
+(the same mechanism that already resolves a local/param reference to its bound value)
+to whatever it's ultimately bound to — back in some concrete call site's own context,
+not the generic callee body — and reads WIDTH from there instead. This is a narrow fix
+for `prio`'s specific need, not a general solution: anywhere else a callee-body
+expression's width is needed independent of its own return value, this same class of
+gap can resurface (noted in TODO.md).
+
+`examples/call_prio.tr` (a generic-width `RoundRobin` wrapping `prio`, matching
+`arbiter.tr`'s actual shape) proves the encoding through real firtool and Icarus
+simulation, deliberately exercising the discriminating cases a narrower test would
+miss: a single bit set, two bits set with the lower one expected to win (a real tie,
+not just "the only bit happens to be the answer"), all bits set (lowest still wins),
+and the all-zero fallback.
+
 ## Tooling
 
 **Editor support added 2026-07-30**, `editors/vscode/`: TextMate-grammar syntax

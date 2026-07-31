@@ -1211,22 +1211,98 @@ module M {
 }
 
 #[test]
-fn call_to_a_builtin_is_still_an_error() {
-    // Only a user `fn`/`impl` call is inlined; a builtin call like
-    // `prio` is a separate, still-unsupported gap (see TODO.md) — this
-    // pins that the two don't get conflated.
+fn call_to_an_unsynthesizable_builtin_is_still_an_error() {
+    // `prio` is the one synthesizable builtin (see the `prio_*` tests
+    // below); the rest (`trunc` here) remain an explicit, separate gap —
+    // this pins that the two don't get conflated.
     let src = "\
 module M {
-    input a : bits[8]
+    input a : bits[16]
     output result : bits[8] = 0
     rule r {
-        result := prio(a)
+        result := trunc(a, 8)
     }
 }
 ";
     let err = emit_from_source(src).unwrap_err();
     assert!(err.iter().any(|e| {
         e.message
-            .contains("builtin calls like `prio` are not yet synthesizable")
+            .contains("calling the builtin `trunc` is not yet supported")
     }));
+}
+
+#[test]
+fn prio_encodes_the_lowest_set_bit_as_a_priority_mux_chain() {
+    let src = "\
+module M {
+    input reqs : bits[4]
+    output grant : bits[2] = 0
+    rule r {
+        grant := prio(reqs)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_grant, mux(bits(reqs, 0, 0), UInt<2>(0), \
+         mux(bits(reqs, 1, 1), UInt<2>(1), mux(bits(reqs, 2, 2), UInt<2>(2), \
+         mux(bits(reqs, 3, 3), UInt<2>(3), UInt<2>(0)))))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn prio_inlines_through_a_user_fn_that_wraps_it() {
+    // Matches `examples/arbiter.tr`'s `RoundRobin` shape: a `prio` call
+    // living inside an otherwise-ordinary inlinable callee body. A
+    // builtin call doesn't disqualify the callee from inlining the way
+    // a call to another user `fn`/`impl` still does (see
+    // `nested_user_call_inside_a_builtins_argument_still_disqualifies`).
+    let src = "\
+module M {
+    input reqs : bits[4]
+    output grant : bits[2] = 0
+
+    RoundRobin(r : bits[4]) : bits[2] <combines> {
+        return prio(r)
+    }
+
+    rule r {
+        grant := RoundRobin(reqs)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_grant, mux(bits(reqs, 0, 0), UInt<2>(0),"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn nested_user_call_inside_a_builtins_argument_still_disqualifies() {
+    // `prio` itself doesn't disqualify a callee from inlining, but a
+    // user call NESTED INSIDE its argument still must: `expr_contains_
+    // call` walks into a builtin call's own arguments even though the
+    // builtin call itself doesn't count.
+    let src = "\
+module M {
+    input reqs : bits[4]
+    output grant : bits[2] = 0
+
+    Widen(x : bits[4]) : bits[4] <combines> {
+        return x
+    }
+    RoundRobin(r : bits[4]) : bits[2] <combines> {
+        return prio(Widen(r))
+    }
+
+    rule r {
+        grant := RoundRobin(reqs)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("calls another function or builtin"))
+    );
 }

@@ -1,0 +1,12 @@
+RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines> {
+    return prio(reqs)
+}
+
+module Top {
+    input reqs : bits[4]
+    output grant : bits[2] = 0
+
+    rule pick {
+        grant := RoundRobin(reqs)
+    }
+}
