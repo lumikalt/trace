@@ -57,6 +57,11 @@
   and unary `-` are supported). `instance.port` is reads only; writes
   only as a whole statement's LHS. See `examples/alu.tr` for what's
   covered: `*`, `&`/`|`/`^`, `<<`/`>>`, unary `-`/`~`, `x[i]`/`x[hi..lo]`.
+  Verilog-style sized literals (`8'd6`/`8'hFF`/`8'b1010`/`8'6`) are also
+  supported, typing directly as `bits[width]` rather than absorbing a
+  width from context the way a bare integer literal does — overflow
+  against their own declared width is a compile error, not silent
+  truncation. See `examples/sized_literal.tr`.
 - Memory writes can't nest in `if`/`while` (register writes can, via a
   `mux`; mem writes are still top-level-only).
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax

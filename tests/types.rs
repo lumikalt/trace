@@ -258,6 +258,25 @@ fn literals_must_fit() {
 }
 
 #[test]
+fn sized_literals_type_directly_and_check_their_own_width() {
+    // Unlike a bare literal, `4'd20` has a definite width of its own —
+    // checked immediately against ITS OWN declared width, not deferred
+    // to wherever it's later used.
+    let (_, _, errors) =
+        run("module M {\n output a : bits[8] = 0\n rule r {\n a := 4'd20\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("20 does not fit in bits[4]"));
+
+    // A real Bits type, not the coercible Ty::Int a bare literal gets:
+    // combining it with a wider value widens to the max, the same rule
+    // two differently-sized real registers already get, not an error.
+    run_ok(
+        "module M {\n input x : bits[16]\n output result : bits[16] = 0\n rule r {\n \
+         result := x + 8'd6\n }\n}\n",
+    );
+}
+
+#[test]
 fn instance_ports_check_direction_and_width() {
     let child = "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
                   rule r {\n b := a\n}\n}\n";

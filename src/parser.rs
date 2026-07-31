@@ -668,6 +668,20 @@ impl<'a> Parser<'a> {
                 };
                 self.ast.push_expr(Expr::Int(value), span)
             }
+            Some(SizedInt) => {
+                let span = self.bump().unwrap().span;
+                let (width, value) = match parse_sized_int(self.text(&span)) {
+                    Some(wv) => wv,
+                    None => {
+                        self.errors.push(ParseError {
+                            span: span.clone(),
+                            message: "sized literal too large".to_string(),
+                        });
+                        (1, 0)
+                    }
+                };
+                self.ast.push_expr(Expr::SizedInt { width, value }, span)
+            }
             Some(LParen) => {
                 self.bump();
                 self.skip_newlines();
@@ -795,4 +809,20 @@ fn parse_int(text: &str) -> Option<u64> {
     } else {
         text.parse().ok()
     }
+}
+
+/// `<width>'<radix?><value>` — e.g. `8'd6`, `8'hFF`, `8'b1010`, `8'o17`,
+/// or `8'6` (no radix letter, defaulting to decimal like `'d`).
+fn parse_sized_int(text: &str) -> Option<(u64, u64)> {
+    let (width, rest) = text.split_once('\'')?;
+    let width = width.replace('_', "").parse().ok()?;
+    let rest = rest.replace('_', "");
+    let value = match rest.as_bytes().first() {
+        Some(b'd') => rest[1..].parse().ok()?,
+        Some(b'h') => u64::from_str_radix(&rest[1..], 16).ok()?,
+        Some(b'b') => u64::from_str_radix(&rest[1..], 2).ok()?,
+        Some(b'o') => u64::from_str_radix(&rest[1..], 8).ok()?,
+        _ => rest.parse().ok()?,
+    };
+    Some((width, value))
 }

@@ -86,6 +86,19 @@ impl<'a> Emitter<'a> {
                 let w = hint.unwrap_or_else(|| self.width_of(id));
                 Ok(format!("UInt<{w}>({v})"))
             }
+            // Unlike a bare `Int`, this already has its own definite
+            // width (types.rs types it as `Bits(Known(width))`, not the
+            // "absorb from context" `Ty::Int`) — so, like `compile_prio`/
+            // `compile_trunc`/`compile_pack`'s own output, it ignores any
+            // external hint and always emits at its own declared width.
+            // A width mismatch against its context (e.g. `x + 8'd6` where
+            // `x` is wider) is exactly the same "mismatched-width Bits
+            // operands" case two real registers of different widths
+            // already produce (`type_binop`'s `Width::Known(x.max(y))`
+            // rule) — FIRRTL's own primops (`add`, etc.) already handle
+            // that, the same way `tail(add(l, r), 1)` already trusts them
+            // to for any two differently-sized real operands.
+            Expr::SizedInt { width, value } => Ok(format!("UInt<{width}>({value})")),
             Expr::Binary { op, lhs, rhs } => self.compile_binop(id, op, lhs, rhs),
             Expr::Unary { op, operand } => self.compile_unop(id, op, operand),
             Expr::Bracket { callee, args } => {
@@ -163,14 +176,16 @@ impl<'a> Emitter<'a> {
             rhs,
         } = self.ast.expr(arg)
         {
-            match (self.ast.expr(*lhs), self.ast.expr(*rhs)) {
-                (Expr::Int(hi), Expr::Int(lo)) => Some((*hi, *lo)),
+            // `const_eval` already accepts a bare `Int` or a sized
+            // literal (`8'd3`) equally — no new literal-recognition
+            // logic needed here, just reusing it instead of matching
+            // `Expr::Int`/`Expr::SizedInt` by hand.
+            match (self.const_eval(*lhs), self.const_eval(*rhs)) {
+                (Some(hi), Some(lo)) => Some((hi, lo)),
                 _ => None,
             }
-        } else if let Expr::Int(i) = self.ast.expr(arg) {
-            Some((*i, *i))
         } else {
-            None
+            self.const_eval(arg).map(|i| (i, i))
         };
         let Some((hi, lo)) = bounds else {
             self.error(
@@ -327,7 +342,7 @@ impl<'a> Emitter<'a> {
         lhs: ExprId,
         rhs: ExprId,
     ) -> Result<String, ()> {
-        let Expr::Int(n) = self.ast.expr(rhs) else {
+        let Some(n) = self.const_eval(rhs) else {
             self.error(
                 self.ast.expr_spans[rhs.0 as usize].clone(),
                 "shift amount must be a literal integer in FIRRTL emission (v0 \
@@ -336,7 +351,6 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         };
-        let n = *n;
         let w = self.width_of(lhs);
         let l = self.compile_expr_hinted(lhs, Some(w))?;
         Ok(match op {

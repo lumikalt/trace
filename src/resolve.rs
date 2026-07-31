@@ -564,7 +564,7 @@ impl<'a> Resolver<'a> {
                     self.error(span, format!("cannot find `{text}`"));
                 }
             }
-            Expr::Int(_) | Expr::Wildcard => {}
+            Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
             Expr::Unary { operand, .. } => self.resolve_expr(operand, in_type),
             Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs, in_type);

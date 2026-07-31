@@ -299,7 +299,7 @@ impl<'a> Checker<'a> {
                     sig.reads.insert(def);
                 }
             }
-            Expr::Int(_) | Expr::Wildcard => {}
+            Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
             Expr::Unary { operand, .. } => self.infer_expr(*operand, sig),
             Expr::Binary { lhs, rhs, .. } => {
                 self.infer_expr(*lhs, sig);
@@ -476,7 +476,7 @@ impl<'a> Checker<'a> {
                 self.check_expr(rhs, item, sig, elab);
             }
             Expr::Field { base, .. } => self.check_expr(base, item, sig, elab),
-            Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => {}
+            Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
         }
     }
 

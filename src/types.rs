@@ -312,6 +312,7 @@ impl<'a> TypeChecker<'a> {
     fn const_eval(&self, id: ExprId, env: &HashMap<DefId, u64>) -> Option<u64> {
         match self.ast.expr(id) {
             Expr::Int(v) => Some(*v),
+            Expr::SizedInt { value, .. } => Some(*value),
             Expr::Ident(_) => {
                 let def = self.res.expr_defs.get(&id)?;
                 env.get(def).copied()
@@ -623,6 +624,21 @@ impl<'a> TypeChecker<'a> {
     fn type_expr_inner(&mut self, id: ExprId, locals: &mut HashMap<DefId, Ty>) -> Ty {
         match self.ast.expr(id).clone() {
             Expr::Int(_) => Ty::Int,
+            // Unlike a bare `Int`, a sized literal has its own definite
+            // width, so it types directly as `Bits(Known(width))` — no
+            // "absorb from context" — and is range-checked right here,
+            // against ITS OWN declared width, rather than deferred to
+            // `check_literal_fits` at whatever coercion site it's later
+            // used in (matches the same `bits_needed` helper that uses).
+            Expr::SizedInt { width, value } => {
+                if bits_needed(value) > width {
+                    self.error(
+                        self.expr_span(id),
+                        format!("{value} does not fit in bits[{width}]"),
+                    );
+                }
+                Ty::Bits(Width::Known(width))
+            }
             Expr::Wildcard => Ty::Unknown,
             Expr::Ident(_) => {
                 let Some(def) = self.res.expr_defs.get(&id).copied() else {

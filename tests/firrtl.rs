@@ -602,6 +602,114 @@ module M {
 }
 
 #[test]
+fn sized_literal_emits_its_own_declared_width() {
+    let src = "\
+module M {
+    output a : bits[8] = 0
+    output b : bits[8] = 0
+    output c : bits[8] = 0
+    output d : bits[8] = 0
+    rule r {
+        a := 8'd6
+        b := 8'hFF
+        c := 8'b1010
+        d := 8'6
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_a, UInt<8>(6)"));
+    assert!(fir.contains("connect __out_b, UInt<8>(255)"));
+    assert!(fir.contains("connect __out_c, UInt<8>(10)"));
+    assert!(fir.contains("connect __out_d, UInt<8>(6)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn sized_literal_widens_in_arithmetic_against_a_wider_operand() {
+    // `8'd6`'s own width (8) is narrower than `x`'s (16) -- FIRRTL's own
+    // `add` primop already handles two differently-sized UInt operands
+    // (same as any two real registers of different widths), so this
+    // must NOT hint the literal up to 16 bits the way a bare, width-less
+    // `Int` literal would.
+    let src = "\
+module M {
+    input x : bits[16]
+    output result : bits[16] = 0
+    rule r {
+        result := x + 8'd6
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, tail(add(x, UInt<8>(6)), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn sized_literal_works_as_a_bit_select_bound_and_a_shift_amount() {
+    let src = "\
+module M {
+    input x : bits[16]
+    output bit3 : bits[1] = 0
+    output shifted : bits[16] = 0
+    rule r {
+        bit3 := x[8'd3]
+        shifted := x << 4'd2
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_bit3, bits(x, 3, 3)"));
+    assert!(fir.contains("connect __out_shifted, tail(shl(x, 2), 2)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn sized_literal_widens_via_a_bare_connect_into_a_wider_target() {
+    // Unlike arithmetic (where `add`/`sub`/etc. combine both operand
+    // widths themselves), a bare `result := 8'd6` connect has no op to
+    // do that widening -- it relies on FIRRTL's `connect` statement
+    // implicitly extending a narrower UInt source into a wider sink.
+    // Confirmed against real firtool: it accepts this and zero-extends
+    // (`16'h6`), the same as it would for two real registers of
+    // differing widths, so emitting the literal at its own declared
+    // width here (not the sink's) is correct, not a gap.
+    let src = "\
+module M {
+    output result : bits[16] = 0
+    rule r {
+        result := 8'd6
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, UInt<8>(6)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn sized_literal_compares_against_a_wider_operand() {
+    // Comparison ops don't unify operand widths in types.rs (Eq/Ne/etc.
+    // always type as bits[1] regardless of operand widths), and FIRRTL's
+    // `eq` primop itself implicitly extends the narrower operand -- so
+    // `x == 8'd6` with `x : bits[16]` needs no special-casing beyond
+    // what the sized literal already does (emit at its own width).
+    let src = "\
+module M {
+    input x : bits[16]
+    output eq : bits[1] = 0
+    rule r {
+        eq := x == 8'd6
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_eq, eq(x, UInt<8>(6))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn shift_by_a_non_literal_amount_is_an_error() {
     let src = "\
 module M {

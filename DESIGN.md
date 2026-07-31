@@ -791,6 +791,49 @@ negate, wrapping within the operand's own width, same convention as `+`/`-`); un
 `~` compiles straight to FIRRTL's `not`. Logical `!` is deliberately left out this
 pass — see TODO.md.
 
+**Verilog-style sized literals, added 2026-07-31**: `<width>'<radix?><value>` — e.g.
+`8'd6`, `8'hFF`, `8'b1010`, `8'o17`, or `8'6` (no radix letter, defaulting to decimal
+like `'d`). Lexed as its own token (`SizedInt`), longer than the plain `Int`
+alternative for the same input, so logos's longest-match rule always prefers it — no
+ambiguity with a bare integer immediately followed by a field access or anything else
+starting with `'`.
+
+This is a SECOND, deliberately different literal-typing model, not a variant of the
+existing one. A bare `Expr::Int` has no width of its own: it types as the coercible
+`Ty::Int`, absorbs a width from whatever context it's used in (`check_assignable`'s
+`(Ty::Int, Ty::Bits(_))` arm, `type_binop`'s mixed-operand arm), and is only
+overflow-checked later, at that coercion site. A sized literal has a definite width
+BY CONSTRUCTION: it types directly as `Ty::Bits(Width::Known(width))` and is
+range-checked immediately, against its OWN declared width, right where it's written —
+`4'd20` is an error ("20 does not fit in bits[4]") even in a context that could
+otherwise absorb a wider value, and this doesn't defer to `check_literal_fits` the way
+a bare `Int` would. Confirmed with Lumi via AskUserQuestion before implementing:
+overflow is a compile error, not silent truncation like Verilog's own `4'd20` = 4 —
+keeping trace's existing anti-silent-truncation stance (the same reasoning behind
+requiring an explicit `trunc()` call elsewhere) rather than adopting Verilog's
+behavior just because the syntax is borrowed from it.
+
+Because it already has a real width, emission (`Expr::SizedInt` in `firrtl/expr.rs`)
+ignores any caller-supplied hint and always emits `UInt<width>(value)` directly — the
+opposite of a bare `Int`, which needs a hint to know what width to emit at.
+`compile_bit_select` and `compile_shift` were refactored from matching `Expr::Int`
+literally to using `const_eval` (which already transparently accepts either literal
+kind), so a sized literal works as a bit-select bound or shift amount for free, no new
+code needed there. When a sized literal's own width doesn't match its context's
+(narrower than an arithmetic operand, or a bare connect into a wider output), the
+mismatch is left to FIRRTL itself to resolve — confirmed empirically, not assumed:
+`result := 8'd6` into a `bits[16]` output compiles straight to
+`connect __out_result, UInt<8>(6)` and firtool accepts it, zero-extending on
+elaboration (`16'h6`), the exact same implicit-widening rule it already applies to two
+real registers of differing widths; `x == 8'd6` against a wider `x` behaves the same
+way through FIRRTL's own `eq` primop. Pinned by
+`sized_literal_widens_via_a_bare_connect_into_a_wider_target` and
+`sized_literal_compares_against_a_wider_operand` (tests/firrtl.rs).
+
+`examples/sized_literal.tr` proves it through real firtool and Icarus simulation,
+using a sized literal both in arithmetic (`x + 8'd6`) and as a bit-select bound
+(`x[8'd3]`).
+
 ## Calling a function from a rule
 
 **Achieved 2026-07-31.** A rule may call a user `fn`/`impl` (not `spec` — those stay

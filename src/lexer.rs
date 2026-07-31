@@ -64,6 +64,16 @@ pub enum TokenKind {
     Ident,
     #[regex(r"0x[0-9A-Fa-f][0-9A-Fa-f_]*|0b[01][01_]*|[0-9][0-9_]*")]
     Int,
+    /// A Verilog-style sized literal: `<width>'<radix?><value>` — e.g.
+    /// `8'd6`, `8'hFF`, `8'b1010`, `8'o17`, or `8'6` (no radix letter,
+    /// defaulting to decimal). Matched as its own token, longer than the
+    /// plain `Int` alternative for the same input, so logos's longest-
+    /// match rule always prefers this over reading just the width as a
+    /// bare `Int` and leaving `'d6` dangling.
+    #[regex(
+        r"[0-9][0-9_]*'(d[0-9][0-9_]*|h[0-9A-Fa-f][0-9A-Fa-f_]*|b[01][01_]*|o[0-7][0-7_]*|[0-9][0-9_]*)"
+    )]
+    SizedInt,
 
     #[token(":=")]
     ColonEq,

@@ -344,6 +344,7 @@ impl<'a> Emitter<'a> {
     pub(crate) fn const_eval(&self, id: ExprId) -> Option<u64> {
         match self.ast.expr(id) {
             Expr::Int(v) => Some(*v),
+            Expr::SizedInt { value, .. } => Some(*value),
             _ => None,
         }
     }

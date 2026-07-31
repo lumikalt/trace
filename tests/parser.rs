@@ -61,6 +61,16 @@ fn range_binds_loosest() {
 }
 
 #[test]
+fn sized_integer_literals_parse() {
+    assert_eq!(stmt_sexpr("x := 8'd6"), "(:= x 8'd6)");
+    assert_eq!(stmt_sexpr("x := 8'hFF"), "(:= x 8'd255)");
+    assert_eq!(stmt_sexpr("x := 8'b1010"), "(:= x 8'd10)");
+    assert_eq!(stmt_sexpr("x := 8'o17"), "(:= x 8'd15)");
+    assert_eq!(stmt_sexpr("x := 8'6"), "(:= x 8'd6)");
+    assert_eq!(stmt_sexpr("x := 16'd1_000"), "(:= x 16'd1000)");
+}
+
+#[test]
 fn guard_postfix() {
     assert_eq!(stmt_sexpr("(mode == Draining)?"), "(? (== mode Draining))");
     assert_eq!(stmt_sexpr("reqs[i]?"), "(? (index reqs i))");

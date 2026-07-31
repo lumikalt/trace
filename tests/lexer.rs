@@ -74,6 +74,14 @@ fn integer_literals() {
 }
 
 #[test]
+fn sized_integer_literals() {
+    assert_eq!(
+        kinds("8'd6 8'hFF 8'b1010 8'o17 8'6 8'd1_000"),
+        vec![SizedInt, SizedInt, SizedInt, SizedInt, SizedInt, SizedInt]
+    );
+}
+
+#[test]
 fn guard_and_fallible_call() {
     assert_eq!(
         kinds("(mode == Draining)?"),

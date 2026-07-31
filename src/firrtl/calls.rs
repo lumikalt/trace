@@ -33,7 +33,7 @@ pub(crate) fn expr_contains_call(ast: &Ast, res: &Resolution, id: ExprId) -> boo
                 .is_some_and(|d| matches!(res.def(*d).kind, DefKind::Fn | DefKind::Impl));
             is_user_call || args.iter().any(|a| expr_contains_call(ast, res, *a))
         }
-        Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => false,
+        Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => false,
         Expr::Unary { operand, .. } => expr_contains_call(ast, res, *operand),
         Expr::Binary { lhs, rhs, .. } => {
             expr_contains_call(ast, res, *lhs) || expr_contains_call(ast, res, *rhs)
@@ -99,7 +99,7 @@ pub(crate) fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
                 collect_calls(ast, *a, out);
             }
         }
-        Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => {}
+        Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
         Expr::Unary { operand, .. } => collect_calls(ast, *operand, out),
         Expr::Binary { lhs, rhs, .. } => {
             collect_calls(ast, *lhs, out);

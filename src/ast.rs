@@ -87,6 +87,16 @@ impl BinOp {
 pub enum Expr {
     Ident(String),
     Int(u64),
+    /// A Verilog-style sized literal, `<width>'<radix?><value>` (e.g.
+    /// `8'd6`, `8'hFF`, `8'6`) — unlike `Int`, which has no width of its
+    /// own and absorbs one from context, this types directly as
+    /// `Ty::Bits(Width::Known(width))` (types.rs), checked for overflow
+    /// against ITS OWN declared width immediately, not deferred to a
+    /// later coercion site.
+    SizedInt {
+        width: u64,
+        value: u64,
+    },
     Wildcard,
     Unary {
         op: UnOp,
@@ -278,6 +288,7 @@ impl Ast {
         match self.expr(id) {
             Expr::Ident(name) => name.clone(),
             Expr::Int(value) => value.to_string(),
+            Expr::SizedInt { width, value } => format!("{width}'d{value}"),
             Expr::Wildcard => "_".to_string(),
             Expr::Unary { op, operand } => {
                 let sym = match op {
