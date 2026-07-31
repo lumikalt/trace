@@ -788,8 +788,8 @@ indices are supported; a computed bound is a v0 restriction, not something the t
 checker would otherwise reject (it happily types a dynamic single-bit select as
 `bits[1]`). Unary `-` compiles to `tail(sub(UInt<w>(0), x), 1)` (two's-complement
 negate, wrapping within the operand's own width, same convention as `+`/`-`); unary
-`~` compiles straight to FIRRTL's `not`. Logical `!` is deliberately left out this
-pass — see TODO.md.
+`~` compiles straight to FIRRTL's `not`. Logical `!` was deliberately left out this
+pass (added later — see "Logical `!`" below).
 
 **Verilog-style sized literals, added 2026-07-31**: `<width>'<radix?><value>` — e.g.
 `8'd6`, `8'hFF`, `8'b1010`, `8'o17`, or `8'6` (no radix letter, defaulting to decimal
@@ -896,6 +896,48 @@ choice only) and confirmed BOTH paths actually pass end to end, not just the aut
 suite: `simulate div_rem` (the documented, user-facing command) and `cargo test` both
 report the correct `q1=15 q2=0 r1=5 r2=13` (`a=200, b=13`: `200/13=15`, `13/200=0`,
 `200%13=5`, `13%200=13`).
+
+**Logical `!`, added 2026-07-31, resolving the "bit-vs-whole-value ambiguity" flagged
+above as the reason it was left out of the div/rem pass.** Lumi raised the actual design
+question directly: does this language need `!` to mean something DIFFERENT from `~`
+(C-style "nonzero is true" truthiness for a wide value), or is it purely redundant with
+`~` given comparisons/guards already produce `bits[1]`? Checked before answering, not
+assumed: `check_cond` (types.rs, gating every `if`/`while` condition) already requires
+EXACT `bits[1]` type equality — `"condition must be bits[1], got {other} (compare
+explicitly)"` — there is no implicit "nonzero is true" coercion anywhere in this
+language for a wider `!x` to usefully mean. So the ambiguity resolves itself: wherever
+`!` would matter, the operand is already 1 bit, where bitwise-complement and logical
+negation are the identical operation. Also checked (and ruled irrelevant): `!=` lexes as
+its own atomic token (`BangEq`), never composed from unary `!` + `=`, so nothing about
+`!`'s own semantics has any mechanical bearing on `!=` — no `~=` rename is needed either
+way, that would be a pure surface-syntax aesthetic choice, not a technical consequence.
+
+Given a genuine choice between "`!` is pure sugar for `~`" and "`!` is a distinct
+operator that additionally REQUIRES `bits[1]`," Lumi picked the latter via
+AskUserQuestion — a real guardrail, not just an alternate spelling: `!x` on a `bits[8]`
+almost certainly means "did you mean a comparison, or `~`?", not "flip every bit," and
+now gets caught at type-check time instead of silently compiling to a bitwise complement
+nobody intended. Mechanism: `types.rs`'s `Expr::Unary` arm (previously ignoring `op`
+entirely — `Neg`/`Not`/`BitNot` all took the identical same-width-passthrough path) now
+special-cases `UnOp::Not` to additionally require `Ty::Bits(Width::Known(1))` (tolerating
+`Width::Unknown`/`Ty::Int`/`Ty::Unknown` the same way `check_cond` does, for a generic
+body not yet concretely instantiated) — `~`/`-` are unaffected. Once that's enforced,
+emission (`firrtl/expr.rs`'s `compile_unop`) needed no new logic at all: `UnOp::Not` and
+`UnOp::BitNot` now share one match arm, both emitting the identical `not(...)` FIRRTL
+primop, proved by asserting `!(x == 0)` and `~(x == 0)` compile to byte-identical FIRRTL
+text (`tests/firrtl.rs`'s
+`logical_not_compiles_identically_to_bitwise_not_on_a_bits_1_value`) — no new example or
+simulation testbench needed, since `~`'s own `not` primop is already proven correct
+through real Icarus simulation by `alu_tb.v`. Pinned in `tests/types.rs`'s
+`logical_not_needs_a_bits_1_operand`.
+
+**A separate, pre-existing looseness surfaced while investigating, deliberately left
+alone rather than folded into this pass:** unlike `if`/`while`, a bare guard `expr?`'s
+inner expression has NO `bits[1]` requirement anywhere in the type checker (`type_expr`'s
+`Expr::Guard` arm just inherits whatever type the inner expression already has). This is
+unrelated to `!` specifically — it would need its own investigation into whether it's
+reachable/harmful in practice — noted here rather than silently ignored, not yet added to
+TODO.md since its actual impact isn't confirmed.
 
 ## Calling a function from a rule
 

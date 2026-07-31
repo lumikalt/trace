@@ -18,7 +18,7 @@
 //! operand's width (it must fit). Writing a wider value into a narrower
 //! register is an error that names `trunc` — no silent truncation.
 
-use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Stmt, StmtId};
+use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Stmt, StmtId, UnOp};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
 use std::collections::HashMap;
@@ -669,18 +669,50 @@ impl<'a> TypeChecker<'a> {
                     _ => Ty::Unknown,
                 }
             }
-            Expr::Unary { operand, .. } => {
+            Expr::Unary { op, operand } => {
                 let t = self.type_expr(operand, locals);
                 match t {
-                    Ty::Bits(_) | Ty::Int | Ty::Unknown => t,
+                    Ty::Bits(_) | Ty::Int | Ty::Unknown => {}
                     other => {
                         self.error(
                             self.expr_span(id),
                             format!("unary operator needs bits, got {other}"),
                         );
-                        Ty::Unknown
+                        return Ty::Unknown;
                     }
                 }
+                // `!` is a real, distinct operator from `~`, not pure
+                // sugar for it: both compile to the identical FIRRTL
+                // `not` primop (see firrtl/expr.rs), but `!` additionally
+                // requires its operand already be `bits[1]` — a
+                // guardrail against accidentally bitwise-negating a
+                // wider value (`!x` on a `bits[8]` almost certainly means
+                // "did you mean a comparison, or `~`?", not "flip every
+                // bit"), since `check_cond` below already requires every
+                // condition position to be exactly `bits[1]` anyway —
+                // there is no implicit "nonzero is true" coercion
+                // anywhere in this language for `!` to usefully mean
+                // something wider.
+                if op == UnOp::Not
+                    && !matches!(
+                        t,
+                        Ty::Bits(Width::Known(1))
+                            | Ty::Bits(Width::Unknown)
+                            | Ty::Unknown
+                            | Ty::Int
+                    )
+                {
+                    self.error(
+                        self.expr_span(id),
+                        format!(
+                            "`!` needs a bits[1] operand, got {t} (use `~` for a \
+                             bitwise complement of a wider value, or compare \
+                             explicitly)"
+                        ),
+                    );
+                    return Ty::Unknown;
+                }
+                t
             }
             Expr::Binary { op, lhs, rhs } => {
                 let l = self.type_expr(lhs, locals);

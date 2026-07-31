@@ -208,6 +208,35 @@ module M {
 }
 
 #[test]
+fn logical_not_needs_a_bits_1_operand() {
+    // `!` and `~` compile to the identical FIRRTL `not` primop (see
+    // firrtl/expr.rs) -- what makes `!` a real, distinct operator rather
+    // than pure aliasing is this restriction: unlike `~`, which accepts
+    // any width, `!` requires its operand already be `bits[1]`, since
+    // there's no implicit "nonzero is true" coercion anywhere in this
+    // language (`conditions_must_be_one_bit`, above) for a wider `!x` to
+    // usefully mean.
+    let src = "\
+module M {
+    reg a : bits[8] = 0
+    output b : bits[8] = 0
+
+    rule r {
+        b := !a
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`!` needs a bits[1] operand"));
+
+    // A genuine bits[1] value -- a comparison's own result -- is fine.
+    run_ok(
+        "module M {\n reg a : bits[8] = 0\n output b : bits[1] = 0\n rule r {\n b := !(a == 0)\n }\n}\n",
+    );
+}
+
+#[test]
 fn shape_errors() {
     // Indexing a register.
     let (_, _, errors) = run("module M {\n reg a : bits[8] = 0\n rule r {\n x := a(3)\n }\n}\n");

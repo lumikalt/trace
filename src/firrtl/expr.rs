@@ -221,19 +221,18 @@ impl<'a> Emitter<'a> {
                 let e = self.compile_expr_hinted(operand, Some(w))?;
                 Ok(format!("tail(sub(UInt<{w}>(0), {e}), 1)"))
             }
-            UnOp::BitNot => {
+            // `!` and `~` emit the IDENTICAL FIRRTL `not` primop — types.rs
+            // already made them a real, distinct operator, not pure
+            // aliasing at this layer's expense: `!`'s own typing rule
+            // requires a `bits[1]` operand (a guardrail against
+            // accidentally bitwise-negating a wider value), while `~`
+            // accepts any width. Bitwise-complementing a single bit IS
+            // logical negation, so once that's enforced, there is nothing
+            // left for emission to do differently.
+            UnOp::BitNot | UnOp::Not => {
                 let w = self.width_of(id);
                 let e = self.compile_expr_hinted(operand, Some(w))?;
                 Ok(format!("not({e})"))
-            }
-            UnOp::Not => {
-                self.error(
-                    self.ast.expr_spans[id.0 as usize].clone(),
-                    "logical `!` is not yet supported in FIRRTL emission (v0 \
-                     restriction: use `~` for bitwise complement, or a comparison)"
-                        .to_string(),
-                );
-                Err(())
             }
         }
     }

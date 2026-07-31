@@ -785,21 +785,30 @@ module M {
 }
 
 #[test]
-fn logical_not_is_an_error_not_a_silent_bitwise_not() {
-    // `!` (UnOp::Not) is deliberately left unimplemented this pass —
-    // only `~` (BitNot) and unary `-` (Neg) are supported — so it must
-    // error, not silently fall through to some other emission.
+fn logical_not_compiles_identically_to_bitwise_not_on_a_bits_1_value() {
+    // `!` and `~` emit the IDENTICAL FIRRTL `not` primop -- what makes
+    // `!` a real, distinct operator (not just a parse-time alias) is a
+    // types.rs restriction (tests/types.rs's
+    // `logical_not_needs_a_bits_1_operand`): `!` requires its operand
+    // already be `bits[1]`, `~` accepts any width. Once that's enforced,
+    // bitwise-complementing the single bit IS logical negation, so
+    // there's nothing left for emission to do differently -- proved here
+    // by asserting both compile to the exact same FIRRTL text.
     let src = "\
 module M {
     input x : bits[8]
-    output y : bits[8] = 0
+    output bang : bits[1] = 0
+    output tilde : bits[1] = 0
     rule r {
-        y := !x
+        bang := !(x == 0)
+        tilde := ~(x == 0)
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(err.iter().any(|e| e.message.contains("logical `!`")));
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_bang, not(eq(x, UInt<8>(0)))"));
+    assert!(fir.contains("connect __out_tilde, not(eq(x, UInt<8>(0)))"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

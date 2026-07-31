@@ -83,7 +83,16 @@
     only as a whole statement's LHS).
   - Dynamic-amount shifts (the shift amount must be a literal).
   - Computed bit-select/slice bounds (`x[hi..lo]` bounds must be literal).
-  - Logical `!` (only `~` and unary `-` are supported).
+
+  `!` is now supported, as a real, distinct operator from `~`, not a
+  parse-time alias — both compile to the identical FIRRTL `not` primop,
+  but `!`'s own types.rs rule requires the operand already be `bits[1]`
+  (`~` accepts any width) — a guardrail against accidentally bitwise-
+  negating a wider value, since this language has no implicit "nonzero
+  is true" coercion anywhere (`if`/`while` conditions already require
+  exact `bits[1]`, same rule). See `tests/types.rs`'s
+  `logical_not_needs_a_bits_1_operand` and `tests/firrtl.rs`'s
+  `logical_not_compiles_identically_to_bitwise_not_on_a_bits_1_value`.
 
   `/` and `%` are now supported (`compile_binop`'s `Div`/`Rem` arms) —
   FIRRTL's own `div`/`rem` primops don't share `add`/`sub`/`mul`'s "always
