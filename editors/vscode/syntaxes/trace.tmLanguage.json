@@ -6,6 +6,7 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#declarations-with-name" },
+    { "include": "#sized-numbers" },
     { "include": "#numbers" },
     { "include": "#keywords" },
     { "include": "#effect-words" },
@@ -19,6 +20,11 @@
     "comments": {
       "name": "comment.line.double-dash.trace",
       "match": "--.*$"
+    },
+    "sized-numbers": {
+      "comment": "Verilog-style sized literal (`8'd6`/`8'hFF`/`8'b1010`/`8'o17`/`8'6`, see src/lexer.rs's SizedInt token) — listed BEFORE #numbers so `8` isn't matched as a bare number first, leaving `'d6` to fall through to #operators (`'`)/#identifiers (`d6`).",
+      "name": "constant.numeric.trace",
+      "match": "\\b[0-9][0-9_]*'(d[0-9][0-9_]*|h[0-9A-Fa-f][0-9A-Fa-f_]*|b[01][01_]*|o[0-7][0-7_]*|[0-9][0-9_]*)\\b"
     },
     "numbers": {
       "name": "constant.numeric.trace",
