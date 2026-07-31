@@ -823,7 +823,13 @@ module M {
 }
 
 #[test]
-fn call_to_a_function_that_writes_state_is_an_error() {
+fn call_inlines_a_function_that_writes_state_and_returns_a_value() {
+    // `Bump` both writes `v` (a side effect) and returns `x + 1` (its
+    // own value, assigned to `result`) from the SAME call site — the
+    // two are independent walks (`callee_reg_write` for `v`,
+    // `compile_callee_body` for `result`'s value via the normal return-
+    // value path) over the same statement, not one computation feeding
+    // the other.
     let src = "\
 module M {
     reg v : bits[8] = 0
@@ -840,10 +846,259 @@ module M {
     }
 }
 ";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, a"));
+    assert!(fir.contains("connect __out_result, tail(add(a, UInt<8>(1)), 1)"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_to_a_writing_function_as_a_bare_statement_discards_the_return_value() {
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        v := x
+        return x + 1
+    }
+
+    rule r {
+        Bump(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, a"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_writes_state_conditionally_inside_its_own_if_else() {
+    // Called as a BARE statement, so only the write-hunt path
+    // (`callee_reg_write`) ever looks at `Bump`'s body — it handles an
+    // `if`/`else` in any position, unlike the return-value path
+    // (`compile_callee_body`), which only accepts one in TAIL position.
+    // See `call_to_a_conditionally_writing_function_whose_return_value_
+    // is_used_requires_tail_position` for that boundary pinned the other
+    // way.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        if x > 10 {
+            v := x
+        } else {
+            v := 0
+        }
+        return x
+    }
+
+    rule r {
+        Bump(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, mux(gt(a, UInt<8>(10)), a, UInt<8>(0))"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_to_a_conditionally_writing_function_whose_return_value_is_used_requires_tail_position() {
+    // The exact same `Bump` as `call_writes_state_conditionally_inside_
+    // its_own_if_else`, but with its return value now consumed
+    // (`result := Bump(a)`) — this DOES run the return-value path
+    // (`compile_callee_body`), which requires a non-`let`/`Assign`
+    // statement (the `if`/`else` here) to be in TAIL position, not
+    // followed by a separate `return`. A clean error, not a silent
+    // miscompile (the whole emission fails before anything is written) —
+    // but a real asymmetry worth pinning: the SAME callee body is
+    // inlinable or not depending on whether its caller uses the return
+    // value.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        if x > 10 {
+            v := x
+        } else {
+            v := 0
+        }
+        return x
+    }
+
+    rule r {
+        result := Bump(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("too complex to inline for its RETURN value")
+    }));
+}
+
+#[test]
+fn same_writing_function_called_from_two_rules_gates_each_write_separately() {
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    input b : bits[8]
+    input sel : bits[1]
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        v := x
+        return x + 1
+    }
+
+    rule r1 {
+        (sel == 1)?
+        Bump(a)
+    }
+    rule r2 {
+        (sel == 0)?
+        Bump(b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("when fires_r1 :\n      connect v, a"));
+    assert!(fir.contains("when fires_r2 :\n      connect v, b"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn call_writes_an_instance_port() {
+    let src = "\
+module Child {
+    input a : bits[8]
+    output b : bits[8] = 0
+    rule pass {
+        b := a
+    }
+}
+module Top {
+    inst c : Child
+    input x : bits[8]
+
+    Drive(v : bits[8]) : bits[8] <combines> {
+        c.a := v
+        return v
+    }
+
+    rule r {
+        Drive(x)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect c.a, x"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_writing_call_nested_in_a_larger_expression_is_an_error_not_a_dropped_write() {
+    // `call_writes_reg`/`call_writes_port` only ever look for a
+    // writing call as a whole statement or the whole RHS of `:=` — a
+    // call nested one level deeper, here as an operand of `+`, would
+    // never be found by either walk, silently dropping `Bump`'s write
+    // to `v` while its return value still inlines fine. Must be an
+    // explicit error, not a silent miscompile.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        v := x
+        return x + 1
+    }
+
+    rule r {
+        result := Bump(a) + 1
+    }
+}
+";
     let err = emit_from_source(src).unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.message.contains("calling a function that writes state"))
+            .any(|e| e.message.contains("may only appear as a whole statement"))
+    );
+}
+
+#[test]
+fn a_writing_call_bound_to_a_let_is_an_error_not_a_dropped_write() {
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        v := x
+        return x + 1
+    }
+
+    rule r {
+        let t = Bump(a)
+        result := t
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("may only appear as a whole statement"))
+    );
+}
+
+#[test]
+fn a_write_transitively_reached_through_a_bare_statement_call_is_an_error() {
+    // Regression test for a real silent miscompile caught before this
+    // shipped: `Outer` (called as a bare statement, its return value
+    // unused) itself calls `Inner`, which writes `w`. `effects.rs`
+    // merges `Outer`'s signature to include `w` in its writes, so
+    // `schedule.rs` correctly believes the rule writes `w` — but with
+    // only `compile_callee_body`'s own (return-value-path-only) "no
+    // further calls" check, nothing on the write-hunt path
+    // (`call_writes_reg` -> `callee_reg_write`) ever rejected `Outer`
+    // calling `Inner`, so `callee_reg_write` scanned `Outer`'s body,
+    // found no direct `w :=`, and silently emitted no connection for
+    // `w` at all — no error, just missing hardware. `validate_call`'s
+    // `body_contains_call` check now runs for every entry point (return
+    // value AND write-hunt), so this is a clean error instead.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    reg w : bits[8] = 0
+    input a : bits[8]
+    Inner(y : bits[8]) : bits[8] <combines> {
+        w := y
+        return y
+    }
+    Outer(x : bits[8]) : bits[8] <combines> {
+        v := Inner(x)
+        return x
+    }
+    rule r {
+        Outer(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("calls another function or builtin"))
     );
 }
 

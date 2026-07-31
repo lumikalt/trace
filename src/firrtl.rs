@@ -30,14 +30,20 @@
 //!   through a `mux`, same as a register write).
 //! - A call to a user `fn`/`impl` is inlined at its call site (FIRRTL has
 //!   no call concept). Restricted to a callee whose body is zero or more
-//!   `let` bindings then either a trailing `return <expr>` or an
-//!   `if`/`else` whose branches both recurse into that same shape
-//!   (mandatory `else`, folded into a `mux`) — no state writes,
-//!   guards/fifo ops, or further calls anywhere (which also rules out
-//!   recursion: a callee that cannot call anything can never call
-//!   itself). A `spec` call cannot reach this pass at all (effects.rs
-//!   already rejects it outside spec-only code); a builtin call (e.g.
-//!   `prio`) is a separate, still-unsupported gap.
+//!   `let` bindings and state writes, then either a trailing
+//!   `return <expr>` or an `if`/`else` whose branches both recurse into
+//!   that same shape (mandatory `else`, folded into a `mux`) — no loops,
+//!   guards/fifo ops, or further calls anywhere in the callee (which
+//!   also rules out recursion: a callee that cannot call anything can
+//!   never call itself). A state write only reaches the emitted
+//!   hardware when the call site is a bare statement or the whole RHS
+//!   of `:=` (`check_writing_call_positions` rejects it anywhere else,
+//!   explicitly, rather than silently dropping it); a conditional write
+//!   is only inlinable that way too if the return value is ALSO used
+//!   (the `if`/`else` must then be in TAIL position, same restriction as
+//!   the return-value-only case). A `spec` call cannot reach this pass
+//!   at all (effects.rs already rejects it outside spec-only code); a
+//!   builtin call (e.g. `prio`) is a separate, still-unsupported gap.
 //! - No `<sequences>` rules: run `lower::plan`/`render` first. This pass
 //!   only lowers "guarded atomic rule" to hardware, not "cycle-crossing
 //!   rule" to guarded atomic rules — that is `lower`'s job.
@@ -70,7 +76,7 @@
 //! writer conflicts with every reader of the same array in v0), so
 //! `read-under-write` is never exercised — it is set to `undefined`.
 
-use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Stmt, StmtId, UnOp};
+use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId, UnOp};
 use crate::effects::Effects;
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
@@ -505,6 +511,7 @@ fn emit_module(
         cx.check_guard_placement(*rule);
         cx.check_fifo_same_cycle(*rule);
         cx.check_no_reassigned_locals(*rule);
+        cx.check_writing_call_positions(*rule);
         let body = rule_body(ast, *rule);
         if let Some(span) = find_nested_mem_write(ast, &body) {
             cx.error(
@@ -1050,6 +1057,71 @@ fn expr_contains_call(ast: &Ast, id: ExprId) -> bool {
     }
 }
 
+/// True if a callee's own body (or one of its `if`/`else` branches, same
+/// shape) contains a call ANYWHERE — a `let`/`return` expression, a
+/// write's RHS, an `if`'s condition, nested arbitrarily deep through
+/// its own `if`/`else`. `validate_call` runs this ONCE, on the whole
+/// body, as the single choke point every inlining entry point
+/// (`compile_call`'s return-value splice, `call_writes_reg`/
+/// `call_writes_port`'s write-hunt) goes through — so a call buried
+/// only reachable through the write-hunt path (a bare-statement call
+/// whose return value nothing ever asks for) still gets this checked,
+/// not just the return-value path `compile_callee_body` walks.
+fn body_contains_call(ast: &Ast, stmts: &[StmtId]) -> bool {
+    stmts.iter().any(|s| match ast.stmt(*s) {
+        Stmt::Let { init, .. } => expr_contains_call(ast, *init),
+        Stmt::Assign { lhs, rhs } => expr_contains_call(ast, *lhs) || expr_contains_call(ast, *rhs),
+        Stmt::Return(Some(e)) => expr_contains_call(ast, *e),
+        Stmt::Return(None) | Stmt::Tick => false,
+        Stmt::Expr(e) => expr_contains_call(ast, *e),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            expr_contains_call(ast, *cond)
+                || body_contains_call(ast, then_body)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| body_contains_call(ast, b))
+        }
+        Stmt::While { cond, body } => {
+            expr_contains_call(ast, *cond) || body_contains_call(ast, body)
+        }
+    })
+}
+
+/// Collects every `Expr::Call` reachable from `id`, including `id`
+/// itself if it is one (and recursing into ITS OWN arguments too,
+/// unlike `expr_contains_call`, which only needs to know one exists
+/// anywhere). Used by `check_writing_call_positions` to find a
+/// state-writing call hiding somewhere other than the two shapes
+/// `call_writes_reg`/`call_writes_port` actually look for.
+fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
+    match ast.expr(id) {
+        Expr::Call { args, .. } => {
+            out.push(id);
+            for a in args {
+                collect_calls(ast, *a, out);
+            }
+        }
+        Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => {}
+        Expr::Unary { operand, .. } => collect_calls(ast, *operand, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_calls(ast, *lhs, out);
+            collect_calls(ast, *rhs, out);
+        }
+        Expr::Guard(inner) | Expr::Spawn(inner) => collect_calls(ast, *inner, out),
+        Expr::Field { base, .. } => collect_calls(ast, *base, out),
+        Expr::Bracket { callee, args } => {
+            collect_calls(ast, *callee, out);
+            for a in args {
+                collect_calls(ast, *a, out);
+            }
+        }
+    }
+}
+
 struct Emitter<'a> {
     ast: &'a Ast,
     res: &'a Resolution,
@@ -1268,6 +1340,102 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// `call_writes_reg`/`call_writes_port` only ever look for a
+    /// state-writing call in two positions: a bare statement (`Bump(a)`)
+    /// or the whole right-hand side of `:=` (`result := Bump(a)`). A
+    /// writing call anywhere else — nested in a `let`, an argument to
+    /// another call, buried in a larger expression like `Bump(a) + 1` —
+    /// would never be found by either walk, so its write would silently
+    /// vanish from the emitted hardware while its return value (if any)
+    /// still inlines fine. Reject that outright, explicitly, rather than
+    /// let it happen: walk every expression reachable from this rule,
+    /// and for every `Expr::Call` found that isn't one of the two
+    /// allowed positions, error if its callee's (merged) signature
+    /// writes anything.
+    fn check_writing_call_positions(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        self.check_writing_call_positions_in(&body);
+    }
+
+    fn check_writing_call_positions_in(&mut self, stmts: &[StmtId]) {
+        for stmt in stmts {
+            let allowed = match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) if matches!(self.ast.expr(e), Expr::Call { .. }) => Some(e),
+                Stmt::Assign { rhs, .. } if matches!(self.ast.expr(rhs), Expr::Call { .. }) => {
+                    Some(rhs)
+                }
+                _ => None,
+            };
+            let mut roots: Vec<ExprId> = Vec::new();
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) => roots.push(e),
+                Stmt::Assign { lhs, rhs } => {
+                    roots.push(lhs);
+                    roots.push(rhs);
+                }
+                Stmt::Let { init, .. } => roots.push(init),
+                Stmt::Return(Some(e)) => roots.push(e),
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    roots.push(cond);
+                    self.check_writing_call_positions_in(&then_body);
+                    if let Some(b) = &else_body {
+                        self.check_writing_call_positions_in(b);
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    roots.push(cond);
+                    self.check_writing_call_positions_in(&body);
+                }
+                Stmt::Return(None) | Stmt::Tick => {}
+            }
+            for root in roots {
+                let mut calls = Vec::new();
+                collect_calls(self.ast, root, &mut calls);
+                for call in calls {
+                    if Some(call) == allowed {
+                        continue;
+                    }
+                    let Expr::Call { callee, .. } = self.ast.expr(call).clone() else {
+                        unreachable!()
+                    };
+                    let Some(&def) = self.res.expr_defs.get(&callee) else {
+                        continue;
+                    };
+                    if !matches!(self.res.def(def).kind, DefKind::Fn | DefKind::Impl) {
+                        continue;
+                    }
+                    let Some(fn_item) = self
+                        .res
+                        .item_defs
+                        .iter()
+                        .find(|(_, d)| **d == def)
+                        .map(|(item, _)| *item)
+                    else {
+                        continue;
+                    };
+                    let Some(sig) = self.fx.sigs.get(&fn_item) else {
+                        continue;
+                    };
+                    if !sig.writes.is_empty() {
+                        self.error(
+                            self.ast.expr_spans[call.0 as usize].clone(),
+                            "a call to a function that writes state may only appear \
+                             as a whole statement, or as the entire right-hand side \
+                             of `:=` (v0 restriction: not nested inside a larger \
+                             expression, a `let`, or as an argument to another \
+                             call — the write would not be found there)"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A depth-1 fifo cannot both `Enq` and `Deq` in the same cycle:
     /// that would require its valid bit to be both 1 (for `Deq`) and 0
     /// (for `Enq`) at once, an always-false guard. Reject it explicitly
@@ -1391,11 +1559,20 @@ impl<'a> Emitter<'a> {
         let mut current: Option<String> = None;
         for stmt in stmts {
             match self.ast.stmt(*stmt).clone() {
-                Stmt::Assign { lhs, rhs } if is_ident_named(self.ast, self.res, lhs, reg_name) => {
-                    current = Some(
-                        self.compile_expr_hinted(rhs, Some(width))
-                            .unwrap_or_default(),
-                    );
+                Stmt::Assign { lhs, rhs } => {
+                    if is_ident_named(self.ast, self.res, lhs, reg_name) {
+                        current = Some(
+                            self.compile_expr_hinted(rhs, Some(width))
+                                .unwrap_or_default(),
+                        );
+                    } else if let Some(v) = self.call_writes_reg(rhs, reg_name, width) {
+                        current = Some(v);
+                    }
+                }
+                Stmt::Expr(e) => {
+                    if let Some(v) = self.call_writes_reg(e, reg_name, width) {
+                        current = Some(v);
+                    }
                 }
                 Stmt::If {
                     cond,
@@ -1430,6 +1607,135 @@ impl<'a> Emitter<'a> {
         current
     }
 
+    /// If `expr` is a call to a function whose (already call-graph-
+    /// merged) signature writes `reg_name`, finds the value it writes by
+    /// running the same validation `compile_call` does (so a write
+    /// reached ONLY this way — a bare `Bump(a)` statement whose return
+    /// value nothing else ever asks for — still gets fully checked, not
+    /// silently skipped), then recursing into the callee's own body with
+    /// its params bound. The callee can't itself call anything (v0
+    /// restriction, unchanged), so this one level of substitution is
+    /// enough regardless of how deep the write is nested in the
+    /// callee's own if/else. `None` for any other shape (not a call, or
+    /// a call that doesn't write this register).
+    fn call_writes_reg(&mut self, expr: ExprId, reg_name: &str, width: u64) -> Option<String> {
+        let Expr::Call { callee, args } = self.ast.expr(expr).clone() else {
+            return None;
+        };
+        // Cheap pre-check before the full (error-emitting) validation,
+        // so a call that doesn't even write this register doesn't
+        // trigger validation — and any of its errors — on every
+        // unrelated register's own pass over the same rule.
+        let def = *self.res.expr_defs.get(&callee)?;
+        if !matches!(self.res.def(def).kind, DefKind::Fn | DefKind::Impl) {
+            return None;
+        }
+        let fn_item = self
+            .res
+            .item_defs
+            .iter()
+            .find(|(_, d)| **d == def)
+            .map(|(item, _)| *item)?;
+        let sig = self.fx.sigs.get(&fn_item)?;
+        if !sig.writes.iter().any(|d| self.res.def(*d).name == reg_name) {
+            return None;
+        }
+        let span = self.ast.expr_spans[expr.0 as usize].clone();
+        let (_, params, body) = self.validate_call(span, callee).ok()?;
+
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            if let Some((i, _)) = self
+                .res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == param.name.span)
+            {
+                let pdef = DefId(i as u32);
+                saved.push((pdef, self.locals.insert(pdef, *arg)));
+            }
+        }
+        let value = self.callee_reg_write(&body, reg_name, width);
+        for (pdef, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(pdef, v);
+                }
+                None => {
+                    self.locals.remove(&pdef);
+                }
+            }
+        }
+        value
+    }
+
+    /// Finds the write a callee's OWN body makes to `reg_name`, mirroring
+    /// `reg_value_in_stmts`'s if/else mux-threading but over a callee's
+    /// statements rather than a rule's: also binds the callee's own
+    /// `let`s (a rule's own top-level `let`s are pre-populated once by
+    /// `enter_rule`, but this walk can start mid-rule, inside a
+    /// DIFFERENT item's body, which `enter_rule` never sees). Ignores
+    /// `Return` entirely — the return value is a wholly separate walk
+    /// (`compile_callee_body`), independent of this one.
+    fn callee_reg_write(&mut self, stmts: &[StmtId], reg_name: &str, width: u64) -> Option<String> {
+        let mut current: Option<String> = None;
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for stmt in stmts {
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Let { name, init } => {
+                    if let Some((i, _)) = self
+                        .res
+                        .defs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| d.span == name.span)
+                    {
+                        let def = DefId(i as u32);
+                        saved.push((def, self.locals.insert(def, init)));
+                    }
+                }
+                Stmt::Assign { lhs, rhs } if is_ident_named(self.ast, self.res, lhs, reg_name) => {
+                    current = Some(
+                        self.compile_expr_hinted(rhs, Some(width))
+                            .unwrap_or_default(),
+                    );
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_val = self.callee_reg_write(&then_body, reg_name, width);
+                    let else_val = else_body
+                        .as_ref()
+                        .and_then(|b| self.callee_reg_write(b, reg_name, width));
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current.clone().unwrap_or_else(|| reg_name.to_string());
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        let cond_str = self
+                            .compile_expr(cond)
+                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
+            }
+        }
+        current
+    }
+
     /// Same threading as `reg_value_in_stmts`, for an instance's input
     /// port: an if/else-nested write folds into a `mux`. A register's
     /// unwritten path holds its own feedback; a port has no state of its
@@ -1454,6 +1760,14 @@ impl<'a> Emitter<'a> {
                             self.compile_expr_hinted(rhs, Some(width))
                                 .unwrap_or_default(),
                         );
+                    } else if let Some(v) = self.call_writes_port(rhs, inst_name, port_name, width)
+                    {
+                        current = Some(v);
+                    }
+                }
+                Stmt::Expr(e) => {
+                    if let Some(v) = self.call_writes_port(e, inst_name, port_name, width) {
+                        current = Some(v);
                     }
                 }
                 Stmt::If {
@@ -1487,6 +1801,143 @@ impl<'a> Emitter<'a> {
                     );
                 }
                 _ => {}
+            }
+        }
+        current
+    }
+
+    /// Same idea as `call_writes_reg`, for an instance's input port
+    /// (`inst_name.port_name`) — matched by the InstPort resource's own
+    /// synthesized name (`inst_port_def` builds it as `"{inst}.{port}"`,
+    /// which is what `sig.writes` actually contains a `DefId` for).
+    fn call_writes_port(
+        &mut self,
+        expr: ExprId,
+        inst_name: &str,
+        port_name: &str,
+        width: u64,
+    ) -> Option<String> {
+        let Expr::Call { callee, args } = self.ast.expr(expr).clone() else {
+            return None;
+        };
+        let def = *self.res.expr_defs.get(&callee)?;
+        if !matches!(self.res.def(def).kind, DefKind::Fn | DefKind::Impl) {
+            return None;
+        }
+        let fn_item = self
+            .res
+            .item_defs
+            .iter()
+            .find(|(_, d)| **d == def)
+            .map(|(item, _)| *item)?;
+        let sig = self.fx.sigs.get(&fn_item)?;
+        let target_name = format!("{inst_name}.{port_name}");
+        if !sig
+            .writes
+            .iter()
+            .any(|d| self.res.def(*d).name == target_name)
+        {
+            return None;
+        }
+        let span = self.ast.expr_spans[expr.0 as usize].clone();
+        let (_, params, body) = self.validate_call(span, callee).ok()?;
+
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            if let Some((i, _)) = self
+                .res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == param.name.span)
+            {
+                let pdef = DefId(i as u32);
+                saved.push((pdef, self.locals.insert(pdef, *arg)));
+            }
+        }
+        let value = self.callee_port_write(&body, inst_name, port_name, width);
+        for (pdef, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(pdef, v);
+                }
+                None => {
+                    self.locals.remove(&pdef);
+                }
+            }
+        }
+        value
+    }
+
+    /// `callee_reg_write`'s counterpart for an instance port, with a
+    /// port's own unwritten-path fallback (`UInt<{width}>(0)`, not a
+    /// register's "hold my own feedback").
+    fn callee_port_write(
+        &mut self,
+        stmts: &[StmtId],
+        inst_name: &str,
+        port_name: &str,
+        width: u64,
+    ) -> Option<String> {
+        let mut current: Option<String> = None;
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for stmt in stmts {
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Let { name, init } => {
+                    if let Some((i, _)) = self
+                        .res
+                        .defs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| d.span == name.span)
+                    {
+                        let def = DefId(i as u32);
+                        saved.push((def, self.locals.insert(def, init)));
+                    }
+                }
+                Stmt::Assign { lhs, rhs } => {
+                    if let Expr::Field { base, name } = self.ast.expr(lhs).clone()
+                        && name == port_name
+                        && is_ident_named_inst(self.ast, self.res, base, inst_name)
+                    {
+                        current = Some(
+                            self.compile_expr_hinted(rhs, Some(width))
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_val = self.callee_port_write(&then_body, inst_name, port_name, width);
+                    let else_val = else_body
+                        .as_ref()
+                        .and_then(|b| self.callee_port_write(b, inst_name, port_name, width));
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current
+                            .clone()
+                            .unwrap_or_else(|| format!("UInt<{width}>(0)"));
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        let cond_str = self
+                            .compile_expr(cond)
+                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
             }
         }
         current
@@ -1706,14 +2157,36 @@ impl<'a> Emitter<'a> {
     /// callee's own internal, still-generic `types.expr_tys` entry for
     /// its return expression(s), which were only ever checked once, that
     /// generically, independent of any particular call site.
-    fn compile_call(
+    /// Resolves a call's callee to its `Item::Fn` and runs every check
+    /// that doesn't depend on WHICH value this particular call site
+    /// wants (its return value, via `compile_call`, or one of its
+    /// writes, via `call_writes_reg`/`call_writes_port`): effect
+    /// coloring (`<sequences>`/`<elaborates>`/`fails`) and the call-site
+    /// module boundary. Shared by both, so a state-writing call reached
+    /// ONLY through its write — its return value never used, e.g. a bare
+    /// `Bump(a)` statement — still gets fully validated, not silently
+    /// skipped just because nothing asks for its return value.
+    ///
+    /// The module-boundary check: a callee's own state references were
+    /// checked ONCE, at their lexical (declaration-site) position, by
+    /// resolve.rs's `check_module_boundary` — which only ever compares
+    /// against the module enclosing the callee's OWN body, never against
+    /// wherever it ends up being called from. A `fn`/`impl` nested
+    /// inside module M is still visible to (and callable from) a rule in
+    /// a module nested inside M, since scopes nest outward-to-inward;
+    /// inlining such a call here would splice a reference to M's own `v`
+    /// into a DIFFERENT module's FIRRTL block, where `v` doesn't exist —
+    /// caught only by firtool's cryptic "unknown declaration" error
+    /// otherwise. `sig.reads`/`sig.writes` is the already-merged
+    /// (through the whole call graph, to a fixpoint) answer for "every
+    /// state def this call transitively reaches" — so one check here,
+    /// against the CALL's own module (`self.module`), covers it
+    /// regardless of how deep the call chain is.
+    fn validate_call(
         &mut self,
-        id: ExprId,
+        span: Span,
         callee: ExprId,
-        args: &[ExprId],
-        hint: Option<u64>,
-    ) -> Result<String, ()> {
-        let span = self.ast.expr_spans[id.0 as usize].clone();
+    ) -> Result<(ItemId, Vec<Param>, Vec<StmtId>), ()> {
         let def = *self.res.expr_defs.get(&callee).expect("checked by caller");
         let Some(fn_item) = self
             .res
@@ -1725,12 +2198,7 @@ impl<'a> Emitter<'a> {
             self.error(span, "cannot find this function's item".to_string());
             return Err(());
         };
-        let Item::Fn {
-            params,
-            body: fn_body,
-            ..
-        } = self.ast.item(fn_item).clone()
-        else {
+        let Item::Fn { params, body, .. } = self.ast.item(fn_item).clone() else {
             self.error(span, "call target is not a function".to_string());
             return Err(());
         };
@@ -1742,21 +2210,6 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         };
-        // A callee's own state references were checked ONCE, at their
-        // lexical (declaration-site) position, by resolve.rs's
-        // `check_module_boundary` — which only ever compares against the
-        // module enclosing the callee's OWN body, never against wherever
-        // it ends up being called from. A `fn`/`impl` nested inside
-        // module M is still visible to (and callable from) a rule in a
-        // module nested inside M, since scopes nest outward-to-inward;
-        // inlining such a call here would splice a reference to M's own
-        // `v` into a DIFFERENT module's FIRRTL block, where `v` doesn't
-        // exist — caught only by firtool's cryptic "unknown declaration"
-        // error otherwise. `sig.reads`/`sig.writes` is the already-
-        // merged (through the whole call graph, to a fixpoint) answer
-        // for "every state def this call transitively reaches" — so one
-        // check here, against the CALL's own module (`self.module`),
-        // covers it regardless of how deep the call chain is.
         for state_def in sig.reads.iter().chain(sig.writes.iter()) {
             if let Some(owner) = self.res.def_owner.get(state_def).copied().flatten()
                 && owner != self.module
@@ -1796,16 +2249,43 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         }
-        if !sig.writes.is_empty() {
+        // Checked ONCE, here, for the WHOLE body (including every branch
+        // of an `if`/`else`), regardless of which entry point (return-
+        // value splice or write-hunt) is asking: a callee whose body
+        // cannot call anything can never call itself, directly or
+        // through a cycle, so recursion needs no separate check. Without
+        // this living at the shared choke point, a call reachable ONLY
+        // through the write-hunt path (a bare-statement call whose
+        // return value nothing ever uses) would skip it entirely —
+        // `compile_callee_body`'s OWN version of this check only runs on
+        // the return-value path, so a transitively-written register
+        // nested two calls deep (`Outer` calls `Inner`, which writes
+        // `w`; a rule calls `Outer` as a bare statement) would silently
+        // vanish from the emitted hardware, with `effects.rs` still
+        // correctly (and now misleadingly) telling schedule.rs that the
+        // rule writes `w`.
+        if body_contains_call(self.ast, &body) {
             self.error(
                 span,
-                "calling a function that writes state is not yet supported in FIRRTL \
-                 emission (v0 restriction: only a pure value-computing function can be \
-                 inlined)"
+                "this function's body calls another function or builtin, which is not \
+                 yet supported for inlining (v0 restriction: a called function's own \
+                 body must not itself call anything, which also rules out recursion)"
                     .to_string(),
             );
             return Err(());
         }
+        Ok((fn_item, params, body))
+    }
+
+    fn compile_call(
+        &mut self,
+        id: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let (_, params, fn_body) = self.validate_call(span.clone(), callee)?;
 
         // Bind params into `self.locals`, saving whatever was there before
         // (from an enclosing call to this SAME function, if any) so it can
@@ -1864,7 +2344,7 @@ impl<'a> Emitter<'a> {
         hint: u64,
         span: &Span,
     ) -> Result<String, ()> {
-        let Some((&last, lets)) = stmts.split_last() else {
+        let Some((&last, rest)) = stmts.split_last() else {
             self.error(
                 span.clone(),
                 "calling a function with an empty body (or an empty `if`/`else` \
@@ -1874,39 +2354,38 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         };
-        if !lets
+        if !rest
             .iter()
-            .all(|s| matches!(self.ast.stmt(*s), Stmt::Let { .. }))
+            .all(|s| matches!(self.ast.stmt(*s), Stmt::Let { .. } | Stmt::Assign { .. }))
         {
             self.error(
                 span.clone(),
-                "this function's body is too complex to inline (v0 restriction: only \
-                 `let` bindings, `if`/`else` branches, and a trailing `return` are \
-                 supported — no state writes, loops, or fifo/guard operations)"
+                "this function's body is too complex to inline for its RETURN value \
+                 (v0 restriction: only `let` bindings and state writes may come \
+                 before a trailing `return`, or a trailing `if`/`else` whose \
+                 branches both end that way — an `if`/`else` anywhere else, a loop, \
+                 or a fifo/guard operation is not supported here). Called as a bare \
+                 statement, with its return value unused, a conditional write like \
+                 this one IS still supported — see `callee_reg_write`/\
+                 `callee_port_write`, a separate walk that doesn't share this \
+                 restriction"
                     .to_string(),
             );
             return Err(());
         }
-        if lets.iter().any(|s| {
-            let Stmt::Let { init, .. } = self.ast.stmt(*s) else {
-                unreachable!()
-            };
-            expr_contains_call(self.ast, *init)
-        }) {
-            self.error(
-                span.clone(),
-                "this function's body calls another function or builtin, which is not \
-                 yet supported for inlining (v0 restriction: a called function's own \
-                 body must not itself call anything, which also rules out recursion)"
-                    .to_string(),
-            );
-            return Err(());
-        }
+        // A leading `Assign` is a state WRITE, a side effect this walk (which
+        // only ever builds the RETURN value) doesn't care about — its own
+        // value is found separately, by `callee_reg_write`/`callee_port_write`
+        // when some register's/port's own write-threading walk reaches this
+        // same call. (Whether this body calls anything at all was already
+        // checked once, for the WHOLE body, by `validate_call` — the single
+        // choke point every inlining entry point goes through, so this
+        // doesn't need its own per-statement check.)
 
         let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
-        for s in lets {
+        for s in rest {
             let Stmt::Let { name, init } = self.ast.stmt(*s) else {
-                unreachable!()
+                continue;
             };
             if let Some((i, _)) = self
                 .res
@@ -1921,51 +2400,23 @@ impl<'a> Emitter<'a> {
         }
 
         let result = match self.ast.stmt(last).clone() {
-            Stmt::Return(Some(ret_expr)) => {
-                if expr_contains_call(self.ast, ret_expr) {
-                    self.error(
-                        span.clone(),
-                        "this function's body calls another function or builtin, \
-                         which is not yet supported for inlining (v0 restriction: a \
-                         called function's own body must not itself call anything, \
-                         which also rules out recursion)"
-                            .to_string(),
-                    );
-                    Err(())
-                } else {
-                    self.compile_expr_hinted(ret_expr, Some(hint))
-                }
-            }
+            Stmt::Return(Some(ret_expr)) => self.compile_expr_hinted(ret_expr, Some(hint)),
             Stmt::If {
                 cond,
                 then_body,
                 else_body: Some(else_body),
-            } => {
-                if expr_contains_call(self.ast, cond) {
-                    self.error(
-                        span.clone(),
-                        "this function's body calls another function or builtin, \
-                         which is not yet supported for inlining (v0 restriction: a \
-                         called function's own body must not itself call anything, \
-                         which also rules out recursion)"
-                            .to_string(),
-                    );
-                    Err(())
-                } else {
-                    match (
-                        self.compile_callee_body(&then_body, hint, span),
-                        self.compile_callee_body(&else_body, hint, span),
-                    ) {
-                        (Ok(t), Ok(e)) => {
-                            let cond_str = self
-                                .compile_expr(cond)
-                                .unwrap_or_else(|_| "UInt<1>(0)".to_string());
-                            Ok(format!("mux({cond_str}, {t}, {e})"))
-                        }
-                        _ => Err(()),
-                    }
+            } => match (
+                self.compile_callee_body(&then_body, hint, span),
+                self.compile_callee_body(&else_body, hint, span),
+            ) {
+                (Ok(t), Ok(e)) => {
+                    let cond_str = self
+                        .compile_expr(cond)
+                        .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                    Ok(format!("mux({cond_str}, {t}, {e})"))
                 }
-            }
+                _ => Err(()),
+            },
             Stmt::If {
                 else_body: None, ..
             } => {

@@ -2,26 +2,28 @@
 
 ## Emission (`src/firrtl.rs`)
 
-- A call to a user `fn`/`impl` inlines only when its body is `let`
-  bindings then a trailing `return`, or an `if`/`else` (mandatory
-  `else`) whose branches both recurse into that same shape, folded into
-  a `mux` — no state writes, guards/fifo ops, or further calls anywhere
+- A call to a user `fn`/`impl` inlines when its body is `let` bindings
+  and state writes, then a trailing `return`, or an `if`/`else`
+  (mandatory `else`) whose branches both recurse into that same shape —
+  no loops, guards/fifo ops, or further calls anywhere in the callee
   (so a called function's own body calling another function, including
   indirect recursion, is rejected outright rather than actually needing
   a recursion check: nothing in the restricted shape can call
-  anything). Builtin calls (`prio`, etc.) are a separate, still-
-  unsupported gap. See `examples/call.tr`, `examples/call_branch.tr`.
-  A call's own state-reaching reads (transitively, through the whole
-  call graph) are already checked against the CALL site's module, not
-  just the callee's declaration site (`compile_call` in firrtl.rs, uses
-  `Resolution::def_owner`) — but a state-*writing* callee is still
-  rejected outright (`sig.writes` must be empty), so this only exercises
-  the read side today. If writes are allowed later: `compile_callee_body`
-  needs a `Stmt::Assign` case, and — the bigger piece —
-  `reg_value_in_stmts`/`inst_port_value_in_stmts` (which walk a RULE's
-  own statement tree directly) need to recurse into a call's callee body
-  to see a write buried inside it; today they have no path into a call
-  at all.
+  anything). A state write reaches the emitted hardware only when the
+  call site is a bare statement or the whole RHS of `:=` — nested any
+  deeper (an argument, a `let`, `Bump(a) + 1`) is a clean, explicit
+  error, since `call_writes_reg`/`call_writes_port` (firrtl.rs) only
+  ever look for a write in those two positions. A callee whose write is
+  conditional (`if`/`else`) is only inlinable as a bare statement — if
+  its return value is ALSO used, the `if`/`else` must be in TAIL
+  position (own separate walk, `compile_callee_body`, stricter shape
+  than the write-hunt walk). A call's own state-reaching reads/writes
+  (transitively, through the whole call graph) are checked against the
+  CALL site's module, not just the callee's declaration site
+  (`validate_call` in firrtl.rs, uses `Resolution::def_owner`). Builtin
+  calls (`prio`, etc.) are a separate, still-unsupported gap — nothing
+  about builtin-call synthesis is implied by any of this. See
+  `examples/call.tr`, `examples/call_branch.tr`, `examples/call_writes.tr`.
 - Expression surface still excludes: other field access, `/`/`%`,
   dynamic-amount shifts (shift amount must be a literal), computed
   bit-select/slice bounds (must be literal), and logical `!` (only `~`

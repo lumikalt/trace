@@ -1,0 +1,14 @@
+module Top {
+    input a : bits[8]
+    output result : bits[8] = 0
+    output v_out : bits[8] = 0
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        v_out := x
+        return x + 1
+    }
+
+    rule compute {
+        result := Bump(a)
+    }
+}

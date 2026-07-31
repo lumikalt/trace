@@ -880,10 +880,10 @@ feature's own common case: a `fn` nested in `M`, called only from a rule also in
 still passes, since `def_owner[state] == self.module` there; `call_reaching_a_different_
 modules_state_is_an_error` (tests/firrtl.rs) pins the cross-module case with the exact
 program above, and `call_to_a_same_module_fn_that_reads_state_still_works` pins that the
-legitimate case wasn't collaterally broken. State-writing callees are still rejected
-outright (`sig.writes` must stay empty) — this pass only closes the boundary hole on the
-read side already in use; TODO.md's calls bullet keeps the (larger, separate)
-write-threading gap open.
+legitimate case wasn't collaterally broken. At the time this landed, state-writing
+callees were still rejected outright (`sig.writes` had to stay empty) — see the
+"State-writing callees" section below for how that check now generalizes to cover
+writes too, for free.
 
 A second correctness subtlety, caught by deliberately constructing and running the
 "obviously risky" case before declaring the feature done, not by any test failure or
@@ -916,6 +916,83 @@ simulation, deliberately choosing operands (`200 + 100`) that overflow `bits[8]`
 the callee's own `let sum = a + b` — `(200 + 100) mod 256 = 44`, then `>> 1 = 22` — so an
 inlined call reusing the wrong (e.g. widened) semantics for its own internal arithmetic
 would show up as a wrong answer, not just "firtool accepted it."
+
+**State-writing callees, added 2026-07-31** (the last piece of the calls TODO bullet,
+picked up as its own followup pass immediately after the module-boundary fix above):
+`Bump(x) { v := x  return x + 1 }` now inlines, both the write to `v` and the return
+value, from one call site. Two independent walks handle the two halves — they are NOT
+one computation feeding the other:
+
+- The return value still goes through `compile_callee_body`, now widened to also accept
+  a leading `Stmt::Assign` (a write) alongside `let`, simply skipped by that walk (a
+  side effect it doesn't care about).
+- The write goes through a NEW pair of functions, `call_writes_reg`/`call_writes_port`
+  (dispatch: is this call, is its already-merged `sig.writes` reaching this specific
+  register/port?) and `callee_reg_write`/`callee_port_write` (the actual value-finding
+  walk, mirroring `reg_value_in_stmts`/`inst_port_value_in_stmts`'s own if/else
+  mux-threading, but over the CALLEE's statements — including binding the callee's own
+  `let`s, which `enter_rule`'s one-time rule-level pre-population never sees, since this
+  walk can start mid-rule, inside a different item's body entirely).
+
+A state-writing call only reaches the emitted hardware when the call site is a bare
+statement (`Bump(a)`, return value discarded) or the entire right-hand side of `:=`
+(`result := Bump(a)`) — `call_writes_reg`/`call_writes_port` only ever look in those two
+positions. Nested any deeper — an argument to another call, a `let`'s init, `Bump(a) +
+1` — is an explicit, up-front error (`check_writing_call_positions`, a new per-rule
+validation pass using a new `collect_calls` tree-walker to enumerate every reachable
+`Expr::Call`, not just check existence like the older `expr_contains_call`), not a
+silent skip. Getting this validation right mattered: without it, a writing call in a
+forbidden position would simply never be visited by either walk, and its write would
+vanish from the output with no diagnostic at all — the same failure shape as every other
+silent-miscompile caught this session, just one syntax position over.
+
+Three real correctness gaps surfaced building this, each caught by deliberately running
+the risky case rather than trusting the code read — the same discipline this whole
+session's calls work has leaned on:
+
+1. **Validation reachable only from the return-value path.** The original
+   `!sig.writes.is_empty()` rejection, and later `compile_callee_body`'s own
+   `<sequences>`/`<elaborates>`/`fails`/module-boundary checks, all lived on the path
+   that runs when a call's RETURN VALUE is compiled. A call reached ONLY through the
+   write-hunt path — a bare `Bump(a)` statement whose return value nothing ever asks
+   for — never touched any of that validation at all. Fixed by extracting a shared
+   `validate_call` (effect coloring + module boundary) that BOTH `compile_call` and
+   `call_writes_reg`/`call_writes_port` call before doing their own thing, so validation
+   runs regardless of which walk is asking.
+2. **The same gap, one level deeper: transitively-written state.** Even after (1),
+   `validate_call` didn't check whether the callee's OWN body calls something else — that
+   check still only lived inside `compile_callee_body`. A rule calling `Outer` as a bare
+   statement, where `Outer` itself calls `Inner`, which writes `w`, would have `w`
+   silently vanish from the emitted hardware: `effects.rs` correctly merges `w` into
+   `Outer`'s (and so the rule's) signature, so `schedule.rs` correctly believes the rule
+   writes `w` — but `callee_reg_write` scanning `Outer`'s own body finds no direct `w :=`
+   (it's one call deeper) and returns nothing, with no error. Fixed by moving the "body
+   contains a call" check into `validate_call` too (a new `body_contains_call` tree-walk,
+   recursing through `if`/`else`), so it runs for every entry point uniformly, and
+   simplifying `compile_callee_body` by deleting its now-redundant per-node version of
+   the same check. `a_write_transitively_reached_through_a_bare_statement_call_is_an_
+   error` (tests/firrtl.rs) pins the exact shape.
+3. **A real asymmetry between the two walks, not a bug, but nearly reported as one.**
+   `callee_reg_write` accepts a conditional write (`if`/`else`) in ANY position, since it
+   scans the whole callee body regardless of where the write sits. `compile_callee_body`
+   only accepts an `if`/`else` in TAIL position (every reachable path must produce a
+   return value, mirroring the branching-callee feature's own restriction) — so the
+   EXACT SAME callee body inlines when called as a bare statement but is rejected
+   ("too complex to inline for its RETURN value") when its return value is also used.
+   This is a real, permanent boundary, not a bug: the write-hunt walk only ever needs
+   "what value lands in this register," while the return-value walk needs "one
+   unambiguous value for every path" — different questions, correctly different answers.
+   The original error message claimed `if`/`else` was unconditionally supported while
+   rejecting one, which would have read as self-contradictory; reworded to name the
+   TAIL-position restriction explicitly and point at the bare-statement path as the
+   escape hatch. Pinned both ways: `call_writes_state_conditionally_inside_its_own_
+   if_else` (bare statement, succeeds) and `call_to_a_conditionally_writing_function_
+   whose_return_value_is_used_requires_tail_position` (return value used, clean error).
+
+`examples/call_writes.tr` proves the combined case (one call site both writing state
+and returning a value) through real firtool and Icarus simulation, observing BOTH halves
+through real ports so a wrong value on EITHER side would fail the testbench, not just
+"firtool accepted it."
 
 ## Tooling
 
