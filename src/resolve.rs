@@ -100,6 +100,13 @@ pub struct Resolution {
     pub refines: HashMap<ItemId, DefId>,
     /// Named item -> its definition (rules, fns, state, modules).
     pub item_defs: HashMap<ItemId, DefId>,
+    /// Every def's immediately-enclosing module, `None` for one declared
+    /// outside any module. `check_module_boundary` uses this to reject a
+    /// state reference that crosses a module boundary at its own
+    /// (lexical, one-time) resolution; firrtl.rs's `compile_call` reuses
+    /// it to catch the same boundary crossing happening dynamically,
+    /// through a call, to a state def the callee reads or writes.
+    pub def_owner: HashMap<DefId, Option<ItemId>>,
 }
 
 impl Resolution {
@@ -129,7 +136,6 @@ pub fn resolve(ast: &Ast) -> (Resolution, Vec<ResolveError>) {
         scopes: vec![HashMap::new()],
         inst_ports: HashMap::new(),
         current_module: Vec::new(),
-        def_owner: HashMap::new(),
     };
     for name in BUILTINS {
         let id = resolver.new_def(name, DefKind::Builtin, 0..0);
@@ -153,14 +159,6 @@ struct Resolver<'a> {
     /// root. Only pushed/popped around a module's own body, not its own
     /// declaration site (see `resolve_item`'s `Item::Module` arm).
     current_module: Vec<ItemId>,
-    /// Every def's immediately-enclosing module, `None` for one declared
-    /// outside any module. Used to reject a state reference that crosses
-    /// a module boundary — hardware modules share nothing but ports, so
-    /// a nested module's rule referencing an ancestor module's own `reg`
-    /// would otherwise resolve to a name that doesn't exist in the
-    /// nested module's own emitted FIRRTL scope (see `resolve_expr`'s
-    /// `Expr::Ident` arm).
-    def_owner: HashMap<DefId, Option<ItemId>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -185,7 +183,7 @@ impl<'a> Resolver<'a> {
     /// (A `Module` name itself is exempt from this — see
     /// `resolve_inst_target`, which deliberately bypasses this check.)
     fn check_module_boundary(&mut self, def: DefId, span: Span, text: &str) -> bool {
-        if self.def_owner.get(&def).copied().flatten() == self.current_module.last().copied() {
+        if self.res.def_owner.get(&def).copied().flatten() == self.current_module.last().copied() {
             return true;
         }
         self.error(
@@ -279,7 +277,8 @@ impl<'a> Resolver<'a> {
             Item::Schedule { .. } => return,
         };
         let def = self.declare(&name, kind);
-        self.def_owner
+        self.res
+            .def_owner
             .insert(def, self.current_module.last().copied());
         self.res.item_defs.insert(id, def);
     }

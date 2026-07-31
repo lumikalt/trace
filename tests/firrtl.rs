@@ -742,6 +742,60 @@ module Top {
 }
 
 #[test]
+fn call_to_a_same_module_fn_that_reads_state_still_works() {
+    // The legitimate case a boundary check must not break: `Bump` is
+    // nested inside `M` and reads `M`'s own `v`; the only rule that
+    // calls it is also inside `M`, so the call site's module matches
+    // every state def `Bump`'s (merged) signature reaches.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        return v + x
+    }
+
+    rule r {
+        result := Bump(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, tail(add(v, a), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn call_reaching_a_different_modules_state_is_an_error() {
+    // A `fn` nested in `M` stays visible to a rule in a module nested
+    // INSIDE `M` (scopes nest outward-to-inward, same as an ordinary
+    // local), but `Bump`'s `v` is `M`'s own register — inlining this
+    // call would splice a reference to `v` into `N`'s separate FIRRTL
+    // block, where `v` doesn't exist. Before this check existed, this
+    // program silently reached firtool as an "unknown declaration `v`"
+    // error instead of a clear trace-level one.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    Bump(x : bits[8]) : bits[8] <combines> { return v + x }
+    module N {
+        input a : bits[8]
+        output result : bits[8] = 0
+        rule r { result := Bump(a) }
+    }
+    inst n : N
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("belongs to a different module"))
+    );
+}
+
+#[test]
 fn call_to_a_function_that_itself_calls_something_is_an_error() {
     // v0 restriction sidesteps recursion entirely: a function whose own
     // body cannot call anything can never call itself, directly or

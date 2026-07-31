@@ -303,6 +303,7 @@ fn emit_module(
         res,
         fx,
         types,
+        module,
         errors: Vec::new(),
         read_ports: HashMap::new(),
         output_regs: HashMap::new(),
@@ -1054,6 +1055,10 @@ struct Emitter<'a> {
     res: &'a Resolution,
     fx: &'a Effects,
     types: &'a Types,
+    /// The module currently being emitted — a call's own state-reaching
+    /// reads/writes are checked against this, not the callee's
+    /// declaration site (see `compile_call`).
+    module: ItemId,
     errors: Vec<EmitError>,
     /// Each static mem-read expression -> its assigned reader port name.
     read_ports: HashMap<ExprId, String>,
@@ -1737,6 +1742,40 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         };
+        // A callee's own state references were checked ONCE, at their
+        // lexical (declaration-site) position, by resolve.rs's
+        // `check_module_boundary` — which only ever compares against the
+        // module enclosing the callee's OWN body, never against wherever
+        // it ends up being called from. A `fn`/`impl` nested inside
+        // module M is still visible to (and callable from) a rule in a
+        // module nested inside M, since scopes nest outward-to-inward;
+        // inlining such a call here would splice a reference to M's own
+        // `v` into a DIFFERENT module's FIRRTL block, where `v` doesn't
+        // exist — caught only by firtool's cryptic "unknown declaration"
+        // error otherwise. `sig.reads`/`sig.writes` is the already-
+        // merged (through the whole call graph, to a fixpoint) answer
+        // for "every state def this call transitively reaches" — so one
+        // check here, against the CALL's own module (`self.module`),
+        // covers it regardless of how deep the call chain is.
+        for state_def in sig.reads.iter().chain(sig.writes.iter()) {
+            if let Some(owner) = self.res.def_owner.get(state_def).copied().flatten()
+                && owner != self.module
+            {
+                self.error(
+                    span,
+                    format!(
+                        "calling `{}` here would reach `{}`, which belongs to a \
+                         different module than this call site (modules share no \
+                         state with each other, only ports declared on themselves) \
+                         — v0 restriction: a fn/impl that reads or writes state can \
+                         only be called from within that state's own module",
+                        self.res.def(def).name,
+                        self.res.def(*state_def).name,
+                    ),
+                );
+                return Err(());
+            }
+        }
         if sig.sequences || sig.elaborates {
             self.error(
                 span,

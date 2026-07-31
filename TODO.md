@@ -11,13 +11,17 @@
   a recursion check: nothing in the restricted shape can call
   anything). Builtin calls (`prio`, etc.) are a separate, still-
   unsupported gap. See `examples/call.tr`, `examples/call_branch.tr`.
-  If a state-writing callee is added later: recheck resolve.rs's
-  module-boundary state check (`check_module_boundary`) against a
-  `fn`/`impl` nested inside a module that reads/writes that module's
-  own state — today irrelevant (the restricted shape can't write state
-  at all), but a state-writing callee would need the boundary
-  re-validated at the CALL site's module, not just the callee's
-  declaration site.
+  A call's own state-reaching reads (transitively, through the whole
+  call graph) are already checked against the CALL site's module, not
+  just the callee's declaration site (`compile_call` in firrtl.rs, uses
+  `Resolution::def_owner`) — but a state-*writing* callee is still
+  rejected outright (`sig.writes` must be empty), so this only exercises
+  the read side today. If writes are allowed later: `compile_callee_body`
+  needs a `Stmt::Assign` case, and — the bigger piece —
+  `reg_value_in_stmts`/`inst_port_value_in_stmts` (which walk a RULE's
+  own statement tree directly) need to recurse into a call's callee body
+  to see a write buried inside it; today they have no path into a call
+  at all.
 - Expression surface still excludes: other field access, `/`/`%`,
   dynamic-amount shifts (shift amount must be a literal), computed
   bit-select/slice bounds (must be literal), and logical `!` (only `~`

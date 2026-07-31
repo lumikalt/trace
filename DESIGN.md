@@ -854,6 +854,37 @@ followup note in TODO.md), a separate, larger change not needed for a purely
 value-computing branch. `examples/call_branch.tr` proves both branches pick correctly
 through real firtool and Icarus simulation.
 
+**Call-site module-boundary check, added 2026-07-31**, closing a real, previously
+untested gap rather than extending scope: `check_module_boundary` in resolve.rs only
+ever runs ONCE, at a state reference's own lexical position — i.e. wherever the
+referencing `fn`/`impl`'s body happens to sit in the source — and never again. A `fn`
+nested inside module `M` stays visible to a rule in a module nested INSIDE `M` (scopes
+nest outward-to-inward, the same way an ordinary local from an enclosing scope stays
+visible), so `M { reg v...  Bump(x){ return v+x }  module N { rule r { result :=
+Bump(a) } } }` resolves and type-checks cleanly today — the only thing that stopped
+it from reaching a user was firtool itself: inlining `Bump` into `N`'s own emitted
+FIRRTL block splices in a bare reference to `v`, which doesn't exist in `N`'s block,
+and firtool rejects it with "unknown declaration `v`" — a real bug (an unclear
+diagnostic from the wrong tool, not a silent miscompile; verified by hand with exactly
+that program before writing the fix, not assumed from reading the code) that would only
+get worse once callees can write state, since then the leak would be a *write* into a
+foreign module's register, not just a read. Fixed in firrtl.rs's `compile_call`, not
+resolve.rs: `Resolution::def_owner` (previously private to `Resolver`, now a public
+field, since firrtl.rs needs it and resolve.rs already computes it) maps every def to
+its owning module; `compile_call` now checks every def in the callee's own *merged*
+`sig.reads`/`sig.writes` (effects.rs's fixpoint has already flattened the whole call
+graph into this one set, so one check on the immediate callee catches an arbitrarily
+deep chain) against `self.module`, the module actually being emitted right now — not
+the callee's declaration site. A same-module call (the base feature's and the branching
+feature's own common case: a `fn` nested in `M`, called only from a rule also in `M`)
+still passes, since `def_owner[state] == self.module` there; `call_reaching_a_different_
+modules_state_is_an_error` (tests/firrtl.rs) pins the cross-module case with the exact
+program above, and `call_to_a_same_module_fn_that_reads_state_still_works` pins that the
+legitimate case wasn't collaterally broken. State-writing callees are still rejected
+outright (`sig.writes` must stay empty) — this pass only closes the boundary hole on the
+read side already in use; TODO.md's calls bullet keeps the (larger, separate)
+write-threading gap open.
+
 A second correctness subtlety, caught by deliberately constructing and running the
 "obviously risky" case before declaring the feature done, not by any test failure or
 user report: `Emitter::locals` is keyed by `DefId`, and every call to the SAME function
