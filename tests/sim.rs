@@ -817,3 +817,44 @@ fn mem_write_branch_runs_through_real_ports() {
         "mem-write-branch results did not match expectations:\n{output}"
     );
 }
+
+#[test]
+fn conflict_free_check_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/conflict_free_check.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/conflict_free_check_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    // The whole point of this test: the compiler-inserted assertion must
+    // be a genuine runtime check, not dead code that always passes. Split
+    // on the testbench's own "safe window done" marker and check the
+    // claim-violation message appears only AFTER it, never before. (Not
+    // checking for "SIMULATION PASSED" here — the testbench prints it
+    // unconditionally at the end regardless of outcome, since the whole
+    // point of the violated window is to trigger the assertion; that
+    // check would be vacuous.)
+    let marker = "SAFE WINDOW DONE";
+    let split = output.find(marker).unwrap_or_else(|| {
+        panic!("testbench did not print its own \"{marker}\" marker:\n{output}")
+    });
+    let (safe_window, rest) = output.split_at(split);
+    let violation_message = "conflict_free claim violated: rule set_a and rule set_b both \
+                              fired the same cycle";
+    assert!(
+        !safe_window.contains(violation_message),
+        "assertion fired during the SAFE window (false positive):\n{output}"
+    );
+    assert!(
+        rest.contains(violation_message),
+        "assertion did NOT fire during the deliberately-violated window (dead check):\n{output}"
+    );
+}

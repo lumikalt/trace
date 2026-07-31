@@ -53,9 +53,6 @@
   exists. No `Enq`+`Deq` of the same fifo in one rule.
 - A local reassigned within one emitted rule is rejected (inlining picks
   the wrong binding otherwise — see DESIGN.md's "sharp edge" note).
-- `conflict_free` claims are recorded and exempt a pair from the derived
-  stall, but the promised simulation assertion that checks the claim
-  doesn't exist yet — an unsound claim currently just compiles.
 
 ## SUBLEQ / boot sequencing
 

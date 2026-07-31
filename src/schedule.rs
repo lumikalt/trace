@@ -9,9 +9,11 @@
 //! specification is an error.
 //!
 //! `conflict_free { a, b }` exempts a pair from scheduling separation.
-//! The claim is recorded, not trusted: the simulator inserts assertions
-//! for it (later work). Claiming conflict-freedom for a pair that does
-//! not conflict is legal overstatement.
+//! The claim is recorded here (`Conflict::exempted`), not trusted: `Emitter`
+//! (firrtl/module.rs) emits a FIRRTL `assert` for every exempted pair,
+//! checking the two rules never both fire the same cycle. Claiming
+//! conflict-freedom for a pair that does not conflict is legal
+//! overstatement.
 //!
 //! Rules conflict only within their own scope (module body or top level):
 //! state is scope-local, so cross-scope conflicts cannot exist.

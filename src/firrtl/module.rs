@@ -289,6 +289,30 @@ pub(crate) fn emit_module(
         fires_name.insert(*rule, signal);
     }
 
+    // `conflict_free`-exempted pairs get no derived stall above — the
+    // claim is recorded, not trusted (DESIGN.md's "Scheduling" tier 2):
+    // check it at simulation time instead, by asserting the two rules
+    // never actually fire the same cycle. `enable` is gated on `not(reset)`
+    // since a rule's own guard may read state that hasn't settled to its
+    // real reset value yet on the reset cycle itself, and a spurious
+    // fires-both during reset would be a false claim violation, not a
+    // real one.
+    for (i, conflict) in conflicts.iter().enumerate() {
+        if !conflict.exempted {
+            continue;
+        }
+        let a_name = item_name(ast, conflict.a);
+        let b_name = item_name(ast, conflict.b);
+        let a_fires = &fires_name[&conflict.a];
+        let b_fires = &fires_name[&conflict.b];
+        let _ = writeln!(
+            fires_body,
+            "    assert(clock, not(and({a_fires}, {b_fires})), not(reset), \"conflict_free \
+             claim violated: rule {a_name} and rule {b_name} both fired the same cycle\") : \
+             conflict_free_check_{i}"
+        );
+    }
+
     // Every mem's `mem` declaration must list all its port names up
     // front (reader/writer are declarations, not just references).
     let mut mem_ports: HashMap<String, (Vec<String>, Option<String>)> = mems

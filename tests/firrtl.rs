@@ -1984,3 +1984,45 @@ module M {
     let verilog = run_firtool(&fir, &[]).expect("firtool should compile this design");
     assert!(verilog.contains("module M"));
 }
+
+#[test]
+fn conflict_free_claim_emits_a_simulation_assertion() {
+    // `conflict_free { a, b }` waives the derived mutual-exclusion stall
+    // between two conflicting rules -- the claim is recorded, not
+    // trusted (DESIGN.md's "Scheduling" tier 2): the compiler must
+    // insert a real check, not just silently accept the annotation.
+    let src = "\
+module M {
+    reg a : bits[8] = 0
+    reg b : bits[8] = 0
+    input we_a : bits[1]
+    input we_b : bits[1]
+
+    rule set_a {
+        (we_a == 1)?
+        a := b
+    }
+
+    rule set_b {
+        (we_b == 1)?
+        b := a
+    }
+
+    schedule {
+        urgency set_a > set_b
+        conflict_free { set_a, set_b }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "assert(clock, not(and(fires_set_a, fires_set_b)), not(reset), \"conflict_free claim \
+         violated: rule set_a and rule set_b both fired the same cycle\") : \
+         conflict_free_check_0"
+    ));
+    // No derived stall between an exempted pair -- unlike a non-exempted
+    // conflict, neither rule's `fires_*` should reference the other's.
+    assert!(!fir.contains("not(fires_set_a)"));
+    assert!(!fir.contains("not(fires_set_b)"));
+    run_firtool(&fir, &[]);
+}

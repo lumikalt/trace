@@ -275,14 +275,58 @@ derived stall: refill fires only when step_s1 is blocked or idle
 
 **Tier 2: annotations (v0).** When the default is wrong, the user shapes it. The
 compiler checks `conflict_free` claims with inserted simulation assertions. It does not
-trust them blindly.
+trust them blindly. The claim itself is "these two rules never actually fire the same
+cycle" — e.g. two writers whose enable conditions the user knows are mutually exclusive
+in practice, even though the static read/write analysis (which can't see into a guard's
+runtime value) flags them as conflicting:
 
 ```
 schedule {
-    urgency step_s1 > refill
-    conflict_free { read_port, write_port }   -- checked in simulation
+    urgency writer_a > writer_b
+    conflict_free { writer_a, writer_b }   -- claim: never both fire; checked in simulation
 }
 ```
+
+This is deliberately NOT "these two may safely fire concurrently" (e.g. a dual-port
+memory's independent read/write) — v0 has no way to prove or check anything about what
+happens WHEN both fire (address disjointness is exactly the tier-3 banked-array proof
+this document defers), so "safe to coincide" would have nothing soundly checkable behind
+it in v0. "Never coincide" is the only reading with a real, insertable runtime check.
+Confirmed with Lumi via AskUserQuestion before finalizing the assertion's polarity,
+since the two readings assert opposite things and this document's own wording could be
+misread either way.
+
+**The tier-2 assertion itself, ACHIEVED 2026-07-31.** For each `conflict_free`-exempted
+pair, `emit_module` (module.rs) emits a FIRRTL `assert` right after the pair's own
+`fires_*` nodes:
+
+```
+assert(clock, not(and(fires_a, fires_b)), not(reset), "conflict_free claim violated: rule a and rule b both fired the same cycle") : conflict_free_check_0
+```
+
+The claim being checked is exactly "these two rules never both fire the same cycle" —
+not anything about the actual addresses/values touched, since v0 has no way to observe
+those independent of firing at all. `enable` is gated on `not(reset)`: a rule's own
+guard may read state that hasn't settled to its real post-reset value yet on the reset
+cycle itself, and a spurious both-fire during reset would be a false claim violation,
+not a real one. This is the FIRRTL verification-statement primitive, confirmed against
+real firtool + Icarus before relying on it: firtool lowers it straight to a SystemVerilog
+concurrent `assert ... else $error(...)`, and — unlike some SVA constructs — Icarus
+(`-g2012`) accepts and correctly evaluates it, printing the exact message text on a
+violated cycle and staying silent otherwise (confirmed both ways, not just the
+happy path).
+
+`examples/conflict_free_check.tr` + `sim/conflict_free_check_tb.v` prove both directions
+through real firtool + Icarus simulation: a window where the claim genuinely holds
+(`we_a`/`we_b` never both 1) produces no assertion failure, and a window that
+deliberately violates it (both 1 the same cycle) DOES — the second half is the important
+proof, confirming the check is a real, live assertion rather than dead code that always
+happens to pass. `tests/firrtl.rs`'s
+`conflict_free_claim_emits_a_simulation_assertion` pins the exact emitted text and
+additionally confirms an exempted pair gets NO derived-stall reference to the other's
+`fires_*` signal (unlike a non-exempted conflict, whose lower-urgency rule's own `fires_*`
+does reference the other's) — the annotation genuinely waives the stall rather than
+silently keeping it around.
 
 **Tier 3: provable disjointness (later, not v0).** Dahlia-style banked and affine array
 types would let the compiler prove two accesses disjoint and drop the conflict. This is
