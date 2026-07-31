@@ -180,6 +180,25 @@ mod tests {
     }
 
     #[test]
+    fn splits_the_logical_not_bits_1_hint() {
+        // Regression test: this message originally read "...got bits[8]
+        // (use `~` for...)" — a parenthetical, not a `"; use "` clause —
+        // so `split_hint` never found it and the full message repeated
+        // in both the header and the underline label (Lumi caught this
+        // by eye, same double-repeat `split_hint`'s own doc comment
+        // exists specifically to avoid).
+        let (main, hint) = split_hint(
+            "`!` needs a bits[1] operand, got bits[8]; use `~` for a bitwise complement \
+             of a wider value, or compare explicitly",
+        );
+        assert_eq!(main, "`!` needs a bits[1] operand, got bits[8]");
+        assert_eq!(
+            hint,
+            Some("use `~` for a bitwise complement of a wider value, or compare explicitly")
+        );
+    }
+
+    #[test]
     fn leaves_a_message_with_no_hint_intact() {
         let (main, hint) = split_hint("this call is not yet supported in FIRRTL emission");
         assert_eq!(main, "this call is not yet supported in FIRRTL emission");

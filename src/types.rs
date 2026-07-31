@@ -705,9 +705,9 @@ impl<'a> TypeChecker<'a> {
                     self.error(
                         self.expr_span(id),
                         format!(
-                            "`!` needs a bits[1] operand, got {t} (use `~` for a \
+                            "`!` needs a bits[1] operand, got {t}; use `~` for a \
                              bitwise complement of a wider value, or compare \
-                             explicitly)"
+                             explicitly"
                         ),
                     );
                     return Ty::Unknown;
