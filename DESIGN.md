@@ -603,8 +603,8 @@ changed by this section.
 
 ## Submodule instantiation
 
-**Achieved 2026-07-30.** Modules stay flat and top-level — no lexical nesting — and
-compose by name:
+**Achieved 2026-07-30.** Modules compose by name, not lexical nesting — a `module` is
+just another item, and `inst name : Module` names one to instantiate:
 
 ```
 module Adder {
@@ -657,6 +657,48 @@ Two design choices carried over deliberately from elsewhere in this document:
   to the port's unconditional `UInt(0)` default rather than holding a stale value, since
   a port (unlike a register) has no state of its own. A memory write still can't nest:
   that restriction remains.
+- **Lexical nesting.** A `module` may itself be declared inside another module's body
+  (**achieved 2026-07-31**) — purely a naming convenience, not a hardware relationship:
+
+  ```
+  module Top {
+      module Adder {
+          input a : bits[8]
+          input b : bits[8]
+          output sum : bits[8] = 0
+          rule add {
+              sum := a + b
+          }
+      }
+      inst adder : Adder
+      ...
+  }
+  ```
+
+  `Adder` is visible only within `Top` (resolve.rs pushes a fresh scope per module,
+  popped on exit — the same mechanism that already kept a `reg`/`rule` name invisible
+  outside its own module) — a sibling module cannot `inst` it. FIRRTL itself has no
+  nested-module concept, so this changes nothing about emission: a nested module still
+  becomes its own top-level FIRRTL block, found by walking the whole AST for `Item::Module`
+  regardless of depth instead of only `ast.roots`. Parsing, resolution's own per-module
+  scoping, effect inference, and scheduling already worked at arbitrary nesting depth
+  with no changes at all — FIRRTL emission was the one place still hard-assuming every
+  module a file-level root.
+
+  Nesting surfaced a real gap worth stating plainly: **modules share no state with each
+  other, however they're lexically arranged.** Before nesting existed, this was true by
+  construction (sibling modules' scopes never overlapped on the resolver's scope stack).
+  Once a module's body can resolve names from an enclosing scope, a nested module's rule
+  could accidentally reference its *parent's* own `reg` — resolving successfully in
+  resolve.rs (the name genuinely is in scope, lexically), but referencing a register that
+  doesn't exist in the nested module's own emitted FIRRTL text, since each module is still
+  emitted as an independent block. Previously this reached `firtool` as a raw "use of
+  unknown declaration" error with no link back to the `.tr` source. Fixed by tracking each
+  definition's owning module (`None` for one declared outside any module) and rejecting,
+  at resolve time, any reference to state whose owner isn't the innermost enclosing
+  module — an `inst` target name is deliberately exempt (that lookup crossing a module
+  boundary is the entire point of nesting), resolved through a separate path that skips
+  the check.
 
 The interesting part was emission, not the front end. Resolution, effect inference, and
 scheduling needed only small, structurally obvious additions (a new `DefKind::Inst`, a

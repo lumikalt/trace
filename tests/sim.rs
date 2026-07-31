@@ -390,3 +390,35 @@ fn submodule_multi_port_runs_through_real_ports() {
         "both ports' writes should land the same cycle (5 + 7 = 12):\n{output}"
     );
 }
+
+/// Proves lexical module nesting through real simulation: examples/
+/// submodule_nested.tr is submodule.tr's exact design with `Adder`
+/// declared inside `Top`'s body instead of as a sibling — same ports, so
+/// sim/submodule_tb.v (unmodified) drives it identically. FIRRTL has no
+/// nested-module concept, so this should behave exactly like the flat
+/// version; reusing the same testbench file is itself part of the proof.
+#[test]
+fn submodule_nested_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/submodule_nested.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/submodule_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=50"),
+        "result did not settle at 20 + 30:\n{output}"
+    );
+}

@@ -1,5 +1,8 @@
 use trace::resolve::{DefKind, Resolution, ResolveError, resolve};
-use trace::{ast::Ast, lexer, parser};
+use trace::{
+    ast::{Ast, Item},
+    lexer, parser,
+};
 
 fn run(src: &str) -> (Ast, Resolution, Vec<ResolveError>) {
     let (tokens, lex_errors) = lexer::lex(src);
@@ -88,6 +91,143 @@ fn inst_resolves_to_a_module_and_ports_are_fields() {
          rule w {\n c.a := v\n v := c.b\n}\n}\n",
     );
     assert!(resolved_kinds(&res).contains(&DefKind::Inst));
+}
+
+#[test]
+fn nested_module_resolves_and_can_be_instantiated_from_its_parent() {
+    let (_, res) = run_ok(
+        "module Top {\n module Adder {\n input a : bits[8]\n output b : bits[8] = 0\n \
+         rule r {\n b := a\n}\n}\n \
+         inst c : Adder\n reg v : bits[8] = 0\n \
+         rule w {\n c.a := v\n v := c.b\n}\n}\n",
+    );
+    assert!(resolved_kinds(&res).contains(&DefKind::Inst));
+    assert!(
+        res.defs
+            .iter()
+            .any(|d| d.name == "Adder" && d.kind == DefKind::Module)
+    );
+}
+
+#[test]
+fn nested_module_is_not_visible_outside_its_lexical_scope() {
+    // `Adder` nested inside `Top` is scoped to `Top` (resolve.rs pushes a
+    // fresh scope per module, popped on exit) — a sibling module can't
+    // name it, same as a `reg`/`rule` declared inside one module was
+    // already invisible to another.
+    let (_, _, errors) = run(
+        "module Top {\n module Adder {\n input a : bits[8]\n}\n inst c : Adder\n}\n\
+         module Sibling {\n inst also_adder : Adder\n}\n",
+    );
+    assert!(errors.iter().any(|e| e.message.contains("cannot find")));
+}
+
+#[test]
+fn nested_module_cannot_read_its_parents_state() {
+    // A nested module's rule referencing its enclosing module's own `reg`
+    // would resolve to a name that doesn't exist in the nested module's
+    // own emitted FIRRTL scope (modules share nothing but ports) — must
+    // be a clean resolve-time error, not a name that silently resolves
+    // and only fails once it's invalid FIRRTL text firtool rejects.
+    let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
+         module Adder {\n input a : bits[8]\n output sum : bits[8] = 0\n \
+         rule add {\n sum := a + v\n}\n}\n inst c : Adder\n}\n");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("belongs to a different module"))
+    );
+}
+
+#[test]
+fn nested_module_cannot_write_its_parents_state() {
+    let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
+         module Adder {\n input a : bits[8]\n rule set {\n v := a\n}\n}\n inst c : Adder\n}\n");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("belongs to a different module"))
+    );
+}
+
+#[test]
+fn nested_module_cannot_declare_reads_on_its_parents_state() {
+    let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
+         module Adder {\n rule r <reads {v}> {\n tick\n}\n}\n inst c : Adder\n}\n");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("belongs to a different module"))
+    );
+}
+
+#[test]
+fn sibling_state_names_do_not_falsely_trigger_the_boundary_check() {
+    // Two UNRELATED modules each declaring their own `v` must not
+    // conflict with each other or with the boundary check (each `v`'s
+    // owner is its own module; neither is an ancestor of the other, so
+    // this must resolve via ordinary shadowing, not an error).
+    run_ok(
+        "module A {\n reg v : bits[8] = 0\n rule r {\n v := v + 1\n}\n}\n\
+         module B {\n reg v : bits[8] = 0\n rule r {\n v := v + 1\n}\n}\n",
+    );
+}
+
+#[test]
+fn nested_module_shadowing_its_parents_state_name_binds_its_own() {
+    // `Child`'s own `v` must win over `Top`'s `v` of the same name —
+    // lookup is innermost-scope-first, so this should just work, but the
+    // boundary check has to agree with that ordering rather than
+    // second-guess it (this is the parent/child case the sibling test
+    // above doesn't exercise: same name, one nested INSIDE the other).
+    let (ast, res) = run_ok(
+        "module Top {\n reg v : bits[8] = 0\n \
+         module Child {\n reg v : bits[8] = 0\n rule r {\n v := v + 1\n}\n}\n inst c : Child\n}\n",
+    );
+
+    let Item::Module {
+        items: top_items, ..
+    } = ast.item(ast.roots[0])
+    else {
+        panic!("expected Top to be the sole root");
+    };
+    let top_v = top_items
+        .iter()
+        .find(|id| matches!(ast.item(**id), Item::Reg { name, .. } if name.text == "v"))
+        .map(|id| res.item_defs[id])
+        .expect("Top's own `v`");
+    let child_item = *top_items
+        .iter()
+        .find(|id| matches!(ast.item(**id), Item::Module { name, .. } if name.text == "Child"))
+        .expect("Child nested in Top");
+    let Item::Module {
+        items: child_items, ..
+    } = ast.item(child_item)
+    else {
+        unreachable!()
+    };
+    let child_v = child_items
+        .iter()
+        .find(|id| matches!(ast.item(**id), Item::Reg { name, .. } if name.text == "v"))
+        .map(|id| res.item_defs[id])
+        .expect("Child's own `v`");
+    assert_ne!(top_v, child_v, "sanity: two distinct `v` defs must exist");
+
+    let ident_exprs: Vec<trace::ast::ExprId> = (0..ast.exprs.len())
+        .map(|i| trace::ast::ExprId(i as u32))
+        .filter(|id| matches!(ast.expr(*id), trace::ast::Expr::Ident(n) if n == "v"))
+        .collect();
+    assert_eq!(
+        ident_exprs.len(),
+        2,
+        "expected two `v` idents in Child's rule"
+    );
+    for id in ident_exprs {
+        assert_eq!(
+            res.expr_defs[&id], child_v,
+            "Child's rule must bind its OWN `v`, not Top's"
+        );
+    }
 }
 
 #[test]

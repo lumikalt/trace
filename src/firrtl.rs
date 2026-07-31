@@ -6,12 +6,21 @@
 //! chain by hand.
 //!
 //! Scope, v0. Each is an explicit error, not a silent skip:
-//! - Modules stay flat and top-level; no lexical nesting (a `module`
-//!   declared inside another module's body is still rejected). Composition
-//!   is by name only: `inst child : Child` declares a child instance,
-//!   `child.port` reads/writes one of its ports. Exactly one top-level
-//!   module must be uninstantiated (the "top"); the rest must be reachable
-//!   from it via `inst`, with no cycle.
+//! - A `module` may be declared inside another module's body — purely a
+//!   naming convenience (resolve.rs scopes it to its parent, invisible to
+//!   siblings), not a hardware relationship. Composition is still only by
+//!   name via `inst child : Child` (`child.port` reads/writes one of its
+//!   ports), and FIRRTL itself has no nested-module concept: a lexically
+//!   nested module still emits as its own top-level FIRRTL block, found
+//!   by `all_modules` regardless of nesting depth. Exactly one module in
+//!   the whole file must be uninstantiated (the "top"); the rest must be
+//!   reachable from it via `inst`, with no cycle. Modules share no state
+//!   with each other regardless of nesting — a rule may only reference
+//!   `reg`/`mem`/`fifo`/`input`/`output`/`inst` declared in its OWN
+//!   module, an explicit resolve-time error otherwise (resolve.rs's
+//!   `check_module_boundary`), since a name from a different module has
+//!   no counterpart in the emitted FIRRTL text this pass produces for
+//!   the module actually being compiled.
 //! - Each instance port is its own conflict resource (resolve.rs
 //!   synthesizes one per `(inst, port)` pair): two rules touching
 //!   different ports of the same instance don't conflict, unlike a `mem`
@@ -74,12 +83,7 @@ pub fn emit(
     types: &Types,
     sched: &Schedule,
 ) -> Result<String, Vec<EmitError>> {
-    let modules: Vec<ItemId> = ast
-        .roots
-        .iter()
-        .copied()
-        .filter(|id| matches!(ast.item(*id), Item::Module { .. }))
-        .collect();
+    let modules: Vec<ItemId> = all_modules(ast);
     if modules.is_empty() {
         return Err(vec![EmitError {
             span: 0..0,
@@ -160,6 +164,23 @@ pub fn emit(
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Every `Item::Module` in the file, regardless of lexical nesting depth
+/// — a module declared inside another module's body (visible only within
+/// that scope, per resolve.rs) still gets its own top-level FIRRTL block,
+/// same as a module declared at the file's own top level; FIRRTL itself
+/// has no nested-module concept, only cross-references via `inst X of Y`.
+fn all_modules(ast: &Ast) -> Vec<ItemId> {
+    let mut out = Vec::new();
+    let mut worklist: Vec<ItemId> = ast.roots.clone();
+    while let Some(id) = worklist.pop() {
+        if let Item::Module { items, .. } = ast.item(id) {
+            out.push(id);
+            worklist.extend(items.iter().copied());
+        }
+    }
+    out
 }
 
 /// The modules a module `m` directly instantiates via `inst`.
@@ -428,17 +449,12 @@ fn emit_module(
                     def,
                 ));
             }
-            Item::Fn { .. } | Item::Schedule { .. } => {}
-            Item::Module { name, .. } => {
-                cx.error(
-                    ast.item_spans[id.0 as usize].clone(),
-                    format!(
-                        "nested module `{}` is not supported (v0 restriction): modules \
-                         stay flat and top-level; use `inst` to compose them instead",
-                        name.text
-                    ),
-                );
-            }
+            // A nested module declaration is transparent to its parent's
+            // own body: it contributes no state/rules here, only a name
+            // scoped to this module (see resolve.rs) that `inst` can
+            // target. It gets its own separate FIRRTL module block,
+            // discovered and emitted independently (see `all_modules`).
+            Item::Fn { .. } | Item::Schedule { .. } | Item::Module { .. } => {}
         }
     }
 

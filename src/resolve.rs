@@ -128,6 +128,8 @@ pub fn resolve(ast: &Ast) -> (Resolution, Vec<ResolveError>) {
         errors: Vec::new(),
         scopes: vec![HashMap::new()],
         inst_ports: HashMap::new(),
+        current_module: Vec::new(),
+        def_owner: HashMap::new(),
     };
     for name in BUILTINS {
         let id = resolver.new_def(name, DefKind::Builtin, 0..0);
@@ -147,6 +149,18 @@ struct Resolver<'a> {
     /// effects.rs's conflict-set intersection to see them as the same
     /// resource).
     inst_ports: HashMap<(DefId, String), DefId>,
+    /// Stack of enclosing `module` items, innermost last; empty at file
+    /// root. Only pushed/popped around a module's own body, not its own
+    /// declaration site (see `resolve_item`'s `Item::Module` arm).
+    current_module: Vec<ItemId>,
+    /// Every def's immediately-enclosing module, `None` for one declared
+    /// outside any module. Used to reject a state reference that crosses
+    /// a module boundary — hardware modules share nothing but ports, so
+    /// a nested module's rule referencing an ancestor module's own `reg`
+    /// would otherwise resolve to a name that doesn't exist in the
+    /// nested module's own emitted FIRRTL scope (see `resolve_expr`'s
+    /// `Expr::Ident` arm).
+    def_owner: HashMap<DefId, Option<ItemId>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -161,6 +175,27 @@ impl<'a> Resolver<'a> {
 
     fn error(&mut self, span: Span, message: String) {
         self.errors.push(ResolveError { span, message });
+    }
+
+    /// True if `def` (assumed state, i.e. `is_state()`) belongs to the
+    /// innermost enclosing module — false and errors otherwise. Modules
+    /// share no state with each other, only ports, so a name declared in
+    /// one module (or at file scope, outside any module) must not
+    /// resolve inside a different one, however it's lexically nested.
+    /// (A `Module` name itself is exempt from this — see
+    /// `resolve_inst_target`, which deliberately bypasses this check.)
+    fn check_module_boundary(&mut self, def: DefId, span: Span, text: &str) -> bool {
+        if self.def_owner.get(&def).copied().flatten() == self.current_module.last().copied() {
+            return true;
+        }
+        self.error(
+            span,
+            format!(
+                "cannot use `{text}` here: it belongs to a different module (modules \
+                 share no state with each other, only ports declared on themselves)"
+            ),
+        );
+        false
     }
 
     /// The `InstPort` resource for `inst`'s `port`, allocating one on
@@ -244,15 +279,19 @@ impl<'a> Resolver<'a> {
             Item::Schedule { .. } => return,
         };
         let def = self.declare(&name, kind);
+        self.def_owner
+            .insert(def, self.current_module.last().copied());
         self.res.item_defs.insert(id, def);
     }
 
     fn resolve_item(&mut self, id: ItemId) {
         match self.ast.item(id) {
             Item::Module { items, .. } => {
+                self.current_module.push(id);
                 self.scopes.push(HashMap::new());
                 self.resolve_scope(&items.clone());
                 self.scopes.pop();
+                self.current_module.pop();
             }
             Item::Reg { ty, init, .. } => {
                 self.resolve_expr(*ty, false);
@@ -270,7 +309,7 @@ impl<'a> Resolver<'a> {
                 }
             }
             Item::Inst { module, .. } => {
-                self.resolve_expr(*module, false);
+                self.resolve_inst_target(*module);
                 if let Some(def) = self.res.expr_defs.get(module).copied()
                     && self.res.def(def).kind != DefKind::Module
                 {
@@ -382,7 +421,9 @@ impl<'a> Resolver<'a> {
                             self.res.def(def).kind.describe()
                         ),
                     ),
-                    Some(_) => {}
+                    Some(def) => {
+                        self.check_module_boundary(def, arg.span.clone(), &arg.text);
+                    }
                 }
             }
         }
@@ -404,25 +445,34 @@ impl<'a> Resolver<'a> {
                 match self.ast.expr(lhs) {
                     Expr::Ident(text) => {
                         if let Some(def) = self.lookup(text) {
-                            if self.res.def(def).kind == DefKind::Input {
-                                self.error(
+                            let in_scope = !self.res.def(def).kind.is_state()
+                                || self.check_module_boundary(
+                                    def,
                                     self.ast.expr_spans[lhs.0 as usize].clone(),
-                                    format!(
-                                        "cannot assign to `{text}`: it is an input port \
-                                         (inputs are read-only, driven from outside the module)"
-                                    ),
+                                    text,
                                 );
-                            } else if self.res.def(def).kind == DefKind::Inst {
-                                self.error(
-                                    self.ast.expr_spans[lhs.0 as usize].clone(),
-                                    format!(
-                                        "cannot assign to `{text}` directly: it is a module \
-                                         instance; write a specific port instead (`{text}.port \
-                                         := ...`)"
-                                    ),
-                                );
+                            if in_scope {
+                                if self.res.def(def).kind == DefKind::Input {
+                                    self.error(
+                                        self.ast.expr_spans[lhs.0 as usize].clone(),
+                                        format!(
+                                            "cannot assign to `{text}`: it is an input port \
+                                             (inputs are read-only, driven from outside the \
+                                             module)"
+                                        ),
+                                    );
+                                } else if self.res.def(def).kind == DefKind::Inst {
+                                    self.error(
+                                        self.ast.expr_spans[lhs.0 as usize].clone(),
+                                        format!(
+                                            "cannot assign to `{text}` directly: it is a \
+                                             module instance; write a specific port instead \
+                                             (`{text}.port := ...`)"
+                                        ),
+                                    );
+                                }
+                                self.res.expr_defs.insert(lhs, def);
                             }
-                            self.res.expr_defs.insert(lhs, def);
                         } else {
                             let name = Name {
                                 text: text.clone(),
@@ -469,13 +519,40 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// The `Module` name in `inst name : Module`: unlike every other
+    /// identifier use, this one deliberately walks past a module
+    /// boundary — a nested module's name is only visible to its
+    /// immediate lexical parent's `inst`, which is exactly what a plain
+    /// scope lookup already gives (see `resolve_item`'s `Item::Module`
+    /// arm), with no `check_module_boundary` call to undo it.
+    fn resolve_inst_target(&mut self, id: ExprId) {
+        let Expr::Ident(text) = self.ast.expr(id).clone() else {
+            self.resolve_expr(id, false);
+            return;
+        };
+        if let Some(def) = self.lookup(&text) {
+            self.res.expr_defs.insert(id, def);
+        } else {
+            let span = self.ast.expr_spans[id.0 as usize].clone();
+            self.error(span, format!("cannot find `{text}`"));
+        }
+    }
+
     /// `in_type`: name misses bind implicit parameters instead of erroring
     /// (only signature types pass true).
     fn resolve_expr(&mut self, id: ExprId, in_type: bool) {
         match self.ast.expr(id).clone() {
             Expr::Ident(text) => {
                 if let Some(def) = self.lookup(&text) {
-                    self.res.expr_defs.insert(id, def);
+                    let ok = !self.res.def(def).kind.is_state()
+                        || self.check_module_boundary(
+                            def,
+                            self.ast.expr_spans[id.0 as usize].clone(),
+                            &text,
+                        );
+                    if ok {
+                        self.res.expr_defs.insert(id, def);
+                    }
                 } else if in_type {
                     let name = Name {
                         text: text.clone(),

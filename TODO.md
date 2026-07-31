@@ -2,11 +2,13 @@
 
 ## Emission (`src/firrtl.rs`)
 
-- Submodules compose by name only (`inst child : Child`, flat top-level
-  modules); no lexical nesting. An instance port write may nest in
-  `if`/`else` (threaded through a `mux`, same as a register write).
 - No calls to user `fn`/`spec`/`impl` from synthesizable rules (needs
-  inlining or instantiation).
+  inlining or instantiation). When this lands: recheck resolve.rs's
+  module-boundary state check (`check_module_boundary`) against a
+  `fn`/`spec`/`impl` nested inside a module that reads/writes that
+  module's own state — today that's moot (calls aren't emitted at all),
+  but inlining would need the boundary re-validated at the CALL site's
+  module, not just the callee's declaration site.
 - Expression surface still excludes: calls, other field access, `/`/`%`,
   dynamic-amount shifts (shift amount must be a literal), computed
   bit-select/slice bounds (must be literal), and logical `!` (only `~`

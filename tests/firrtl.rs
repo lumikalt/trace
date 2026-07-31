@@ -515,6 +515,49 @@ module Top {
 }
 
 #[test]
+fn nested_module_emits_as_its_own_top_level_firrtl_block() {
+    // `Adder` declared lexically inside `Top`'s body still gets its own
+    // separate FIRRTL `module` block, cross-referenced by `inst ... of
+    // Adder` — FIRRTL itself has no nested-module concept, only
+    // top-level modules wired together (same shape as two sibling
+    // modules, see `emits_submodule_instance`, just found via a
+    // different AST walk).
+    let src = "\
+module Top {
+    module Adder {
+        input a : bits[8]
+        input b : bits[8]
+        output sum : bits[8] = 0
+        rule add {
+            sum := a + b
+        }
+    }
+    inst adder : Adder
+    input x : bits[8]
+    input y : bits[8]
+    output result : bits[8] = 0
+    rule wire {
+        adder.a := x
+        adder.b := y
+        result := adder.sum
+    }
+}
+";
+    let fir = emit_from_source(src).unwrap();
+    assert!(fir.contains("circuit Top :"));
+    assert!(fir.contains("public module Top :"));
+    assert!(fir.contains("module Adder :") && !fir.contains("public module Adder :"));
+    assert!(fir.contains("inst adder of Adder"));
+
+    let Some(verilog) = run_firtool(&fir, &["--disable-opt"]) else {
+        return;
+    };
+    assert!(verilog.contains("module Adder("));
+    assert!(verilog.contains("module Top("));
+    assert!(verilog.contains("Adder adder ("));
+}
+
+#[test]
 fn alu_emits_widened_expression_surface() {
     let fir = emit_from_source(&read_example("alu.tr")).expect("emission should succeed");
 
