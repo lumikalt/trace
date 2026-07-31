@@ -66,7 +66,7 @@
     },
     "operators": {
       "name": "keyword.operator.trace",
-      "match": ":=|==|!=|<=|>=|<<|>>|\\.\\.|[:=<>.?|^&+\\-*/%~!]"
+      "match": ":=|==|!=|<=|>=|<<|>>|\\.\\.|\\+:|-:|[:=<>.?|^&+\\-*/%~!]"
     },
     "punctuation": {
       "name": "punctuation.trace",

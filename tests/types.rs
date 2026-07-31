@@ -132,6 +132,77 @@ fn bit_select_and_slice() {
 }
 
 #[test]
+fn dynamic_slice_bounds_are_a_type_error() {
+    // Unlike a single index (always exactly 1 bit, static or dynamic), a
+    // slice's WIDTH depends on both bounds -- if either isn't a
+    // compile-time constant, the width genuinely can't be known, so
+    // this must be an explicit type error, not silently fall through to
+    // some default width (it used to silently type as bits[1], a real
+    // latent mistyping bug: a narrower-than-declared value would have
+    // passed `check_assignable` without complaint).
+    let src = "\
+module M {
+    input x : bits[8]
+    input a : bits[3]
+    input b : bits[3]
+    output y : bits[8] = 0
+    rule r {
+        y := x[a..b]
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("must both be compile-time constants")
+    );
+
+    // A single dynamic index is unaffected -- still well-typed as
+    // bits[1], same as a static one.
+    run_ok(
+        "module M {\n input x : bits[8]\n input i : bits[3]\n output y : bits[1] = 0\n \
+         rule r {\n y := x[i]\n }\n}\n",
+    );
+}
+
+#[test]
+fn indexed_part_select_types_by_its_static_width_regardless_of_a_dynamic_base() {
+    // `x[base +: width]`/`x[base -: width]`: `base` may be dynamic, but
+    // `width` must be a compile-time constant -- the whole point is that
+    // the RESULT's width is fixed even though the start position isn't
+    // known until runtime.
+    run_ok(
+        "module M {\n input x : bits[8]\n input base : bits[3]\n output y : bits[4] = 0\n \
+         rule r {\n y := x[base +: 4]\n }\n}\n",
+    );
+    run_ok(
+        "module M {\n input x : bits[8]\n input base : bits[3]\n output y : bits[4] = 0\n \
+         rule r {\n y := x[base -: 4]\n }\n}\n",
+    );
+
+    let src = "\
+module M {
+    input x : bits[8]
+    input base : bits[3]
+    input w : bits[3]
+    output y : bits[4] = 0
+    rule r {
+        y := x[base +: w]
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("needs a compile-time constant width")
+    );
+}
+
+#[test]
 fn implicit_width_params_instantiate_at_call_sites() {
     // N solves to 8, so clog2(N) = 3: assigning to bits[3] works and
     // assigning to bits[2] fails.

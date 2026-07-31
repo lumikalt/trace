@@ -113,6 +113,18 @@ fn bit_is_its_own_keyword_distinct_from_bits() {
 }
 
 #[test]
+fn indexed_part_select_operators_beat_a_bare_plus_or_minus() {
+    // `+:`/`-:` (Verilog-style indexed part-select) are their own
+    // two-character tokens, distinct from `+`/`-` followed by `:` —
+    // longest-match-wins, same mechanism `:=` already relies on to beat
+    // a bare `:`.
+    assert_eq!(kinds("base +: 4"), vec![Ident, PlusColon, Int]);
+    assert_eq!(kinds("base -: 4"), vec![Ident, MinusColon, Int]);
+    // A bare `+`/`-` (no immediately-following `:`) is unaffected.
+    assert_eq!(kinds("a + b"), vec![Ident, Plus, Ident]);
+}
+
+#[test]
 fn bad_bytes_merge_into_one_error() {
     let (tokens, errors) = lex("a @@ b");
     assert_eq!(

@@ -799,7 +799,11 @@ module M {
 }
 
 #[test]
-fn bit_select_with_computed_bounds_is_an_error() {
+fn dynamic_single_index_select_compiles_to_a_dynamic_shift() {
+    // A single index is always exactly 1 bit whether it's a compile-time
+    // constant or a genuine runtime value -- `x[i]` with a dynamic `i`
+    // shifts the target bit down to position 0 (`dshr`) then takes it,
+    // rather than erroring the way it used to (v0 restriction lifted).
     let src = "\
 module M {
     input x : bits[8]
@@ -810,11 +814,65 @@ module M {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_y, bits(dshr(x, i), 0, 0)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn indexed_part_select_up_and_down_use_dshr_plus_a_static_truncate() {
+    // `x[base +: width]`/`x[base -: width]` (Verilog-style indexed
+    // part-select): `base` may be dynamic, but `width` is always a
+    // compile-time constant, so the RESULT's width is well-defined even
+    // though the starting bit isn't known until runtime. `+:` shifts
+    // `base` itself down to position 0; `-:` shifts `base-(width-1)`
+    // down instead, so the SAME low `width` bits after either shift
+    // land on the intended window -- both then truncate with a STATIC
+    // `bits(..., width-1, 0)`, unlike a fully dynamic slice (still
+    // unsupported: see `dynamic_slice_bounds_are_a_type_error`,
+    // tests/types.rs).
+    let src = "\
+module M {
+    input x : bits[8]
+    input base : bits[3]
+    output up : bits[4] = 0
+    output down : bits[4] = 0
+    rule r {
+        up := x[base +: 4]
+        down := x[base -: 4]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_up, bits(dshr(x, base), 3, 0)"));
     assert!(
-        err.iter()
-            .any(|e| e.message.contains("bounds must be literal integers"))
+        fir.contains("connect __out_down, bits(dshr(x, tail(sub(base, UInt<3>(3)), 1)), 3, 0)")
     );
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn indexed_part_select_width_folds_a_non_literal_constant_expression() {
+    // Regression: the width must come from the bracket's own
+    // types.rs-computed type (`width_of(id)`), not from re-const-evaling
+    // `rhs` at emission time. types.rs's `const_eval` folds binary ops
+    // (`2 + 2`), but firrtl's own `const_eval` only recognizes a bare
+    // literal -- an earlier version fell back to `unwrap_or(1)` here,
+    // silently emitting a 1-bit select for a `bits[4]` output instead of
+    // erroring or using the real width.
+    let src = "\
+module M {
+    input x : bits[8]
+    input base : bits[3]
+    output y : bits[4] = 0
+    rule r {
+        y := x[base +: 2 + 2]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_y, bits(dshr(x, base), 3, 0)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

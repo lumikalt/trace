@@ -783,10 +783,13 @@ FIRRTL primop that matched them:
   now — see "Dynamic-amount shifts" below.
 
 Bit-select and slice (`x[i]`, `x[hi..lo]`) compile to FIRRTL's `bits(x, hi, lo)`
-primop, which also needs static bounds — so, like shifts, only literal-integer
-indices are supported; a computed bound is a v0 restriction, not something the type
-checker would otherwise reject (it happily types a dynamic single-bit select as
-`bits[1]`). Unary `-` compiles to `tail(sub(UInt<w>(0), x), 1)` (two's-complement
+primop, which needs static bounds — at the time this was written, only literal-integer
+indices were supported; a computed bound was a v0 restriction, not something the type
+checker would otherwise reject (it happily typed a dynamic single-bit select as
+`bits[1]`). A dynamic single index and Verilog-style indexed part-select are now
+supported — see "Dynamic bit-select and indexed part-select" below; a fully dynamic
+slice (both bounds non-const) remains unsupported, but is now a real type error rather
+than the same silent `bits[1]` mistyping. Unary `-` compiles to `tail(sub(UInt<w>(0), x), 1)` (two's-complement
 negate, wrapping within the operand's own width, same convention as `+`/`-`); unary
 `~` compiles straight to FIRRTL's `not`. Logical `!` was deliberately left out this
 pass (added later — see "Logical `!`" below).
@@ -1007,6 +1010,84 @@ runtime, not a constant baked in at synthesis time the way a static `<< 3` would
 results at each `n` are cross-checked against `alu_tb.v`'s own already-proven static
 `<<3`/`>>3` values (0x18/0x1c) — confirming the dynamic path computes the identical
 answer a literal shift already does, not just "firtool accepted it."
+
+**Dynamic bit-select and indexed part-select, added 2026-07-31.** Scoped into three
+distinct sub-cases rather than treated as one feature, since a computed bit-select
+bound can mean genuinely different things:
+
+- **A single index (`x[i]`) may now be dynamic.** Always exactly 1 bit regardless — the
+  type checker already typed it that way unconditionally, so nothing about the WIDTH
+  rule needed to change, only emission. `compile_bit_select` tries `const_eval` first
+  (the existing static `bits(x, i, i)` path, unchanged) and falls through to
+  `bits(dshr(x, i), 0, 0)` — shift the target bit down to position 0 with a dynamic
+  shift, then take it — when `i` isn't const.
+- **A fully dynamic slice (`x[hi..lo]` with a non-const `hi`/`lo`) stays unsupported —
+  but this closes a real latent bug, not just a v0 restriction.** `type_bracket`'s
+  fallback used to type ANY unrecognized bracket-argument shape as `Ty::Bits(Width::Known(1))`,
+  including a `Range` with non-literal bounds — so `x[a..b]` with runtime `a`/`b`
+  type-checked successfully as `bits[1]` with zero error, silently accepting what should
+  have been rejected (confirmed empirically with a scratch `.tr` file before the fix: it
+  compiled clean). The reason it can't just be supported like a single index is width,
+  not value — a slice's result width IS `hi - lo + 1`, so a dynamic bound means a
+  dynamically-SIZED result, which this statically-typed language has no way to express.
+  `type_bracket` now explicitly errors ("bounds must both be compile-time constants...")
+  instead of falling through to the generic 1-bit default.
+- **New syntax fills the actual gap a dynamic slice was standing in for: Verilog-style
+  indexed part-select, `x[base +: width]` / `x[base -: width]`.** `base` may be dynamic,
+  but `width` must be a compile-time constant — that's what keeps the result width
+  well-defined despite the start position not being known until runtime. This is the
+  established real-world HDL precedent for exactly this shape (borrowed, not invented);
+  Python-style `a[start:stop:step]` stride slicing was considered and rejected as prior
+  art — a stride has no natural meaning for a contiguous hardware bit-vector, only a
+  position and a width do. Lexed as two new longest-match tokens (`PlusColon`/
+  `MinusColon`, beating a bare `+`/`-` the same way `:=` already beats a bare `:`), parsed
+  at the same loose binding power as `Range` (only meaningful as a `Bracket`'s own
+  argument, never a general expression). `type_bracket` types the whole expression as
+  `Ty::Bits(Width::Known(width))` when `width` const-evals (types.rs's OWN `const_eval`,
+  which folds binops and `clog2` — stronger than firrtl's), erroring separately for a
+  non-const width and for a width of 0. Emission shifts the desired low bit down to
+  position 0 with `dshr` (same idea as the dynamic single-index case) — `+:`'s low bit is
+  `base` itself; `-:`'s is `base - (width - 1)`, shifted with the same
+  `tail(sub(...), 1)` carry-truncation pattern used everywhere else in this emitter for
+  width-correct subtraction — then takes a STATIC `bits(..., width - 1, 0)`, which is
+  exactly what makes this simpler than a fully dynamic slice: the truncation point is
+  fixed at compile time even though the shift amount isn't.
+
+  Emission reads `width` off the bracket expression's OWN types.rs-computed type
+  (`self.width_of(id)`, where `id` is the whole `x[base +: width]` expression), not by
+  re-const-evaluating the width expression a second time at emission time. This
+  distinction mattered in practice, not just in theory: an earlier version called
+  firrtl's own (deliberately simpler) `const_eval` on the width expression directly and
+  fell back to `unwrap_or(1)` on failure, reasoning that types.rs must have already
+  proven it constant — true, but proven constant by types.rs's MORE POWERFUL
+  `const_eval` (folds binops, `clog2`), not firrtl's. A width like `clog2(8)` or `2 + 2`
+  types.rs accepts as constant could fail firrtl's own narrower `const_eval`, silently
+  falling back to a 1-bit select for what should have been a 4-bit one — a genuine
+  silent miscompile, caught by review before landing (see
+  `indexed_part_select_width_folds_a_non_literal_constant_expression`, tests/firrtl.rs)
+  rather than shipped. Reading the already-validated width off the bracket's own type
+  sidesteps the asymmetry entirely, rather than trying to keep two `const_eval`
+  implementations' notion of "constant" in sync.
+
+  `examples/dynamic_bit_select.tr` + `sim/dynamic_bit_select_tb.v` prove all three cases
+  through real firtool + Icarus simulation, driving `i`/`base` = 4 then 7 against a fixed
+  `x = 0xE3` across two cycles — `i = 7` is deliberately chosen (not just the always-safe
+  `i = 4`) specifically to exercise `+:`'s shift window (bits 7..10) exceeding `x`'s own
+  8-bit width, proving `dshr`'s zero-padding beyond the original width is handled
+  correctly, not just the in-range case.
+
+Considered and explicitly declined in the same pass: a Rust-style `..=` (inclusive) /
+`..` (exclusive) split, prompted by wanting an inclusive range operator analogous to
+Rust's. The natural follow-on question — since bit-select ranges are descending
+(`x[hi..lo]`) while Rust's exclusive `..` is ascending — was whether a symmetric mirror
+operator (`=..`) could make `N-1 =..0` and `N..0` equivalent. Investigated via a full
+recon of every `..`-related code site plus manual reasoning against that exact test
+equation: making the scheme self-consistent would require `..`'s excluded endpoint to be
+"whichever operand is numerically larger" rather than "whichever is written second" — an
+implicit, value-based exclusion rule, genuinely ambiguous, not just unusual. Per the
+explicit fallback condition this was scoped under (ambiguous → don't do it at all), `..`
+stays exactly as it already was everywhere: inclusive, both ends, unchanged. No new
+range-related operators exist for this purpose.
 
 ## Calling a function from a rule
 

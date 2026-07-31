@@ -61,6 +61,22 @@ fn range_binds_loosest() {
 }
 
 #[test]
+fn indexed_part_select_binds_as_loosely_as_range() {
+    // `+:`/`-:` are semantic siblings of `..` (each only meaningful as a
+    // `Bracket`'s own argument) and share its binding power, so a
+    // complex `base`/`width` expression on either side parses whole
+    // before the part-select operator applies, same as `0..N-1` above.
+    assert_eq!(
+        stmt_sexpr("x := a[base + 1 +: width - 1]"),
+        "(:= x (index a (+: (+ base 1) (- width 1))))"
+    );
+    assert_eq!(
+        stmt_sexpr("x := a[base + 1 -: width - 1]"),
+        "(:= x (index a (-: (+ base 1) (- width 1))))"
+    );
+}
+
+#[test]
 fn sized_integer_literals_parse() {
     assert_eq!(stmt_sexpr("x := 8'd6"), "(:= x 8'd6)");
     assert_eq!(stmt_sexpr("x := 8'hFF"), "(:= x 8'd255)");

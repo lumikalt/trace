@@ -103,7 +103,7 @@ impl<'a> Emitter<'a> {
             Expr::Unary { op, operand } => self.compile_unop(id, op, operand),
             Expr::Bracket { callee, args } => {
                 if matches!(self.types.expr_tys.get(&callee), Some(Ty::Bits(_))) {
-                    self.compile_bit_select(callee, &args)
+                    self.compile_bit_select(id, callee, &args)
                 } else {
                     self.error(
                         self.ast.expr_spans[id.0 as usize].clone(),
@@ -152,13 +152,29 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// `x[i]` or `x[hi..lo]` on a bits-typed (not memory) base. FIRRTL's
-    /// `bits` primop needs static bounds, so both forms require literal
-    /// integer indices — a computed bound is a v0 restriction, not a
-    /// missing feature the type checker would otherwise reject (it
-    /// happily types a dynamic single-bit select as `bits[1]`).
+    /// `x[i]` (single index), `x[hi..lo]` (slice), or `x[base +:
+    /// width]`/`x[base -: width]` (indexed part-select) on a bits-typed
+    /// (not memory) base. Each has a different rule for what may be
+    /// dynamic (a runtime, not compile-time-constant, expression):
+    /// - a slice's bounds must BOTH be static — types.rs already rejects
+    ///   a non-const bound as a type error before this ever runs (a
+    ///   slice's WIDTH can't be known otherwise), so the fallback error
+    ///   below is unreachable in practice, kept only for defense in
+    ///   depth;
+    /// - a single index may be dynamic — always exactly 1 bit either
+    ///   way, compiled via `dshr(x, i)` then taking bit 0 when `i` isn't
+    ///   const, or the existing static `bits(x, i, i)` when it is;
+    /// - indexed part-select's `base` may always be dynamic (that's the
+    ///   whole point — a fixed-WIDTH slice starting somewhere runtime-
+    ///   computed); only `width` must be static, already validated by
+    ///   types.rs. Compiled the same way a dynamic index is (`dshr` to
+    ///   bring the desired low bit down to position 0), then a STATIC
+    ///   `bits(..., width-1, 0)` truncation — `width` being static is
+    ///   exactly what makes this different from (and simpler than) a
+    ///   fully dynamic slice, which has no such fixed truncation point.
     pub(crate) fn compile_bit_select(
         &mut self,
+        id: ExprId,
         callee: ExprId,
         args: &[ExprId],
     ) -> Result<String, ()> {
@@ -170,43 +186,80 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         };
-        let bounds = if let Expr::Binary {
-            op: BinOp::Range,
-            lhs,
-            rhs,
-        } = self.ast.expr(arg)
-        {
-            // `const_eval` already accepts a bare `Int` or a sized
-            // literal (`8'd3`) equally — no new literal-recognition
-            // logic needed here, just reusing it instead of matching
-            // `Expr::Int`/`Expr::SizedInt` by hand.
-            match (self.const_eval(*lhs), self.const_eval(*rhs)) {
-                (Some(hi), Some(lo)) => Some((hi, lo)),
-                _ => None,
+        if let Expr::Binary { op, lhs, rhs } = self.ast.expr(arg).clone() {
+            match op {
+                BinOp::Range => {
+                    // `const_eval` already accepts a bare `Int` or a
+                    // sized literal (`8'd3`) equally — no new literal-
+                    // recognition logic needed here, just reusing it
+                    // instead of matching `Expr::Int`/`Expr::SizedInt`
+                    // by hand.
+                    let Some((hi, lo)) = self.const_eval(lhs).zip(self.const_eval(rhs)) else {
+                        self.error(
+                            self.ast.expr_spans[arg.0 as usize].clone(),
+                            "a slice's bounds must be literal integers in FIRRTL \
+                             emission (types.rs should already have rejected a \
+                             non-const bound as a type error before this point)"
+                                .to_string(),
+                        );
+                        return Err(());
+                    };
+                    if hi < lo {
+                        self.error(
+                            self.ast.expr_spans[arg.0 as usize].clone(),
+                            format!(
+                                "slice bounds must be high..low (got {hi}..{lo}); the \
+                                 type checker accepts either order but FIRRTL's \
+                                 `bits` primop needs hi >= lo"
+                            ),
+                        );
+                        return Err(());
+                    }
+                    return Ok(format!("bits({base}, {hi}, {lo})"));
+                }
+                BinOp::PlusColon | BinOp::MinusColon => {
+                    // Read the already-validated width off the bracket
+                    // expression's own type (`id`, not `rhs`) instead of
+                    // re-deriving it here with `const_eval`: types.rs's
+                    // `const_eval` folds binary ops and `clog2`, but
+                    // firrtl's own `const_eval` only recognizes a bare
+                    // literal, so a width types.rs accepted as constant
+                    // (e.g. `x[base +: clog2(8)]`) could const_eval to
+                    // `None` right here — falling back to a wrong default
+                    // width would silently emit a too-narrow select
+                    // instead of erroring or using the real width.
+                    let width = self.width_of(id);
+                    let ow = self.width_of(lhs);
+                    let off = self.compile_expr_hinted(lhs, Some(ow))?;
+                    let shift_by = match op {
+                        // `+:`: the low bit of the result is `base`
+                        // itself — shift it straight down to position 0.
+                        BinOp::PlusColon => off,
+                        // `-:`: the low bit of the result is
+                        // `base - (width - 1)` — shift THAT down to
+                        // position 0 instead, same `tail(sub(...), 1)`
+                        // carry-bit truncation any other subtraction in
+                        // this emitter uses.
+                        BinOp::MinusColon => format!(
+                            "tail(sub({off}, UInt<{ow}>({})), 1)",
+                            width.saturating_sub(1)
+                        ),
+                        _ => unreachable!(),
+                    };
+                    return Ok(format!("bits(dshr({base}, {shift_by}), {}, 0)", width - 1));
+                }
+                _ => {}
             }
-        } else {
-            self.const_eval(arg).map(|i| (i, i))
-        };
-        let Some((hi, lo)) = bounds else {
-            self.error(
-                self.ast.expr_spans[arg.0 as usize].clone(),
-                "bit-select/slice bounds must be literal integers in FIRRTL emission \
-                 (v0 restriction: no computed bit-select bounds)"
-                    .to_string(),
-            );
-            return Err(());
-        };
-        if hi < lo {
-            self.error(
-                self.ast.expr_spans[arg.0 as usize].clone(),
-                format!(
-                    "slice bounds must be high..low (got {hi}..{lo}); the type checker \
-                     accepts either order but FIRRTL's `bits` primop needs hi >= lo"
-                ),
-            );
-            return Err(());
         }
-        Ok(format!("bits({base}, {hi}, {lo})"))
+        // A single index — static (the existing fast path, unchanged)
+        // or dynamic (new: shift the target bit down to position 0,
+        // then take it — always exactly 1 bit regardless).
+        if let Some(i) = self.const_eval(arg) {
+            return Ok(format!("bits({base}, {i}, {i})"));
+        }
+        let iw = self.width_of(arg);
+        let i = self.compile_expr_hinted(arg, Some(iw))?;
+        Ok(format!("bits(dshr({base}, {i}), 0, 0)"))
     }
 
     pub(crate) fn compile_unop(

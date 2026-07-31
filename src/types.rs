@@ -767,8 +767,17 @@ impl<'a> TypeChecker<'a> {
         if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
             return Ty::Bits(Width::Known(1));
         }
-        if op == Range {
-            return Ty::Unknown; // only meaningful inside any(...)
+        if matches!(op, Range | PlusColon | MinusColon) {
+            // Only meaningful as a `Bracket`'s own argument (`type_bracket`
+            // re-matches the raw AST shape there for the real width rule);
+            // reached here only via the generic per-subexpression walk
+            // `type_bracket` already does before that re-match, or if
+            // used somewhere illegal (e.g. a bare `x := a +: b` statement)
+            // — silently `Unknown` either way, same treatment `Range` has
+            // always had. Emission's own generic `compile_binop` catch-all
+            // still rejects an illegal bare use explicitly, so nothing
+            // silently miscompiles.
+            return Ty::Unknown;
         }
         match (l, r) {
             (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
@@ -853,21 +862,88 @@ impl<'a> TypeChecker<'a> {
                 *elem
             }
             Ty::Bits(w) => {
-                // Bit select or slice.
-                if let Some(arg) = args.first()
-                    && let Expr::Binary {
-                        op: BinOp::Range,
-                        lhs,
-                        rhs,
-                    } = self.ast.expr(*arg)
-                    && let (Some(hi), Some(lo)) = (
-                        self.const_eval(*lhs, &HashMap::new()),
-                        self.const_eval(*rhs, &HashMap::new()),
-                    )
-                {
-                    return Ty::Bits(Width::Known(hi.abs_diff(lo) + 1));
-                }
                 let _ = w;
+                // Bit select (`x[i]`), slice (`x[hi..lo]`), or indexed
+                // part-select (`x[base +: width]`/`x[base -: width]`) —
+                // three shapes, each with a genuinely different width
+                // rule, distinguished by the argument's own AST shape.
+                if let Some(&arg) = args.first()
+                    && let Expr::Binary { op, lhs, rhs } = self.ast.expr(arg).clone()
+                {
+                    match op {
+                        // A slice's width can ONLY be known if BOTH
+                        // bounds are compile-time constants — FIRRTL's
+                        // `bits` primop needs static bounds, and there's
+                        // no way to express a dynamically-SIZED result
+                        // in this language's type system at all (unlike
+                        // a single index, whose width is always exactly
+                        // 1 regardless of whether it's dynamic). A
+                        // non-const bound here used to silently fall
+                        // through to the `Ty::Bits(Width::Known(1))`
+                        // fallback below — a real latent mistyping bug
+                        // (a narrower-than-declared value passes
+                        // `check_assignable` without complaint) — now an
+                        // explicit error instead.
+                        BinOp::Range => {
+                            return match (
+                                self.const_eval(lhs, &HashMap::new()),
+                                self.const_eval(rhs, &HashMap::new()),
+                            ) {
+                                (Some(hi), Some(lo)) => Ty::Bits(Width::Known(hi.abs_diff(lo) + 1)),
+                                _ => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        "a slice's bounds (`x[hi..lo]`) must both be \
+                                         compile-time constants (this language has no \
+                                         way to express a dynamically-sized result); \
+                                         use indexed part-select for a dynamic start \
+                                         with a fixed width instead — `x[base +: \
+                                         width]`/`x[base -: width]`"
+                                            .to_string(),
+                                    );
+                                    Ty::Unknown
+                                }
+                            };
+                        }
+                        // Indexed part-select: `base` may be anything —
+                        // its own width is irrelevant to the RESULT's
+                        // width, which is fixed entirely by `width`, so
+                        // (unlike a slice) this only ever needs ONE side
+                        // to be a compile-time constant.
+                        BinOp::PlusColon | BinOp::MinusColon => {
+                            return match self.const_eval(rhs, &HashMap::new()) {
+                                Some(width) if width >= 1 => Ty::Bits(Width::Known(width)),
+                                Some(_) => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        format!(
+                                            "indexed part-select (`{}`) width must be \
+                                             at least 1",
+                                            op.symbol()
+                                        ),
+                                    );
+                                    Ty::Unknown
+                                }
+                                None => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        format!(
+                                            "indexed part-select (`{}`) needs a \
+                                             compile-time constant width",
+                                            op.symbol()
+                                        ),
+                                    );
+                                    Ty::Unknown
+                                }
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                // A single index — `x[i]` — is always exactly 1 bit,
+                // whether `i` is a compile-time constant or a genuine
+                // runtime value; unlike a slice, there's no ambiguity
+                // about the result's width to resolve either way.
                 Ty::Bits(Width::Known(1))
             }
             Ty::Unknown => Ty::Unknown,

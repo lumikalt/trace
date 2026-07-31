@@ -1,0 +1,23 @@
+-- Three bit-select shapes whose bounds may be runtime expressions:
+-- `x[i]` (single index, always exactly 1 bit whether `i` is static or
+-- dynamic), and Verilog-style indexed part-select `x[base +: width]`/
+-- `x[base -: width]` (dynamic `base`, but `width` must be a compile-
+-- time constant -- that's what makes the RESULT'S width well-defined
+-- even though the starting bit isn't known until runtime). A plain
+-- slice `x[hi..lo]` still requires BOTH bounds to be literal -- there is
+-- no way to express a dynamically-SIZED result in this language, only
+-- a dynamically-POSITIONED fixed-size one (`+:`/`-:`) or a dynamically-
+-- positioned single bit (`x[i]`). See sim/dynamic_bit_select_tb.v.
+module Top {
+    input x : bits[8]
+    input i : bits[3]
+    output bit_out : bits[1] = 0
+    output up : bits[4] = 0
+    output down : bits[4] = 0
+
+    rule compute {
+        bit_out := x[i]
+        up := x[i +: 4]
+        down := x[i -: 4]
+    }
+}

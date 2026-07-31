@@ -57,6 +57,12 @@ pub enum BinOp {
     Gt,
     Ge,
     Range,
+    /// Verilog-style indexed part-select, ascending: `x[base +: width]` —
+    /// only meaningful as a `Bracket`'s own argument, same restriction as
+    /// `Range`.
+    PlusColon,
+    /// The descending mirror of `PlusColon`: `x[base -: width]`.
+    MinusColon,
 }
 
 impl BinOp {
@@ -79,6 +85,8 @@ impl BinOp {
             BinOp::Gt => ">",
             BinOp::Ge => ">=",
             BinOp::Range => "..",
+            BinOp::PlusColon => "+:",
+            BinOp::MinusColon => "-:",
         }
     }
 }

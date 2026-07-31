@@ -116,6 +116,16 @@ pub enum TokenKind {
     Caret,
     #[token("&")]
     Amp,
+    /// Verilog-style indexed part-select (`x[base +: width]`): `base` may
+    /// be a runtime expression, `width` must be a compile-time constant.
+    /// Longest-match beats a bare `+` the same way `:=` already beats a
+    /// bare `:`, so this needs no special handling to disambiguate from
+    /// `a + b` followed by `:` in some other context.
+    #[token("+:")]
+    PlusColon,
+    /// The descending mirror of `+:` (`x[base -: width]`).
+    #[token("-:")]
+    MinusColon,
     #[token("+")]
     Plus,
     #[token("-")]

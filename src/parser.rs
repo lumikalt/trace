@@ -53,7 +53,7 @@ struct Parser<'a> {
 fn infix_bp(kind: TokenKind) -> Option<(u8, u8)> {
     use TokenKind::*;
     let bp = match kind {
-        DotDot => (1, 2),
+        DotDot | PlusColon | MinusColon => (1, 2),
         EqEq | BangEq | Lt | Le | Gt | Ge => (3, 4),
         Pipe => (5, 6),
         Caret => (7, 8),
@@ -79,6 +79,8 @@ fn binop_of(kind: TokenKind) -> BinOp {
     use TokenKind::*;
     match kind {
         DotDot => BinOp::Range,
+        PlusColon => BinOp::PlusColon,
+        MinusColon => BinOp::MinusColon,
         EqEq => BinOp::Eq,
         BangEq => BinOp::Ne,
         Lt => BinOp::Lt,

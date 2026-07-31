@@ -758,3 +758,36 @@ fn dynamic_shift_runs_through_real_ports() {
         "dynamic shift results did not match expectations:\n{output}"
     );
 }
+
+/// Proves all three dynamic bit-select shapes end to end: a single index
+/// (`x[i]`), and Verilog-style indexed part-select (`x[i +: 4]`/
+/// `x[i -: 4]`). `x` stays fixed at 0xE3 while `i` changes between two
+/// values across two cycles, and the second (`i=7`) deliberately runs
+/// `up` past the top of `x`'s own 8 bits to prove the dshr-based
+/// implementation's zero-padding beyond the original width is correct,
+/// not just the always-in-range case.
+#[test]
+fn dynamic_bit_select_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/dynamic_bit_select.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/dynamic_bit_select_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: i4 bit=0 up=e down=1; i7 bit=1 up=1 down=e"),
+        "dynamic bit-select results did not match expectations:\n{output}"
+    );
+}

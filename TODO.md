@@ -81,7 +81,10 @@
 - Expression surface still excludes:
   - Field access other than `instance.port` (which is reads only; writes
     only as a whole statement's LHS).
-  - Computed bit-select/slice bounds (`x[hi..lo]` bounds must be literal).
+  - A fully dynamic slice (`x[hi..lo]` with a non-const `hi`/`lo`) is
+    intentionally unsupported — its result width would be dynamically
+    sized, which this language has no way to express — and is now a hard
+    type error, not silent bit-1 mistyping (see below).
 
   Dynamic-amount shifts are now supported — `x << n`/`x >> n` compile to
   FIRRTL's `dshl`/`dshr` when `n` isn't a compile-time constant.
@@ -132,6 +135,39 @@
   pure sugar for `bits[1]` (`input a : bit`, `mem m : bit[16]`) —
   desugared in the parser to the identical AST a literal `bits[1]` would
   produce, so nothing downstream needs any awareness of it.
+
+  Computed bit-select bounds: `x[i]` now allows a dynamic (non-const) `i`
+  — always exactly 1 bit either way, compiling to `bits(dshr(x, i), 0,
+  0)` when `i` isn't const rather than erroring the way it used to. New
+  Verilog-style indexed part-select syntax, `x[base +: width]`/`x[base
+  -: width]`, covers the "dynamic start, fixed width" case a plain slice
+  can't: `base` may be dynamic, `width` must be a compile-time constant
+  (so the RESULT's width is always well-defined), `+:`/`-:` compile to
+  the same `dshr`-to-position-0 idea plus a STATIC `bits(..., width-1,
+  0)` truncate — `-:`'s low bit is `base-(width-1)`, shifted down with
+  the same `tail(sub(...), 1)` carry-truncation pattern used everywhere
+  else in the emitter. Emission reads `width` off the bracket
+  expression's own types.rs-computed type (`width_of`), not by
+  re-const-evaluating the width expression at emission time — firrtl's
+  `const_eval` is strictly weaker than types.rs's (no binop/`clog2`
+  folding), so re-deriving it here could silently emit a too-narrow
+  select for a width types.rs had already proven constant (see
+  `indexed_part_select_width_folds_a_non_literal_constant_expression`,
+  tests/firrtl.rs — caught in review before landing, not shipped).
+  A fully dynamic slice (`x[hi..lo]`, both bounds non-const) is a type
+  error, not silently `bits[1]` — this was a latent bug (the old
+  fallback typed ANY unrecognized bracket-arg shape as 1 bit with no
+  error at all). Considered and rejected: a Rust-style `..=`/exclusive
+  `..` split, and a symmetric `=..` mirror for descending bit-select
+  ranges (`N-1 =..0 == N..0`) — the mirror scheme is only consistent if
+  `..`'s excluded endpoint is "whichever operand is numerically larger"
+  rather than "whichever is written second", an implicit value-based
+  exclusion rule judged genuinely ambiguous; `..` stays exactly as-is
+  (inclusive, both ends, unchanged) everywhere. Python-style stride
+  slicing was also considered and rejected — a stride has no meaning for
+  a contiguous hardware bit-vector. See `examples/dynamic_bit_select.tr`
+  + `sim/dynamic_bit_select_tb.v` (both directions, including a shift
+  window exceeding the base value's own width).
 - Memory writes can't nest in `if`/`while` (register writes can, via a
   `mux`; mem writes are still top-level-only).
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax
