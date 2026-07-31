@@ -61,7 +61,11 @@
   supported, typing directly as `bits[width]` rather than absorbing a
   width from context the way a bare integer literal does — overflow
   against their own declared width is a compile error, not silent
-  truncation. See `examples/sized_literal.tr`.
+  truncation. See `examples/sized_literal.tr`. `reg`/`output` may omit
+  `: ty` when initialized with a sized literal (`reg a = 8'd6`), which
+  infers `bits[width]` from the literal — only a literal initializer
+  works (`reg a = 8'd6 + 1` or `reg a = 6` still need an explicit type).
+  See `examples/infer_reg_ty.tr`.
 - Memory writes can't nest in `if`/`while` (register writes can, via a
   `mux`; mem writes are still top-level-only).
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax

@@ -666,6 +666,24 @@ module M {
 }
 
 #[test]
+fn reg_and_output_emit_using_their_inferred_width() {
+    let src = "\
+module M {
+    reg a = 8'd6
+    output b = 16'hFF00
+    rule r {
+        a := a + 1
+        b := 1
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset a : UInt<8>, clock, reset, UInt<8>(6)"));
+    assert!(fir.contains("regreset __out_b : UInt<16>, clock, reset, UInt<16>(65280)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn sized_literal_widens_via_a_bare_connect_into_a_wider_target() {
     // Unlike arithmetic (where `add`/`sub`/etc. combine both operand
     // widths themselves), a bare `result := 8'd6` connect has no op to

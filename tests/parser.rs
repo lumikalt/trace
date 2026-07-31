@@ -279,6 +279,50 @@ module M
 }
 
 #[test]
+fn reg_and_output_infer_type_from_a_sized_literal_init() {
+    // Omitting `: ty` when initialized with a sized literal synthesizes
+    // the identical `bits[width]` an explicit annotation would parse to.
+    let ast = parse_ok("module M {\n reg a = 8'd6\n output b = 16'hFF00\n}\n");
+    assert_eq!(
+        ast.dump(),
+        "\
+module M
+  reg a : (index bits 8) = 8'd6
+  output b : (index bits 16) = 16'd65280
+",
+    );
+}
+
+#[test]
+fn reg_without_type_or_sized_literal_init_is_an_error() {
+    for src in ["module M {\n reg a\n}\n", "module M {\n reg a = 6\n}\n"] {
+        let (tokens, _) = lexer::lex(src);
+        let (_, errors) = parser::parse(src, &tokens);
+        assert!(!errors.is_empty(), "expected an error for {src:?}");
+    }
+}
+
+#[test]
+fn mem_fifo_input_inst_still_require_an_explicit_type() {
+    // Type inference is reg/output-only (the only decls with an `= init`);
+    // every other decl kind must still spell `: ty` out.
+    for src in [
+        "module M {\n mem m 8\n}\n",
+        "module M {\n fifo f 8\n}\n",
+        "module M {\n input i 8\n}\n",
+        "module M {\n inst i Child\n}\n",
+    ] {
+        let (tokens, _) = lexer::lex(src);
+        let (_, errors) = parser::parse(src, &tokens);
+        assert!(!errors.is_empty(), "expected an error for {src:?}");
+        assert!(
+            errors[0].message.contains("before type"),
+            "{src:?}: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn input_output_ports() {
     let ast = parse_ok(
         "module M {\n input inc : bits[8]\n output sum : bits[8] = 0\n\

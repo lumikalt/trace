@@ -834,6 +834,35 @@ way through FIRRTL's own `eq` primop. Pinned by
 using a sized literal both in arithmetic (`x + 8'd6`) and as a bit-select bound
 (`x[8'd3]`).
 
+**Inferred `reg`/`output` types from a sized literal, added 2026-07-31.** `reg name :
+ty = init` and `output name : ty = init` may omit `: ty` when `init` is a sized
+literal — `reg a = 8'd6` declares an ordinary `bits[8]` register, identical in every
+respect to writing `reg a : bits[8] = 8'd6` out by hand. The parser synthesizes the
+same `bits[width]` expression the explicit syntax would parse to (an `Expr::Ident("bits")`
+Bracket-applied to the literal's own width, both using the literal's span) and splices it
+into the item — nothing downstream of the parser (resolve, effects, types, scheduling,
+emission) can tell the difference, since it's the identical AST shape either way. This
+is why the feature needed no changes anywhere but parser.rs: the inferred type gets
+resolved, overflow-checked, and emitted exactly like a hand-written one, confirmed by a
+test that writes an out-of-range value against the *inferred* width and gets the same
+"does not fit" error a hand-written `: bits[8]` would.
+
+Scope is deliberately narrow: inference only fires when the initializer is *literally*
+a sized literal — `reg a = 8'd6 + 8'd1` and `reg a = 6` (a bare, width-less `Int`) both
+still require an explicit `: ty`, same restriction-class as shift amounts and
+bit-select bounds needing a literal elsewhere in this doc. The reason is the same one
+that makes a sized literal special to begin with: it's the only expression with a
+definite width before any type-checking has run, so it's the only one a purely
+syntactic (parse-time) inference can read a width off of without doing real type
+inference. `mem`/`fifo`/`input`/`inst` are unaffected (and unaffectable) — none of them
+has an `= init` for a type to be inferred from.
+
+`examples/infer_reg_ty.tr` + `sim/infer_reg_ty_tb.v` prove the inferred width is a real
+`bits[8]`/`bits[16]`, not just accepted syntax, through real ports: `acc` (an inferred
+`reg`) starts at 6 and accumulates `inc`, while `hi` (an inferred `output`, never
+written by any rule) holds its `0xFF00` reset value forever — both observed directly,
+not inferred from "it compiled."
+
 ## Calling a function from a rule
 
 **Achieved 2026-07-31.** A rule may call a user `fn`/`impl` (not `spec` — those stay

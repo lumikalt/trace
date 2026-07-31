@@ -275,37 +275,104 @@ impl<'a> Parser<'a> {
     /// `reg name : ty (= init)?` / `mem name : ty` / `fifo name : ty` /
     /// `input name : ty` / `output name : ty (= init)?` /
     /// `inst name : Module`
+    ///
+    /// `reg`/`output` may omit `: ty` when initialized with a sized literal
+    /// (`reg a = 8'd6`) — the literal's own width becomes the declared
+    /// type, synthesized as the same `bits[width]` expression the explicit
+    /// syntax would parse to, so nothing downstream of the parser needs to
+    /// know the type was inferred rather than written. No other
+    /// initializer shape can stand in for an explicit type: a sized
+    /// literal is the only expression with a definite width before any
+    /// type-checking runs (see types.rs's two literal-typing models).
     fn parse_state_decl(&mut self, keyword: TokenKind) -> Option<ItemId> {
         let lo = self.cur_span().start;
         self.bump(); // keyword
         let name = self.expect_ident("declaration name")?;
-        self.expect(TokenKind::Colon, "`:` before type").ok()?;
-        let ty = self.parse_expr(TYPE_MIN_BP)?;
+        let infers_ty = matches!(keyword, TokenKind::Reg | TokenKind::Output);
+        let ty = if self.eat(TokenKind::Colon) {
+            Some(self.parse_expr(TYPE_MIN_BP)?)
+        } else {
+            if !infers_ty {
+                self.expect(TokenKind::Colon, "`:` before type").ok()?;
+            }
+            None
+        };
         let item = match keyword {
-            TokenKind::Reg => {
+            TokenKind::Reg | TokenKind::Output => {
+                if ty.is_none() && !self.at(TokenKind::Eq) {
+                    self.errors.push(ParseError {
+                        span: self.cur_span(),
+                        message: "expected `:` before type, or `=` with a sized-literal \
+                                  initializer to infer it"
+                            .to_string(),
+                    });
+                    return None;
+                }
                 let init = if self.eat(TokenKind::Eq) {
                     Some(self.parse_expr(0)?)
                 } else {
                     None
                 };
-                Item::Reg { name, ty, init }
-            }
-            TokenKind::Mem => Item::Mem { name, ty },
-            TokenKind::Fifo => Item::Fifo { name, ty },
-            TokenKind::Input => Item::Input { name, ty },
-            TokenKind::Output => {
-                let init = if self.eat(TokenKind::Eq) {
-                    Some(self.parse_expr(0)?)
-                } else {
-                    None
+                let ty = match ty {
+                    Some(ty) => ty,
+                    None => self.infer_ty_from_sized_literal(init.unwrap())?,
                 };
-                Item::Output { name, ty, init }
+                if keyword == TokenKind::Reg {
+                    Item::Reg { name, ty, init }
+                } else {
+                    Item::Output { name, ty, init }
+                }
             }
-            TokenKind::Inst => Item::Inst { name, module: ty },
+            TokenKind::Mem => Item::Mem {
+                name,
+                ty: ty.unwrap(),
+            },
+            TokenKind::Fifo => Item::Fifo {
+                name,
+                ty: ty.unwrap(),
+            },
+            TokenKind::Input => Item::Input {
+                name,
+                ty: ty.unwrap(),
+            },
+            TokenKind::Inst => Item::Inst {
+                name,
+                module: ty.unwrap(),
+            },
             _ => unreachable!(),
         };
         self.expect_terminator();
         Some(self.ast.push_item(item, lo..self.prev_end))
+    }
+
+    /// Synthesizes the `bits[width]` type expression a sized literal's own
+    /// width implies, for a `reg`/`output` declaration that omitted `: ty`.
+    /// Errors if the initializer isn't literally a sized literal — a bare
+    /// `Int` has no width of its own (it absorbs one from context, which
+    /// doesn't exist yet at this declaration), and a larger expression's
+    /// width isn't knowable this early in the pipeline.
+    fn infer_ty_from_sized_literal(&mut self, init: ExprId) -> Option<ExprId> {
+        let span = self.ast.expr_spans[init.0 as usize].clone();
+        let Expr::SizedInt { width, .. } = self.ast.expr(init) else {
+            self.errors.push(ParseError {
+                span: span.clone(),
+                message: "cannot infer a type here: the initializer must be a sized \
+                          literal like `8'd6`, or give an explicit `: bits[N]`"
+                    .to_string(),
+            });
+            return None;
+        };
+        let width_expr = self.ast.push_expr(Expr::Int(*width), span.clone());
+        let bits_ident = self
+            .ast
+            .push_expr(Expr::Ident("bits".to_string()), span.clone());
+        Some(self.ast.push_expr(
+            Expr::Bracket {
+                callee: bits_ident,
+                args: vec![width_expr],
+            },
+            span,
+        ))
     }
 
     /// `rule name <effects>? { body }`

@@ -277,6 +277,19 @@ fn sized_literals_type_directly_and_check_their_own_width() {
 }
 
 #[test]
+fn reg_and_output_infer_type_from_a_sized_literal_init() {
+    // `reg a = 8'd6` behaves identically to `reg a : bits[8] = 8'd6` from
+    // types.rs's perspective onward -- a later out-of-range write against
+    // the INFERRED width is still an error, proving the synthesized type
+    // is a real bits[8], not just accepted syntax with no teeth.
+    let (_, _, errors) = run("module M {\n reg a = 8'd6\n rule r {\n a := 300\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("300 does not fit in bits[8]"));
+
+    run_ok("module M {\n reg a = 8'd6\n output b = 16'hFF00\n}\n");
+}
+
+#[test]
 fn instance_ports_check_direction_and_width() {
     let child = "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
                   rule r {\n b := a\n}\n}\n";
