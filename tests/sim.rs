@@ -422,3 +422,32 @@ fn submodule_nested_runs_through_real_ports() {
         "result did not settle at 20 + 30:\n{output}"
     );
 }
+
+/// Proves an inlined call to a user `fn` through real simulation, not
+/// just that firtool accepts the emitted text. `--disable-opt` here is
+/// for an unrelated reason from every other use of that flag in this
+/// file: it avoids firtool hoisting the call body's shared subexpression
+/// into an `automatic` variable inside the `always` block, a construct
+/// Icarus rejects (see the comment on the matching tests/firrtl.rs test).
+#[test]
+fn call_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/call.tr")).unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=22"),
+        "result did not settle at (200+100 mod 256)>>1 = 22:\n{output}"
+    );
+}

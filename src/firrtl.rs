@@ -28,8 +28,14 @@
 //!   static/lexical, so no runtime disjointness proof is needed to tell
 //!   two ports apart. A port write may nest in `if`/`else` (threaded
 //!   through a `mux`, same as a register write).
-//! - No calls to user `fn`/`spec`/`impl` items — needs inlining/
-//!   instantiation machinery this pass doesn't build yet.
+//! - A call to a user `fn`/`impl` is inlined at its call site (FIRRTL has
+//!   no call concept). Restricted to a callee whose body is zero or more
+//!   `let` bindings then one trailing `return <expr>` — no branches,
+//!   state writes, guards/fifo ops, or further calls (which also rules
+//!   out recursion: a callee that cannot call anything can never call
+//!   itself). A `spec` call cannot reach this pass at all (effects.rs
+//!   already rejects it outside spec-only code); a builtin call (e.g.
+//!   `prio`) is a separate, still-unsupported gap.
 //! - No `<sequences>` rules: run `lower::plan`/`render` first. This pass
 //!   only lowers "guarded atomic rule" to hardware, not "cycle-crossing
 //!   rule" to guarded atomic rules — that is `lower`'s job.
@@ -42,9 +48,10 @@
 //!   (`+`/`-`/`*`, all modular/width-matching the type checker),
 //!   bitwise (`&`/`|`/`^`/`~`), static (literal-amount only) shifts
 //!   (`<<`/`>>`), unary negate (`-`), comparisons, bit-select/slice
-//!   (`x[i]`/`x[hi..lo]`, literal bounds only), memory indexing, and
-//!   `instance.port`. No calls, other field access, `/`/`%`, dynamic-
-//!   amount shifts, computed bit-select bounds, or logical `!` yet.
+//!   (`x[i]`/`x[hi..lo]`, literal bounds only), memory indexing,
+//!   `instance.port`, and a call to a simple user `fn`/`impl` (see
+//!   above). No other field access, `/`/`%`, dynamic-amount shifts,
+//!   computed bit-select bounds, or logical `!` yet.
 //!
 //! Fifos are depth-1 buffers: one data register plus one valid bit.
 //! `Deq[]` succeeds iff valid; `Enq[x]` succeeds iff not valid — the
@@ -292,6 +299,7 @@ fn emit_module(
     let mut cx = Emitter {
         ast,
         res,
+        fx,
         types,
         errors: Vec::new(),
         read_ports: HashMap::new(),
@@ -1019,9 +1027,30 @@ fn is_ident_named_inst(ast: &Ast, res: &Resolution, id: ExprId, name: &str) -> b
         })
 }
 
+/// Whether any `Expr::Call` appears anywhere in `id`'s subtree — used to
+/// reject a callee whose own body calls something else (see
+/// `Emitter::compile_call`'s doc comment for why that rules out
+/// recursion too, not just deep inlining).
+fn expr_contains_call(ast: &Ast, id: ExprId) -> bool {
+    match ast.expr(id) {
+        Expr::Call { .. } => true,
+        Expr::Ident(_) | Expr::Int(_) | Expr::Wildcard => false,
+        Expr::Unary { operand, .. } => expr_contains_call(ast, *operand),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_contains_call(ast, *lhs) || expr_contains_call(ast, *rhs)
+        }
+        Expr::Guard(inner) | Expr::Spawn(inner) => expr_contains_call(ast, *inner),
+        Expr::Field { base, .. } => expr_contains_call(ast, *base),
+        Expr::Bracket { callee, args } => {
+            expr_contains_call(ast, *callee) || args.iter().any(|a| expr_contains_call(ast, *a))
+        }
+    }
+}
+
 struct Emitter<'a> {
     ast: &'a Ast,
     res: &'a Resolution,
+    fx: &'a Effects,
     types: &'a Types,
     errors: Vec<EmitError>,
     /// Each static mem-read expression -> its assigned reader port name.
@@ -1509,19 +1538,22 @@ impl<'a> Emitter<'a> {
                 let def = self.res.expr_defs.get(&id).copied();
                 match def.map(|d| self.res.def(d).clone()) {
                     Some(d) if d.kind == DefKind::Output => Ok(self.output_regs[&d.name].clone()),
-                    Some(d) if d.kind == DefKind::Local => match self.locals.get(&def.unwrap()) {
-                        Some(bound) => self.compile_expr_hinted(*bound, hint),
-                        None => {
-                            self.error(
-                                self.ast.expr_spans[id.0 as usize].clone(),
-                                "cannot find this local's binding in the rule currently \
-                                 being compiled (v0 restriction: a local is only \
-                                 resolved within its own rule)"
-                                    .to_string(),
-                            );
-                            Err(())
+                    Some(d) if matches!(d.kind, DefKind::Local | DefKind::Param) => {
+                        match self.locals.get(&def.unwrap()) {
+                            Some(bound) => self.compile_expr_hinted(*bound, hint),
+                            None => {
+                                self.error(
+                                    self.ast.expr_spans[id.0 as usize].clone(),
+                                    "cannot find this local's binding in the rule \
+                                     currently being compiled (v0 restriction: a local \
+                                     or a called function's parameter is only resolved \
+                                     within its own rule/call)"
+                                        .to_string(),
+                                );
+                                Err(())
+                            }
                         }
-                    },
+                    }
                     Some(d) if matches!(d.kind, DefKind::Reg | DefKind::Input) => Ok(d.name),
                     _ => {
                         self.error(
@@ -1550,6 +1582,29 @@ impl<'a> Emitter<'a> {
                             .to_string(),
                     );
                     Err(())
+                }
+            }
+            Expr::Call { callee, args } => {
+                match self
+                    .res
+                    .expr_defs
+                    .get(&callee)
+                    .map(|d| self.res.def(*d).kind)
+                {
+                    Some(DefKind::Fn | DefKind::Impl) => self.compile_call(id, callee, &args, hint),
+                    _ => {
+                        self.error(
+                            self.ast.expr_spans[id.0 as usize].clone(),
+                            "this call is not yet supported in FIRRTL emission (v0 \
+                             restriction: only a call to a user `fn`/`impl` with a \
+                             simple body — `let` bindings then a single trailing \
+                             `return`, no branches, no state writes, no nested calls — \
+                             can be inlined; builtin calls like `prio` are not yet \
+                             synthesizable)"
+                                .to_string(),
+                        );
+                        Err(())
+                    }
                 }
             }
             _ => {
@@ -1615,6 +1670,204 @@ impl<'a> Emitter<'a> {
             return Err(());
         }
         Ok(format!("bits({base}, {hi}, {lo})"))
+    }
+
+    /// Inlines a call to a user `fn`/`impl`: FIRRTL has no call concept,
+    /// so the callee's body is spliced into the caller at its call site
+    /// rather than emitted as its own hardware. v0 restricts the callee
+    /// to a pure value computation the width-hint machinery can thread
+    /// through unchanged — anything else is an explicit error, not a
+    /// silent miscompile:
+    /// - no `<sequences>`/`<elaborates>` color, no state writes, and no
+    ///   possible failure (a guard inside the body would already set
+    ///   this) — effects.rs's already-merged signature answers all three
+    ///   in one check, including through the callee's own calls;
+    /// - body shape: zero or more `let` bindings, then exactly one
+    ///   trailing `return <expr>` — no branches, no state writes (a
+    ///   redundant but cheaper check than the signature one above), no
+    ///   further calls (sidesteps recursion entirely: a function whose
+    ///   own body cannot call anything can never call itself, directly
+    ///   or through a cycle).
+    ///
+    /// Width correctness for a generic callee (`bits[N]` params): this
+    /// call expression's own OUTER width (`id`, already instantiated to
+    /// a concrete number by types.rs's call-site solver) is used as the
+    /// hint threaded into the callee's return expression — never the
+    /// callee's own internal, still-generic `types.expr_tys` entry for
+    /// its return expression, which was only ever checked once, that
+    /// generically, independent of any particular call site.
+    fn compile_call(
+        &mut self,
+        id: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let def = *self.res.expr_defs.get(&callee).expect("checked by caller");
+        let Some(fn_item) = self
+            .res
+            .item_defs
+            .iter()
+            .find(|(_, d)| **d == def)
+            .map(|(item, _)| *item)
+        else {
+            self.error(span, "cannot find this function's item".to_string());
+            return Err(());
+        };
+        let Item::Fn {
+            params,
+            body: fn_body,
+            ..
+        } = self.ast.item(fn_item).clone()
+        else {
+            self.error(span, "call target is not a function".to_string());
+            return Err(());
+        };
+
+        let Some(sig) = self.fx.sigs.get(&fn_item) else {
+            self.error(
+                span,
+                "no effect signature computed for this function".to_string(),
+            );
+            return Err(());
+        };
+        if sig.sequences || sig.elaborates {
+            self.error(
+                span,
+                "calling a <sequences>/<elaborates> function is not yet supported in \
+                 FIRRTL emission (v0 restriction: only a pure <combines> value \
+                 computation can be inlined)"
+                    .to_string(),
+            );
+            return Err(());
+        }
+        if sig.fails {
+            self.error(
+                span,
+                "calling a function that can fail (a guard in its body) is not yet \
+                 supported in FIRRTL emission (v0 restriction: an inlined call cannot \
+                 gate the caller's rule)"
+                    .to_string(),
+            );
+            return Err(());
+        }
+        if !sig.writes.is_empty() {
+            self.error(
+                span,
+                "calling a function that writes state is not yet supported in FIRRTL \
+                 emission (v0 restriction: only a pure value-computing function can be \
+                 inlined)"
+                    .to_string(),
+            );
+            return Err(());
+        }
+
+        let Some((&last, lets)) = fn_body.split_last() else {
+            self.error(
+                span,
+                "calling a function with an empty body is not yet supported in FIRRTL \
+                 emission (v0 restriction)"
+                    .to_string(),
+            );
+            return Err(());
+        };
+        if !lets
+            .iter()
+            .all(|s| matches!(self.ast.stmt(*s), Stmt::Let { .. }))
+        {
+            self.error(
+                span,
+                "this function's body is too complex to inline (v0 restriction: only \
+                 `let` bindings followed by a single trailing `return` are supported \
+                 — no branches, state writes, or fifo/guard operations)"
+                    .to_string(),
+            );
+            return Err(());
+        }
+        let Stmt::Return(Some(ret_expr)) = self.ast.stmt(last).clone() else {
+            self.error(
+                span,
+                "this function's body must end with `return <expr>` to be inlined \
+                 (v0 restriction)"
+                    .to_string(),
+            );
+            return Err(());
+        };
+        if expr_contains_call(self.ast, ret_expr)
+            || lets.iter().any(|s| {
+                let Stmt::Let { init, .. } = self.ast.stmt(*s) else {
+                    unreachable!()
+                };
+                expr_contains_call(self.ast, *init)
+            })
+        {
+            self.error(
+                span,
+                "this function's body calls another function or builtin, which is not \
+                 yet supported for inlining (v0 restriction: a called function's own \
+                 body must not itself call anything, which also rules out recursion)"
+                    .to_string(),
+            );
+            return Err(());
+        }
+
+        // Bind params/lets into `self.locals`, saving whatever was there
+        // before (from an enclosing call to this SAME function, if any)
+        // so it can be restored once this call's return expression is
+        // fully compiled. Without this, `Avg(Avg(x, y), z)` would
+        // silently miscompile: `Avg`'s param DefIds are shared across
+        // every call to `Avg`, so compiling the outer call's first
+        // argument (which recurses into the inner `Avg(x, y)` call)
+        // would rebind them out from under the outer call before it
+        // gets to compile its second argument — a real, observed silent
+        // drop of `z`, not a hypothetical. Save/restore makes this
+        // properly reentrant regardless of how deep or indirect the
+        // nesting is (as an argument, or via a `let` whose value is a
+        // call), not just the syntactically-nested case.
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for s in lets {
+            let Stmt::Let { name, init } = self.ast.stmt(*s) else {
+                unreachable!()
+            };
+            if let Some((i, _)) = self
+                .res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == name.span)
+            {
+                let def = DefId(i as u32);
+                saved.push((def, self.locals.insert(def, *init)));
+            }
+        }
+        for (param, arg) in params.iter().zip(args.iter()) {
+            if let Some((i, _)) = self
+                .res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == param.name.span)
+            {
+                let def = DefId(i as u32);
+                saved.push((def, self.locals.insert(def, *arg)));
+            }
+        }
+
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let result = self.compile_expr_hinted(ret_expr, Some(w));
+
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
+            }
+        }
+        result
     }
 
     fn compile_unop(&mut self, id: ExprId, op: UnOp, operand: ExprId) -> Result<String, ()> {

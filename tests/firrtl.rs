@@ -694,3 +694,146 @@ module M {
             .any(|e| e.message.contains("div and rem are not supported"))
     );
 }
+
+#[test]
+fn call_inlines_a_pure_function_with_a_let_and_a_trailing_return() {
+    let fir = emit_from_source(&read_example("call.tr")).expect("emission should succeed");
+    // `Avg`'s body (`let sum = a + b; return sum >> 1`) spliced straight
+    // into the call site, exactly as if it had been written inline —
+    // no trace of a call, no separate `module Avg`.
+    assert!(fir.contains("connect __out_result, pad(shr(tail(add(a, b), 1), 1), 8)"));
+    assert!(!fir.contains("module Avg"));
+
+    // firtool hoists the shared `a + b` into a named temp under default
+    // optimization, which it then declares `automatic` inside the
+    // `always` block — a construct Icarus rejects ("Overriding the
+    // default variable lifetime is not yet supported"). `--disable-opt`
+    // keeps it a plain `wire` instead; unrelated to dead-code elimination,
+    // the usual reason other tests pass this flag.
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn nested_call_to_the_same_function_does_not_clobber_the_outer_arguments() {
+    // Regression test for a real silent miscompile caught before this
+    // shipped: `Avg`'s param DefIds are shared across every call to
+    // `Avg`, so compiling the outer call's first argument (which
+    // recurses into the inner `Avg(x, y)` call) would rebind them out
+    // from under the outer call before it got to compile `z` — without
+    // `compile_call`'s save/restore, this silently produced `(x-y)-y`,
+    // dropping `z` entirely, instead of `(x-y)-z`.
+    let src = "\
+Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
+    return a - b
+}
+module Top {
+    input x : bits[8]
+    input y : bits[8]
+    input z : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := Avg(Avg(x, y), z)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, tail(sub(tail(sub(x, y), 1), z), 1)"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_to_a_function_that_itself_calls_something_is_an_error() {
+    // v0 restriction sidesteps recursion entirely: a function whose own
+    // body cannot call anything can never call itself, directly or
+    // through a cycle.
+    let src = "\
+Inner(x : bits[8]) : bits[8] <combines> {
+    return x + 1
+}
+Outer(x : bits[8]) : bits[8] <combines> {
+    return Inner(x)
+}
+module M {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := Outer(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("calls another function or builtin"))
+    );
+}
+
+#[test]
+fn call_to_a_function_that_writes_state_is_an_error() {
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Bump(x : bits[8]) : bits[8] <combines> {
+        v := x
+        return x + 1
+    }
+
+    rule r {
+        result := Bump(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("calling a function that writes state"))
+    );
+}
+
+#[test]
+fn call_to_a_branching_function_is_an_error() {
+    let src = "\
+Pick(x : bits[8]) : bits[8] <combines> {
+    if x > 10 {
+        return x
+    }
+    return 0
+}
+module M {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := Pick(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("too complex to inline"))
+    );
+}
+
+#[test]
+fn call_to_a_builtin_is_still_an_error() {
+    // Only a user `fn`/`impl` call is inlined; a builtin call like
+    // `prio` is a separate, still-unsupported gap (see TODO.md) — this
+    // pins that the two don't get conflated.
+    let src = "\
+module M {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := prio(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("builtin calls like `prio` are not yet synthesizable")
+    }));
+}

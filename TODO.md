@@ -2,14 +2,21 @@
 
 ## Emission (`src/firrtl.rs`)
 
-- No calls to user `fn`/`spec`/`impl` from synthesizable rules (needs
-  inlining or instantiation). When this lands: recheck resolve.rs's
-  module-boundary state check (`check_module_boundary`) against a
-  `fn`/`spec`/`impl` nested inside a module that reads/writes that
-  module's own state — today that's moot (calls aren't emitted at all),
-  but inlining would need the boundary re-validated at the CALL site's
-  module, not just the callee's declaration site.
-- Expression surface still excludes: calls, other field access, `/`/`%`,
+- A call to a user `fn`/`impl` inlines only when its body is `let`
+  bindings then a single trailing `return` — no branches, state writes,
+  guards/fifo ops, or further calls (so a called function's own body
+  calling another function, including indirect recursion, is rejected
+  outright rather than actually needing a recursion check: nothing in
+  the restricted shape can call anything). Builtin calls (`prio`, etc.)
+  are a separate, still-unsupported gap. See `examples/call.tr`.
+  If richer callee bodies (branches, multiple state-touching statements)
+  are added later: recheck resolve.rs's module-boundary state check
+  (`check_module_boundary`) against a `fn`/`impl` nested inside a module
+  that reads/writes that module's own state — today irrelevant (the
+  restricted shape can't write state at all), but a state-writing callee
+  would need the boundary re-validated at the CALL site's module, not
+  just the callee's declaration site.
+- Expression surface still excludes: other field access, `/`/`%`,
   dynamic-amount shifts (shift amount must be a literal), computed
   bit-select/slice bounds (must be literal), and logical `!` (only `~`
   and unary `-` are supported). `instance.port` is reads only; writes

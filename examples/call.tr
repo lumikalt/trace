@@ -1,0 +1,14 @@
+Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
+    let sum = a + b
+    return sum >> 1
+}
+
+module Top {
+    input a : bits[8]
+    input b : bits[8]
+    output result : bits[8] = 0
+
+    rule compute {
+        result := Avg(a, b)
+    }
+}

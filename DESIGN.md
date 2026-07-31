@@ -791,6 +791,77 @@ negate, wrapping within the operand's own width, same convention as `+`/`-`); un
 `~` compiles straight to FIRRTL's `not`. Logical `!` is deliberately left out this
 pass — see TODO.md.
 
+## Calling a function from a rule
+
+**Achieved 2026-07-31.** A rule may call a user `fn`/`impl` (not `spec` — those stay
+verification-only, effects.rs already rejects calling one outside spec-only code before
+emission ever runs):
+
+```
+Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
+    let sum = a + b
+    return sum >> 1
+}
+
+module Top {
+    input a : bits[8]
+    input b : bits[8]
+    output result : bits[8] = 0
+
+    rule compute {
+        result := Avg(a, b)
+    }
+}
+```
+
+FIRRTL has no function-call concept, so the callee is inlined at its call site — its
+body spliced into the caller, the same way a rule-local (`let x = ...` or `x := ...`)
+already gets inlined by reference rather than declared as its own wire. A call's
+arguments bind to the callee's parameters through that exact mechanism (`Emitter::
+locals`, previously only accepting `DefKind::Local`, now also accepts `DefKind::Param`)
+— no new substitution machinery needed, just widening an existing kind check.
+
+v0 restricts the callee to a body the inliner can splice with zero ambiguity: zero or
+more `let` bindings, then exactly one trailing `return <expr>`. Everything else about a
+richer function — branches, state writes, guards, fifo ops, a call to yet another
+function — is an explicit error, not silently dropped or partially inlined. The last
+restriction is worth spelling out: a callee whose own body cannot call anything can
+never call itself, directly or through a cycle, so recursion needs no separate check —
+it's ruled out by construction, for free, by the same restriction that keeps inlining
+simple. A builtin call (`prio`, etc.) is a different, still-unsupported gap — nothing
+about builtin-call synthesis is implied by this work.
+
+A second correctness subtlety, caught by advisor review before shipping, not by any test
+failure: `Emitter::locals` is keyed by `DefId`, and every call to the SAME function
+reuses that function's one set of parameter `DefId`s. Binding params without saving what
+was there before is unsound the moment one call nests inside another call to the SAME
+function — `Avg(Avg(x, y), z)` — because compiling the outer call's first argument
+recurses into the inner `Avg(x, y)` call, which rebinds `Avg`'s param `DefId`s to `x`/`y`
+*before* the outer call gets to compile `z`. The outer call would then read the INNER
+call's rebound value instead of its own — `z` silently vanishes, replaced by whichever
+value the inner call last bound to the same slot. `compile_call` now saves each
+`DefId`'s previous binding (`None` if it had none) before rebinding it, and restores it
+after the return expression is fully compiled — ordinary save/restore, making calls
+properly reentrant regardless of how deeply or indirectly they nest (as an argument, or
+through a `let` whose value happens to be a call), not just the syntactically-obvious
+case. `nested_call_to_the_same_function_does_not_clobber_the_outer_arguments` (tests/
+firrtl.rs) pins the exact failing shape.
+
+One correctness subtlety, for a callee using an implicit width parameter (`bits[N]`):
+the callee's own body is type-checked exactly once, generically, independent of any
+particular call site, so `N` is never concretely resolved in its `types.expr_tys`
+entries. The call EXPRESSION's own type, by contrast, is resolved through the normal
+call-site instantiation `type_call` already does for any call (spec or synthesizable
+alike) — so the inliner threads the call's own already-concrete width down into the
+callee's return expression as an explicit hint, and never falls back to the callee's
+own (possibly-generic) width for it.
+
+`examples/call.tr` proves it through real firtool and Icarus simulation, deliberately
+choosing operands (`200 + 100`) that overflow `bits[8]` inside the callee's own `let
+sum = a + b` — `(200 + 100) mod 256 = 44`, then `>> 1 = 22` — so an inlined call reusing
+the wrong (e.g. widened) semantics for its own internal arithmetic would show up as a
+wrong answer, not just "firtool accepted it."
+
 ## Tooling
 
 **Editor support added 2026-07-30**, `editors/vscode/`: TextMate-grammar syntax
