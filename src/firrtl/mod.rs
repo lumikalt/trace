@@ -32,12 +32,21 @@
 //!   no call concept). Restricted to a callee whose body is zero or more
 //!   `let` bindings and state writes, then either a trailing
 //!   `return <expr>` or an `if`/`else` whose branches both recurse into
-//!   that same shape (mandatory `else`, folded into a `mux`) — no loops,
-//!   guards/fifo ops, or further calls anywhere in the callee (which
-//!   also rules out recursion: a callee that cannot call anything can
-//!   never call itself). A state write only reaches the emitted
-//!   hardware when the call site is a bare statement or the whole RHS
-//!   of `:=` (`check_writing_call_positions` rejects it anywhere else,
+//!   that same shape (mandatory `else`, folded into a `mux`) — no loops
+//!   or guards/fifo ops anywhere in the callee. A callee's own body MAY
+//!   call another `fn`/`impl` (composition, not just a leaf value
+//!   computation), used as a value — a `let`'s init, the return
+//!   expression, or a state write's own RHS, never as a bare statement
+//!   (`calls.rs`'s `body_has_bare_call_statement`, a shape nothing walks
+//!   into yet) — as long as it doesn't form a call CYCLE, direct or
+//!   indirect (a STATIC property of which functions' own bodies name
+//!   which others, `find_call_cycle`) and the nested call doesn't itself
+//!   write state (v0 restriction, not a silent drop: the write-hunt one
+//!   level into a callee's own body doesn't yet recurse a second level
+//!   to find a write buried behind ANOTHER call). A state write only
+//!   reaches the emitted hardware when the call site is a bare
+//!   statement or the whole RHS of `:=`
+//!   (`check_writing_call_positions` rejects it anywhere else,
 //!   explicitly, rather than silently dropping it); a conditional write
 //!   is only inlinable that way too if the return value is ALSO used
 //!   (the `if`/`else` must then be in TAIL position, same restriction as

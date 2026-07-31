@@ -28,7 +28,7 @@ pub(crate) fn clog2(v: u64) -> u64 {
 
 pub(crate) fn item_name(ast: &Ast, id: ItemId) -> &str {
     match ast.item(id) {
-        Item::Rule { name, .. } => &name.text,
+        Item::Rule { name, .. } | Item::Fn { name, .. } => &name.text,
         _ => "?",
     }
 }

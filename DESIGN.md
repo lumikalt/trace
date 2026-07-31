@@ -1198,6 +1198,100 @@ preserves the ordering through more than one `cat`. Like `prio`/`trunc`, a call 
 same distinguishable-halves technique `call_trunc.tr` uses (`a = 0xAA`, `b = 0xBB`,
 checking the RESULT lands as `0xAABB` specifically, not just "some concatenation").
 
+**A callee may call another callee, added 2026-07-31** (the last bundled piece of the
+calls TODO line — user picked this over generalizing `concrete_width_of` or lifting the
+loop/guard/fifo-op restriction). Before this, a called function's own body was banned
+from containing ANY further call at all — a blanket rule that doubled as free recursion
+prevention ("a callee that cannot call anything can never call itself") but also blocked
+ordinary composition (`Outer` calling `Inner` for a value). Lifted to: a callee's own
+body MAY call another callee, used as a value (a `let`'s init, the return expression, or
+a state write's own RHS) — the actual restriction moved to two narrower, explicit cases,
+plus real cycle detection to replace what the blanket ban used to prevent for free.
+
+**Cycle detection is a STATIC property of the call graph, not a dynamic "currently
+inlining" stack — and getting this wrong was a real, caught-before-shipping bug.** The
+first design tracked an `Emitter.call_stack: Vec<ItemId>`, pushed/popped around each
+recursive compile step, checked in `validate_call` for whether the callee being
+validated was already on it. This looked right and passed every test written against
+it — until `nested_call_to_the_same_function_does_not_clobber_the_outer_arguments`
+(an EXISTING regression test, `Avg(Avg(x, y), z)` called from a rule) started failing
+with a false "call cycle: Avg -> Avg". Root cause: compiling the OUTER `Avg` call
+dereferences `Avg`'s own param `a`, which is bound (via `self.locals`) to the ARGUMENT
+expression — the INNER `Avg(x, y)` call — and compiling that happens lazily, WHILE
+`call_stack` still says "currently inlining `Avg`", even though the inner call's text
+lives in the RULE's own source, not `Avg`'s. The dynamic stack couldn't tell "A's own
+body calls A" (a real, unbounded cycle) apart from "compiling an argument that happens
+to invoke the same function" (always finite, bounded by the source file's own static
+nesting depth). Fixed by switching to a purely structural check: `direct_callees` walks
+a function's own literal body (`let` inits, the return expression, write RHS values, `if`
+conditions, bare statements — recursing into a call's own arguments too, so `prio(Widen(
+r))` still finds `Widen`) and collects exactly which OTHER functions it names, with NO
+dependence on call order or argument substitution; `find_call_cycle` then does an
+on-path DFS from the callee being validated (same on-path/fully-visited shape as
+`visit_module`'s module-instantiation cycle check) to see whether that graph, followed
+transitively, ever leads back to itself. `Avg`'s own body (`let sum = a + b  return sum
+>> 1`) contains no call at all, so it's never flagged, regardless of how many times or
+how deeply it's invoked at any particular call site. Direct self-recursion never reaches
+this check in practice — effects.rs already requires `<elaborates>` for it, and an
+`<elaborates>` function can't be inlined at all — so `find_call_cycle` is only ever
+exercised by INDIRECT/mutual recursion (`A` calls `B` calls `A`, neither self-recursive),
+which effects.rs's own (direct-only) recursion check doesn't catch.
+
+**A nested call may not itself write state — checked structurally, not dynamically,
+against the SAME false-positive risk.** `validate_call` walks `direct_callees` for the
+function being validated and rejects if any of them has a non-empty (already
+call-graph-merged) `sig.writes` — precise about WHICH nested call, since `direct_callees`
+carries each call's own `ExprId` for the error span. This is deliberately conservative,
+not because composing a state-writing function is unsafe in principle, but because
+nothing walks into it to make it SAFE yet: `callee_reg_write`/`callee_port_write` (the
+write-hunt one level into a callee's own body) don't recurse a second level into a nested
+call's own body, so a write reachable only that way would silently vanish from the
+emitted hardware — the same bug class as this session's earlier state-writing-callee
+gaps (`a_write_transitively_reached_through_a_bare_statement_call_is_an_error`, now
+caught earlier and more precisely by this same check). The guard is narrow, not "any
+writing function with a nested call is suspect": a state-writing callee may still call a
+PURE helper for its own write's value (`Bump(x) { v := Helper(x)  return x }`) — `Helper`'s
+empty `sig.writes` never trips the guard, pinned by
+`a_state_writing_callee_may_still_call_a_pure_helper`.
+
+**A nested call used as a BARE STATEMENT (return value discarded) is a separate,
+narrower restriction, unconditional regardless of purity.** Neither of the two ways a
+callee's body gets walked can safely see into this shape: the return-value walk
+(`compile_callee_body`) already rejects any non-`Let`/`Assign` statement before the tail,
+so it can never even reach one; the write-hunt walk has no `Stmt::Expr` match arm at all
+and would otherwise silently skip right past it. Rather than teach either walk to handle
+it (a bare call's purpose can only be a state-writing side effect, which needs the SAME
+second-level write-hunt recursion the guard above is standing in for), it's rejected
+outright — `body_has_bare_call_statement`, a purely structural check with no
+call-order dependency either.
+
+**What's still deferred, explicitly, not silently:** a nested call that writes state
+(needs `callee_reg_write`/`callee_port_write` taught to recurse a second level — the
+actual write-threading work, not just a validation guard) and a nested bare-statement
+call (needs both walks widened to accept it, plus the write-hunt teaching above to make
+it useful). Both are real, scoped-out follow-ups, not forgotten — see TODO.md.
+
+**A latent width-hint gap this feature newly makes reachable, not something it needs to
+fix:** a nested call inside a GENERIC (`bits[N]`) callee body, reached through a binop
+(`Outer(x : bits[N]) { return Inner(x) + 1 }`), fails with a clean "no concrete width"
+error rather than a miscompile — `compile_binop` computes its own width hint via
+`known_width(id)` (`types.expr_tys` for the binop's own, still-generic id), ignoring
+whatever hint its own caller threaded down, so the nested call ends up with no hint at
+all and falls back to the same dead end. This is the exact same class of gap already
+documented for `prio`'s own argument width (`concrete_width_of` follows a value through
+`self.locals` back to a concrete call site) — genuinely latent before this feature (no
+existing test called a generic function whose return expression was a plain binop, only
+ever a bare param reference or a nested call), not a regression this pass introduces.
+Verified as a clean error, not a hang or a silent wrong answer, and pinned
+(`a_generic_nested_call_through_a_binop_is_a_clean_error_not_a_miscompile`) so it stays
+a known, documented boundary rather than resurfacing as a surprise.
+
+`examples/call_nested.tr` proves pure composition through real firtool and Icarus
+simulation: `Top`'s rule calls `Outer`, which itself calls `Inner`, with inputs chosen so
+the SECOND case deliberately overflows `bits[8]` inside `Outer`'s own `* 2` — proving the
+nested call chain reuses ordinary modular arithmetic all the way through, not some wider
+intermediate the call boundary might otherwise hide.
+
 ## Tooling
 
 **Editor support added 2026-07-30**, `editors/vscode/`: TextMate-grammar syntax

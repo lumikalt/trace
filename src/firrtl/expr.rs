@@ -129,9 +129,9 @@ impl<'a> Emitter<'a> {
                             self.ast.expr_spans[id.0 as usize].clone(),
                             "this call is not yet supported in FIRRTL emission (v0 \
                              restriction: only a call to a user `fn`/`impl` with a \
-                             simple body — `let` bindings, `if`/`else` branches, and a \
-                             trailing `return`, no nested user-function calls — can be \
-                             inlined; or a call to the builtin `prio`)"
+                             simple body — `let` bindings, `if`/`else` branches, a \
+                             trailing `return`, and no call cycles — can be inlined; \
+                             or a call to a builtin like `prio`)"
                                 .to_string(),
                         );
                         Err(())

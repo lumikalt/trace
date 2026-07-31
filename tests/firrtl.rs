@@ -922,16 +922,18 @@ module M {
 }
 
 #[test]
-fn call_to_a_function_that_itself_calls_something_is_an_error() {
-    // v0 restriction sidesteps recursion entirely: a function whose own
-    // body cannot call anything can never call itself, directly or
-    // through a cycle.
+fn a_callee_may_call_another_callee_for_a_pure_value() {
+    // Composition: `Outer`'s own body calls `Inner`, using its return
+    // value inside a `let`. Distinguishable arithmetic at each step
+    // (Inner: +1, Outer: *2) so a wrong nesting order or a dropped call
+    // shows up as a wrong number, not just "it compiled."
     let src = "\
 Inner(x : bits[8]) : bits[8] <combines> {
     return x + 1
 }
 Outer(x : bits[8]) : bits[8] <combines> {
-    return Inner(x)
+    let doubled = Inner(x) * 2
+    return doubled
 }
 module M {
     input a : bits[8]
@@ -941,11 +943,196 @@ module M {
     }
 }
 ";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(
+        fir.contains("connect __out_result, tail(mul(tail(add(a, UInt<8>(1)), 1), UInt<8>(2)), 8)")
+    );
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn calling_the_same_nested_function_twice_independently_is_not_a_cycle() {
+    // A diamond, not a cycle: `Outer` calls `Inner` twice. `find_call_
+    // cycle` only follows `Inner`'s OWN body (which calls nothing), so
+    // neither call trips the cycle check regardless of how many times
+    // `Outer` happens to reference `Inner`.
+    let src = "\
+Inner(x : bits[8]) : bits[8] <combines> {
+    return x + 1
+}
+Outer(x : bits[8]) : bits[8] <combines> {
+    let a = Inner(x)
+    let b = Inner(x + 1)
+    return a + b
+}
+module M {
+    input x : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := Outer(x)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_generic_nested_call_through_a_binop_is_a_clean_error_not_a_miscompile() {
+    // Boundary this feature newly makes reachable, not something it
+    // needs to solve: `compile_binop` computes ITS OWN width hint via
+    // `known_width(id)` (`types.expr_tys` for the binop's own id),
+    // ignoring whatever hint its caller threaded down — fine for a
+    // CONCRETE callee body, but `Outer`'s body here is generic
+    // (`bits[N]`), type-checked once with `N` never resolved, so
+    // `known_width` returns nothing and the nested `Inner(x)` call
+    // falls back to `width_of`, which also finds nothing. Pinned as a
+    // clean error (not a hang, not a wrong width silently emitted) —
+    // the same latent gap already documented for `prio`'s own argument
+    // width (`concrete_width_of`), not something this feature fixes.
+    let src = "\
+Inner(x : bits[N]) : bits[N] <combines> {
+    return x
+}
+Outer(x : bits[N]) : bits[N] <combines> {
+    return Inner(x) + 1
+}
+module M {
+    reg r : bits[8] = 0
+    rule compute {
+        r := Outer(r)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("no concrete width")));
+}
+
+#[test]
+fn an_indirect_call_cycle_is_a_clean_error_not_a_hang() {
+    // Direct self-recursion never reaches this check at all: effects.rs
+    // already rejects it upstream (`recursion_requires_elaborates`,
+    // tests/effects.rs), and an `<elaborates>` function can't be
+    // inlined in the first place (`validate_call`'s own `sig.elaborates`
+    // check, above). Indirect/mutual recursion is different: neither
+    // `A` nor `B` calls itself directly, so effects.rs has nothing to
+    // catch, and this cycle is only ever caught here, by
+    // `find_call_cycle`'s static call graph, at emission time.
+    let src = "\
+A(x : bits[8]) : bits[8] <combines> {
+    return B(x)
+}
+B(x : bits[8]) : bits[8] <combines> {
+    return A(x)
+}
+module M {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := A(a)
+    }
+}
+";
     let err = emit_from_source(src).unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.message.contains("calls another function or builtin"))
+            .any(|e| e.message.contains("call cycle: A -> B -> A"))
     );
+}
+
+#[test]
+fn a_nested_call_used_as_a_value_that_writes_state_is_an_error() {
+    // `Inner` writes `w`; `Outer` uses `Inner`'s return value inside a
+    // `let`. The write is invisible to both the return-value walk (which
+    // only cares about values) and the write-hunt walk (which doesn't
+    // recurse a second level into a nested call yet) -- rejected
+    // outright rather than silently dropped.
+    let src = "\
+module M {
+    reg w : bits[8] = 0
+    output result : bits[8] = 0
+
+    Inner(x : bits[8]) : bits[8] <combines, writes {w}> {
+        w := x
+        return x + 1
+    }
+    Outer(x : bits[8]) : bits[8] <combines, writes {w}> {
+        let t = Inner(x)
+        return t
+    }
+
+    rule r {
+        result := Outer(w)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("writes state") && e.message.contains("Inner"))
+    );
+}
+
+#[test]
+fn a_state_writing_callee_may_still_call_a_pure_helper() {
+    // The write guard is narrow: it rejects a NESTED call that itself
+    // writes state, not every callee with a nested call. `Bump` writes
+    // `v` directly (an `Assign`, not a call) using `Helper`'s (pure)
+    // return value — `Helper` has an empty `sig.writes`, so the guard
+    // never fires for it.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Helper(x : bits[8]) : bits[8] <combines> {
+        return x + 1
+    }
+    Bump(x : bits[8]) : bits[8] <combines, writes {v}> {
+        v := Helper(x)
+        return x
+    }
+
+    rule r {
+        result := Bump(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, tail(add(a, UInt<8>(1)), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_nested_bare_statement_call_is_an_error_even_when_pure() {
+    // `Inner(x)` inside `Outer`'s body, as a bare statement (return
+    // value discarded): the shape neither walk can see into today —
+    // rejected outright even though `Inner` is pure here and writes
+    // nothing (a state-writing nested call in this shape would ALSO hit
+    // the write guard above, so this test deliberately uses a pure
+    // callee to isolate the bare-statement check specifically) — see
+    // `body_has_bare_call_statement`'s own doc comment.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    output result : bits[8] = 0
+
+    Inner(x : bits[8]) : bits[8] <combines> {
+        return x + 1
+    }
+    Outer(x : bits[8]) : bits[8] <combines> {
+        Inner(x)
+        return x + 1
+    }
+
+    rule r {
+        result := Outer(v)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("bare statement")));
 }
 
 #[test]
@@ -1194,15 +1381,14 @@ fn a_write_transitively_reached_through_a_bare_statement_call_is_an_error() {
     // shipped: `Outer` (called as a bare statement, its return value
     // unused) itself calls `Inner`, which writes `w`. `effects.rs`
     // merges `Outer`'s signature to include `w` in its writes, so
-    // `schedule.rs` correctly believes the rule writes `w` — but with
-    // only `compile_callee_body`'s own (return-value-path-only) "no
-    // further calls" check, nothing on the write-hunt path
-    // (`call_writes_reg` -> `callee_reg_write`) ever rejected `Outer`
-    // calling `Inner`, so `callee_reg_write` scanned `Outer`'s body,
-    // found no direct `w :=`, and silently emitted no connection for
-    // `w` at all — no error, just missing hardware. `validate_call`'s
-    // `body_contains_call` check now runs for every entry point (return
-    // value AND write-hunt), so this is a clean error instead.
+    // `schedule.rs` correctly believes the rule writes `w` — but
+    // `callee_reg_write` (the write-hunt one level into a callee's own
+    // body) doesn't recurse a second level into `Inner`'s own body, so
+    // it would silently find no direct `w :=` and emit no connection at
+    // all. Now caught earlier: `validate_call`'s nested-write guard sees
+    // `Inner` (used as `v`'s write value inside `Outer`'s own body)
+    // itself writes state, and rejects the call outright rather than
+    // letting the write vanish.
     let src = "\
 module M {
     reg v : bits[8] = 0
@@ -1224,7 +1410,7 @@ module M {
     let err = emit_from_source(src).unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.message.contains("calls another function or builtin"))
+            .any(|e| e.message.contains("writes state") && e.message.contains("Inner"))
     );
 }
 
@@ -1505,21 +1691,23 @@ module M {
 }
 
 #[test]
-fn nested_user_call_inside_a_builtins_argument_still_disqualifies() {
-    // `prio` itself doesn't disqualify a callee from inlining, but a
-    // user call NESTED INSIDE its argument still must: `expr_contains_
-    // call` walks into a builtin call's own arguments even though the
-    // builtin call itself doesn't count.
+fn user_call_nested_inside_a_builtins_argument_composes() {
+    // `prio` doesn't disqualify a callee from inlining, and (since
+    // callee-calling-callee composition landed) neither does a user
+    // call nested inside a builtin's own argument: `Mask` clears bit 3
+    // before `prio` ever sees it, so feeding in a request with ONLY bit
+    // 3 set must still fall back to 0 (no eligible bit), not 3 — proof
+    // `Mask` actually ran first, not just that emission succeeded.
     let src = "\
 module M {
     input reqs : bits[4]
     output grant : bits[2] = 0
 
-    Widen(x : bits[4]) : bits[4] <combines> {
-        return x
+    Mask(x : bits[4]) : bits[4] <combines> {
+        return x & 4'd7
     }
     RoundRobin(r : bits[4]) : bits[2] <combines> {
-        return prio(Widen(r))
+        return prio(Mask(r))
     }
 
     rule r {
@@ -1527,9 +1715,8 @@ module M {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(
-        err.iter()
-            .any(|e| e.message.contains("calls another function or builtin"))
-    );
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("and(reqs, UInt<4>(7))"));
+    let verilog = run_firtool(&fir, &[]).expect("firtool should compile this design");
+    assert!(verilog.contains("module M"));
 }

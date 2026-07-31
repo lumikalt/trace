@@ -3,94 +3,158 @@
 //! the callee in at its call site instead of emitting it as its own
 //! hardware. `validate_call` is the single choke point every inlining
 //! entry point (here, and writes.rs's write-hunt) goes through: effect
-//! coloring, the call-site module boundary, and "does this body call a
-//! user fn/impl anywhere" (which also rules out recursion — see
-//! `compile_call`'s own doc comment). `compile_callee_body` builds the
-//! callee's return value; `compile_prio` is the one synthesizable
-//! builtin, a fixed-priority `mux` chain. See mod.rs's module doc
-//! comment for the full v0 restriction this all enforces.
+//! coloring, the call-site module boundary, a call-CYCLE check
+//! (`find_call_cycle` — a callee may itself call another callee, just
+//! not one that transitively calls back to itself), and a guard
+//! against a NESTED call writing state (a callee called from inside
+//! another callee's own body may only be a pure value computation —
+//! see mod.rs's module doc comment for why). `compile_callee_body`
+//! builds the callee's return value; `compile_prio` is the one
+//! synthesizable builtin, a fixed-priority `mux` chain.
 
 use super::Emitter;
+use super::writes::item_name;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
 
-/// Whether any call to a user `fn`/`impl` appears anywhere in `id`'s
-/// subtree — used to reject a callee whose own body calls something
-/// else (see `Emitter::compile_call`'s doc comment for why that rules
-/// out recursion too, not just deep inlining). A call to a BUILTIN
-/// (`prio`, etc.) does NOT count: a builtin has no body of its own to
-/// (re)inline, so it carries none of the reentrancy/recursion risk this
-/// check exists to rule out — see `Emitter::compile_builtin_call`. Its
-/// own arguments are still walked, though: `prio(SomeUserFn(x))` must
-/// still disqualify on `SomeUserFn`.
-pub(crate) fn expr_contains_call(ast: &Ast, res: &Resolution, id: ExprId) -> bool {
-    match ast.expr(id) {
-        Expr::Call { callee, args } => {
-            let is_user_call = res
-                .expr_defs
-                .get(callee)
-                .is_some_and(|d| matches!(res.def(*d).kind, DefKind::Fn | DefKind::Impl));
-            is_user_call || args.iter().any(|a| expr_contains_call(ast, res, *a))
-        }
-        Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => false,
-        Expr::Unary { operand, .. } => expr_contains_call(ast, res, *operand),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_contains_call(ast, res, *lhs) || expr_contains_call(ast, res, *rhs)
-        }
-        Expr::Guard(inner) | Expr::Spawn(inner) => expr_contains_call(ast, res, *inner),
-        Expr::Field { base, .. } => expr_contains_call(ast, res, *base),
-        Expr::Bracket { callee, args } => {
-            expr_contains_call(ast, res, *callee)
-                || args.iter().any(|a| expr_contains_call(ast, res, *a))
-        }
-    }
-}
-
-/// True if a callee's own body (or one of its `if`/`else` branches, same
-/// shape) contains a call to a user `fn`/`impl` ANYWHERE — a
-/// `let`/`return` expression, a write's RHS, an `if`'s condition, nested
-/// arbitrarily deep through its own `if`/`else` (a call to a BUILTIN
-/// does not count — see `expr_contains_call`). `validate_call` runs
-/// this ONCE, on the whole body, as the single choke point every
-/// inlining entry point (`compile_call`'s return-value splice,
-/// `call_writes_reg`/`call_writes_port`'s write-hunt) goes through — so
-/// a call buried only reachable through the write-hunt path (a
-/// bare-statement call whose return value nothing ever asks for) still
-/// gets this checked, not just the return-value path
-/// `compile_callee_body` walks.
-pub(crate) fn body_contains_call(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> bool {
+/// True if a callee's own body (or one of its `if`/`else` branches)
+/// contains a call used as a BARE STATEMENT (`Inner(x)` on its own
+/// line, its return value thrown away) anywhere — the one call shape
+/// neither of the two ways a callee's body gets walked can handle
+/// safely today: `compile_callee_body` (the return-value walk) already
+/// rejects any non-`Let`/`Assign` statement before the tail, so it can
+/// never reach one; `callee_reg_write`/`callee_port_write` (the
+/// write-hunt walk, one level into a callee's own body) have no
+/// `Stmt::Expr` arm at all and would otherwise silently skip right over
+/// it — so a state write reachable ONLY through a bare nested call
+/// would vanish from the emitted hardware with no error, the same bug
+/// class as this session's earlier state-writing-callee gaps. A call
+/// used as a VALUE (a `let`'s init, the tail return expression, or a
+/// state write's own RHS) is unaffected — only a call whose return
+/// value is discarded is restricted here.
+fn body_has_bare_call_statement(ast: &Ast, stmts: &[StmtId]) -> bool {
     stmts.iter().any(|s| match ast.stmt(*s) {
-        Stmt::Let { init, .. } => expr_contains_call(ast, res, *init),
-        Stmt::Assign { lhs, rhs } => {
-            expr_contains_call(ast, res, *lhs) || expr_contains_call(ast, res, *rhs)
-        }
-        Stmt::Return(Some(e)) => expr_contains_call(ast, res, *e),
-        Stmt::Return(None) | Stmt::Tick => false,
-        Stmt::Expr(e) => expr_contains_call(ast, res, *e),
+        Stmt::Expr(e) => matches!(ast.expr(*e), Expr::Call { .. }),
         Stmt::If {
-            cond,
             then_body,
             else_body,
+            ..
         } => {
-            expr_contains_call(ast, res, *cond)
-                || body_contains_call(ast, res, then_body)
+            body_has_bare_call_statement(ast, then_body)
                 || else_body
-                    .as_ref()
-                    .is_some_and(|b| body_contains_call(ast, res, b))
+                    .as_deref()
+                    .is_some_and(|b| body_has_bare_call_statement(ast, b))
         }
-        Stmt::While { cond, body } => {
-            expr_contains_call(ast, res, *cond) || body_contains_call(ast, res, body)
-        }
+        _ => false,
     })
 }
 
+/// Every `fn`/`impl` item directly called anywhere within `stmts` — a
+/// `let`'s init, the tail return expression, a state write's RHS, an
+/// `if`'s condition, a bare statement, or nested inside another call's
+/// own arguments (`prio(Widen(r))`) — each paired with that specific
+/// call's own `ExprId`, for precise error spans.
+///
+/// Deliberately a STATIC property of `stmts` (the callee's own literal
+/// AST), never based on runtime call order or `self.locals` argument
+/// substitution: an earlier design tracked a dynamic "currently
+/// compiling this fn's body" stack, and it false-positived on
+/// `Avg(Avg(x, y), z)` — a RULE calling `Avg` twice, once nested as an
+/// argument. Compiling `Avg`'s own body dereferences its own param `a`,
+/// which lazily pulls in the ARGUMENT expression — and that argument
+/// happens to also call `Avg` — but that call lives in the CALL SITE's
+/// text (the rule's), not in `Avg`'s own body, which contains no call
+/// at all. Walking `stmts` directly is immune to that: it only ever
+/// sees what `fn_item` itself literally wrote.
+fn direct_callees(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Vec<(ItemId, ExprId)> {
+    fn body_call_exprs(ast: &Ast, stmts: &[StmtId], out: &mut Vec<ExprId>) {
+        for stmt in stmts {
+            match ast.stmt(*stmt) {
+                Stmt::Let { init, .. } => collect_calls(ast, *init, out),
+                Stmt::Assign { lhs, rhs } => {
+                    collect_calls(ast, *lhs, out);
+                    collect_calls(ast, *rhs, out);
+                }
+                Stmt::Return(Some(e)) => collect_calls(ast, *e, out),
+                Stmt::Return(None) | Stmt::Tick => {}
+                Stmt::Expr(e) => collect_calls(ast, *e, out),
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    collect_calls(ast, *cond, out);
+                    body_call_exprs(ast, then_body, out);
+                    if let Some(b) = else_body {
+                        body_call_exprs(ast, b, out);
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    collect_calls(ast, *cond, out);
+                    body_call_exprs(ast, body, out);
+                }
+            }
+        }
+    }
+    let mut call_exprs = Vec::new();
+    body_call_exprs(ast, stmts, &mut call_exprs);
+    call_exprs
+        .into_iter()
+        .filter_map(|call_id| {
+            let Expr::Call { callee, .. } = ast.expr(call_id) else {
+                unreachable!("collect_calls only ever returns Expr::Call ids")
+            };
+            let def = *res.expr_defs.get(callee)?;
+            if !matches!(res.def(def).kind, DefKind::Fn | DefKind::Impl) {
+                return None; // a builtin (e.g. `prio`) — no body of its own
+            }
+            let item = res
+                .item_defs
+                .iter()
+                .find(|(_, d)| **d == def)
+                .map(|(item, _)| *item)?;
+            Some((item, call_id))
+        })
+        .collect()
+}
+
+/// If `item`'s own body transitively reaches itself through
+/// `direct_callees`, the chain that proves it (`item`, ..., `item`).
+/// Same on-path DFS shape `visit_module` (module.rs) already uses for
+/// instantiation cycles: the same function reached twice on unrelated
+/// branches (a diamond) is fine, only a genuine cycle isn't — `path`
+/// tracks the current chain, not everything ever visited.
+fn find_call_cycle(ast: &Ast, res: &Resolution, item: ItemId) -> Option<Vec<ItemId>> {
+    fn walk(
+        ast: &Ast,
+        res: &Resolution,
+        item: ItemId,
+        path: &mut Vec<ItemId>,
+    ) -> Option<Vec<ItemId>> {
+        if path.contains(&item) {
+            let mut chain = path.clone();
+            chain.push(item);
+            return Some(chain);
+        }
+        let Item::Fn { body, .. } = ast.item(item) else {
+            return None;
+        };
+        path.push(item);
+        let found = direct_callees(ast, res, body)
+            .into_iter()
+            .find_map(|(callee, _)| walk(ast, res, callee, path));
+        path.pop();
+        found
+    }
+    walk(ast, res, item, &mut Vec::new())
+}
+
 /// Collects every `Expr::Call` reachable from `id`, including `id`
-/// itself if it is one (and recursing into ITS OWN arguments too,
-/// unlike `expr_contains_call`, which only needs to know one exists
-/// anywhere). Used by `check_writing_call_positions` to find a
-/// state-writing call hiding somewhere other than the two shapes
-/// `call_writes_reg`/`call_writes_port` actually look for.
+/// itself if it is one (and recursing into ITS OWN arguments too).
+/// Used by `check_writing_call_positions` to find a state-writing call
+/// hiding somewhere other than the two shapes `call_writes_reg`/
+/// `call_writes_port` actually look for, and by `direct_callees` above.
 pub(crate) fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
     match ast.expr(id) {
         Expr::Call { args, .. } => {
@@ -132,10 +196,17 @@ impl<'a> Emitter<'a> {
     ///   into this same shape (mandatory `else` — every reachable path
     ///   must produce a value, folded into a `mux` by
     ///   `compile_callee_body`), no state writes (a redundant but
-    ///   cheaper check than the signature one above), no further calls
-    ///   anywhere in the tree (sidesteps recursion entirely: a function
-    ///   whose own body cannot call anything can never call itself,
-    ///   directly or through a cycle).
+    ///   cheaper check than the signature one above);
+    /// - a callee's own body MAY call another `fn`/`impl` (composition is
+    ///   allowed), used as a value — never as a bare statement, a
+    ///   separate check below — as long as it doesn't transitively call
+    ///   back to itself (`find_call_cycle`, a genuine cycle, direct or
+    ///   indirect, would unroll forever) and doesn't itself write state
+    ///   (a nested call may only be a pure value computation —
+    ///   `callee_reg_write`/`callee_port_write`, the write-hunt one
+    ///   level into a callee's own body, don't yet recurse a second
+    ///   level to find a write buried behind ANOTHER call — v0
+    ///   restriction, not a silent drop, see the guard below).
     ///
     /// Width correctness for a generic callee (`bits[N]` params): this
     /// call expression's own OUTER width (`id`, already instantiated to
@@ -236,27 +307,78 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         }
-        // Checked ONCE, here, for the WHOLE body (including every branch
-        // of an `if`/`else`), regardless of which entry point (return-
-        // value splice or write-hunt) is asking: a callee whose body
-        // cannot call anything can never call itself, directly or
-        // through a cycle, so recursion needs no separate check. Without
-        // this living at the shared choke point, a call reachable ONLY
-        // through the write-hunt path (a bare-statement call whose
-        // return value nothing ever uses) would skip it entirely —
-        // `compile_callee_body`'s OWN version of this check only runs on
-        // the return-value path, so a transitively-written register
-        // nested two calls deep (`Outer` calls `Inner`, which writes
-        // `w`; a rule calls `Outer` as a bare statement) would silently
-        // vanish from the emitted hardware, with `effects.rs` still
-        // correctly (and now misleadingly) telling schedule.rs that the
-        // rule writes `w`.
-        if body_contains_call(self.ast, self.res, &body) {
+        // Cycle check, not a blanket "no nested calls" ban: a STATIC
+        // property of which functions' own bodies reference which other
+        // functions BY NAME (`find_call_cycle`), not a dynamic
+        // "currently compiling" stack — see that function's own doc
+        // comment for why a dynamic stack gives a false positive on
+        // `Avg(Avg(x, y), z)`. If `fn_item`'s own body transitively
+        // reaches itself this way, inlining it would never terminate.
+        if let Some(chain) = find_call_cycle(self.ast, self.res, fn_item) {
+            let names: Vec<&str> = chain
+                .iter()
+                .map(|item| item_name(self.ast, *item))
+                .collect();
             self.error(
                 span,
-                "this function's body calls another function or builtin, which is not \
-                 yet supported for inlining (v0 restriction: a called function's own \
-                 body must not itself call anything, which also rules out recursion)"
+                format!(
+                    "call cycle: {} — calling a function whose body (transitively) \
+                     calls itself is not supported (would require infinite inlining)",
+                    names.join(" -> ")
+                ),
+            );
+            return Err(());
+        }
+        // A callee may compose (call another callee) for its RETURN
+        // value, but a call NESTED in fn_item's OWN body may not itself
+        // write state: unlike the top-level write-hunt
+        // (`call_writes_reg`/`call_writes_port`, which starts from a
+        // RULE and finds the callee's own direct writes),
+        // `callee_reg_write`/`callee_port_write` don't recurse a second
+        // level into a nested call's own body — so a write reachable
+        // only that way would silently vanish from the emitted hardware
+        // rather than erroring, the same bug class as this session's
+        // earlier state-writing-callee gaps. `direct_callees` finds
+        // every call textually inside `body` (a `let`'s init, the
+        // return expression, a write's RHS, a bare statement) so this
+        // catches the nested call regardless of where in the body it
+        // appears — precise about WHICH one, since it comes with the
+        // call's own span, not just `fn_item`'s.
+        for (callee_item, callee_expr) in direct_callees(self.ast, self.res, &body) {
+            if self
+                .fx
+                .sigs
+                .get(&callee_item)
+                .is_some_and(|s| !s.writes.is_empty())
+            {
+                self.error(
+                    self.ast.expr_spans[callee_expr.0 as usize].clone(),
+                    format!(
+                        "`{}` writes state, so calling it from inside another \
+                         function's body is not yet supported (v0 restriction: a \
+                         nested call may only be a pure value computation — call \
+                         it directly from a rule instead)",
+                        item_name(self.ast, callee_item),
+                    ),
+                );
+                return Err(());
+            }
+        }
+        // A call used only for its own effect (a bare statement, return
+        // value discarded) anywhere in THIS callee's own body is a
+        // separate, narrower restriction than the guard above: even a
+        // call to a perfectly pure function in this shape is rejected,
+        // not because composing it is unsafe, but because nothing
+        // currently walks INTO it to find out whether it's safe — see
+        // `body_has_bare_call_statement`'s own doc comment for exactly
+        // which two walks can't see it.
+        if body_has_bare_call_statement(self.ast, &body) {
+            self.error(
+                span,
+                "this function's body calls another function as a bare statement \
+                 (its return value unused) — not yet supported for inlining (v0 \
+                 restriction: a nested call may only be used as a value — a `let` \
+                 binding, the return expression, or a state write's right-hand side)"
                     .to_string(),
             );
             return Err(());
