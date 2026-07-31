@@ -1,0 +1,9 @@
+module Top {
+    input a : bits[8]
+    input b : bits[8]
+    output result : bits[16] = 0
+
+    rule combine {
+        result := pack(a, b)
+    }
+}

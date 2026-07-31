@@ -1212,9 +1212,29 @@ module M {
 
 #[test]
 fn call_to_an_unsynthesizable_builtin_is_still_an_error() {
-    // `prio` and `trunc` are the two synthesizable builtins (see the
-    // `prio_*`/`trunc_*` tests); the rest (`pack` here) remain an
-    // explicit, separate gap — this pins that they don't get conflated.
+    // `prio`/`trunc`/`pack` are the synthesizable builtins (see the
+    // `prio_*`/`trunc_*`/`pack_*` tests); `clog2` (a compile-time-only
+    // `Ty::Int` construct — see DESIGN.md's "the second synthesizable
+    // builtin" section) remains an explicit, separate gap — this pins
+    // that it doesn't get conflated with the others.
+    let src = "\
+module M {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule r {
+        result := clog2(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("calling the builtin `clog2` is not yet supported")
+    }));
+}
+
+#[test]
+fn pack_concatenates_msb_first() {
     let src = "\
 module M {
     input a : bits[8]
@@ -1225,11 +1245,51 @@ module M {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(err.iter().any(|e| {
-        e.message
-            .contains("calling the builtin `pack` is not yet supported")
-    }));
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, cat(a, b)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn pack_of_three_folds_left_to_right() {
+    let src = "\
+module M {
+    input a : bits[8]
+    input b : bits[8]
+    input c : bits[8]
+    output result : bits[24] = 0
+    rule r {
+        result := pack(a, b, c)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, cat(cat(a, b), c)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn pack_inlines_through_a_user_fn_that_wraps_it() {
+    // Like `prio`/`trunc`, a call to `pack` doesn't disqualify its
+    // enclosing callee from inlining.
+    let src = "\
+module M {
+    input a : bits[8]
+    input b : bits[8]
+    output result : bits[16] = 0
+
+    Combine(x : bits[8], y : bits[8]) : bits[16] <combines> {
+        return pack(x, y)
+    }
+
+    rule r {
+        result := Combine(a, b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, cat(a, b)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

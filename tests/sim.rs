@@ -555,3 +555,29 @@ fn call_trunc_runs_through_real_ports() {
         "result did not settle at 239 (0xef, the low byte of 0xbeef):\n{output}"
     );
 }
+
+#[test]
+fn call_pack_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_pack.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_pack_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=43707"),
+        "result did not settle at 43707 (0xaabb, a in the high byte):\n{output}"
+    );
+}

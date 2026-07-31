@@ -1083,18 +1083,48 @@ real use in the repo is compile-time, so giving them a RUNTIME hardware meaning 
 mean inventing semantics with no grounding anywhere in the design, a fundamentally
 different kind of gap than `prio` (which had a real spec-level purpose, `arbiter.tr`'s
 refinement, to confirm an encoding against) or `trunc` (unambiguous by construction).
-`pack` (concatenation, well-defined) is real but its only documented use
-(`Fetch2`'s `pack(h1.result, h2.result)`, above) lives inside a `<sequences>`/spawn
-body — synthesizing it for plain rule bodies is possible but wouldn't serve that
-actual use case until spawn/sync/race get a synthesis path of their own, a separate
-and larger gap (TODO.md's own "Language features with no synthesis path yet"
-section). Scoped this way with Lumi via AskUserQuestion before writing any code,
-rather than assuming "close the whole TODO line" meant treating all four builtins as
-one uniform task.
+`pack` (concatenation, well-defined) was flagged in this same pass as real but tied to
+a `<sequences>`/spawn body in its only DOCUMENTED use — see the next section for why
+that turned out not to block implementing it anyway. Scoped this way with Lumi via
+AskUserQuestion before writing any code, rather than assuming "close the whole TODO
+line" meant treating all four builtins as one uniform task.
 
 `examples/call_trunc.tr` proves it through real firtool and Icarus simulation,
 deliberately feeding a value (`0xBEEF`) whose low and high bytes differ, so truncating
 to the wrong end would show up as a wrong answer (`0xEF`, not `0xBE`).
+
+**`pack`, the third synthesizable builtin, added 2026-07-31** (a follow-up pass, once
+Lumi asked to go for it specifically, after this section had left it flagged as "tied
+to spawn" rather than implemented). Revisiting the reasoning above: `pack`'s only
+DOCUMENTED example (`Fetch2`'s `pack(h1.result, h2.result)`, above) lives inside a
+`<sequences>`/spawn body, which still has no synthesis path of its own — but
+concatenation itself doesn't NEED that surrounding feature to be well-defined or
+useful. A plain combinational rule can concatenate two register values just as
+sensibly as a spawned computation's results can; implementing `pack` now doesn't serve
+`Fetch2`'s specific example (spawn still can't be synthesized), but it's a real,
+independently useful primitive that doesn't have to wait for spawn to land.
+
+Unlike `prio`, but like `trunc`, `pack`'s WIDTH semantics need no invented decision —
+`types.rs`'s own `"pack"` typing rule already sums argument widths, so the result
+width always matches automatically; `compile_pack` doesn't even need a hint the way
+`compile_prio` did. What DID need deciding, and wasn't pinned down anywhere in the
+repo before this pass: concatenation ORDER — which argument becomes the more
+significant bits. Went with the FIRST argument as most significant, matching FIRRTL's
+own `cat(hi, lo)` primop directly (so `compile_pack` needs no reordering, just folding
+multiple arguments left-to-right: `cat(cat(a, b), c)` for three), and the same
+"leftmost is most significant" convention as Chisel's `Cat` and Verilog's `{a, b}`
+concatenation — strong enough external precedent that, unlike `prio`'s tie-breaking
+rule, this didn't need an AskUserQuestion round to confirm before implementing.
+Verified empirically anyway, not just asserted: ran the compiled FIRRTL through real
+firtool and Icarus with `a = 0xAA`, `b = 0xBB` and confirmed `result = 0xAABB` (not
+`0xBBAA`) before writing it into this section as settled fact, and again with three
+arguments (`0x11, 0x22, 0x33` → `0x112233`) to confirm the left-to-right fold
+preserves the ordering through more than one `cat`. Like `prio`/`trunc`, a call to
+`pack` doesn't disqualify its enclosing callee from inlining, for the same reason.
+
+`examples/call_pack.tr` proves it through real firtool and Icarus simulation, with the
+same distinguishable-halves technique `call_trunc.tr` uses (`a = 0xAA`, `b = 0xBB`,
+checking the RESULT lands as `0xAABB` specifically, not just "some concatenation").
 
 ## Tooling
 

@@ -335,19 +335,44 @@ impl<'a> Emitter<'a> {
         match self.res.def(def).name.as_str() {
             "prio" => self.compile_prio(id, args, hint),
             "trunc" => self.compile_trunc(id, args, hint),
+            "pack" => self.compile_pack(id, args),
             name => {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
                     format!(
                         "calling the builtin `{name}` is not yet supported in FIRRTL \
                          emission (v0 restriction: only `prio` — a fixed-priority \
-                         encoder — and `trunc` — bit truncation — are synthesizable \
-                         today)"
+                         encoder — `trunc` — bit truncation — and `pack` — \
+                         concatenation — are synthesizable today)"
                     ),
                 );
                 Err(())
             }
         }
+    }
+
+    /// `pack(a, b, ...)`: concatenates its arguments into one wider bit
+    /// vector, the FIRST argument as the MOST significant bits — matching
+    /// FIRRTL's own `cat` primop (`cat(hi, lo)`, `hi` more significant)
+    /// directly, and the same "leftmost is most significant" convention
+    /// as Chisel's `Cat`/Verilog's `{a, b}`. `types.rs`'s own `"pack"`
+    /// typing rule (sum of argument widths) already guarantees this
+    /// matches the call's own result width — no hint needed, unlike
+    /// `prio`/`trunc`. More than two arguments fold left-to-right
+    /// (`cat(cat(a, b), c)`), which preserves the same ordering: `a` is
+    /// still more significant than `b`, both more significant than `c`.
+    fn compile_pack(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let Some((&first, rest)) = args.split_first() else {
+            self.error(span, "`pack` takes at least one argument".to_string());
+            return Err(());
+        };
+        let mut acc = self.compile_expr(first)?;
+        for &a in rest {
+            let piece = self.compile_expr(a)?;
+            acc = format!("cat({acc}, {piece})");
+        }
+        Ok(acc)
     }
 
     /// `trunc(value, width)`: the low `width` bits of `value` — exactly

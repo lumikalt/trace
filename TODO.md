@@ -21,25 +21,28 @@
   (transitively, through the whole call graph) are checked against the
   CALL site's module, not just the callee's declaration site
   (`validate_call` in firrtl.rs, uses `Resolution::def_owner`). Of the
-  builtins, `prio` (a fixed-priority encoder, `compile_prio`) and
-  `trunc` (the low N bits, `compile_trunc`) are synthesizable, as `mux`/
-  `bits` FIRRTL text — neither disqualifies a callee from inlining the
-  way a call to another user `fn`/`impl` still does. The rest of the
-  builtin vocabulary isn't a "not implemented yet" gap so much as "not
-  applicable to a plain combinational rule body at all": `clog2`/`len`
-  type as `Ty::Int`, a compile-time-only type (bit-width computation in
-  a type position, or a list's length during elaboration) — giving them
-  a RUNTIME hardware meaning would mean inventing new semantics with no
-  grounding anywhere in the design, unlike `prio`/`trunc`, which had (or
-  got) a concrete spec before being implemented. `pack` (concatenation)
-  is well-defined but its only documented use (DESIGN.md's `Fetch2`
-  example) is inside a `<sequences>`/spawn body — synthesizing it for
-  plain rule bodies is possible but wouldn't serve that actual use case
-  until spawn/sync/race get a synthesis path of their own (a separate,
-  larger gap, see below). `bits`/`wire`/`list`/`any`/`sync`/`race`
-  aren't this kind of gap at all — type-position constructs, a
-  spec/`chooses`-only construct, or (`sync`/`race`) the same
-  FSM/spawn-sequencing gap already rejected in `lower.rs`. A generic
+  builtins, `prio` (a fixed-priority encoder, `compile_prio`), `trunc`
+  (the low N bits, `compile_trunc`), and `pack` (concatenation, first
+  argument most significant — matching FIRRTL's own `cat` primop
+  directly, folding left-to-right for 3+ arguments, `compile_pack`) are
+  synthesizable, as `mux`/`bits`/`cat` FIRRTL text — none of the three
+  disqualifies a callee from inlining the way a call to another user
+  `fn`/`impl` still does. `pack`'s only DOCUMENTED use (DESIGN.md's
+  `Fetch2` example) is inside a `<sequences>`/spawn body, which still
+  has no synthesis path of its own (a separate, larger gap, see below)
+  — but concatenation is equally well-defined for a plain combinational
+  rule body, so it didn't need that surrounding feature to be useful
+  standalone. The rest of the builtin vocabulary isn't a "not
+  implemented yet" gap so much as "not applicable to a plain
+  combinational rule body at all": `clog2`/`len` type as `Ty::Int`, a
+  compile-time-only type (bit-width computation in a type position, or
+  a list's length during elaboration) — giving them a RUNTIME hardware
+  meaning would mean inventing new semantics with no grounding anywhere
+  in the design, unlike `prio`/`trunc`/`pack`, each of which had (or
+  got) a concrete spec before being implemented. `bits`/`wire`/`list`/
+  `any`/`sync`/`race` aren't this kind of gap at all — type-position
+  constructs, a spec/`chooses`-only construct, or (`sync`/`race`) the
+  same FSM/spawn-sequencing gap already rejected in `lower.rs`. A generic
   callee parameter's own width (`bits[N]`) is only resolvable, inside
   the callee's body, for its OWN return value (hint-threaded) or by
   following it through `self.locals` back to a concrete call-site
@@ -47,7 +50,7 @@
   — anywhere else a callee-body expression's width is needed
   independent of the return value, this same gap can resurface. See
   `examples/call.tr`, `examples/call_branch.tr`, `examples/call_writes.tr`,
-  `examples/call_prio.tr`, `examples/call_trunc.tr`.
+  `examples/call_prio.tr`, `examples/call_trunc.tr`, `examples/call_pack.tr`.
 - Expression surface still excludes: other field access, `/`/`%`,
   dynamic-amount shifts (shift amount must be a literal), computed
   bit-select/slice bounds (must be literal), and logical `!` (only `~`
