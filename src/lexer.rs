@@ -25,6 +25,13 @@ pub enum TokenKind {
     Mem,
     #[token("fifo")]
     Fifo,
+    /// Pure syntax sugar for `bits[1]` — see `Parser::parse_expr`'s `Bit`
+    /// arm, which desugars it to the identical AST a literal `bits[1]`
+    /// would produce. A real keyword (not a `resolve.rs` `BUILTINS`
+    /// identifier like `bits` itself) so it can never collide with a
+    /// user-declared name the way an ordinary identifier could.
+    #[token("bit")]
+    Bit,
     #[token("input")]
     Input,
     #[token("output")]

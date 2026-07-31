@@ -40,7 +40,7 @@
         },
         {
           "name": "keyword.declaration.trace",
-          "match": "\\b(module|rule|reg|mem|fifo|input|output|inst|spec|impl|refines|schedule|let)\\b"
+          "match": "\\b(module|rule|reg|mem|fifo|input|output|inst|spec|impl|refines|schedule|let|bit)\\b"
         }
       ]
     },

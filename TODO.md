@@ -118,7 +118,10 @@
   `reg`/`output` may omit `: ty` when initialized with a sized literal
   (`reg a = 8'd6`), which infers `bits[width]` from the literal — only a
   literal initializer works (`reg a = 8'd6 + 1` or `reg a = 6` still need
-  an explicit type). See `examples/infer_reg_ty.tr`.
+  an explicit type). See `examples/infer_reg_ty.tr`. `bit` is a keyword,
+  pure sugar for `bits[1]` (`input a : bit`, `mem m : bit[16]`) —
+  desugared in the parser to the identical AST a literal `bits[1]` would
+  produce, so nothing downstream needs any awareness of it.
 - Memory writes can't nest in `if`/`while` (register writes can, via a
   `mux`; mem writes are still top-level-only).
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax

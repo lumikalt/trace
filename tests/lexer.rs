@@ -101,6 +101,18 @@ fn keywords_are_not_idents() {
 }
 
 #[test]
+fn bit_is_its_own_keyword_distinct_from_bits() {
+    // `bit` (sugar for `bits[1]`) is a real lexer keyword, not a
+    // `resolve.rs` BUILTINS identifier like `bits` itself — same
+    // longest-match-wins guarantee already covers the prefix overlap
+    // (`bits`, `bitmask`, ... all still lex as one `Ident`, not `Bit`
+    // followed by leftover characters).
+    assert_eq!(kinds("bit"), vec![Bit]);
+    assert_eq!(kinds("bits"), vec![Ident]);
+    assert_eq!(kinds("bitmask"), vec![Ident]);
+}
+
+#[test]
 fn bad_bytes_merge_into_one_error() {
     let (tokens, errors) = lex("a @@ b");
     assert_eq!(

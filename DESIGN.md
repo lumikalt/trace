@@ -939,6 +939,40 @@ unrelated to `!` specifically — it would need its own investigation into wheth
 reachable/harmful in practice — noted here rather than silently ignored, not yet added to
 TODO.md since its actual impact isn't confirmed.
 
+**`bit` as sugar for `bits[1]`, added 2026-07-31, Lumi's request right after logical `!`
+landed.** A new lexer keyword (`src/lexer.rs`), not a `resolve.rs` `BUILTINS` identifier
+like `bits` itself — a real keyword so it can never collide with a user-declared name the
+way an ordinary identifier could, matching how `reg`/`mem`/`fifo`/`input`/`output` are
+already reserved tokens. Desugars purely in the parser: `Parser::parse_expr`'s primary
+dispatch, on seeing the `Bit` token, synthesizes the EXACT AST shape a literal `bits[1]`
+would itself produce (`Bracket { callee: Ident("bits"), args: [Int(1)] }`) via a new
+shared helper, `synth_bits_ty` (also now used by the pre-existing sized-literal-inferred-
+`reg`-type feature, factored out rather than duplicated). This is the same "needed no
+changes anywhere but parser.rs" shape that feature already established — resolve, effects,
+types, and emission all see the identical AST either way, with zero new awareness of
+`bit` as a concept. `bit[N]` (bracket-applied) works as a mem element type for free,
+through `eval_ty`'s existing generic "recurse into the callee, wrap as `Ty::Mem`" branch
+— `mem m : bit[16]` is structurally identical to `mem m : bits[1][16]`, not a special
+case. Unlike `reg`/`mem`/`fifo`/`input`/`output` (contextual keywords that fall back to
+plain `Expr::Ident` in expression position, for the case where a user's own declared item
+happens to be spelled that word), `bit` has no such fallback — it isn't a declaration-
+introducing keyword with a following name to collide with, so every occurrence
+unconditionally desugars.
+
+Proved at three levels rather than assumed transitively: `tests/parser.rs`'s
+`bit_is_pure_sugar_for_bits_1` asserts AST-level equality (`x := bit` and `x := bits[1]`
+produce identical s-expressions, scalar and bracket-applied); `tests/firrtl.rs`'s
+`bit_emits_byte_identical_firrtl_to_bits_1` asserts the full emitted FIRRTL text is
+identical for a scalar port/reg AND a `mem`, verified against real firtool; `tests/
+lexer.rs`'s `bit_is_its_own_keyword_distinct_from_bits` confirms the same longest-match
+guarantee that already protects `tick`/`ticker` also protects `bit`/`bits`/`bitmask` (no
+prefix-collision risk from adding the keyword). No new example or simulation testbench
+was added — `bits[1]` semantics are already proven correct through many existing
+examples, and this feature is, by construction, indistinguishable from that spelling
+everywhere past the parser, the same reasoning `!` used to skip a redundant sim proof.
+`editors/vscode/syntaxes/trace.tmLanguage.json`'s keyword list was updated alongside the
+lexer change, per the standing "kept in sync by hand" note in that file.
+
 ## Calling a function from a rule
 
 **Achieved 2026-07-31.** A rule may call a user `fn`/`impl` (not `spec` — those stay

@@ -386,3 +386,17 @@ fn one_error_not_a_cascade() {
     assert!(!errors.is_empty());
     assert!(errors.len() <= 2, "error cascade: {errors:?}");
 }
+
+#[test]
+fn bit_is_pure_sugar_for_bits_1() {
+    // `bit` desugars in the parser to the IDENTICAL AST a literal
+    // `bits[1]` produces (`Bracket { Ident("bits"), [Int(1)] }`) — proved
+    // here at the AST level so every downstream pass (resolve/effects/
+    // types/emission) can stay unaware `bit` was ever written, the same
+    // "needed no changes anywhere but parser.rs" property the sized-
+    // literal-inferred-`reg`-type feature already established.
+    assert_eq!(stmt_sexpr("x := bit"), stmt_sexpr("x := bits[1]"));
+    // Bracket-applied, `bit` behaves as a mem element type exactly like
+    // `bits[1]` would (`mem m : bit[16]` == `mem m : bits[1][16]`).
+    assert_eq!(stmt_sexpr("x := bit[16]"), stmt_sexpr("x := bits[1][16]"));
+}

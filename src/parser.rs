@@ -345,6 +345,27 @@ impl<'a> Parser<'a> {
         Some(self.ast.push_item(item, lo..self.prev_end))
     }
 
+    /// Synthesizes the `bits[width]` type expression by hand — the AST
+    /// shape a literal `bits[width]` would itself parse to
+    /// (`Bracket { callee: Ident("bits"), args: [Int(width)] }`), so
+    /// nothing downstream (resolve/effects/types/emission) can tell the
+    /// difference. Shared by `infer_ty_from_sized_literal` (below) and
+    /// the `bit` keyword's desugar (`parse_expr`'s `Bit` arm) — both are
+    /// pure parser-level sugar for an already-explicit `bits[N]` spelling.
+    fn synth_bits_ty(&mut self, width: u64, span: Span) -> ExprId {
+        let width_expr = self.ast.push_expr(Expr::Int(width), span.clone());
+        let bits_ident = self
+            .ast
+            .push_expr(Expr::Ident("bits".to_string()), span.clone());
+        self.ast.push_expr(
+            Expr::Bracket {
+                callee: bits_ident,
+                args: vec![width_expr],
+            },
+            span,
+        )
+    }
+
     /// Synthesizes the `bits[width]` type expression a sized literal's own
     /// width implies, for a `reg`/`output` declaration that omitted `: ty`.
     /// Errors if the initializer isn't literally a sized literal — a bare
@@ -362,17 +383,8 @@ impl<'a> Parser<'a> {
             });
             return None;
         };
-        let width_expr = self.ast.push_expr(Expr::Int(*width), span.clone());
-        let bits_ident = self
-            .ast
-            .push_expr(Expr::Ident("bits".to_string()), span.clone());
-        Some(self.ast.push_expr(
-            Expr::Bracket {
-                callee: bits_ident,
-                args: vec![width_expr],
-            },
-            span,
-        ))
+        let width = *width;
+        Some(self.synth_bits_ty(width, span))
     }
 
     /// `rule name <effects>? { body }`
@@ -719,6 +731,21 @@ impl<'a> Parser<'a> {
             Some(Underscore) => {
                 let span = self.bump().unwrap().span;
                 self.ast.push_expr(Expr::Wildcard, span)
+            }
+            // `bit` is pure sugar for `bits[1]`, desugared here rather
+            // than given its own `Ty`-like AST node — everything
+            // downstream (resolve/effects/types/emission) sees the exact
+            // same `Bracket { Ident("bits"), [1] }` shape a literal
+            // `bits[1]` would produce, so it needs no awareness `bit` was
+            // ever written. Unlike `reg`/`mem`/`fifo`/`input`/`output`
+            // (contextual keywords that fall back to `Expr::Ident` in
+            // expression position, for the case where a user's own item
+            // happens to be named that word), `bit` has no such fallback:
+            // it isn't a declaration-introducing keyword with a
+            // followed name to collide with, so it always desugars.
+            Some(Bit) => {
+                let span = self.bump().unwrap().span;
+                self.synth_bits_ty(1, span)
             }
             Some(Int) => {
                 let span = self.bump().unwrap().span;

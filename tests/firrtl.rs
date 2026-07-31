@@ -626,6 +626,48 @@ module M {
 }
 
 #[test]
+fn bit_emits_byte_identical_firrtl_to_bits_1() {
+    // `bit` is pure parser sugar (tests/parser.rs's
+    // `bit_is_pure_sugar_for_bits_1`) -- proved here at the emission
+    // layer too, for a scalar port/reg AND a mem element type
+    // (`mem m : bit[16]` == `mem m : bits[1][16]`), by generating both
+    // spellings and asserting the FIRRTL text is identical apart from
+    // the module's own name.
+    let bit_src = "\
+module Bit {
+    input a : bit
+    reg v : bit = 0
+    mem m : bit[16]
+    output o : bit = 0
+    rule r {
+        v := a
+        o := v
+    }
+}
+";
+    let bits_src = "\
+module Bits {
+    input a : bits[1]
+    reg v : bits[1] = 0
+    mem m : bits[1][16]
+    output o : bits[1] = 0
+    rule r {
+        v := a
+        o := v
+    }
+}
+";
+    let bit_fir = emit_from_source(bit_src).expect("emission should succeed");
+    let bits_fir = emit_from_source(bits_src).expect("emission should succeed");
+    assert_eq!(
+        bit_fir.replace("Bit", "M"),
+        bits_fir.replace("Bits", "M"),
+        "bit and bits[1] should emit identical FIRRTL"
+    );
+    run_firtool(&bit_fir, &[]);
+}
+
+#[test]
 fn sized_literal_widens_in_arithmetic_against_a_wider_operand() {
     // `8'd6`'s own width (8) is narrower than `x`'s (16) -- FIRRTL's own
     // `add` primop already handles two differently-sized UInt operands
