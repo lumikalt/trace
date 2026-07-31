@@ -601,6 +601,83 @@ that shape, and whether it generalizes past SUBLEQ, is undone design work, not a
 emitter gap). `sim/subleq_tb.v` still pokes `dut.m_ext.Memory[i]` directly and is not
 changed by this section.
 
+**Memory writes nested in `if`/`else`, added 2026-07-31.** A memory write used to be
+restricted to a rule's top level — `m[addr] := data` had to be unconditional (given the
+rule fires) rather than living inside an `if`. That was strictly narrower than what
+register and instance-port writes already supported (both thread through nested
+`if`/`else` as a `mux` — see "Module ports"), and the gap mattered in practice: a guard
+(`(we == 1)?`, `PortRam`'s own pattern above) can express "only write sometimes," but
+only by gating the *entire rule*, including any unrelated, unconditional work — a
+register increment that should keep running every cycle regardless of whether this
+cycle also happens to write memory can't be expressed with a guard at all.
+
+```
+module MemWriteBranch {
+    mem m : bits[8][16]
+
+    input we : bits[1]
+    input addr : bits[4]
+    input data : bits[8]
+    input read_addr : bits[4]
+    output read_data : bits[8] = 0
+    output count : bits[8] = 0
+
+    rule step {
+        count := count + 1
+        if we == 1 {
+            m[addr] := data
+        }
+        read_data := m[read_addr]
+    }
+}
+```
+
+`count` increments every cycle, unconditionally; `m` is only written when `we == 1` —
+both in the same rule, something no combination of guards could express before this.
+
+The mux-threading itself (`writes.rs`'s new `mem_write_in_stmts`, mirroring
+`reg_value_in_stmts`'s existing recursive walk over `if`/`else`) has one genuine
+difference from the register/port case, not just a mechanical port: a register always
+has a well-defined "hold" value for a branch that doesn't write it (its own current
+value, faithfully carried forward by FIRRTL's own register semantics), and an instance
+port falls back to a literal `0` (no state of its own, same idea). A **memory** write is
+different again — when neither branch of an `if`/`else` writes it, the write must not
+happen AT ALL this cycle, not "happen with address/data 0." So `mem_write_in_stmts`
+threads an explicit boolean write-enable alongside the muxed addr/data, rather than
+reusing either existing fallback convention: `en = and(fires_rule, wrote_cond)`, where
+`wrote_cond` is itself a muxed boolean, `UInt<1>(1)` on a path that writes and `UInt<1>(0)`
+on one that doesn't (own literal-0 fallback, same shape as the addr/data fallback).
+Across rules, the writer port's own top-level `en` becomes an OR of `and(fires_r,
+wrote_cond_r)` over every writing rule, replacing the old plain `OR of fires` (correct
+before only because a top-level write was, by construction, guaranteed to happen
+whenever its rule fired at all).
+
+This also closed a real modeling gap in the pre-existing preflight check
+(`checks.rs`'s `find_nested_mem_write`, now removed): a memory write nested in `if`
+used to be rejected UNCONDITIONALLY, with no separate carve-out for `if` vs `while` the
+way register writes have never needed (a `while` inside an emitted rule body is not a
+real reachable case — `sequences` lowering removes it before FIRRTL emission ever
+runs — so `mem_write_in_stmts`'s own `Stmt::While` arm is a defensive assertion, not
+user-facing validation, exactly mirroring `reg_value_in_stmts`'s identical arm). No
+separate preflight pass is needed for the `if`/`else` case at all now, matching how
+register writes were never preflight-checked either — the mux-threading function itself
+is the only place nesting is inspected.
+
+`examples/mem_write_branch.tr` + `sim/mem_write_branch_tb.v` prove it through real
+firtool + Icarus simulation: `count` is checked to keep incrementing across cycles where
+`we` stays low (proving the conditional write doesn't gate the rest of the rule the way
+a guard would), a write is then driven for one cycle and read back, and a LATER
+non-writing cycle at the same address is checked to leave the previously-written word
+untouched — proving `en` is genuinely `0` on that path, not just addr/data quietly
+defaulting to 0 while still enabled. That example only exercises `if` WITHOUT `else`
+(the write-enable-toggling case, mux against a literal-0 default) — the other half of
+"threads through if/else as a mux," where BOTH branches write a real (non-default)
+addr/data pair so the write always happens but which addr/data is muxed by the
+condition, is covered separately by `tests/firrtl.rs`'s
+`nested_mem_write_with_both_branches_writing_muxes_real_addr_and_data` (FIRRTL-text
+assertion + real firtool, no separate sim needed — the enable machinery itself is
+already sim-proven by the if-only case above).
+
 ## Submodule instantiation
 
 **Achieved 2026-07-30.** Modules compose by name, not lexical nesting — a `module` is

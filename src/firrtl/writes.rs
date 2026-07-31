@@ -1,7 +1,11 @@
-//! State-write threading: a register/instance-port write folds through
-//! if/else as a `mux` (`reg_value_in_stmts`/`inst_port_value_in_stmts`),
-//! same priority-mux pattern as everywhere else in emission. A write
-//! reached only through a call (`call_writes_reg`/`call_writes_port`)
+//! State-write threading: a register/instance-port/memory write folds
+//! through if/else as a `mux` (`reg_value_in_stmts`/
+//! `inst_port_value_in_stmts`/`mem_write_in_stmts`), same priority-mux
+//! pattern as everywhere else in emission. Unlike a register or port, a
+//! memory write also threads an explicit write-enable boolean alongside
+//! the muxed addr/data — see `mem_write_in_stmts`'s own doc comment for
+//! why. A write reached only through a call (`call_writes_reg`/
+//! `call_writes_port`; a call can't write a memory, unchanged)
 //! recurses into the callee's own body (`callee_reg_write`/
 //! `callee_port_write`) with its params bound, mirroring the same
 //! mux-threading one level deeper — and `callee_reg_write`/
@@ -61,16 +65,37 @@ pub(crate) fn writers_of(
         .collect()
 }
 
+/// Whether a rule writes `mem_name` ANYWHERE in its body, including
+/// nested inside `if`/`else` — used only to decide whether this rule is
+/// a writer of this mem at all (`writers_of`); the actual per-branch
+/// addr/data/enable is threaded separately by `mem_write_in_stmts`.
 pub(crate) fn find_mem_write(
     ast: &Ast,
     res: &Resolution,
     stmts: &[StmtId],
     mem_name: &str,
 ) -> Option<StmtId> {
-    stmts
-        .iter()
-        .copied()
-        .find(|s| is_mem_write_to(ast, res, *s, mem_name))
+    for stmt in stmts {
+        if is_mem_write_to(ast, res, *stmt, mem_name) {
+            return Some(*stmt);
+        }
+        let nested = match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => find_mem_write(ast, res, then_body, mem_name).or_else(|| {
+                else_body
+                    .as_deref()
+                    .and_then(|b| find_mem_write(ast, res, b, mem_name))
+            }),
+            _ => None,
+        };
+        if nested.is_some() {
+            return nested;
+        }
+    }
+    None
 }
 
 /// True for a plain register write OR an output write (`sum := ...`) —
@@ -153,27 +178,84 @@ impl<'a> Emitter<'a> {
             .unwrap_or_else(|| "UInt<1>(1)".to_string())
     }
 
-    pub(crate) fn write_target(
+    /// The (write-enable, addr, data) a rule's execution actually drives
+    /// onto `mem_name`'s shared writer port this cycle — threads a
+    /// nested `if`/`else` through a `mux` exactly like
+    /// `reg_value_in_stmts`, with one difference a register doesn't
+    /// need: a register always has a well-defined "hold" fallback (its
+    /// own current value) for a branch that doesn't write it, but a
+    /// memory write has no such thing — when NEITHER branch writes, the
+    /// write just doesn't happen at all. So this threads an explicit
+    /// write-enable boolean alongside the muxed addr/data (falling back
+    /// to a literal 0, the same "no state of its own" idea
+    /// `inst_port_value_in_stmts` already uses for instance ports),
+    /// rather than reusing a "hold" value the way a register does.
+    /// `None` means this rule never writes `mem_name` anywhere in its
+    /// body.
+    pub(crate) fn mem_write_in_stmts(
         &mut self,
-        rule: ItemId,
+        stmts: &[StmtId],
         mem_name: &str,
         elem_width: u64,
-    ) -> (String, String) {
-        let body = rule_body(self.ast, rule);
-        let Some(stmt) = find_mem_write(self.ast, self.res, &body, mem_name) else {
-            return ("UInt<1>(0)".to_string(), "UInt<1>(0)".to_string());
-        };
-        let Stmt::Assign { lhs, rhs } = self.ast.stmt(stmt).clone() else {
-            unreachable!()
-        };
-        let Expr::Bracket { args, .. } = self.ast.expr(lhs).clone() else {
-            unreachable!()
-        };
-        let addr = self.compile_expr(args[0]).unwrap_or_default();
-        let data = self
-            .compile_expr_hinted(rhs, Some(elem_width))
-            .unwrap_or_default();
-        (addr, data)
+        addr_width: u64,
+    ) -> Option<(String, String, String)> {
+        let mut current: Option<(String, String, String)> = None;
+        for stmt in stmts {
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Assign { lhs, rhs }
+                    if is_mem_write_to(self.ast, self.res, *stmt, mem_name) =>
+                {
+                    let Expr::Bracket { args, .. } = self.ast.expr(lhs).clone() else {
+                        unreachable!()
+                    };
+                    let addr = self.compile_expr(args[0]).unwrap_or_default();
+                    let data = self
+                        .compile_expr_hinted(rhs, Some(elem_width))
+                        .unwrap_or_default();
+                    current = Some(("UInt<1>(1)".to_string(), addr, data));
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_val =
+                        self.mem_write_in_stmts(&then_body, mem_name, elem_width, addr_width);
+                    let else_val = else_body
+                        .as_ref()
+                        .and_then(|b| self.mem_write_in_stmts(b, mem_name, elem_width, addr_width));
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current.clone().unwrap_or_else(|| {
+                            (
+                                "UInt<1>(0)".to_string(),
+                                format!("UInt<{addr_width}>(0)"),
+                                format!("UInt<{elem_width}>(0)"),
+                            )
+                        });
+                        let (te, ta, td) = then_val.unwrap_or_else(|| hold.clone());
+                        let (ee, ea, ed) = else_val.unwrap_or(hold);
+                        let cond_str = self
+                            .compile_expr(cond)
+                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        current = Some((
+                            format!("mux({cond_str}, {te}, {ee})"),
+                            format!("mux({cond_str}, {ta}, {ea})"),
+                            format!("mux({cond_str}, {td}, {ed})"),
+                        ));
+                    }
+                }
+                Stmt::While { .. } => {
+                    self.error(
+                        self.ast.stmt_spans[stmt.0 as usize].clone(),
+                        "a loop in an emitted rule body is not supported (sequences \
+                         lowering should have removed it before emission)"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        current
     }
 
     /// The value `reg_name` takes on when this rule's statements run,

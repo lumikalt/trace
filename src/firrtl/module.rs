@@ -7,7 +7,6 @@
 
 use super::EmitError;
 use super::Emitter;
-use super::checks::*;
 use super::fifo::*;
 use super::module_name;
 use super::writes::*;
@@ -244,25 +243,15 @@ pub(crate) fn emit_module(
     }
 
     // Guards must all precede any state write, and not be nested.
-    // Memory writes must stay top-level (not threaded through a mux yet).
-    // Register writes and instance-port writes may nest in if/else —
-    // SUBLEQ's branch does, for a register — both are threaded through a
-    // mux (see `reg_value_in_stmts`/`inst_port_value_in_stmts`).
+    // Register, instance-port, and memory writes may all nest in
+    // if/else — SUBLEQ's branch does, for a register — each threaded
+    // through a `mux` (see `reg_value_in_stmts`/
+    // `inst_port_value_in_stmts`/`mem_write_in_stmts`).
     for rule in &rules {
         cx.check_guard_placement(*rule);
         cx.check_fifo_same_cycle(*rule);
         cx.check_no_reassigned_locals(*rule);
         cx.check_writing_call_positions(*rule);
-        let body = rule_body(ast, *rule);
-        if let Some(span) = find_nested_mem_write(ast, &body) {
-            cx.error(
-                span,
-                "a memory write nested in if/while is not yet supported in FIRRTL \
-                 emission (v0 restriction); only a register or instance port write \
-                 may be conditional"
-                    .to_string(),
-            );
-        }
     }
     if !cx.errors.is_empty() {
         return Err(cx.errors);
@@ -326,8 +315,13 @@ pub(crate) fn emit_module(
         let _ = writeln!(mem_body, "    connect {mem_name}.{port}.addr, {addr}");
     }
 
-    // Writers: one shared port per mem, enable = OR of writer fires,
-    // priority-muxed by urgency (most urgent's connect emitted last).
+    // Writers: one shared port per mem, enable = OR of (writer fires AND
+    // actually writes this cycle), priority-muxed by urgency (most
+    // urgent's connect emitted last). A writer's own write may now be
+    // conditional (nested in if/else) rather than guaranteed just
+    // because the rule fires, so `en` can no longer be a plain OR of
+    // `fires` alone — each writer's own write-enable (from
+    // `mem_write_in_stmts`) has to factor in too.
     for (mem_name, elem_width, depth) in &mems {
         let writers = writers_of(ast, res, &rules, mem_name);
         if writers.is_empty() {
@@ -337,12 +331,33 @@ pub(crate) fn emit_module(
         if let Some((_, writer)) = mem_ports.get_mut(mem_name) {
             *writer = Some(port.clone());
         }
-        let en = writers
+        let addr_w = clog2(*depth).max(1);
+        // Compute each writer's (write-enable, addr, data) up front — the
+        // `en` net needs every writer's own enable, and the priority
+        // loop below needs the same values again, so they're only
+        // compiled once per writer rather than twice.
+        let per_writer: Vec<(ItemId, String, String, String)> = writers
             .iter()
-            .map(|r| fires_name[r].clone())
+            .map(|&rule| {
+                cx.enter_rule(rule);
+                let body = rule_body(ast, rule);
+                let (wrote, addr, data) = cx
+                    .mem_write_in_stmts(&body, mem_name, *elem_width, addr_w)
+                    .unwrap_or_else(|| {
+                        (
+                            "UInt<1>(0)".to_string(),
+                            format!("UInt<{addr_w}>(0)"),
+                            format!("UInt<{elem_width}>(0)"),
+                        )
+                    });
+                (rule, wrote, addr, data)
+            })
+            .collect();
+        let en = per_writer
+            .iter()
+            .map(|(rule, wrote, ..)| format!("and({}, {wrote})", fires_name[rule]))
             .reduce(|a, b| format!("or({a}, {b})"))
             .unwrap();
-        let addr_w = clog2(*depth).max(1);
         let _ = writeln!(mem_body, "    connect {mem_name}.{port}.clk, clock");
         let _ = writeln!(mem_body, "    connect {mem_name}.{port}.en, {en}");
         let _ = writeln!(mem_body, "    connect {mem_name}.{port}.mask, UInt<1>(1)");
@@ -360,12 +375,14 @@ pub(crate) fn emit_module(
         );
         // Least urgent first, so the most urgent's connect wins (FIRRTL
         // last-connect); only one writer's fires can be true at once
-        // among non-exempted conflicting writers.
-        let mut ordered = writers.clone();
-        ordered.sort_by_key(|r| std::cmp::Reverse(order.iter().position(|x| x == r)));
-        for rule in ordered {
-            cx.enter_rule(rule);
-            let (addr, data) = cx.write_target(rule, mem_name, *elem_width);
+        // among non-exempted conflicting writers. The addr/data
+        // connected here are already correctly muxed down to their
+        // rule's own default (0) on any path that doesn't actually
+        // write, by `mem_write_in_stmts` itself — no extra gating needed
+        // beyond the existing `when {f}`.
+        let mut ordered = per_writer;
+        ordered.sort_by_key(|(rule, ..)| std::cmp::Reverse(order.iter().position(|x| x == rule)));
+        for (rule, _wrote, addr, data) in ordered {
             let f = &fires_name[&rule];
             let _ = writeln!(mem_body, "    when {f} :");
             let _ = writeln!(mem_body, "      connect {mem_name}.{port}.addr, {addr}");

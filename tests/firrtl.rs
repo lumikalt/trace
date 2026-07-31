@@ -311,7 +311,12 @@ module M {
 }
 
 #[test]
-fn errors_on_nested_mem_write() {
+fn nested_mem_write_threads_an_explicit_write_enable() {
+    // A memory write may now nest inside `if`/`else`, mirroring register
+    // and instance-port writes -- but unlike either of those (which
+    // always have a well-defined "hold" value), a memory write has no
+    // state of its own to hold, so a branch that doesn't write must
+    // produce en=0, not just addr/data defaulting to 0.
     let src = "\
 module M {
     reg cond : bits[1] = 0
@@ -326,11 +331,50 @@ module M {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(
-        err.iter()
-            .any(|e| e.message.contains("memory write nested"))
-    );
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect m.w_m.en, and(fires_r, mux(eq(cond, UInt<1>(1)), UInt<1>(1), UInt<1>(0)))"
+    ));
+    assert!(fir.contains("connect m.w_m.addr, UInt<4>(0)"));
+    assert!(fir.contains("connect m.w_m.data, UInt<8>(0)"));
+    assert!(fir.contains("connect m.w_m.addr, mux(eq(cond, UInt<1>(1)), addr, UInt<4>(0))"));
+    assert!(fir.contains("connect m.w_m.data, mux(eq(cond, UInt<1>(1)), v, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn nested_mem_write_with_both_branches_writing_muxes_real_addr_and_data() {
+    // The `if`-without-`else` case above only ever exercises the
+    // write-enable TOGGLING (a mux against a literal-0 default). This
+    // covers the other half of "threads through if/else as a mux": both
+    // branches write a REAL (non-default) addr/data pair, so the write
+    // always happens (`en` folds to effectively `fires_r`, not
+    // conditional), but WHICH addr/data is muxed by `cond`.
+    let src = "\
+module M {
+    reg cond : bits[1] = 0
+    mem m : bits[8][16]
+    reg addr_a : bits[8] = 0
+    reg addr_b : bits[8] = 0
+    reg va : bits[8] = 0
+    reg vb : bits[8] = 0
+
+    rule r {
+        if cond == 1 {
+            m[addr_a] := va
+        } else {
+            m[addr_b] := vb
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect m.w_m.en, and(fires_r, mux(eq(cond, UInt<1>(1)), UInt<1>(1), UInt<1>(1)))"
+    ));
+    assert!(fir.contains("connect m.w_m.addr, mux(eq(cond, UInt<1>(1)), addr_a, addr_b)"));
+    assert!(fir.contains("connect m.w_m.data, mux(eq(cond, UInt<1>(1)), va, vb)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

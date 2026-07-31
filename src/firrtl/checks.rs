@@ -1,18 +1,20 @@
 //! Pre-compilation validation, run once per rule before any expression is
 //! compiled: guard/fifo-op placement (`check_guard_placement`,
 //! `check_fifo_same_cycle`), no reassigned locals
-//! (`check_no_reassigned_locals`), a state-writing call only in an
-//! allowed position (`check_writing_call_positions`), and a memory write
-//! not nested in `if`/`while` (`find_nested_mem_write`, checked by
-//! module.rs directly). Each violation is an explicit `Emitter::error`,
-//! never a silent skip — see mod.rs's module doc comment.
+//! (`check_no_reassigned_locals`), and a state-writing call only in an
+//! allowed position (`check_writing_call_positions`). Each violation is
+//! an explicit `Emitter::error`, never a silent skip — see mod.rs's
+//! module doc comment. A memory write MAY nest in `if`/`else` (threaded
+//! through a `mux` by `writes.rs`'s `mem_write_in_stmts`, same as a
+//! register or instance-port write) — there is no separate preflight
+//! check for it here, matching how a register write's own nesting isn't
+//! preflight-checked either.
 
 use super::Emitter;
 use super::calls::*;
 use super::fifo::*;
 use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
-use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
 
 pub(crate) fn is_mem_write_to(ast: &Ast, res: &Resolution, stmt: StmtId, mem_name: &str) -> bool {
@@ -23,70 +25,6 @@ pub(crate) fn is_mem_write_to(ast: &Ast, res: &Resolution, stmt: StmtId, mem_nam
         return false;
     };
     matches!(res.expr_defs.get(callee), Some(d) if res.def(*d).name == mem_name)
-}
-
-/// A memory write nested inside `if`/`while` is not supported: unlike
-/// register writes (which thread through a `mux`), memory writes also
-/// need an addr/data pair muxed together, and no example needs it yet.
-/// Only descends into control flow — a top-level write is fine and is
-/// found separately by `find_mem_write`.
-pub(crate) fn find_nested_mem_write(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
-    for stmt in stmts {
-        match ast.stmt(*stmt) {
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                if let Some(s) = find_any_mem_write_deep(ast, then_body) {
-                    return Some(ast.stmt_spans[s.0 as usize].clone());
-                }
-                if let Some(s) = else_body
-                    .as_deref()
-                    .and_then(|b| find_any_mem_write_deep(ast, b))
-                {
-                    return Some(ast.stmt_spans[s.0 as usize].clone());
-                }
-            }
-            Stmt::While { body, .. } => {
-                if let Some(s) = find_any_mem_write_deep(ast, body) {
-                    return Some(ast.stmt_spans[s.0 as usize].clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-pub(crate) fn find_any_mem_write_deep(ast: &Ast, stmts: &[StmtId]) -> Option<StmtId> {
-    for stmt in stmts {
-        // Bracket-indexed assignment is only produced by a mem write
-        // (`m[addr] := v`) — no other lvalue in the grammar has this
-        // shape — so a structural check is precise without `Resolution`.
-        if let Stmt::Assign { lhs, .. } = ast.stmt(*stmt)
-            && matches!(ast.expr(*lhs), Expr::Bracket { .. })
-        {
-            return Some(*stmt);
-        }
-        let nested = match ast.stmt(*stmt) {
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => find_any_mem_write_deep(ast, then_body).or_else(|| {
-                else_body
-                    .as_deref()
-                    .and_then(|b| find_any_mem_write_deep(ast, b))
-            }),
-            Stmt::While { body, .. } => find_any_mem_write_deep(ast, body),
-            _ => None,
-        };
-        if nested.is_some() {
-            return nested;
-        }
-    }
-    None
 }
 
 impl<'a> Emitter<'a> {
