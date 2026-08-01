@@ -700,6 +700,31 @@ module M {
 }
 
 #[test]
+fn let_bound_mem_read_emits_a_real_read_port() {
+    // `collect_read_sites` used to have no `Stmt::Let` arm (only
+    // `Assign`/`Expr`/`If`), so `let v = m[addr]` never got wired into
+    // `read_ports` -- the read fell through to the generic "indexing
+    // form not supported" error instead of emitting a real read port.
+    // Same Assign-vs-Let parity gap as the fifo-op bug this session.
+    let src = "\
+module M {
+    mem m : bits[8][256]
+    input addr : bits[8]
+    output out : bits[8] = 0
+
+    rule r {
+        let v = m[addr]
+        out := v
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect m.r0.addr, addr"));
+    assert!(fir.contains("connect __out_out, m.r0.data"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn errors_on_ambiguous_top_module() {
     // Two modules that don't instantiate each other: still an error, just
     // reworded now that multiple modules is legal when one instantiates

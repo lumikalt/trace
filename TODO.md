@@ -68,12 +68,13 @@
   errors now, closing two real silent-miscompile gaps the recent
   fifo/spawn audit found. See DESIGN.md's "`sequences`: multi-cycle
   code" and "Memory, fifo, and submodule declarations" sections.
-  Remaining, lower priority, message quality only (both already
-  hard-error today, just confusingly): `let x = m[addr]` fails with a
-  generic "indexing form not supported" instead of naming the real
-  restriction; `let h = spawn Foo(args)` gets lumped into the generic
-  `race`-not-supported error instead of saying spawn's result must be
-  bound with `:=`.
+- The two message-quality gaps queued alongside the above are also
+  closed: `let x = m[addr]` (a memory read bound with `let`) now emits a
+  real read port and compiles, instead of erroring (`collect_read_sites`
+  had no `Stmt::Let` arm, the same Assign-vs-Let parity gap as the
+  fifo-op bug); `let h = spawn Foo(args)` now names the real restriction
+  (bind with `:=`, since `.result`/`.done` are read on a later cycle)
+  instead of being blamed on `race`.
 
 ## Language features with no synthesis path yet
 

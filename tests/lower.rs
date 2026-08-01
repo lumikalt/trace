@@ -356,6 +356,32 @@ module M {
 }
 
 #[test]
+fn rejects_a_spawn_bound_with_let() {
+    // `spawn_trigger_shape` only recognizes `Stmt::Assign` (`h := spawn
+    // ...`); a `let`-bound spawn used to fall through to the generic
+    // unsupported-construct scan and get blamed on `race`. It should get
+    // its own message naming the real restriction instead.
+    let src = "\
+Foo() : bits[8] <sequences> {
+    tick
+    return 8'd1
+}
+
+module M {
+    output out : bits[8] = 0
+    rule r <sequences> {
+        let h = spawn Foo()
+        tick sync[h]
+        out := h.result
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("bind it with `h := spawn"));
+}
+
+#[test]
 fn no_tick_no_lowering() {
     // <sequences> with zero ticks: nothing to cut, plan skips it.
     let c = run("rule r <sequences> {\n x := 1\n}\n");

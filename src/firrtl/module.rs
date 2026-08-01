@@ -694,6 +694,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 Stmt::Expr(e) => self.collect_read_sites_expr(e, rule, *stmt),
+                Stmt::Let { init, .. } => self.collect_read_sites_expr(init, rule, *stmt),
                 Stmt::If {
                     cond,
                     then_body,

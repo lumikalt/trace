@@ -219,6 +219,16 @@ fn plan_rule(
                 .to_string(),
         }]);
     }
+    if let Some(span) = find_let_bound_spawn(ast, body) {
+        return Err(vec![LowerError {
+            span,
+            message: "a spawned handle's `.result`/`.done` are always read on a LATER \
+                      cycle, so `spawn` needs the same real register-backed binding a \
+                      value crossing a `tick` does — bind it with `h := spawn \
+                      Callee(args)`, not `let h = spawn Callee(args)`"
+                .to_string(),
+        }]);
+    }
     if let Some(span) = find_unsupported_construct(ast, res, body, true) {
         return Err(vec![LowerError {
             span,
@@ -943,6 +953,26 @@ fn find_spawn_in_expr(ast: &Ast, id: ExprId) -> Option<Span> {
     for child in sub_exprs(ast, id) {
         if let Some(span) = find_spawn_in_expr(ast, child) {
             return Some(span);
+        }
+    }
+    None
+}
+
+/// Recognizes `let h = spawn Callee(args)` at a body's top level —
+/// `spawn_trigger_shape` only matches `Stmt::Assign`, so a `let`-bound
+/// spawn would otherwise fall through to `find_unsupported_construct`
+/// and get reported as if it were an unsupported `race`, rather than
+/// naming the real restriction (same root cause as a `let`-bound value
+/// crossing a `tick`: `let` always shadow-binds a fresh local instead of
+/// writing a register, which a spawn handle needs since it's read on a
+/// later cycle by definition). Checked before the generic scan, same as
+/// `find_nested_spawn` above.
+fn find_let_bound_spawn(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
+    for stmt in stmts {
+        if let Stmt::Let { init, .. } = ast.stmt(*stmt)
+            && let Expr::Spawn(_) = ast.expr(*init)
+        {
+            return Some(ast.expr_spans[init.0 as usize].clone());
         }
     }
     None
