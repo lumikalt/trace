@@ -431,6 +431,37 @@ module M {
     assert!(c.errors[0].message.contains("`race`"));
 }
 
+#[test]
+fn spawning_the_same_handle_twice_is_rejected() {
+    // `:=` binds a local only when unresolved, so the second `h :=
+    // spawn ...` reuses the SAME handle_def as the first rather than
+    // shadowing it -- each spawn occurrence needs its own private
+    // register set, so this must be caught directly here, not left to
+    // surface as a confusing "already defined" resolve error several
+    // passes later on an auto-generated register name.
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        h := spawn Slow(1)
+        h := spawn Slow(2)
+        tick
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(
+        c.errors[0]
+            .message
+            .contains("already names an earlier `spawn`")
+    );
+}
+
 // A wrong argument count is caught earlier, by types.rs's ordinary call
 // arity check on `spawn`'s inner call expression (same as any other
 // call) — `run()` here always sees type-checked input, so there's no

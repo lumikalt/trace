@@ -246,7 +246,26 @@ fn plan_rule(
     for seg in &segments {
         for stmt in &seg.stmts {
             if let Some((handle_def, handle_name, call)) = spawn_trigger_shape(ast, res, *stmt) {
-                handle_defs.insert(handle_def);
+                // `:=` binds a local only when unresolved, so a SECOND
+                // `h := spawn ...` reuses the exact same `handle_def` as
+                // the first rather than shadowing it — each occurrence
+                // needs its own private `__cont_*`/`__done_*`/etc.
+                // register set (see `plan_spawn`), so two spawns sharing
+                // one handle would plan and render TWO conflicting
+                // register/rule definitions under the identical name.
+                // Left uncaught, this surfaces several passes later as a
+                // confusing "already defined" resolve error on an
+                // auto-generated register name the user never wrote,
+                // rather than pointing at the actual mistake.
+                if !handle_defs.insert(handle_def) {
+                    return Err(vec![LowerError {
+                        span: ast.stmt_spans[stmt.0 as usize].clone(),
+                        message: format!(
+                            "`{handle_name}` already names an earlier `spawn` in this rule; \
+                             each spawn needs its own handle — give this one a different name"
+                        ),
+                    }]);
+                }
                 spawn_sites.push((*stmt, handle_def, handle_name, call));
             } else if let Some(handles) = sync_call_shape(ast, res, *stmt) {
                 syncs.push((*stmt, handles));

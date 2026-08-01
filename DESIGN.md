@@ -223,7 +223,9 @@ read-only.
 
 `spawn` must sit at the top level of its enclosing segment, the same restriction
 `tick` has. A loop can therefore never contain a `spawn`, so the number of spawns
-in a design is always static.
+in a design is always static. Each spawn needs its own handle: reusing a handle
+name for a second `spawn` in the same rule is a compile-time error, since each
+occurrence gets its own private register set.
 
 `sync[h1, h2, ...]` waits for every named handle to finish. Square brackets mark
 it as a fallible operation, the same convention `f.Deq[]`/`f.Enq[x]` use. It must
