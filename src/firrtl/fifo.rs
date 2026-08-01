@@ -18,7 +18,8 @@
 //! per-statement `fifo_guard_cond` call for exactly this reason.
 
 use super::Emitter;
-use crate::ast::{Ast, Expr, ExprId, Stmt, StmtId};
+use super::writes::rule_body;
+use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Stmt, StmtId};
 use crate::resolve::{DefKind, Resolution};
 
 pub(crate) fn fifo_valid_name(fifo: &str) -> String {
@@ -122,4 +123,129 @@ impl<'a> Emitter<'a> {
         };
         self.fifo_op(expr)
     }
+
+    /// Every fifo op a rule performs, whether directly at its own top
+    /// level or reached through exactly one bare-statement/`:=`-RHS call
+    /// to a `sig.fails`-foldable callee (the same restriction `check_
+    /// fails_is_foldable_guard` already enforces on the callee side — a
+    /// callee this permissive to call can only have TOP-LEVEL fifo ops
+    /// in its own body, never nested deeper). `stmt` is always the
+    /// RULE's own originating statement (the call site, for a via-callee
+    /// op), so callers can `set_pos`/dedupe/group by it exactly like a
+    /// direct op.
+    ///
+    /// The single point every fifo-touch question in this module routes
+    /// through: module.rs's per-fifo state-transition emission,
+    /// `compile_guard`'s pass-through precondition, and `check_fifo_op_
+    /// counts`'s double-op collision check all call this, rather than
+    /// each independently re-scanning `rule_body` — three independent
+    /// scans reaching through the call boundary would drift out of
+    /// agreement with each other, exactly the silent-miscompile class
+    /// this whole area of the compiler exists to close off.
+    pub(crate) fn rule_fifo_ops(&self, rule: ItemId) -> Vec<RuleFifoOp> {
+        let body = rule_body(self.ast, rule);
+        let mut out = Vec::new();
+        for stmt in &body {
+            if let Some((fifo, is_enq, value)) = self.fifo_op_stmt(*stmt) {
+                out.push(RuleFifoOp {
+                    stmt: *stmt,
+                    fifo,
+                    is_enq,
+                    value,
+                    callee_ctx: None,
+                });
+                continue;
+            }
+            let call_expr = match self.ast.stmt(*stmt) {
+                Stmt::Expr(e) if matches!(self.ast.expr(*e), Expr::Call { .. }) => Some(*e),
+                Stmt::Assign { rhs, .. } if matches!(self.ast.expr(*rhs), Expr::Call { .. }) => {
+                    Some(*rhs)
+                }
+                _ => None,
+            };
+            let Some(call_expr) = call_expr else { continue };
+            let Expr::Call { callee, args } = self.ast.expr(call_expr).clone() else {
+                continue;
+            };
+            let Some(&def) = self.res.expr_defs.get(&callee) else {
+                continue;
+            };
+            if !matches!(self.res.def(def).kind, DefKind::Fn | DefKind::Impl) {
+                continue;
+            }
+            let Some(fn_item) = self
+                .res
+                .item_defs
+                .iter()
+                .find(|(_, d)| **d == def)
+                .map(|(item, _)| *item)
+            else {
+                continue;
+            };
+            if !self.fx.sigs.get(&fn_item).is_some_and(|s| s.fails) {
+                continue;
+            }
+            let Item::Fn {
+                body: callee_body, ..
+            } = self.ast.item(fn_item).clone()
+            else {
+                continue;
+            };
+            for cstmt in &callee_body {
+                if let Some((fifo, is_enq, value)) = self.fifo_op_stmt(*cstmt) {
+                    out.push(RuleFifoOp {
+                        stmt: *stmt,
+                        fifo,
+                        is_enq,
+                        value,
+                        callee_ctx: Some((fn_item, args.clone())),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Compiles `op`'s `Enq` value — `None` for a `Deq` (nothing to
+    /// compile). For a via-callee op, binds the callee's own params AND
+    /// top-level `let`s (`bind_callee_context`, calls.rs) around the
+    /// compile, so a value like `buf.Enq[x]` (a param) or `output.Enq[y]`
+    /// where `y := input.Deq[]` was bound earlier in the SAME callee
+    /// (the "bridge" pattern, DESIGN.md's `examples/fifo_bridge.tr`
+    /// wrapped in a callee) both resolve against the call's actual
+    /// arguments and the callee's own local bindings, not an unbound
+    /// name.
+    pub(crate) fn compile_fifo_op_value(&mut self, op: &RuleFifoOp, hint: u64) -> Option<String> {
+        let value = op.value?;
+        let Some((fn_item, args)) = &op.callee_ctx else {
+            return Some(
+                self.compile_expr_hinted(value, Some(hint))
+                    .unwrap_or_default(),
+            );
+        };
+        let Item::Fn { params, body, .. } = self.ast.item(*fn_item).clone() else {
+            return None;
+        };
+        let saved = self.bind_callee_context(&params, args, &body);
+        let result = self
+            .compile_expr_hinted(value, Some(hint))
+            .unwrap_or_default();
+        self.restore_callee_context(saved);
+        Some(result)
+    }
+}
+
+/// One fifo op a rule performs — see `Emitter::rule_fifo_ops`'s own doc
+/// comment for the full picture. `callee_ctx`: `Some((fn_item, args))`
+/// when this op was found inside a callee's own body (reached through a
+/// call at `stmt`), so `compile_fifo_op_value` knows to bind that
+/// callee's params/locals before compiling `value`; `None` for a fifo
+/// op sitting directly in the rule.
+#[derive(Clone)]
+pub(crate) struct RuleFifoOp {
+    pub(crate) stmt: StmtId,
+    pub(crate) fifo: String,
+    pub(crate) is_enq: bool,
+    pub(crate) value: Option<ExprId>,
+    pub(crate) callee_ctx: Option<(ItemId, Vec<ExprId>)>,
 }

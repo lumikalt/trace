@@ -209,6 +209,37 @@ fn fifo_bridge_runs_and_backpressures() {
     );
 }
 
+/// Proves examples/call_fifo.tr — fifo_bridge.tr's own transfer logic,
+/// wrapped in a callee instead of written directly in the rule —
+/// produces the IDENTICAL forward-path/backpressure handshaking through
+/// real simulation, not just that firtool accepts the fold's emitted
+/// text (pinned separately in tests/firrtl.rs against the unoptimized
+/// FIRRTL). Exercises the harder composition: a fifo op reached through
+/// a callee call, a `let`-bound callee-local threaded from a `Deq` into
+/// an `Enq` within that same callee, and the callee's own return value
+/// all agreeing on the same underlying register.
+#[test]
+fn call_fifo_bridges_through_a_callee_with_identical_handshaking() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_fifo.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_fifo_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves memory is fully loadable and observable through ordinary
 /// ports, no hierarchical peek/poke: sim/port_ram_tb.v writes distinct
 /// words to two addresses through `addr`/`write_data`/`write_en` and
@@ -463,6 +494,38 @@ fn call_runs_through_real_ports() {
     assert!(
         output.contains("final: result=22"),
         "result did not settle at (200+100 mod 256)>>1 = 22:\n{output}"
+    );
+}
+
+/// Proves a callee's bare guard actually gates the caller's rule
+/// through real simulation, not just that firtool accepts the fold's
+/// emitted `neq(a, 0)` guard string (that part is pinned in
+/// tests/firrtl.rs, against the unoptimized FIRRTL text). `--disable-
+/// opt` for the same `automatic`-lifetime reason `call_runs_through_
+/// real_ports` needs it.
+#[test]
+fn call_guard_folds_the_callees_guard_through_real_simulation() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_guard.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_guard_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=7"),
+        "expected result to hold at 7:\n{output}"
     );
 }
 

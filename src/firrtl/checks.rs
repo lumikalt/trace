@@ -1,10 +1,14 @@
 //! Pre-compilation validation, run once per rule before any expression is
-//! compiled: guard/fifo-op placement (`check_guard_placement`), at most
-//! one `Enq` and at most one `Deq` per fifo (`check_fifo_op_counts`), and
-//! a state-writing call only in an allowed position
-//! (`check_writing_call_positions`). Each violation is an explicit
-//! `Emitter::error`, never a silent skip — see mod.rs's module doc
-//! comment. A memory write MAY nest in `if`/`else` (threaded through a
+//! compiled: guard/fifo-op/failing-call placement (`check_guard_
+//! placement`), at most one `Enq` and at most one `Deq` per fifo
+//! (`check_fifo_op_counts`), a state-writing call only in an allowed
+//! position (`check_writing_call_positions`), a failing call likewise
+//! (`check_failing_call_positions`), and whether a `sig.fails` callee's
+//! own fail condition is actually foldable into a caller's guard at all
+//! (`check_fails_is_foldable_guard`, called from calls.rs's
+//! `validate_call` against the CALLEE's own body). Each violation is an
+//! explicit `Emitter::error`, never a silent skip — see mod.rs's module
+//! doc comment. A memory write MAY nest in `if`/`else` (threaded through a
 //! `mux` by `writes.rs`'s `mem_write_in_stmts`, same as a register or
 //! instance-port write) — there is no separate preflight check for it
 //! here; instead `mem_write_in_stmts` itself rejects a second
@@ -27,6 +31,7 @@ use super::calls::*;
 use super::fifo::*;
 use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
+use crate::lexer::Span;
 use crate::resolve::{DefKind, Resolution};
 use std::collections::HashMap;
 
@@ -60,6 +65,14 @@ impl<'a> Emitter<'a> {
                              (v0 restriction): it must gate the whole rule"
                                 .to_string(),
                         );
+                    } else if self.is_failing_call(rhs) && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a call to a function that can fail, after a state write, \
+                             is not yet supported (v0 restriction): its guard must \
+                             gate the whole rule"
+                                .to_string(),
+                        );
                     }
                 }
                 Stmt::Expr(e) => {
@@ -77,6 +90,14 @@ impl<'a> Emitter<'a> {
                              (v0 restriction): it must gate the whole rule"
                                 .to_string(),
                         );
+                    } else if self.is_failing_call(e) && seen_write {
+                        self.error(
+                            self.ast.expr_spans[e.0 as usize].clone(),
+                            "a call to a function that can fail, after a state write, \
+                             is not yet supported (v0 restriction): its guard must \
+                             gate the whole rule"
+                                .to_string(),
+                        );
                     }
                 }
                 Stmt::Let { init, .. } => {
@@ -85,6 +106,14 @@ impl<'a> Emitter<'a> {
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
                             "a fifo operation after a state write is not yet supported \
                              (v0 restriction): it must gate the whole rule"
+                                .to_string(),
+                        );
+                    } else if self.is_failing_call(init) && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a call to a function that can fail, after a state write, \
+                             is not yet supported (v0 restriction): its guard must \
+                             gate the whole rule"
                                 .to_string(),
                         );
                     }
@@ -105,6 +134,14 @@ impl<'a> Emitter<'a> {
                                 .to_string(),
                         );
                     }
+                    if self.contains_failing_call(*stmt) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a call to a function that can fail, nested in if/while, \
+                             is not yet supported (v0 restriction)"
+                                .to_string(),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -121,15 +158,12 @@ impl<'a> Emitter<'a> {
     /// comment). Enqueuing one fifo and dequeuing a DIFFERENT one is
     /// unaffected — this counts occurrences per fifo, not per rule.
     pub(crate) fn check_fifo_op_counts(&mut self, rule: ItemId) {
-        let body = rule_body(self.ast, rule);
+        let ops = self.rule_fifo_ops(rule);
         let mut enqs: HashMap<String, Vec<StmtId>> = HashMap::new();
         let mut deqs: HashMap<String, Vec<StmtId>> = HashMap::new();
-        for stmt in &body {
-            let Some((fifo, is_enq, _)) = self.fifo_op_stmt(*stmt) else {
-                continue;
-            };
-            let bucket = if is_enq { &mut enqs } else { &mut deqs };
-            bucket.entry(fifo).or_default().push(*stmt);
+        for op in &ops {
+            let bucket = if op.is_enq { &mut enqs } else { &mut deqs };
+            bucket.entry(op.fifo.clone()).or_default().push(op.stmt);
         }
         for (kind, map, message) in [
             (
@@ -184,11 +218,99 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn check_writing_call_positions_in(&mut self, stmts: &[StmtId]) {
+        let mut bad = Vec::new();
+        self.calls_outside_allowed_positions(stmts, false, &mut bad);
+        for call in bad {
+            let Some(fn_item) = self.call_target_fn(call) else {
+                continue;
+            };
+            let Some(sig) = self.fx.sigs.get(&fn_item) else {
+                continue;
+            };
+            if !sig.writes.is_empty() {
+                self.error(
+                    self.ast.expr_spans[call.0 as usize].clone(),
+                    "a call to a function that writes state may only appear \
+                     as a whole statement, or as the entire right-hand side \
+                     of `:=` (v0 restriction: not nested inside a larger \
+                     expression, a `let`, or as an argument to another \
+                     call — the write would not be found there)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    /// A failing call may only appear as a whole statement, or as the
+    /// entire right-hand side of `:=` — the only positions
+    /// `compile_guard`'s fold (`callee_fail_cond`, calls.rs) actually
+    /// looks in (deliberately not `let` too, even though the fifo-op
+    /// fold allows that: fewer allowed positions is a smaller surface
+    /// to get wrong, and nothing needs it yet — add it later alongside
+    /// a `callee_fail_cond` call site for `Stmt::Let` if an example
+    /// wants it). Anywhere else (nested in a larger expression, an
+    /// argument, a condition) its guard would silently never reach the
+    /// rule's own guard, exactly the hole `check_writing_call_
+    /// positions_in` already closes for a writing call — same shared
+    /// traversal (`calls_outside_allowed_positions`), different
+    /// predicate. Rule-level only: a callee's own body can never
+    /// contain a nested failing call at all (`check_fails_is_foldable_
+    /// guard` forbids it outright, any position), so there is nothing
+    /// for this to additionally catch there.
+    pub(crate) fn check_failing_call_positions(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        let mut bad = Vec::new();
+        self.calls_outside_allowed_positions(&body, false, &mut bad);
+        for call in bad {
+            let Some(fn_item) = self.call_target_fn(call) else {
+                continue;
+            };
+            if self.fx.sigs.get(&fn_item).is_some_and(|s| s.fails) {
+                self.error(
+                    self.ast.expr_spans[call.0 as usize].clone(),
+                    "a call to a function that can fail may only appear as a whole \
+                     statement, or as the entire right-hand side of `:=` (v0 \
+                     restriction: not nested inside a larger expression, a \
+                     condition, a `let`, or as an argument to another call — its \
+                     guard would not be folded into the caller's rule there)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    /// Every `Expr::Call` reachable within `stmts` that ISN'T sitting as
+    /// a whole bare statement or the entire right-hand side of `:=`
+    /// (the two positions a nested write or a nested fail condition can
+    /// actually be found/folded from) — including inside `if`/`while`
+    /// sub-bodies. Shared traversal for `check_writing_call_positions_
+    /// in` (flags a state-writing target) and `check_failing_call_
+    /// positions` (flags a failing target): same reachable-call
+    /// enumeration, different predicate over what's disallowed outside
+    /// the two safe positions. `allow_let`: whether a `let`'s own init
+    /// also counts as an allowed position — `false` for both current
+    /// callers (a write inside a `let` init is never findable by the
+    /// write-hunt walk at all, and a failing call there is deliberately
+    /// out of scope for now too, see `check_failing_call_positions`'s
+    /// own doc comment) but kept as a parameter rather than hardcoded,
+    /// since the two checks' allowed-position sets are conceptually
+    /// independent even though they agree today.
+    fn calls_outside_allowed_positions(
+        &self,
+        stmts: &[StmtId],
+        allow_let: bool,
+        out: &mut Vec<ExprId>,
+    ) {
         for stmt in stmts {
             let allowed = match self.ast.stmt(*stmt).clone() {
                 Stmt::Expr(e) if matches!(self.ast.expr(e), Expr::Call { .. }) => Some(e),
                 Stmt::Assign { rhs, .. } if matches!(self.ast.expr(rhs), Expr::Call { .. }) => {
                     Some(rhs)
+                }
+                Stmt::Let { init, .. }
+                    if allow_let && matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                {
+                    Some(init)
                 }
                 _ => None,
             };
@@ -207,14 +329,14 @@ impl<'a> Emitter<'a> {
                     else_body,
                 } => {
                     roots.push(cond);
-                    self.check_writing_call_positions_in(&then_body);
+                    self.calls_outside_allowed_positions(&then_body, allow_let, out);
                     if let Some(b) = &else_body {
-                        self.check_writing_call_positions_in(b);
+                        self.calls_outside_allowed_positions(b, allow_let, out);
                     }
                 }
                 Stmt::While { cond, body } => {
                     roots.push(cond);
-                    self.check_writing_call_positions_in(&body);
+                    self.calls_outside_allowed_positions(&body, allow_let, out);
                 }
                 Stmt::Return(None) | Stmt::Tick => {}
             }
@@ -222,43 +344,151 @@ impl<'a> Emitter<'a> {
                 let mut calls = Vec::new();
                 collect_calls(self.ast, root, &mut calls);
                 for call in calls {
-                    if Some(call) == allowed {
-                        continue;
-                    }
-                    let Expr::Call { callee, .. } = self.ast.expr(call).clone() else {
-                        unreachable!()
-                    };
-                    let Some(&def) = self.res.expr_defs.get(&callee) else {
-                        continue;
-                    };
-                    if !matches!(self.res.def(def).kind, DefKind::Fn | DefKind::Impl) {
-                        continue;
-                    }
-                    let Some(fn_item) = self
-                        .res
-                        .item_defs
-                        .iter()
-                        .find(|(_, d)| **d == def)
-                        .map(|(item, _)| *item)
-                    else {
-                        continue;
-                    };
-                    let Some(sig) = self.fx.sigs.get(&fn_item) else {
-                        continue;
-                    };
-                    if !sig.writes.is_empty() {
-                        self.error(
-                            self.ast.expr_spans[call.0 as usize].clone(),
-                            "a call to a function that writes state may only appear \
-                             as a whole statement, or as the entire right-hand side \
-                             of `:=` (v0 restriction: not nested inside a larger \
-                             expression, a `let`, or as an argument to another \
-                             call — the write would not be found there)"
-                                .to_string(),
-                        );
+                    if Some(call) != allowed {
+                        out.push(call);
                     }
                 }
             }
+        }
+    }
+
+    /// Resolves a `Call` expression's callee to the `ItemId` of the
+    /// `fn`/`impl` it targets, or `None` if it isn't a call to one at
+    /// all (a builtin, or unresolved).
+    fn call_target_fn(&self, call: ExprId) -> Option<ItemId> {
+        let Expr::Call { callee, .. } = self.ast.expr(call).clone() else {
+            return None;
+        };
+        let def = *self.res.expr_defs.get(&callee)?;
+        if !matches!(self.res.def(def).kind, DefKind::Fn | DefKind::Impl) {
+            return None;
+        }
+        self.res
+            .item_defs
+            .iter()
+            .find(|(_, d)| **d == def)
+            .map(|(item, _)| *item)
+    }
+
+    /// Whether `expr` is itself a call to a function whose (merged)
+    /// effect signature can fail — used by `check_guard_placement` to
+    /// treat a failing call the same as a bare guard or fifo op for the
+    /// "must precede any write, not nested in if/while" placement rule.
+    pub(crate) fn is_failing_call(&self, expr: ExprId) -> bool {
+        self.call_target_fn(expr)
+            .is_some_and(|fn_item| self.fx.sigs.get(&fn_item).is_some_and(|s| s.fails))
+    }
+
+    /// Whether `stmt` (an `if`/`while`, recursively) contains a call to
+    /// a failing function anywhere within it.
+    fn contains_failing_call(&self, stmt: StmtId) -> bool {
+        let mut calls = Vec::new();
+        collect_all_calls_in(self.ast, std::slice::from_ref(&stmt), &mut calls);
+        calls.iter().any(|call| self.is_failing_call(*call))
+    }
+
+    /// A `sig.fails` callee is only inlinable when its ENTIRE fail
+    /// condition reduces to bare, top-level guards `(cond)?` directly
+    /// in its own body — the only shape `callee_fail_cond`
+    /// (calls.rs) actually folds into a caller's own guard. Anything
+    /// else that could ALSO be contributing to `sig.fails` is rejected
+    /// outright here, rather than silently folding only PART of the
+    /// real fail condition (which would let the caller's rule fire on
+    /// a cycle it shouldn't — the same silent-drop class `check_
+    /// writing_call_positions_in` already guards against for writes):
+    /// - a fifo op anywhere in the body (its own state-transition
+    ///   emission isn't built here; a separate, larger follow-up),
+    /// - a guard nested inside one of the callee's own `if`/`else`
+    ///   branches — syntactically legal per `compile_callee_body`'s
+    ///   shape (a guard is an allowed "bare statement" there), but
+    ///   invisible to `callee_fail_cond`'s flat top-level scan; caught
+    ///   here by comparing "guards anywhere" against "guards at the
+    ///   top level" and rejecting if they differ,
+    /// - a nested call to ANOTHER function that can itself fail — v0
+    ///   folds one level only, not a chain of failing callees.
+    pub(crate) fn check_fails_is_foldable_guard(
+        &mut self,
+        span: Span,
+        body: &[StmtId],
+    ) -> Result<(), ()> {
+        let top_level_guards = body
+            .iter()
+            .filter(|s| {
+                matches!(self.ast.stmt(**s), Stmt::Expr(e) if matches!(self.ast.expr(*e), Expr::Guard(_)))
+            })
+            .count();
+        let any_guards = body
+            .iter()
+            .filter(|s| contains_guard(self.ast, **s))
+            .count();
+        let top_level_fifo_ops = body
+            .iter()
+            .filter(|s| self.fifo_op_stmt(**s).is_some())
+            .count();
+        let any_fifo_ops = body
+            .iter()
+            .filter(|s| contains_fifo_op(self.ast, self.res, **s))
+            .count();
+        let mut calls = Vec::new();
+        collect_all_calls_in(self.ast, body, &mut calls);
+        let nested_failing_call = calls.iter().any(|call| self.is_failing_call(*call));
+        if top_level_guards + top_level_fifo_ops == 0
+            || any_guards != top_level_guards
+            || any_fifo_ops != top_level_fifo_ops
+            || nested_failing_call
+        {
+            self.error(
+                span,
+                "calling a function that can fail is only supported when its \
+                 failure reduces entirely to bare, top-level guards `(cond)?` \
+                 and/or fifo ops directly in its own body (v0 restriction): a \
+                 guard or fifo op nested inside an if/else branch, or a nested \
+                 call to another failing function, can't yet be folded into \
+                 the caller's own guard"
+                    .to_string(),
+            );
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+/// Every `Expr::Call` reachable anywhere within `stmts`, including
+/// inside `if`/`while` sub-bodies — unlike `calls_outside_allowed_
+/// positions`, no position filtering, just existence anywhere. Used by
+/// `check_fails_is_foldable_guard`/`contains_failing_call` to find a
+/// nested failing call hiding at ANY depth, not just the disallowed
+/// positions a writing/failing call at the RULE level already checks.
+pub(crate) fn collect_all_calls_in(ast: &Ast, stmts: &[StmtId], out: &mut Vec<ExprId>) {
+    for stmt in stmts {
+        let mut roots: Vec<ExprId> = Vec::new();
+        match ast.stmt(*stmt).clone() {
+            Stmt::Expr(e) => roots.push(e),
+            Stmt::Assign { lhs, rhs } => {
+                roots.push(lhs);
+                roots.push(rhs);
+            }
+            Stmt::Let { init, .. } => roots.push(init),
+            Stmt::Return(Some(e)) => roots.push(e),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                roots.push(cond);
+                collect_all_calls_in(ast, &then_body, out);
+                if let Some(b) = &else_body {
+                    collect_all_calls_in(ast, b, out);
+                }
+            }
+            Stmt::While { cond, body } => {
+                roots.push(cond);
+                collect_all_calls_in(ast, &body, out);
+            }
+            Stmt::Return(None) | Stmt::Tick => {}
+        }
+        for root in roots {
+            collect_calls(ast, root, out);
         }
     }
 }

@@ -8,8 +8,20 @@
   color:
   - A callee body must be zero-or-more `let`s + state writes, then a
     trailing `return` or an `if`/`else` (mandatory `else`) recursing
-    into that same shape — no loops, guards, or fifo ops anywhere in a
-    callee, ever (not scoped to be lifted, just not yet attempted).
+    into that same shape. Bare, top-level guards AND fifo ops are now
+    both allowed — folded into the caller's own rule guard
+    (`check_fails_is_foldable_guard`, `callee_fail_cond`, `fifo.rs`'s
+    `rule_fifo_ops`/`compile_fifo_op_value`) — but only when the
+    callee's ENTIRE fail condition reduces to that shape: a guard or
+    fifo op nested inside one of the callee's own `if`/`else` branches,
+    or a nested call to another failing function (v0 folds one level
+    only), still reject outright, explicitly, rather than fold only
+    part of the real condition. A callee-local feeding a `Deq` into a
+    later `Enq` must be `let`-bound, not `:=` (see DESIGN.md's "Calling
+    a function from a rule"). Loops and `<elaborates>`
+    recursion/unrolling remain entirely unimplemented — no
+    unroll-and-splice machinery exists anywhere yet, not scoped to be
+    lifted, just not yet attempted (DESIGN.md's `AdderTree` example).
   - A nested call composes as a value, or as a state-writing bare
     statement / `:=` RHS, as long as it doesn't form a call cycle
     (static call-graph check) — nested any deeper than those two write
@@ -29,7 +41,8 @@
   See `examples/call.tr`, `examples/call_branch.tr`,
   `examples/call_writes.tr`, `examples/call_prio.tr`,
   `examples/call_trunc.tr`, `examples/call_pack.tr`,
-  `examples/call_nested.tr`, `examples/call_nested_writes.tr`.
+  `examples/call_nested.tr`, `examples/call_nested_writes.tr`,
+  `examples/call_guard.tr`, `examples/call_fifo.tr`.
 - Expression surface still excludes:
   - Field access other than `instance.port` (which is reads only; writes
     only as a whole statement's LHS).

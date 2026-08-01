@@ -1,0 +1,13 @@
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    (x != 0)?
+    return x
+}
+
+module Top {
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    rule compute {
+        result := Classify(a)
+    }
+}

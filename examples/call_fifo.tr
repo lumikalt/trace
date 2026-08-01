@@ -1,0 +1,23 @@
+-- examples/fifo_bridge.tr's own transfer logic, wrapped in a callee
+-- instead of written directly in the rule: `Bridge`'s two fail sources
+-- (`Deq[]` on an empty `input`, `Enq[x]` on a full `output`) both fold
+-- into `transfer`'s own guard, and the enqueued value threads through
+-- a `let`-bound callee-local (`x`), not just a parameter. `Bridge` is
+-- nested inside the module (not top-level, like a pure helper) since
+-- it reads/writes `input`/`output`, module state it can only reach
+-- from within that module's own boundary.
+module CallFifoBridge {
+    fifo input : bits[8]
+    fifo output : bits[8]
+    output last : bits[8] = 0
+
+    Bridge() : bits[8] <combines, fails> {
+        let x = input.Deq[]
+        output.Enq[x]
+        return x
+    }
+
+    rule transfer {
+        last := Bridge()
+    }
+}

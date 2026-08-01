@@ -267,14 +267,7 @@ impl<'a> Emitter<'a> {
             return Err(());
         }
         if sig.fails {
-            self.error(
-                span,
-                "calling a function that can fail (a guard in its body) is not yet \
-                 supported in FIRRTL emission (v0 restriction: an inlined call cannot \
-                 gate the caller's rule)"
-                    .to_string(),
-            );
-            return Err(());
+            self.check_fails_is_foldable_guard(span.clone(), &body)?;
         }
         // Cycle check, not a blanket "no nested calls" ban: a STATIC
         // property of which functions' own bodies reference which other
@@ -553,6 +546,129 @@ impl<'a> Emitter<'a> {
         Ok(acc)
     }
 
+    /// Binds `params` to `args` (a call's actual arguments) AND `body`'s
+    /// own top-level `let`s (their init expressions, substituted
+    /// wherever referenced later — the same "splice the whole init
+    /// expression at each use site" strategy `compile_callee_body`'s own
+    /// locals loop uses, not "compute once, reuse the compiled string")
+    /// into `self.locals`, saving whatever was there before so it can be
+    /// restored via `restore_callee_context`. Shared by `callee_fail_
+    /// cond` (a guard referencing a preceding callee-local, not just a
+    /// param, needs this too — `let y = x + 1 / (y != 0)?` previously
+    /// failed to resolve `y` at all) and `fifo.rs`'s `compile_fifo_op_
+    /// value` (an `Enq`'s value referencing a `let`-bound `Deq` result
+    /// from earlier in the same callee, the "bridge" pattern).
+    pub(crate) fn bind_callee_context(
+        &mut self,
+        params: &[Param],
+        args: &[ExprId],
+        body: &[StmtId],
+    ) -> Vec<(DefId, Option<ExprId>)> {
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            if let Some((i, _)) = self
+                .res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == param.name.span)
+            {
+                let def = DefId(i as u32);
+                saved.push((def, self.locals.insert(def, *arg)));
+            }
+        }
+        for stmt in body {
+            if let Stmt::Let { name, init } = self.ast.stmt(*stmt)
+                && let Some((i, _)) = self
+                    .res
+                    .defs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, d)| d.span == name.span)
+            {
+                let def = DefId(i as u32);
+                saved.push((def, self.locals.insert(def, *init)));
+            }
+        }
+        saved
+    }
+
+    pub(crate) fn restore_callee_context(&mut self, saved: Vec<(DefId, Option<ExprId>)>) {
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
+            }
+        }
+    }
+
+    /// If `call_expr` (a `Call` with the given `callee`/`args`) targets a
+    /// function whose own effect signature can fail, folds that
+    /// failure's condition into the caller's own guard: binds `callee`'s
+    /// params (and its own top-level `let`s) to this call's context via
+    /// `bind_callee_context` — the same reentrant save/restore
+    /// `compile_call` uses for a return value, so a guard written in
+    /// terms of a parameter OR a preceding callee-local compiles against
+    /// the actual substituted expression, not an unbound name — then
+    /// compiles the callee's own top-level guard(s), AND-reduced. `None`
+    /// if `callee` isn't a fails-ing call at all — an ordinary call has
+    /// nothing to fold. A fifo op's own guard contribution is NOT
+    /// handled here — see fifo.rs's `rule_fifo_ops`, folded separately
+    /// by `compile_guard` (writes.rs) so it can be combined with the
+    /// rule's OTHER touches of the same fifo (the Enq+Deq pass-through
+    /// case) before deciding the actual guard term.
+    ///
+    /// `validate_call` is the single authority on whether folding this
+    /// call is even sound; this re-runs it (safe — `Emitter::error`
+    /// dedupes by (span, message), so a call already rejected there
+    /// doesn't double-report) purely to reuse its resolution/validation,
+    /// and returns `None` on failure since the call's own body
+    /// compilation (elsewhere, when this statement's RHS is compiled)
+    /// will already surface the real error.
+    pub(crate) fn callee_fail_cond(
+        &mut self,
+        call_expr: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+    ) -> Option<String> {
+        let def = *self.res.expr_defs.get(&callee)?;
+        if !matches!(self.res.def(def).kind, DefKind::Fn | DefKind::Impl) {
+            return None;
+        }
+        let fn_item = *self
+            .res
+            .item_defs
+            .iter()
+            .find(|(_, d)| **d == def)
+            .map(|(item, _)| item)?;
+        let sig = self.fx.sigs.get(&fn_item)?;
+        if !sig.fails {
+            return None;
+        }
+        let span = self.ast.expr_spans[call_expr.0 as usize].clone();
+        let Ok((_, params, body)) = self.validate_call(span, callee) else {
+            return None;
+        };
+        let saved = self.bind_callee_context(&params, args, &body);
+        let mut conds = Vec::new();
+        for stmt in &body {
+            if let Stmt::Expr(e) = self.ast.stmt(*stmt)
+                && let Expr::Guard(inner) = self.ast.expr(*e)
+            {
+                conds.push(
+                    self.compile_expr(*inner)
+                        .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
+                );
+            }
+        }
+        self.restore_callee_context(saved);
+        conds.into_iter().reduce(|a, b| format!("and({a}, {b})"))
+    }
+
     /// Compiles a callee's body (or an `if`/`else` branch of one, which
     /// has the identical shape) to a single value: zero or more `let`
     /// bindings, then either a trailing `return <expr>` or an `if`/`else`
@@ -585,7 +701,10 @@ impl<'a> Emitter<'a> {
             // guard or fifo op would already have set `sig.fails`,
             // rejected by `validate_call` before this ever runs, so
             // this is deliberately narrower than "any Expr statement".
-            Stmt::Expr(e) => matches!(self.ast.expr(*e), Expr::Call { .. }),
+            Stmt::Expr(e) => {
+                matches!(self.ast.expr(*e), Expr::Call { .. } | Expr::Guard(_))
+                    || self.fifo_op(*e).is_some()
+            }
             _ => false,
         }) {
             self.error(

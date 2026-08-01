@@ -252,6 +252,7 @@ pub(crate) fn emit_module(
     for rule in &rules {
         cx.check_guard_placement(*rule);
         cx.check_writing_call_positions(*rule);
+        cx.check_failing_call_positions(*rule);
         cx.check_fifo_op_counts(*rule);
     }
     if !cx.errors.is_empty() {
@@ -447,24 +448,27 @@ pub(crate) fn emit_module(
     // the pre-edge `data` before this connect takes effect — the same
     // "reads see the old value, connects land for next cycle" register
     // semantics used everywhere else in this emitter.
-    // `(rule, Some((enqueue statement, enqueued value)), saw a dequeue)`.
-    type FifoTouch = (ItemId, Option<(StmtId, ExprId)>, bool);
+    // `(rule, Some(the Enq op — direct or via a callee), saw a dequeue)`.
+    // `rule_fifo_ops` (fifo.rs) is the single enumerator every fifo-touch
+    // question in this emitter routes through — it already finds an Enq/
+    // Deq reached through exactly one failing-callee call, not just a
+    // rule's own top-level statements, and `check_fifo_op_counts` has
+    // already confirmed (before this ever runs) that a rule enqueues at
+    // most once and dequeues at most once per fifo, however it's spread
+    // across a direct op and a callee's own op.
+    type FifoTouch = (ItemId, Option<RuleFifoOp>, bool);
     let mut fifo_body = String::new();
     for (fifo_name, width) in &fifos {
         let mut touching: Vec<FifoTouch> = Vec::new();
         for rule in &rules {
-            let body = rule_body(ast, *rule);
-            let mut enq: Option<(StmtId, ExprId)> = None;
+            let mut enq: Option<RuleFifoOp> = None;
             let mut saw_deq = false;
-            for s in &body {
-                let Some((name, is_enq, value)) = cx.fifo_op_stmt(*s) else {
-                    continue;
-                };
-                if &name != fifo_name {
+            for op in cx.rule_fifo_ops(*rule) {
+                if &op.fifo != fifo_name {
                     continue;
                 }
-                if is_enq {
-                    enq = value.map(|v| (*s, v));
+                if op.is_enq {
+                    enq = Some(op);
                 } else {
                     saw_deq = true;
                 }
@@ -483,10 +487,10 @@ pub(crate) fn emit_module(
             cx.enter_rule(rule);
             let f = &fires_name[&rule];
             let _ = writeln!(fifo_body, "    when {f} :");
-            if let Some((enq_stmt, value_expr)) = enq {
-                cx.set_pos(rule, enq_stmt);
+            if let Some(enq_op) = enq {
+                cx.set_pos(rule, enq_op.stmt);
                 let value = cx
-                    .compile_expr_hinted(value_expr, Some(*width))
+                    .compile_fifo_op_value(&enq_op, *width)
                     .unwrap_or_default();
                 let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(1)");
                 let _ = writeln!(fifo_body, "      connect {data}, {value}");

@@ -556,11 +556,64 @@ A callee's body may:
   both recurse into that same shape (the `else` is mandatory: every reachable
   path must produce a value).
 
-A callee's body may **not** contain a guard, a fifo operation, or a loop. A
-nested call is legal only as a value (a `let`'s init, the return expression, or
-a write's own right-hand side, including as an argument to a builtin like
-`prio`); a call nested any deeper — as part of a larger expression — is an
-error. A call cycle, direct or through another function, is an error.
+A callee's body may **not** contain a loop. A nested call is legal only as a
+value (a `let`'s init, the return expression, or a write's own right-hand
+side, including as an argument to a builtin like `prio`); a call nested any
+deeper — as part of a larger expression — is an error. A call cycle, direct
+or through another function, is an error.
+
+A callee's body **may** contain bare, top-level guards and/or fifo ops
+(`fails`, per the section above) — calling it folds every one of them into
+the caller's own rule guard, substituted against that call's actual
+arguments, exactly as if they had been written directly in the caller:
+
+```
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    (x != 0)?
+    return x
+}
+
+rule step {
+    result := Classify(a)    -- rule's own guard becomes (a != 0)?
+}
+
+Push(x : bits[8]) : bits[8] <combines, fails> {
+    buf.Enq[x]
+    return x
+}
+
+rule enqueue {
+    result := Push(a)    -- rule's own guard becomes not(buf's valid)
+}
+```
+
+A callee's fifo ops combine with the caller's own (and with fifo ops reached
+through a *different* callee call in the same rule) using the identical
+Enq+Deq pass-through rule a rule's own body already follows — a rule that
+directly `Deq`s a fifo while calling a callee that `Enq`s that SAME fifo gets
+one combined `valid`-only guard, not the separately-computed (and always
+false) AND of each op's own individual guard. A `let`-bound callee-local
+feeding a `Deq` into a later `Enq` within the same callee (the
+`fifo_bridge.tr` pattern, wrapped in a callee — see `examples/call_fifo.tr`)
+works the same way a rule-level local does, with one sharp edge: it must be
+`let`-bound, not `:=`-reassigned — a callee's own locals don't have access to
+the position-snapshot machinery that makes rule-level `:=` reassignment work
+(see "Locals" below), so `x := input.Deq[]` inside a callee fails with a
+not-obviously-related "cannot find this local's binding" error; `let x =
+input.Deq[]` is required there.
+
+The fold only understands one shape: the callee's *entire* fail condition must
+reduce to bare guards and fifo ops sitting directly at its own top level —
+not nested inside one of its own `if`/`else` branches (legal syntax there,
+since both are ordinary allowed statements in a branch, but invisible to the
+fold's flat scan), and not a nested call to another failing function (v0
+folds one level only — a callee calling ANOTHER failing callee is still an
+error). Anything outside that shape is a compile-time error rather than a
+partial, silently-wrong fold. The call itself may only appear as a whole
+statement or the entire right-hand side of `:=` — the same two positions a
+state-writing call is already restricted to, and for the identical reason:
+nested any deeper (an argument, a `let`, `Classify(a) + 1`), the guard
+wouldn't be found there and would silently stop gating the rule.
 
 A generic parameter's own width, used independently of the callee's return
 value (for example, as an argument to `prio` inside a generic callee), is only
@@ -1078,6 +1131,55 @@ argument, a `let`'s init, part of a larger expression) is an explicit error, not
 a silent skip, since neither is a shape the writer-hunting walk knows how to
 find.
 
+A failing call — one whose callee's own effect signature can fail — is folded
+into the caller's rule guard in two independent pieces that both write into
+`compile_guard`'s own condition list, one per fail source:
+
+- **Guards**: `callee_fail_cond`, the same reentrant param-substitution
+  `compile_call` uses for a return value, run instead against the callee's
+  own bare top-level guard expressions — params (AND the callee's own
+  top-level `let`s, via the shared `bind_callee_context`/`restore_callee_
+  context` helpers, so a guard referencing a preceding callee-local resolves
+  too, not just a parameter) bind to the call's actual arguments, the
+  callee's guard conditions compile under that binding (so `(x != 0)?`
+  compiles to `neq(a, 0)` when called `Classify(a)`, never a reference to the
+  unbound parameter name), AND-reduced.
+- **Fifo ops**: `fifo.rs`'s `rule_fifo_ops` is the single enumerator every
+  fifo-touch question in the emitter routes through — module.rs's per-fifo
+  state-transition emission, `compile_guard`'s Enq+Deq pass-through
+  precondition, and `check_fifo_op_counts`'s double-op collision check all
+  call it, rather than each independently re-scanning a rule's statements
+  (three independent scans reaching through the call boundary would drift
+  out of agreement with each other, exactly the silent-miscompile class this
+  whole area exists to close off). It finds every fifo op a rule performs,
+  direct or reached through exactly one bare-statement/`:=`-RHS call to a
+  failing callee, so a rule that directly touches a fifo AND calls a callee
+  that ALSO touches it combine into one correct pass-through guard, and a
+  rule that already touches a fifo directly plus a callee that touches the
+  SAME fifo the SAME way is caught by the ordinary double-Enq/double-Deq
+  collision check, unchanged. `compile_fifo_op_value` compiles an `Enq`'s
+  value under the same `bind_callee_context` binding as the guard fold — so
+  a `let`-bound callee-local fed from a `Deq` earlier in the SAME callee (the
+  `fifo_bridge.tr` pattern wrapped in a callee) resolves correctly too.
+
+`validate_call` gates both on `check_fails_is_foldable_guard`: a callee is
+only eligible when `sig.fails` is *entirely* explained by bare, top-level
+guards and/or fifo ops — checked by comparing "guards (or fifo ops) anywhere
+in the body, including inside `if`/`else` branches" against "guards (or fifo
+ops) at the top level only" (the shape the folds actually reach) and
+rejecting if either pair differs, or a nested call to another failing
+function is found. Trusting `sig.fails` at face value here — inlining any
+callee that merely CAN fail, without confirming the fold actually reaches
+every source of that failure — would silently drop part of the real fail
+condition, letting the caller's rule fire on a cycle it shouldn't; the same
+silent-drop class `check_writing_call_positions_in` already guards against
+for writes. `check_failing_call_positions` extends that same writing-call
+positional restriction (bare statement or `:=` RHS only, checked via the
+shared `calls_outside_allowed_positions` traversal) to a failing call at the
+rule level, for the identical reason. `check_guard_placement` treats a
+failing call the same as a bare guard or fifo op for the existing "must
+precede any write, not nested in `if`/`while`" placement rule.
+
 A generic callee's own body is type-checked once, independent of any call site,
 so an implicit width parameter is never concretely resolved inside it. The
 callee's return-value width comes from the call expression's own concrete
@@ -1148,8 +1250,11 @@ noted:
   nesting (`examples/submodule.tr`, `examples/submodule_multi_port.tr`,
   `examples/submodule_nested.tr`).
 - Calling a `fn`/`impl` from a rule: values, branching bodies, state-writing
-  callees, calls nested through other callees, the synthesizable builtins
-  `prio`/`trunc`/`pack` (`examples/call*.tr`).
+  callees, calls nested through other callees, a callee whose own body is a
+  bare top-level guard and/or fifo op (folded into the caller's own rule
+  guard, including the Enq+Deq pass-through case split across the call
+  boundary — `examples/call_guard.tr`, `examples/call_fifo.tr`), the
+  synthesizable builtins `prio`/`trunc`/`pack` (`examples/call*.tr`).
 - The `schedule` block: `urgency`, `mutually_exclusive` (checked simulation
   assertion), `conflict_free` (trusted, unchecked; rejected outright on a
   write/write conflict).

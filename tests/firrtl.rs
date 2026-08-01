@@ -1991,6 +1991,368 @@ module M {
 }
 
 #[test]
+fn call_folds_a_guard_that_references_a_preceding_callee_local() {
+    // Regression test for a real gap found while extending this area to
+    // fifo ops: `callee_fail_cond` originally only bound the callee's
+    // PARAMS, not its own top-level `let`s, so a guard written in terms
+    // of a preceding local (`let y = x + 1 / (y != 0)?`) failed to
+    // resolve `y` at all (a clean error, not a miscompile, but a real
+    // gap) until `bind_callee_context` started binding both.
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    let y = x + 1
+    (y != 0)?
+    return y
+}
+module Top {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule compute {
+        result := Classify(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_compute = neq(tail(add(a, UInt<8>(1)), 1), UInt<8>(0))"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_folds_a_callees_bare_guard_into_the_callers_own_guard() {
+    // `Classify`'s `(x != 0)?` isn't the caller's own guard textually —
+    // it's DESIGN.md's own "fails" example. The fold must compile the
+    // condition against the CALL SITE's argument (`a`), not the
+    // callee's own parameter name (`x`) unbound — the exact
+    // param-substitution trap this fold has to get right.
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    (x != 0)?
+    return x
+}
+module Top {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule compute {
+        result := Classify(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_compute = neq(a, UInt<8>(0))"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_folds_a_guard_and_threads_a_state_write_from_the_same_callee() {
+    // The untested intersection between the guard fold and the
+    // existing write-hunt: `Bump`'s body both guards AND writes `v` —
+    // two independent passes over the same callee body
+    // (`callee_fail_cond` for the guard, `callee_reg_write` for the
+    // write) have to agree on the same rule-level guard, not just each
+    // compile in isolation. Confirmed through real simulation before
+    // this was added (both writes gated identically, `v` holds when
+    // `a == 0`) — this pins the emitted shape.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    input a : bits[8]
+    output result : bits[8] = 0
+    Bump(x : bits[8]) : bits[8] <combines, fails> {
+        (x != 0)?
+        v := x
+        return x + 1
+    }
+    rule r {
+        result := Bump(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = neq(a, UInt<8>(0))"));
+    let write_count = fir.matches("when fires_r :").count();
+    assert_eq!(
+        write_count, 2,
+        "expected both v's write and result's write to be gated by the \
+         SAME fires_r (one that includes the folded guard), not two \
+         independently-computed conditions:\n{fir}"
+    );
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn a_failing_call_nested_in_a_larger_expression_is_an_error_not_a_dropped_guard() {
+    // Mirrors `a_writing_call_nested_in_a_larger_expression_is_an_error_
+    // not_a_dropped_write`: `compile_guard`'s fold only scans a call
+    // sitting as a whole bare statement or the entire RHS of `:=` — one
+    // nested inside `+ 1` would never be found there, silently letting
+    // the caller's rule fire on a cycle `Classify` should have blocked.
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    (x != 0)?
+    return x
+}
+module Top {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule compute {
+        result := Classify(a) + 1
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("may only appear as a whole statement"))
+    );
+}
+
+#[test]
+fn a_failing_callee_with_a_guard_nested_in_if_else_is_still_rejected() {
+    // Syntactically legal per `compile_callee_body`'s shape (a bare
+    // guard is an allowed statement inside an if/else branch), but
+    // invisible to `callee_fail_cond`'s flat top-level scan — folding
+    // only the (nonexistent) top-level guard would silently drop this
+    // one, letting the caller's rule fire even when `flag == 1` and
+    // `x == 0`. `check_fails_is_foldable_guard` must catch this by
+    // comparing "guards anywhere" against "guards at the top level".
+    let src = "\
+Classify(x : bits[8], flag : bits[1]) : bits[8] <combines, fails> {
+    if flag == 1 {
+        (x != 0)?
+        return x
+    } else {
+        return 0
+    }
+}
+module Top {
+    input a : bits[8]
+    input f : bits[1]
+    output result : bits[8] = 0
+    rule compute {
+        result := Classify(a, f)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("reduces entirely to bare, top-level guards")
+    }));
+}
+
+#[test]
+fn call_folds_a_callees_fifo_op_into_the_callers_own_guard() {
+    // A fifo op in a callee's own body sets `sig.fails` exactly like a
+    // guard does, and now folds the same way: the Enq's own precondition
+    // (`not(valid)`) becomes the caller's rule guard, and the Enq's
+    // value threads through the same param substitution a guard's
+    // condition already gets.
+    let src = "\
+module Top {
+    fifo buf : bits[8]
+    input a : bits[8]
+    output result : bits[8] = 0
+
+    Classify(x : bits[8]) : bits[8] <combines, fails> {
+        buf.Enq[x]
+        return x
+    }
+
+    rule compute {
+        result := Classify(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_compute = not(__fifo_buf_valid)"));
+    assert!(fir.contains("connect __fifo_buf_data, a"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn call_folds_both_a_guard_and_a_fifo_op_from_the_same_callee() {
+    // The untested intersection between the two independent condition-
+    // folding paths that now both write into `compile_guard`'s `conds`
+    // list: `callee_fail_cond` (the guard) and `rule_fifo_ops`'s fifo
+    // term (the Enq). Confirmed neither drops nor double-counts the
+    // other's contribution before this shipped.
+    let src = "\
+module Top {
+    fifo buf : bits[8]
+    input a : bits[8]
+    output result : bits[8] = 0
+    Push(x : bits[8]) : bits[8] <combines, fails> {
+        (x != 0)?
+        buf.Enq[x]
+        return x
+    }
+    rule compute {
+        result := Push(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_compute = and(not(__fifo_buf_valid), neq(a, UInt<8>(0)))"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn a_rule_enqueuing_directly_and_via_a_callee_is_still_a_double_enq_error() {
+    // The double-op collision check (`check_fifo_op_counts`) has to
+    // reach through the call boundary too, or this would silently keep
+    // only the last write to land — the same class of bug `check_
+    // fifo_op_counts` already exists to reject at the rule's own top
+    // level.
+    let src = "\
+module Top {
+    fifo buf : bits[8]
+    input a : bits[8]
+    input b : bits[8]
+    output result : bits[8] = 0
+
+    Classify(x : bits[8]) : bits[8] <combines, fails> {
+        buf.Enq[x]
+        return x
+    }
+
+    rule compute {
+        buf.Enq[b]
+        result := Classify(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("appears more than once in this rule"))
+    );
+}
+
+#[test]
+fn a_direct_deq_and_a_via_callee_enq_combine_into_one_pass_through() {
+    // The rule's own `Deq` and the callee's own `Enq` touch the SAME
+    // fifo — this must produce the ordinary Enq+Deq pass-through
+    // (`valid` stays 1, data updates to the new value), not a
+    // dequeue-only guard, proving `compile_guard`'s fifo pre-scan and
+    // module.rs's state-transition emission agree on the SAME whole-
+    // rule view of this fifo (both now routed through `rule_fifo_ops`),
+    // not two independently-computed answers that happen to usually
+    // match.
+    let src = "\
+module Top {
+    fifo buf : bits[8]
+    input a : bits[8]
+    output result : bits[8] = 0
+    output val : bits[8] = 0
+
+    Classify(x : bits[8]) : bits[8] <combines, fails> {
+        buf.Enq[x]
+        return x
+    }
+
+    rule compute {
+        val := buf.Deq[]
+        result := Classify(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    // The combined pass-through guard is just `valid` (see fifo.rs's
+    // `rule_fifo_guard_cond`) -- NOT `and(valid, not(valid))`, which
+    // would be the wrong, always-false AND of each op's own individual
+    // guard if the two ops were folded independently instead of unified.
+    assert!(fir.contains("node fires_compute = __fifo_buf_valid"));
+    assert!(!fir.contains("and(__fifo_buf_valid"));
+    assert!(fir.contains("connect __fifo_buf_valid, UInt<1>(1)"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn a_failing_callee_that_calls_another_failing_callee_is_still_rejected() {
+    // v0 folds one level only — `Outer` itself has no guard of its own,
+    // its `sig.fails` is entirely bubbled up from calling `Inner`.
+    // Folding would need to recurse into `Inner`'s own body too, not
+    // built here.
+    let src = "\
+Inner(x : bits[8]) : bits[8] <combines, fails> {
+    (x != 0)?
+    return x
+}
+Outer(x : bits[8]) : bits[8] <combines, fails> {
+    return Inner(x)
+}
+module Top {
+    input a : bits[8]
+    output result : bits[8] = 0
+    rule compute {
+        result := Outer(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("reduces entirely to bare, top-level guards")
+    }));
+}
+
+#[test]
+fn a_failing_call_nested_in_if_else_at_the_rule_level_is_still_rejected() {
+    // Same v0 restriction ordinary guards/fifo ops already have at the
+    // rule level (`check_guard_placement`): a guard must gate the WHOLE
+    // rule, unconditionally — one reachable only through a branch reads
+    // as conditional even though nothing here would actually make it
+    // behave that way, so it's rejected for clarity, matching existing
+    // precedent exactly.
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    (x != 0)?
+    return x
+}
+module Top {
+    input a : bits[8]
+    input cond : bits[1]
+    output result : bits[8] = 0
+    rule compute {
+        if cond == 1 {
+            result := Classify(a)
+        } else {
+            result := 0
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("nested in if/while, is not yet supported")
+    }));
+}
+
+#[test]
+fn a_failing_call_as_a_bare_statement_after_a_state_write_is_still_rejected() {
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    (x != 0)?
+    return x
+}
+module Top {
+    input a : bits[8]
+    reg r : bits[8] = 0
+    rule compute {
+        r := a
+        Classify(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("after a state write"))
+    );
+}
+
+#[test]
 fn a_write_transitively_reached_through_a_bare_statement_call_threads_through() {
     // Regression test for a real silent miscompile caught before
     // callee-calling-callee shipped: `Outer` (called as a bare

@@ -266,26 +266,40 @@ impl<'a> Emitter<'a> {
 
     pub(crate) fn compile_guard(&mut self, rule: ItemId) -> String {
         let body = rule_body(self.ast, rule);
-        // Pre-scan which fifos this rule enqueues/dequeues (top-level
-        // only, matching `fifo_op_stmt`'s own scope) so a same-fifo
-        // Enq+Deq pair contributes ONE combined guard term below, not
-        // the AND of each op's own individual (mutually exclusive)
-        // guard — see fifo.rs's module doc comment.
+        // `rule_fifo_ops` (fifo.rs) already finds every fifo op this
+        // rule performs, direct OR reached through one failing-callee
+        // call — the single enumerator every fifo-touch question in
+        // this emitter routes through, so this guard's precondition
+        // always agrees with module.rs's state-transition emission and
+        // `check_fifo_op_counts`'s collision check. Aggregate saw-enq/
+        // saw-deq PER FIFO across the WHOLE rule first (not per
+        // statement) so a same-fifo Enq+Deq pair — even split across a
+        // direct op and a callee's own op — contributes ONE combined
+        // guard term below, not the AND of each op's own individual
+        // (mutually exclusive) guard — see fifo.rs's module doc comment.
+        let ops = self.rule_fifo_ops(rule);
         let mut fifo_ops: std::collections::HashMap<String, (bool, bool)> = Default::default();
-        for stmt in &body {
-            if let Some((fifo, is_enq, _)) = self.fifo_op_stmt(*stmt) {
-                let entry = fifo_ops.entry(fifo).or_insert((false, false));
-                if is_enq {
-                    entry.0 = true;
-                } else {
-                    entry.1 = true;
-                }
+        for op in &ops {
+            let entry = fifo_ops.entry(op.fifo.clone()).or_insert((false, false));
+            if op.is_enq {
+                entry.0 = true;
+            } else {
+                entry.1 = true;
             }
         }
         let mut conds = Vec::new();
         let mut fifo_conds_emitted: std::collections::HashSet<String> = Default::default();
         for stmt in &body {
             self.set_pos(rule, *stmt);
+            let stmt_fifo_conds: Vec<String> = ops
+                .iter()
+                .filter(|o| o.stmt == *stmt)
+                .filter(|o| fifo_conds_emitted.insert(o.fifo.clone()))
+                .map(|o| {
+                    let (saw_enq, saw_deq) = fifo_ops[&o.fifo];
+                    rule_fifo_guard_cond(&o.fifo, saw_enq, saw_deq)
+                })
+                .collect();
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Expr(e) => {
                     if let Expr::Guard(inner) = self.ast.expr(e) {
@@ -293,20 +307,29 @@ impl<'a> Emitter<'a> {
                             self.compile_expr(*inner)
                                 .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
                         );
-                    } else if let Some((fifo, ..)) = self.fifo_op(e)
-                        && fifo_conds_emitted.insert(fifo.clone())
-                    {
-                        let (saw_enq, saw_deq) = fifo_ops[&fifo];
-                        conds.push(rule_fifo_guard_cond(&fifo, saw_enq, saw_deq));
+                    } else {
+                        conds.extend(stmt_fifo_conds);
+                        if let Expr::Call { callee, args } = self.ast.expr(e).clone()
+                            && let Some(cond) = self.callee_fail_cond(e, callee, &args)
+                        {
+                            conds.push(cond);
+                        }
                     }
                 }
-                Stmt::Assign { rhs, .. } | Stmt::Let { init: rhs, .. } => {
-                    if let Some((fifo, ..)) = self.fifo_op(rhs)
-                        && fifo_conds_emitted.insert(fifo.clone())
+                Stmt::Assign { rhs, .. } => {
+                    conds.extend(stmt_fifo_conds);
+                    if let Expr::Call { callee, args } = self.ast.expr(rhs).clone()
+                        && let Some(cond) = self.callee_fail_cond(rhs, callee, &args)
                     {
-                        let (saw_enq, saw_deq) = fifo_ops[&fifo];
-                        conds.push(rule_fifo_guard_cond(&fifo, saw_enq, saw_deq));
+                        conds.push(cond);
                     }
+                }
+                // A `let`-bound failing call is deliberately out of
+                // scope for now (`check_failing_call_positions` rejects
+                // it before this ever runs) -- only fifo-op folding
+                // still applies here, matching existing precedent.
+                Stmt::Let { .. } => {
+                    conds.extend(stmt_fifo_conds);
                 }
                 _ => {}
             }
