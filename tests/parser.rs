@@ -129,6 +129,61 @@ fn spawn_prefix() {
 }
 
 #[test]
+fn bare_tick_is_still_one_statement() {
+    let src = "rule t {\n tick\n}\n";
+    let ast = parse_ok(src);
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 1);
+    assert!(matches!(ast.stmt(body[0]), trace::ast::Stmt::Tick));
+}
+
+#[test]
+fn tick_with_trailing_expr_desugars_to_two_statements() {
+    // `tick <expr>` is sugar for a bare `tick` immediately followed by
+    // `<expr>` as its own statement — not a new AST shape lower.rs would
+    // need to know about.
+    let src = "rule t {\n tick sync[h1, h2]\n}\n";
+    let ast = parse_ok(src);
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 2, "tick + the trailing expr as its own stmt");
+    assert!(matches!(ast.stmt(body[0]), trace::ast::Stmt::Tick));
+    match ast.stmt(body[1]) {
+        trace::ast::Stmt::Expr(e) => {
+            assert_eq!(ast.expr_sexpr(*e), "(index sync h1 h2)");
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+}
+
+#[test]
+fn tick_with_guard_expr_parses_same_as_a_separate_guard_statement() {
+    let fused = "rule t {\n tick (x == 0)?\n}\n";
+    let split = "rule t {\n tick\n (x == 0)?\n}\n";
+    let fused_ast = parse_ok(fused);
+    let split_ast = parse_ok(split);
+    let Item::Rule { body: fb, .. } = fused_ast.item(fused_ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Rule { body: sb, .. } = split_ast.item(split_ast.roots[0]) else {
+        panic!()
+    };
+    assert_eq!(fb.len(), 2);
+    assert_eq!(sb.len(), 2);
+    for (a, b) in [(fb[0], sb[0]), (fb[1], sb[1])] {
+        let sexpr = |ast: &Ast, s| match ast.stmt(s) {
+            trace::ast::Stmt::Expr(e) => ast.expr_sexpr(*e),
+            trace::ast::Stmt::Tick => "tick".to_string(),
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        assert_eq!(sexpr(&fused_ast, a), sexpr(&split_ast, b));
+    }
+}
+
+#[test]
 fn rule_with_effects() {
     let ast = parse_ok("rule step <sequences, reads {pc, mem}, writes {mem}> {\n tick\n}\n");
     let Item::Rule { effects, body, .. } = ast.item(ast.roots[0]) else {

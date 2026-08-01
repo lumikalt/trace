@@ -630,8 +630,8 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     let before = self.pos;
-                    if let Some(stmt) = self.parse_stmt() {
-                        body.push(stmt);
+                    if let Some(stmts) = self.parse_stmt() {
+                        body.extend(stmts);
                     }
                     if self.pos == before {
                         self.bump();
@@ -642,12 +642,29 @@ impl<'a> Parser<'a> {
         Some(body)
     }
 
-    fn parse_stmt(&mut self) -> Option<StmtId> {
+    fn parse_stmt(&mut self) -> Option<Vec<StmtId>> {
         use TokenKind::*;
         let lo = self.cur_span().start;
+        let mut extra_guard: Option<StmtId> = None;
         let stmt = match self.peek() {
             Some(Tick) => {
                 self.bump();
+                match self.peek() {
+                    Some(Newline) | Some(Semi) | Some(RBrace) | None => {}
+                    // `tick <expr>`: the trailing expression gates entry
+                    // into the segment this tick opens — sugar for
+                    // writing it as that segment's own first statement
+                    // (an explicit `cond?` guard, or an already-fallible
+                    // bracket op like `sync[h1, h2]`), so it parses into
+                    // an ordinary extra statement rather than a new AST
+                    // shape lower.rs would need to know about.
+                    _ => {
+                        let expr_lo = self.cur_span().start;
+                        let expr = self.parse_expr(0)?;
+                        extra_guard =
+                            Some(self.ast.push_stmt(Stmt::Expr(expr), expr_lo..self.prev_end));
+                    }
+                }
                 self.expect_terminator();
                 Stmt::Tick
             }
@@ -691,7 +708,10 @@ impl<'a> Parser<'a> {
                 }
             }
         };
-        Some(self.ast.push_stmt(stmt, lo..self.prev_end))
+        let id = self.ast.push_stmt(stmt, lo..self.prev_end);
+        let mut out = vec![id];
+        out.extend(extra_guard);
+        Some(out)
     }
 
     fn parse_if(&mut self) -> Option<Stmt> {

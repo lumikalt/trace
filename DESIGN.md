@@ -175,6 +175,13 @@ survive past the cycle where it was computed. `tick` must sit at the top level o
 a `sequences` body: it cannot nest inside `if`/`while`. A conditional cycle
 boundary has no defined meaning yet.
 
+`tick` may name a trailing fallible expression: `tick <expr>`. The segment `tick`
+opens does not fire until `<expr>` succeeds; until then, the rule retries every
+cycle without otherwise progressing. Bare `tick` is shorthand for a trailing
+expression that always succeeds. `<expr>` follows the same rule as any other
+fallible operation: an explicit `cond?` guard, or an already-fallible bracket
+operation such as `sync[h1, h2]` (see "`spawn` and `sync`" below).
+
 ### `spawn` and `sync`
 
 `spawn` starts an independent, parallel computation. `sync` waits for one or more
@@ -202,8 +209,7 @@ module Fetch2 {
     rule fetch2 <sequences> {
         h1 := spawn ReadBank0(pc)
         h2 := spawn ReadBank1(pc + 1)
-        tick
-        sync(h1, h2)                        -- waits until both finish
+        tick sync[h1, h2]                   -- waits until both finish
         ir := pack(h1.result, h2.result)
     }
 }
@@ -219,10 +225,11 @@ read-only.
 `tick` has. A loop can therefore never contain a `spawn`, so the number of spawns
 in a design is always static.
 
-`sync(h1, h2, ...)` waits for every named handle to finish. It must appear as its
-own statement, not nested inside `if`/`while` or embedded in a larger expression.
-Until every named handle is done, the rule containing `sync` retries every cycle
-without otherwise progressing.
+`sync[h1, h2, ...]` waits for every named handle to finish. Square brackets mark
+it as a fallible operation, the same convention `f.Deq[]`/`f.Enq[x]` use. It must
+appear as its own statement, not nested inside `if`/`while` or embedded in a
+larger expression — the idiomatic place is directly after `tick`
+(`tick sync[h1, h2]`), so the wait and the cycle boundary read as one step.
 
 `race` is not yet supported. See Part 3.
 
@@ -741,10 +748,17 @@ behind the rule's own mandatory `tick`.
 what makes "spawn counts are static" hold: no loop construct can contain a
 spawn, so there is no dynamic spawn count to reason about.
 
-`sync(h1, h2, ...)` lowers to one `(h{i}.done == 1)? ` guard per handle, inserted
+`sync[h1, h2, ...]` lowers to one `(h{i}.done == 1)? ` guard per handle, inserted
 in place of the call, gating the segment it is written in exactly like any other
 guard. The segment containing `sync` does not fire, and does not advance its
 own enclosing continuation, until every named handle has finished.
+
+`tick <expr>` is parser sugar, not a new construct this pass has to know about.
+The parser desugars it into a bare `tick` immediately followed by `<expr>` as
+its own statement — the opened segment's leading statement — so `tick
+sync[h1, h2]` and writing `tick` then `sync[h1, h2]` on the next line produce
+identical trees. Every pass downstream of parsing (segmentation, capture
+computation, sync detection, effect checking) sees only the desugared form.
 
 `race` needs a loser-cancellation latch that is not designed yet: the ordinary
 scheduler's derived-stall machinery only arbitrates a same-cycle write conflict,

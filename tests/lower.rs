@@ -316,8 +316,7 @@ module Fetch2 {
     rule fetch2 <sequences> {
         h1 := spawn ReadBank0(pc)
         h2 := spawn ReadBank1(pc + 1)
-        tick
-        sync(h1, h2)
+        tick sync[h1, h2]
         ir := pack(h1.result, h2.result)
     }
 }
@@ -359,7 +358,7 @@ fn spawn_sync_structural_shape() {
         "no `spawn` keyword should survive lowering"
     );
     assert!(
-        !rendered.contains("sync("),
+        !rendered.contains("sync["),
         "no `sync` call should survive lowering"
     );
 }
@@ -400,7 +399,7 @@ module M {
         h := spawn Slow(1)
         tick
         if 1 == 1 {
-            sync(h)
+            sync[h]
         }
     }
 }
@@ -423,7 +422,7 @@ module M {
         h1 := spawn Slow(1)
         h2 := spawn Slow(2)
         tick
-        w := race(h1, h2)
+        w := race[h1, h2]
     }
 }
 ";

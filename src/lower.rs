@@ -41,11 +41,18 @@
 //! observe `done` before the trigger's own segment has run at least once
 //! — so the continuation register resets to a plain 0, same as every
 //! other continuation register in this emitter, no sentinel value
-//! needed. `sync(h1, h2, ...)`
-//! lowers to one `(__done_h{i} == 1)?` guard per handle, inserted in
-//! place of the call — reusing "guard fails, segment retries next cycle"
-//! unchanged, no new segmentation trigger. `h.result`/`h.done` anywhere
-//! in the enclosing rule rewrite to `__result_*`/`__done_*` reads.
+//! needed. `sync[h1, h2, ...]` (brackets: sync is a fallible operation,
+//! same convention as `f.Deq[]`/`f.Enq[x]`) lowers to one
+//! `(__done_h{i} == 1)?` guard per handle, inserted in place of the
+//! call — reusing "guard fails, segment retries next cycle" unchanged,
+//! no new segmentation trigger. `h.result`/`h.done` anywhere in the
+//! enclosing rule rewrite to `__result_*`/`__done_*` reads.
+//! `tick` optionally takes a trailing fallible expression
+//! (`tick sync[h1, h2]`): parser.rs desugars this into a plain `tick`
+//! followed by that expression as the opened segment's own leading
+//! statement, so this module never sees a distinct AST shape for it —
+//! `tick sync[h1, h2]` and separately writing `tick` then `sync[h1, h2]`
+//! on the next line produce identical trees.
 //! `race` stays unimplemented (DESIGN.md: needs a loser-cancellation
 //! latch not yet designed).
 //!
@@ -127,7 +134,8 @@ pub struct LoweredRule {
     pub segments: Vec<Segment>,
     pub captures: Vec<CapturedLocal>,
     pub spawns: Vec<SpawnPlan>,
-    /// `sync(...)` call statements, each naming the handles it joins.
+    /// `sync[...]` bracket-call statements, each naming the handles it
+    /// joins.
     pub syncs: Vec<(StmtId, Vec<DefId>)>,
     /// Every `h.result`/`h.done` reference anywhere in this rule's own
     /// segments, rewritten to the owning spawn's register name.
@@ -216,8 +224,8 @@ fn plan_rule(
             span,
             message: "sequences lowering does not yet support `race` (v0 restriction); \
                       `spawn`/`sync` need `spawn`'s result bound directly to a fresh local \
-                      (`h := spawn Callee(args)`) and `sync(...)` written as its own \
-                      statement"
+                      (`h := spawn Callee(args)`) and `sync[...]` written as its own \
+                      statement or as a `tick`'s trailing expression (`tick sync[...]`)"
                 .to_string(),
         }]);
     }
@@ -370,12 +378,14 @@ fn spawn_trigger_shape(
     Some((def, res.def(def).name.clone(), *inner))
 }
 
-/// Recognizes `sync(h1, h2, ...)` written as its own bare statement.
+/// Recognizes `sync[h1, h2, ...]` written as its own bare statement
+/// (including the leading statement of a segment a `tick sync[...]`
+/// desugars into — see `parser.rs`'s `tick`-with-expr handling).
 fn sync_call_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefId>> {
     let Stmt::Expr(e) = ast.stmt(stmt) else {
         return None;
     };
-    let Expr::Call { callee, args } = ast.expr(*e) else {
+    let Expr::Bracket { callee, args } = ast.expr(*e) else {
         return None;
     };
     let def = res.expr_defs.get(callee)?;
@@ -908,7 +918,8 @@ fn find_spawn_in_expr(ast: &Ast, id: ExprId) -> Option<Span> {
 
 /// Scans for anything this pass still can't handle: `race` always, plus
 /// `spawn`/`sync` used in any shape other than the two legitimate ones
-/// (`h := spawn Callee(args)`, `sync(...)` as its own statement) — those
+/// (`h := spawn Callee(args)`, `sync[...]` as its own statement — which
+/// also covers a `tick sync[...]`'s desugared second statement) — those
 /// two are recognized and skipped by the caller before reaching here.
 fn find_unsupported_construct(
     ast: &Ast,
@@ -936,7 +947,7 @@ fn find_unsupported_construct(
             let Stmt::Expr(e) = ast.stmt(*stmt) else {
                 unreachable!()
             };
-            let Expr::Call { args, .. } = ast.expr(*e) else {
+            let Expr::Bracket { args, .. } = ast.expr(*e) else {
                 unreachable!()
             };
             for arg in args {
@@ -975,7 +986,7 @@ fn find_unsupported_construct(
 fn find_unsupported_in_expr(ast: &Ast, res: &Resolution, id: ExprId) -> Option<Span> {
     match ast.expr(id) {
         Expr::Spawn(_) => return Some(ast.expr_spans[id.0 as usize].clone()),
-        Expr::Call { callee, .. } => {
+        Expr::Call { callee, .. } | Expr::Bracket { callee, .. } => {
             if let Some(def) = res.expr_defs.get(callee) {
                 let d = res.def(*def);
                 if d.kind == DefKind::Builtin && (d.name == "sync" || d.name == "race") {

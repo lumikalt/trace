@@ -268,6 +268,22 @@ rule r <sequences> {
 }
 
 #[test]
+fn bracket_builtin_call_gets_the_same_checks_as_a_paren_call() {
+    // `sync`/`race` are called with brackets (`sync[...]`), a distinct AST
+    // shape (`Expr::Bracket`) from an ordinary paren call (`Expr::Call`) —
+    // the `<sequences>`-required check has to run for that shape too, not
+    // just the paren-call one, or `sync[...]` in an ordinary `combines`
+    // rule would silently pass.
+    let (_, _, errors) = run("module M {\n reg h : bits[1] = 0\n rule t {\n w := sync[h]\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`sync` requires `<sequences>`"));
+
+    let (_, _, errors) = run("module M {\n reg h : bits[1] = 0\n rule t {\n w := race[h]\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`race` requires `<sequences>`"));
+}
+
+#[test]
 fn all_examples_pass_effect_check() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {

@@ -3,7 +3,7 @@
 -- Proves the spawn lowering's plain-0 continuation-register reset is
 -- safe even when the trigger is delayed for several cycles after reset
 -- (not just the immediate-trigger shape fetch2.tr exercises) --
--- see sim/fetch2_gated_tb.v and DESIGN.md's "sync, race, spawn" section.
+-- see sim/fetch2_gated_tb.v and DESIGN.md's "spawn and sync" section.
 module Fetch2Gated {
     mem bank0 : bits[16][8]
     mem bank1 : bits[16][8]
@@ -27,8 +27,7 @@ module Fetch2Gated {
         (go == 1)?
         h1 := spawn ReadBank0(pc)
         h2 := spawn ReadBank1(pc + 1)
-        tick
-        sync(h1, h2)
+        tick sync[h1, h2]
         ir := pack(h1.result, h2.result)
     }
 }

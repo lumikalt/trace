@@ -495,10 +495,16 @@ impl<'a> Checker<'a> {
             Expr::Bracket { callee, args } => {
                 if elab && self.fifo_op_target(callee).is_some() {
                     self.error(
-                        span,
+                        span.clone(),
                         "fifo operations cannot fail at elaboration time".to_string(),
                     );
                 }
+                // A builtin called via brackets (`sync[...]`, `race[...]`)
+                // needs the same callee-name checks (e.g. `<sequences>`
+                // required) that a paren call already gets — brackets are
+                // a distinct AST shape from `Expr::Call`, so that check
+                // doesn't run for free here.
+                self.check_call(callee, item, sig, span);
                 self.check_expr(callee, item, sig, elab);
                 for arg in args {
                     self.check_expr(arg, item, sig, elab);

@@ -882,6 +882,19 @@ impl<'a> TypeChecker<'a> {
             };
         }
 
+        // A builtin used with brackets (`sync[h1, h2]`, `race[h1, h2]`) —
+        // brackets mark fallibility, matching `f.Deq[]`/`f.Enq[x]`, so a
+        // fallible builtin is called this way rather than with parens.
+        // Dispatches through the same per-builtin type rule an ordinary
+        // (infallible) `name(args)` call already uses.
+        if let Some(def) = self.res.expr_defs.get(&callee).copied()
+            && self.res.def(def).kind == DefKind::Builtin
+        {
+            let name = self.res.def(def).name.clone();
+            let arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(*a, locals)).collect();
+            return self.type_builtin_call(id, &name, args, &arg_tys);
+        }
+
         let base = self.type_expr(callee, locals);
         for a in args {
             self.type_expr(*a, locals);

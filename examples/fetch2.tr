@@ -23,8 +23,7 @@ module Fetch2 {
     rule fetch2 <sequences> {
         h1 := spawn ReadBank0(pc)
         h2 := spawn ReadBank1(pc + 1)
-        tick
-        sync(h1, h2)
+        tick sync[h1, h2]
         ir := pack(h1.result, h2.result)
     }
 }
