@@ -505,7 +505,11 @@ module M {
 }
 
 #[test]
-fn race_is_still_rejected() {
+fn race_value_producing_form_is_still_rejected() {
+    // `race[...]` is a guard, not a value (v0: no cancellation-safe way
+    // to hand back a value was designed) -- only the bare top-level
+    // statement shape lowers; `w := race[...]` still isn't recognized
+    // and falls through to the generic unsupported-construct message.
     let src = "\
 Slow(x : bits[8]) : bits[8] <sequences> {
     tick
@@ -524,6 +528,105 @@ module M {
     let c = run(src);
     assert_eq!(c.errors.len(), 1);
     assert!(c.errors[0].message.contains("`race`"));
+}
+
+#[test]
+fn race_let_bound_is_rejected_with_a_dedicated_message() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        h1 := spawn Slow(1)
+        h2 := spawn Slow(2)
+        tick
+        let w = race[h1, h2]
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("has nothing to bind"));
+}
+
+#[test]
+fn race_nested_in_if_is_rejected() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        h1 := spawn Slow(1)
+        h2 := spawn Slow(2)
+        tick
+        if 1 == 1 {
+            race[h1, h2]
+        }
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("v0 restriction"));
+}
+
+#[test]
+fn race_structural_shape() {
+    let src = "\
+Fast(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x + 1
+}
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    tick
+    return x + 2
+}
+
+module M {
+    output out : bits[8] = 0
+    rule pick <sequences> {
+        hf := spawn Fast(1)
+        hs := spawn Slow(1)
+        tick
+        race[hf, hs]
+        if hf.done == 1 {
+            out := hf.result
+        } else {
+            out := hs.result
+        }
+    }
+}
+";
+    let c = run(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered.len(), 1);
+    let lr = &c.lowered[0];
+    assert_eq!(lr.spawns.len(), 2);
+    assert_eq!(lr.races.len(), 1);
+    assert_eq!(lr.races[0].1.len(), 2);
+
+    let rendered = render(&c.ast, src, &c.lowered);
+    let rendered = assert_round_trips(&rendered);
+    // Race's own guard: an OR of both handles' done registers.
+    assert!(rendered.contains("__done_pick_hf | __done_pick_hs) == 1"));
+    // Every one of the losing side's OWN segments gains an extra guard
+    // requiring the OTHER handle hasn't already finished -- checked on
+    // BOTH spawns' segments, not just one, since either could lose.
+    assert!(rendered.contains("__cont_pick_hf == 0"));
+    assert!(rendered.contains("__done_pick_hs == 0"));
+    assert!(rendered.contains("__cont_pick_hs == 0"));
+    assert!(rendered.contains("__done_pick_hf == 0"));
+    assert!(
+        !rendered.contains("race["),
+        "no `race` call should survive lowering"
+    );
 }
 
 #[test]

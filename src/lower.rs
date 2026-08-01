@@ -137,6 +137,11 @@ pub struct LoweredRule {
     /// `sync[...]` bracket-call statements, each naming the handles it
     /// joins.
     pub syncs: Vec<(StmtId, Vec<DefId>)>,
+    /// `race[...]` bracket-call statements, each naming the handles
+    /// racing — every handle named in a group is that group's every
+    /// OTHER named handle's "competitor" (see `render_rule`'s own doc
+    /// comment on cancellation).
+    pub races: Vec<(StmtId, Vec<DefId>)>,
     /// Every `h.result`/`h.done` reference anywhere in this rule's own
     /// segments, rewritten to the owning spawn's register name.
     pub handle_field_rewrites: Vec<(Span, String)>,
@@ -229,13 +234,24 @@ fn plan_rule(
                 .to_string(),
         }]);
     }
+    if let Some(span) = find_let_bound_race(ast, res, body) {
+        return Err(vec![LowerError {
+            span,
+            message: "`race[...]` is a guard, not a value — it has nothing to bind; drop \
+                      the `let name = ` and write it as its own statement (or as a \
+                      `tick`'s trailing expression, `tick race[...]`), then read \
+                      whichever handle's `.done` is 1 yourself"
+                .to_string(),
+        }]);
+    }
     if let Some(span) = find_unsupported_construct(ast, res, body, true) {
         return Err(vec![LowerError {
             span,
-            message: "sequences lowering does not yet support `race` (v0 restriction); \
-                      `spawn`/`sync` need `spawn`'s result bound directly to a fresh local \
-                      (`h := spawn Callee(args)`) and `sync[...]` written as its own \
-                      statement or as a `tick`'s trailing expression (`tick sync[...]`)"
+            message: "unsupported use of `spawn`/`sync`/`race` (v0 restriction): `spawn`'s \
+                      result must be bound directly to a fresh local (`h := spawn \
+                      Callee(args)`), and `sync[...]`/`race[...]` must be written as their \
+                      own statement or as a `tick`'s trailing expression (`tick sync[...]`, \
+                      `tick race[...]`)"
                 .to_string(),
         }]);
     }
@@ -253,6 +269,7 @@ fn plan_rule(
     let mut handle_defs: HashSet<DefId> = HashSet::new();
     let mut spawn_sites: Vec<(StmtId, DefId, String, ExprId)> = Vec::new();
     let mut syncs: Vec<(StmtId, Vec<DefId>)> = Vec::new();
+    let mut races: Vec<(StmtId, Vec<DefId>)> = Vec::new();
     for seg in &segments {
         for stmt in &seg.stmts {
             if let Some((handle_def, handle_name, call)) = spawn_trigger_shape(ast, res, *stmt) {
@@ -279,6 +296,8 @@ fn plan_rule(
                 spawn_sites.push((*stmt, handle_def, handle_name, call));
             } else if let Some(handles) = sync_call_shape(ast, res, *stmt) {
                 syncs.push((*stmt, handles));
+            } else if let Some(handles) = race_call_shape(ast, res, *stmt) {
+                races.push((*stmt, handles));
             }
         }
     }
@@ -329,6 +348,7 @@ fn plan_rule(
         captures,
         spawns,
         syncs,
+        races,
         handle_field_rewrites,
     })
 }
@@ -411,6 +431,26 @@ fn spawn_trigger_shape(
 /// (including the leading statement of a segment a `tick sync[...]`
 /// desugars into — see `parser.rs`'s `tick`-with-expr handling).
 fn sync_call_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefId>> {
+    handle_bracket_call_shape(ast, res, stmt, "sync")
+}
+
+/// Recognizes `race[h1, h2, ...]` written as its own bare statement, the
+/// same shape `sync` uses (a bracket-call naming handles, as its own
+/// top-level statement) — `race` differs only in what it lowers to
+/// (every named handle's OWN segments gain an extra "no other named
+/// competitor has already finished" guard, computed in `plan_rule`; see
+/// its own doc comment there for why this needs no separate cancellation
+/// register).
+fn race_call_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefId>> {
+    handle_bracket_call_shape(ast, res, stmt, "race")
+}
+
+fn handle_bracket_call_shape(
+    ast: &Ast,
+    res: &Resolution,
+    stmt: StmtId,
+    name: &str,
+) -> Option<Vec<DefId>> {
     let Stmt::Expr(e) = ast.stmt(stmt) else {
         return None;
     };
@@ -419,7 +459,7 @@ fn sync_call_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefI
     };
     let def = res.expr_defs.get(callee)?;
     let d = res.def(*def);
-    if d.kind != DefKind::Builtin || d.name != "sync" {
+    if d.kind != DefKind::Builtin || d.name != name {
         return None;
     }
     let mut handles = Vec::new();
@@ -978,11 +1018,32 @@ fn find_let_bound_spawn(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
     None
 }
 
-/// Scans for anything this pass still can't handle: `race` always, plus
-/// `spawn`/`sync` used in any shape other than the two legitimate ones
-/// (`h := spawn Callee(args)`, `sync[...]` as its own statement — which
-/// also covers a `tick sync[...]`'s desugared second statement) — those
-/// two are recognized and skipped by the caller before reaching here.
+/// Recognizes `let x = race[h1, h2, ...]` at a body's top level — `race`
+/// is a guard, not a value (`Ty::Unit`), so binding it to anything is a
+/// mistake; without this check it falls through to the generic
+/// unsupported-construct scan below and gets reported as if `race[...]`
+/// itself were unsupported, rather than naming the real mistake (same
+/// shape as `find_let_bound_spawn` above, different underlying reason).
+fn find_let_bound_race(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<Span> {
+    for stmt in stmts {
+        if let Stmt::Let { init, .. } = ast.stmt(*stmt)
+            && let Expr::Bracket { callee, .. } = ast.expr(*init)
+            && let Some(def) = res.expr_defs.get(callee)
+            && res.def(*def).kind == DefKind::Builtin
+            && res.def(*def).name == "race"
+        {
+            return Some(ast.expr_spans[init.0 as usize].clone());
+        }
+    }
+    None
+}
+
+/// Scans for anything this pass still can't handle: `spawn`/`sync`/
+/// `race` used in any shape other than the three legitimate ones
+/// (`h := spawn Callee(args)`, `sync[...]`/`race[...]` as their own
+/// statement — which also covers a `tick sync[...]`/`tick race[...]`'s
+/// desugared second statement) — those three are recognized and
+/// skipped by the caller before reaching here.
 fn find_unsupported_construct(
     ast: &Ast,
     res: &Resolution,
@@ -992,6 +1053,7 @@ fn find_unsupported_construct(
     for stmt in stmts {
         let is_spawn_trigger = top_level && spawn_trigger_shape(ast, res, *stmt).is_some();
         let is_sync_call = top_level && sync_call_shape(ast, res, *stmt).is_some();
+        let is_race_call = top_level && race_call_shape(ast, res, *stmt).is_some();
 
         if is_spawn_trigger {
             let Stmt::Assign { rhs, .. } = ast.stmt(*stmt) else {
@@ -1005,7 +1067,7 @@ fn find_unsupported_construct(
                     return Some(span);
                 }
             }
-        } else if is_sync_call {
+        } else if is_sync_call || is_race_call {
             let Stmt::Expr(e) = ast.stmt(*stmt) else {
                 unreachable!()
             };
@@ -1367,6 +1429,32 @@ fn expand(
         .collect()
 }
 
+/// `race[h1, h2, ...]`'s own guard (does the enclosing segment advance)
+/// is one `((d1 | d2 | ...) == 1)?` line, an OR of every named handle's
+/// `done` — the mirror of `sync`'s AND. The actual "loser cancellation"
+/// DESIGN.md flagged as undesigned needs no separate latch/register at
+/// all: every handle race names gets an EXTRA guard clause on every one
+/// of its OWN segments (computed below, threaded into
+/// `render_spawn_segments`), requiring that none of its named
+/// competitors has ALREADY finished. Reading a competitor's `done`
+/// register directly (not a value some other statement wrote and that
+/// only becomes visible next cycle) is what makes this exact —
+/// `done` IS the resolving signal, so there is no one-cycle lag for a
+/// stray write to sneak through. A handle that's genuinely behind is
+/// permanently blocked the moment a competitor's `done` becomes
+/// visible, never firing another segment (until the enclosing rule
+/// re-triggers it, which also resets its competitors' `done` back to
+/// 0). Two handles finishing on the exact same cycle both attempt their
+/// final segment that cycle; each also reads the other's `done` (still
+/// 0 mid-cycle), so both fire — but this makes their final segments
+/// mutually conflict (each reads what the other writes), so the
+/// ordinary derived-stall scheduler picks exactly one by priority
+/// (declaration order, or an explicit `urgency` directive) if they'd
+/// otherwise land the same cycle; the loser of THAT tie simply stalls
+/// a cycle, then sees the winner's `done` and is permanently blocked —
+/// same outcome as any other race, no double-completion. Verified via
+/// `--explain-schedule` on a hand-lowered two-spawn example before this
+/// was implemented, not assumed.
 fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
     let mut out = String::new();
     for cap in &lr.captures {
@@ -1384,8 +1472,31 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
         lr.spawns.iter().map(|s| (s.trigger_stmt, s)).collect();
     let sync_by_stmt: HashMap<StmtId, &Vec<DefId>> =
         lr.syncs.iter().map(|(s, h)| (*s, h)).collect();
+    let race_by_stmt: HashMap<StmtId, &Vec<DefId>> =
+        lr.races.iter().map(|(s, h)| (*s, h)).collect();
     let spawn_by_handle: HashMap<DefId, &SpawnPlan> =
         lr.spawns.iter().map(|s| (s.handle_def, s)).collect();
+
+    // Every handle's competitors (every OTHER handle it's ever named
+    // alongside in a `race[...]`, unioned across every such statement),
+    // as done-register-name guard clauses to insert into that handle's
+    // OWN segments.
+    let mut competitor_guards: HashMap<DefId, Vec<String>> = HashMap::new();
+    for (_, handles) in &lr.races {
+        for &h in handles {
+            for &other in handles {
+                if other == h {
+                    continue;
+                }
+                if let Some(plan) = spawn_by_handle.get(&other) {
+                    competitor_guards
+                        .entry(h)
+                        .or_default()
+                        .push(format!("({} == 0)?", plan.done_name));
+                }
+            }
+        }
+    }
 
     let nsegs = lr.segments.len() as u64;
     for seg in &lr.segments {
@@ -1399,6 +1510,15 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
                     if let Some(plan) = spawn_by_handle.get(h) {
                         out.push_str(&format!("    ({} == 1)?\n", plan.done_name));
                     }
+                }
+            } else if let Some(handles) = race_by_stmt.get(stmt) {
+                let dones: Vec<&str> = handles
+                    .iter()
+                    .filter_map(|h| spawn_by_handle.get(h))
+                    .map(|plan| plan.done_name.as_str())
+                    .collect();
+                if !dones.is_empty() {
+                    out.push_str(&format!("    (({}) == 1)?\n", dones.join(" | ")));
                 }
             } else {
                 let span = ast.stmt_spans[stmt.0 as usize].clone();
@@ -1415,7 +1535,11 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
     }
 
     for spawn in &lr.spawns {
-        render_spawn_segments(&mut out, src, ast, spawn);
+        let extra_guards = competitor_guards
+            .get(&spawn.handle_def)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        render_spawn_segments(&mut out, src, ast, spawn, extra_guards);
     }
     out
 }
@@ -1462,7 +1586,19 @@ fn render_spawn_trigger(
     out.push_str(&format!("    {} := 0\n", spawn.cont_name));
 }
 
-fn render_spawn_segments(out: &mut String, src: &str, ast: &Ast, spawn: &SpawnPlan) {
+/// `extra_guards` is empty unless `spawn`'s handle is named in some
+/// `race[...]` in the enclosing rule — one `(competitor_done == 0)?`
+/// per named competitor, added to EVERY one of this spawn's own
+/// segments, so a handle that loses a race can never fire another
+/// segment again (see `render_rule`'s own doc comment for why this
+/// alone is a correct, exact cancellation with no separate latch).
+fn render_spawn_segments(
+    out: &mut String,
+    src: &str,
+    ast: &Ast,
+    spawn: &SpawnPlan,
+    extra_guards: &[String],
+) {
     let nsegs = spawn.segments.len() as u64;
     for seg in &spawn.segments {
         out.push_str(&format!(
@@ -1470,6 +1606,9 @@ fn render_spawn_segments(out: &mut String, src: &str, ast: &Ast, spawn: &SpawnPl
             spawn.base_rule_name, spawn.handle_name, seg.index
         ));
         out.push_str(&format!("    ({} == {})?\n", spawn.cont_name, seg.index));
+        for guard in extra_guards {
+            out.push_str(&format!("    {guard}\n"));
+        }
         let is_last = seg.index + 1 == nsegs;
         for stmt in &seg.stmts {
             if is_last && matches!(ast.stmt(*stmt), Stmt::Return(_)) {

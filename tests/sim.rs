@@ -1060,6 +1060,31 @@ fn fetch2_gated_runs_through_real_ports() {
     );
 }
 
+/// Proves `race` actually cancels its loser, end to end: Fast (1 tick)
+/// always beats Slow (2 ticks); this checks Slow's own internal
+/// `done`/`result` registers directly (hierarchical path), not just the
+/// `out` port, since `out` alone can't distinguish true cancellation
+/// from "the loser ran to completion anyway, but nothing happened to
+/// read its result" -- see sim/race_tb.v's own comment.
+#[test]
+fn race_cancels_the_loser() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/race.tr")).unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/race_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves the `Checksum` motivating example (unrolled accumulation via
 /// a local reassigned four times in a row) through real firtool and
 /// Icarus, not just plausible-looking FIRRTL text. See

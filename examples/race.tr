@@ -1,0 +1,30 @@
+-- DESIGN.md's `race` example: two independent computations start
+-- together; whichever finishes first wins, and the loser's own FSM is
+-- permanently blocked from ever completing (see "Race lowering").
+module Race {
+    input trigger : bits[1]
+    output out : bits[8] = 0
+
+    Fast(x : bits[8]) : bits[8] <sequences> {
+        tick
+        return x + 1
+    }
+    Slow(x : bits[8]) : bits[8] <sequences> {
+        tick
+        tick
+        return x + 2
+    }
+
+    rule pick <sequences> {
+        trigger?
+        hf := spawn Fast(1)
+        hs := spawn Slow(1)
+        tick
+        race[hf, hs]
+        if hf.done == 1 {
+            out := hf.result
+        } else {
+            out := hs.result
+        }
+    }
+}

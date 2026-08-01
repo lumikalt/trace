@@ -188,10 +188,11 @@ expression that always succeeds. `<expr>` follows the same rule as any other
 fallible operation: an explicit `cond?` guard, or an already-fallible bracket
 operation such as `sync[h1, h2]` (see "`spawn` and `sync`" below).
 
-### `spawn` and `sync`
+### `spawn`, `sync`, and `race`
 
 `spawn` starts an independent, parallel computation. `sync` waits for one or more
-spawned computations to finish.
+spawned computations to finish. `race` waits for the FIRST of two or more to
+finish, and permanently blocks every other named one from ever completing.
 
 ```
 module Fetch2 {
@@ -242,7 +243,48 @@ appear as its own statement, not nested inside `if`/`while` or embedded in a
 larger expression — the idiomatic place is directly after `tick`
 (`tick sync[h1, h2]`), so the wait and the cycle boundary read as one step.
 
-`race` is not yet supported. See Part 3.
+```
+module FirstWins {
+    input trigger : bits[1]
+    output out : bits[8] = 0
+
+    Fast(x : bits[8]) : bits[8] <sequences> {
+        tick
+        return x + 1
+    }
+    Slow(x : bits[8]) : bits[8] <sequences> {
+        tick
+        tick
+        return x + 2
+    }
+
+    rule pick <sequences> {
+        trigger?
+        hf := spawn Fast(1)
+        hs := spawn Slow(1)
+        tick
+        race[hf, hs]                        -- waits until either finishes
+        if hf.done == 1 {
+            out := hf.result
+        } else {
+            out := hs.result
+        }
+    }
+}
+```
+
+`race[h1, h2, ...]` is a guard, same convention and same top-level-only
+restriction as `sync` — but it succeeds as soon as ANY named handle finishes,
+not all of them, and it permanently blocks every OTHER named handle from ever
+completing (v0: guard only, no value of its own — read whichever handle's
+`.done` came back 1 yourself, as `FirstWins` does above; a `winner := race[...]`
+value form is possible but not yet built, see Part 3). `race` does not un-write
+anything a loser already wrote before losing — only that loser's FUTURE
+segments are blocked, so a racer with a side effect beyond its own return value
+must not depend on losing having no effect. A simultaneous finish (both named
+handles ready the same cycle) is tie-broken by the ordinary scheduler's own
+declaration-order/`urgency` priority, the same as any other same-cycle
+conflict — exactly one handle ever actually completes, never both.
 
 ### `chooses`: specification, not synthesis
 
@@ -737,7 +779,7 @@ silent miscompile, until `let` gains the same support.
 
 A `sequences` rule reports its own cost: segment count and saved-register bits.
 
-## Spawn and sync lowering
+## Spawn, sync, and race lowering
 
 `spawn Callee(args)` is macro-expansion, not module instantiation, consistent
 with how every other call is inlined. At the spawn's call site, `Callee`'s own
@@ -791,13 +833,44 @@ sync[h1, h2]` and writing `tick` then `sync[h1, h2]` on the next line produce
 identical trees. Every pass downstream of parsing (segmentation, capture
 computation, sync detection, effect checking) sees only the desugared form.
 
-`race` needs a loser-cancellation latch that is not designed yet: the ordinary
-scheduler's derived-stall machinery only arbitrates a same-cycle write conflict,
-but `race` means "the first handle to complete wins" — a cross-cycle property
-nothing in the current design handles. Gating a write on "my own `done` flipped
-this cycle" is not enough, since a loser could retry into the same segment on a
-later cycle and overwrite the winner. `race` is deferred until that latch is
-designed.
+`race[h1, h2, ...]` lowers to one `((h1.done | h2.done | ...) == 1)? ` guard —
+the OR-mirror of `sync`'s AND — plus, for EVERY handle named in the group, an
+extra `(h{other}.done == 0)?` guard clause on EVERY ONE of that handle's own
+segment rules, for every OTHER handle in the same group. This needs no separate
+cancellation latch/register at all: a competitor's `done` register IS the
+resolving signal, read directly, so there is no one-cycle lag for a stray write
+to land through. The moment any named handle's `done` becomes visible, every
+other named handle's next segment sees its own extra guard fail and is
+permanently blocked — it can never fire again until the enclosing rule
+re-triggers it, which also resets every competitor's `done` back to 0. (An
+earlier draft tried a separate `cancelled` register, SET the cycle the race
+resolves — that is inherently one cycle late: a loser whose own last segment
+happens to be ready on the exact same cycle the race resolves would fire
+anyway, since the cancellation write isn't visible until the cycle after. Hand-
+tracing a two-racer example surfaced this before it shipped; reading `done`
+directly has no such gap.)
+
+Two handles CAN legitimately both attempt their final segment on the exact same
+cycle (each reads the other's `done`, still 0 mid-cycle, so both fire) — but
+this makes their final segments mutually conflict in the ordinary scheduler
+(each reads what the other writes), so if they'd otherwise land the same cycle,
+the derived-stall machinery picks exactly one by priority (declaration order,
+or an explicit `urgency` directive); the loser of that tie stalls one cycle,
+then sees the winner's `done` and is permanently blocked. Verified via
+`--explain-schedule` on a hand-lowered two-spawn example, and via a real
+firtool+Icarus simulation asserting the loser's own `done`/`result` registers
+never change (`examples/race.tr` + `sim/race_tb.v`) — not assumed, since a
+racing spawn reading another spawn's `done` is a genuinely new conflict shape
+(every existing case has the ENCLOSING rule reading a spawn's `done`, never one
+spawn reading another's).
+
+`race[...]` is guard-only in v0 (no value of its own): the natural
+value-producing lowering (splice an `if`/`else` picking the winner's result)
+does not work, since a local first bound INSIDE `if`/`else` does not resolve
+outside it in this language — confirmed empirically before ruling the approach
+out. A real value form would need `race[...]` compiled as a first-class
+expression straight to a FIRRTL `mux`, bypassing trace-source `if`/`else`
+entirely; not yet built (see Part 3).
 
 ## FIFO synthesis emission
 
@@ -997,6 +1070,7 @@ noted:
 - Guarded atomic rules, effects, `reads`/`writes` rows, `fails` inference.
 - `sequences`/`tick` lowering (`examples/rmw.tr`, `examples/subleq.tr`).
 - `spawn`/`sync` (`examples/fetch2.tr`, `examples/fetch2_gated.tr`).
+- `race`, guard-only, with true loser cancellation (`examples/race.tr`).
 - `chooses`/`any`/spec refinement (checked, not synthesized).
 - The full expression surface: arithmetic, bitwise ops, static and dynamic
   shifts, unary negate/complement/not, bit-select and slice, indexed
@@ -1020,9 +1094,11 @@ noted:
 
 Not yet implemented:
 
-- **`race`.** Needs a loser-cancellation latch (see Part 2); no design exists
-  yet. `examples/fetch2.tr` is a ready multi-spawn example to design one
-  against.
+- **`race`'s value-producing form** (`winner := race[...]`). The guard-only
+  form is done (see Part 2); a value form needs `race[...]` compiled as a
+  first-class expression to a FIRRTL `mux`, since the natural trace-source
+  `if`/`else` splice does not work (a local first bound inside `if`/`else`
+  does not resolve outside it).
 - **Combinational-only (stateless) modules.** `output` is register-backed by
   design, so a pure function of inputs cannot be expressed without a cycle of
   delay.
