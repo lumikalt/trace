@@ -175,6 +175,12 @@ survive past the cycle where it was computed. `tick` must sit at the top level o
 a `sequences` body: it cannot nest inside `if`/`while`. A conditional cycle
 boundary has no defined meaning yet.
 
+A value that crosses a `tick` must be bound with `:=`, not `let`, until `let`
+gains the same support (v0 restriction, a compile-time error): `v := mem[addr]`
+above works because `v` still parses as an ordinary register write once it
+becomes one; `let v = mem[addr]` would not, since `let` always binds a fresh
+local rather than writing an existing register.
+
 `tick` may name a trailing fallible expression: `tick <expr>`. The segment `tick`
 opens does not fire until `<expr>` succeeds; until then, the rule retries every
 cycle without otherwise progressing. Bare `tick` is shorthand for a trailing
@@ -360,7 +366,13 @@ A memory access is `m[addr]` to read, `m[addr] := value` to write. A read is
 free: it is wired unconditionally, independent of whether any rule fires, so it
 may appear anywhere an ordinary expression can. A write may nest inside
 `if`/`else` (see "Nested writes" below); outside of `if`/`else` it must sit at a
-rule's top level, same as any other statement.
+rule's top level, same as any other statement. A memory has one write port: a
+second *unconditional* write to the same memory in one rule is a compile-time
+error, since it would silently discard the first — even to a different
+address, only one write can land per cycle. Two `if`-guarded writes to the same
+memory are fine and chain by priority (the later one wins when both fire); an
+unconditional write followed by a conditional one is also fine, the
+unconditional write becoming that `if`'s implicit fallback.
 
 A fifo has two operations, both fallible:
 
@@ -424,6 +436,9 @@ rule r {
 
 A local whose width never resolves to a concrete `bits[w]` anywhere in the rule
 (for example, one used only as a memory-read index) still rejects reassignment.
+
+Inside a `sequences` body, only a `:=`-bound local can cross a `tick`; see
+"`sequences`: multi-cycle code" above.
 
 ## Calling a function from a rule
 
@@ -707,7 +722,12 @@ register would change its semantics from "sees the new value" to "sees the old
 value" (a register is speculative until the clock edge). A local reassigned
 across segments, or read in its own assignment segment, is a compile error
 rather than a silent miscompile. A captured local's type must be a concrete
-`bits[w]`.
+`bits[w]`. A captured local must be bound with `:=`: the lowering splices the
+original binding statement verbatim, relying on it staying a valid register
+write once promoted, which only holds for `:=` — `let` always binds a fresh
+local, so it would silently shadow the register instead of writing it. A
+`let`-bound value that needs to cross a `tick` is a compile error, not a
+silent miscompile, until `let` gains the same support.
 
 A `sequences` rule reports its own cost: segment count and saved-register bits.
 

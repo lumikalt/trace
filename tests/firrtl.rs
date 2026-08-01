@@ -587,6 +587,119 @@ module M {
 }
 
 #[test]
+fn a_second_unconditional_mem_write_in_one_rule_is_an_error() {
+    // Two unconditional writes to the same mem, even at different
+    // addresses: only one write port exists, so the second would
+    // silently discard the first with zero trace in the emitted FIRRTL
+    // (confirmed before this check existed). A memory's address makes
+    // this a real surprise, unlike `reg := a; reg := b`, where "last
+    // wins" is ordinary, expected reassignment of the same location.
+    let src = "\
+module M {
+    mem m : bits[8][256]
+    input addr0 : bits[8]
+    input addr1 : bits[8]
+
+    rule r {
+        m[addr0] := 8'd11
+        m[addr1] := 8'd22
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("written here unconditionally"))
+    );
+}
+
+#[test]
+fn an_unconditional_mem_write_after_a_conditional_one_is_also_an_error() {
+    // Same bug, the other order: the `if`'s entire muxed write --
+    // guard condition included -- vanished with zero trace once the
+    // unconditional write after it just overwrote `current` outright.
+    let src = "\
+module M {
+    mem m : bits[8][256]
+    input cond : bits[1]
+    input addr0 : bits[8]
+    input addr1 : bits[8]
+
+    rule r {
+        if cond == 1 {
+            m[addr0] := 8'd11
+        }
+        m[addr1] := 8'd22
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("written here unconditionally"))
+    );
+}
+
+#[test]
+fn two_conditional_writes_to_the_same_mem_chain_correctly_and_are_not_an_error() {
+    // Two `if`-guarded writes to the same mem DO thread correctly (each
+    // is muxed against whatever came before, exactly like the existing
+    // if/else nesting support) -- only an UNCONDITIONAL write following
+    // an earlier one is the bug. This must keep working, not get
+    // swept up by too broad a fix.
+    let src = "\
+module M {
+    mem m : bits[8][256]
+    input condA : bits[1]
+    input condB : bits[1]
+    input addrA : bits[8]
+    input addrB : bits[8]
+
+    rule r {
+        if condA == 1 {
+            m[addrA] := 8'd11
+        }
+        if condB == 1 {
+            m[addrB] := 8'd22
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    // condB takes priority (declared second); falls back to condA's
+    // write, which falls back to no write at all.
+    assert!(fir.contains(
+        "connect m.w_m.addr, mux(eq(condB, UInt<1>(1)), addrB, mux(eq(condA, UInt<1>(1)), addrA, UInt<8>(0)))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn an_unconditional_write_followed_by_a_conditional_one_is_not_an_error() {
+    // The mirror of the previous case: an earlier unconditional write
+    // correctly becomes a later `if`'s implicit else-fallback, so this
+    // ordering was never broken and must stay legal.
+    let src = "\
+module M {
+    mem m : bits[8][256]
+    input cond : bits[1]
+    input addr0 : bits[8]
+    input addr1 : bits[8]
+
+    rule r {
+        m[addr0] := 8'd11
+        if cond == 1 {
+            m[addr1] := 8'd22
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, mux(eq(cond, UInt<1>(1)), addr1, addr0)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn errors_on_ambiguous_top_module() {
     // Two modules that don't instantiate each other: still an error, just
     // reworded now that multiple modules is legal when one instantiates

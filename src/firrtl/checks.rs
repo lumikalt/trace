@@ -7,8 +7,12 @@
 //! comment. A memory write MAY nest in `if`/`else` (threaded through a
 //! `mux` by `writes.rs`'s `mem_write_in_stmts`, same as a register or
 //! instance-port write) — there is no separate preflight check for it
-//! here, matching how a register write's own nesting isn't preflight-
-//! checked either. A rule enqueueing AND dequeueing the SAME fifo is
+//! here; instead `mem_write_in_stmts` itself rejects a second
+//! *unconditional* write to the same memory in one rule inline, as it
+//! walks the statements (a preflight count would false-positive on
+//! `if { m[a] := x } m[a] := y`, which is fine — the unconditional write
+//! becomes that `if`'s implicit else). A rule enqueueing AND dequeueing
+//! the SAME fifo is
 //! likewise no longer a preflight rejection (see fifo.rs's module doc
 //! comment for the pass-through semantics `compile_guard`, not a check
 //! here, computes) — but two `Enq`s (or two `Deq`s) of that same fifo

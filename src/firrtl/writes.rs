@@ -346,6 +346,35 @@ impl<'a> Emitter<'a> {
                 Stmt::Assign { lhs, rhs }
                     if is_mem_write_to(self.ast, self.res, *stmt, mem_name) =>
                 {
+                    // Unlike the `Stmt::If` arm below, an unconditional
+                    // write has no condition to mux against a prior
+                    // `current` — it always fires, so it can only ever
+                    // replace whatever came before, silently discarding
+                    // it (a memory has one write port; a prior write here
+                    // is not "held" the way an unwritten register or fifo
+                    // slot naturally would be). That's fine as the FIRST
+                    // write in a rule, or as an if-block's implicit
+                    // fallback (an earlier unconditional write correctly
+                    // becomes a later `if`'s else-branch — see that arm),
+                    // but wrong the moment it comes SECOND: silently
+                    // dropping an already-computed write, guard condition
+                    // included, is exactly the class of bug
+                    // `check_fifo_op_counts` exists to reject for fifos.
+                    if current.is_some() {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            format!(
+                                "`{mem_name}` is written here unconditionally, after an \
+                                 earlier write to it in this rule; the earlier write \
+                                 would be silently discarded (one write port, so only \
+                                 one write can land per cycle) — guard this write with \
+                                 an `if` so it only replaces the earlier one on purpose, \
+                                 or restructure so `{mem_name}` is written at most once \
+                                 unconditionally"
+                            ),
+                        );
+                        continue;
+                    }
                     let Expr::Bracket { args, .. } = self.ast.expr(lhs).clone() else {
                         unreachable!()
                     };

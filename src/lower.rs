@@ -666,6 +666,7 @@ fn compute_captures(
 ) -> Result<Vec<CapturedLocal>, Vec<LowerError>> {
     let mut assigns: BTreeMap<DefId, BTreeSet<usize>> = Default::default();
     let mut reads: BTreeMap<DefId, BTreeSet<usize>> = Default::default();
+    let mut let_bound: HashSet<DefId> = Default::default();
     for seg in segments {
         scan_stmts(
             ast,
@@ -674,6 +675,7 @@ fn compute_captures(
             seg.index as usize,
             &mut assigns,
             &mut reads,
+            &mut let_bound,
         );
     }
     assigns.retain(|d, _| !exclude.contains(d));
@@ -688,6 +690,17 @@ fn compute_captures(
             continue; // stays a plain local within one generated segment
         }
         let name = res.def(*def).name.clone();
+        if let_bound.contains(def) {
+            errors.push(LowerError {
+                span: res.def(*def).span.clone(),
+                message: format!(
+                    "`{name}` is bound with `let`, but its value needs to survive past a \
+                     `tick` (sequences lowering does not yet support this — v0 \
+                     restriction); use `{name} := ...` instead of `let {name} = ...`"
+                ),
+            });
+            continue;
+        }
         if assign_segs.len() != 1 {
             let segs: Vec<String> = assign_segs.iter().map(|s| s.to_string()).collect();
             errors.push(LowerError {
@@ -1060,6 +1073,7 @@ fn scan_stmts(
     segment: usize,
     assigns: &mut BTreeMap<DefId, BTreeSet<usize>>,
     reads: &mut BTreeMap<DefId, BTreeSet<usize>>,
+    let_bound: &mut HashSet<DefId>,
 ) {
     for stmt in stmts {
         match ast.stmt(*stmt).clone() {
@@ -1084,10 +1098,19 @@ fn scan_stmts(
                     .enumerate()
                     .find(|(_, d)| d.span == name.span)
                 {
-                    assigns
-                        .entry(DefId(idx as u32))
-                        .or_default()
-                        .insert(segment);
+                    let def = DefId(idx as u32);
+                    assigns.entry(def).or_default().insert(segment);
+                    // A `let`-bound value can't yet cross a tick: render's
+                    // splice-based lowering relies on the ORIGINAL binding
+                    // statement staying syntactically valid once the
+                    // captured local becomes a `reg` of the same name —
+                    // true by accident for `x := value` (still a plain
+                    // register write), never true for `let x = value`
+                    // (always binds a FRESH local, shadowing the register
+                    // rather than writing it). Recorded here so
+                    // `compute_captures` can reject it once it knows this
+                    // def genuinely needs to survive past a tick.
+                    let_bound.insert(def);
                 }
             }
             Stmt::Expr(e) => scan_expr(ast, res, e, segment, reads),
@@ -1100,14 +1123,14 @@ fn scan_stmts(
                 else_body,
             } => {
                 scan_expr(ast, res, cond, segment, reads);
-                scan_stmts(ast, res, &then_body, segment, assigns, reads);
+                scan_stmts(ast, res, &then_body, segment, assigns, reads, let_bound);
                 if let Some(else_body) = else_body {
-                    scan_stmts(ast, res, &else_body, segment, assigns, reads);
+                    scan_stmts(ast, res, &else_body, segment, assigns, reads, let_bound);
                 }
             }
             Stmt::While { cond, body } => {
                 scan_expr(ast, res, cond, segment, reads);
-                scan_stmts(ast, res, &body, segment, assigns, reads);
+                scan_stmts(ast, res, &body, segment, assigns, reads, let_bound);
             }
         }
     }

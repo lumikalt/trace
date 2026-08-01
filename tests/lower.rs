@@ -287,6 +287,75 @@ module M {
 }
 
 #[test]
+fn rejects_let_bound_value_crossing_a_tick() {
+    // `let v = value` relies on `render`'s splice-verbatim trick to turn
+    // into a register write once `v` becomes a captured local -- that
+    // trick only works for `x := value` (still a plain register write
+    // once `x` is a `reg`), never for `let x = value` (always binds a
+    // FRESH local, shadowing the register instead of writing it). Left
+    // unrejected this used to silently compile with the captured value
+    // permanently stuck at its reset value -- see TODO.md.
+    let src = "\
+module M {
+    output out : bits[8] = 0
+    rule r <sequences> {
+        let v = 8'd5
+        tick
+        out := v + 1
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("bound with `let`"));
+}
+
+#[test]
+fn rejects_let_bound_value_crossing_a_tick_in_a_spawn_callee() {
+    // Same restriction applies inside a spawned <sequences> fn's own
+    // body, since `plan_spawn` reuses the identical `compute_captures`
+    // machinery as a top-level rule.
+    let src = "\
+Foo() : bits[8] <sequences> {
+    let v = 8'd5
+    tick
+    return v + 1
+}
+
+module M {
+    output out : bits[8] = 0
+    rule r <sequences> {
+        h := spawn Foo()
+        tick sync[h]
+        out := h.result
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("bound with `let`"));
+}
+
+#[test]
+fn let_bound_value_within_one_segment_is_unaffected() {
+    // A `let` that never needs to cross a tick stays an ordinary local
+    // -- only a `let` that must survive past a tick is rejected.
+    let src = "\
+module M {
+    output out : bits[8] = 0
+    rule r <sequences> {
+        let v = 8'd5
+        out := v + 1
+        tick
+    }
+}
+";
+    let c = run(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered[0].captures.len(), 0);
+}
+
+#[test]
 fn no_tick_no_lowering() {
     // <sequences> with zero ticks: nothing to cut, plan skips it.
     let c = run("rule r <sequences> {\n x := 1\n}\n");
