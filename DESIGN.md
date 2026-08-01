@@ -753,17 +753,69 @@ value on a write cycle rather than reading a half-committed word. `sim/port_ram_
 proves it through real ports: two distinct addresses, written and read back without
 aliasing.
 
-**This closes the general capability, not SUBLEQ's specific gap.** SUBLEQ needs to load
-an entire *program* — a whole memory's worth of words — before the CPU's own rules
-start running, and its rules (`step`, `refill`) start firing the instant `reset`
-clears, racing any port-driven load sequence. `PortRam`'s pattern works per-word, on
-demand, with no notion of "not yet loaded" — good enough for a RAM, not for booting a
-CPU from a cold `mem`. Making that work needs a real design decision this document does
-not make yet: some kind of boot/load mode that holds `step`/`refill` off until loading
-finishes (an extra `input` gating their guards would work structurally, but *deciding*
-that shape, and whether it generalizes past SUBLEQ, is undone design work, not an
-emitter gap). `sim/subleq_tb.v` still pokes `dut.m_ext.Memory[i]` directly and is not
-changed by this section.
+**This closes the general capability, not SUBLEQ's specific gap** — that gap is closed
+separately below.
+
+**SUBLEQ boot loading, ACHIEVED 2026-08-01** (Lumi's pick off TODO.md's remaining SUBLEQ
+gap, offered alongside "reassigned locals" and "spawn/sync/race synthesis"). `PortRam`'s
+pattern works per-word, on demand, with no notion of "not yet loaded" — good enough for
+a RAM, not for booting a CPU from a cold `mem`, since `step`/`refill` start firing the
+instant `reset` clears, racing any port-driven load sequence. The actual open design
+question was never "can this be built" (an extra `input` gating the CPU rules' guards
+was already sketched above as structurally obvious) but "how does loading ever finish" —
+put to Lumi via AskUserQuestion since it's a real design fork, not a fact to derive:
+a fixed word count baked into the hardware (auto-completing after N loads) vs. an
+external `boot_done` pulse the loader asserts whenever it's actually done. **Lumi picked
+the pulse** — it makes no assumption about program length or how the words arrive (a
+real UART or SPI-flash loader has no reason to know the count up front, or to write
+every word contiguously with zero gaps).
+
+`examples/subleq_boot.tr` is `examples/subleq.tr` plus a `reg booted : bits[1] = 0`, four
+new `input`s (`load_addr`/`load_data`/`load_en`/`boot_done`), and two new rules: `load`
+(mirrors `PortRam`'s own write rule, guarded `(booted == 0)? (load_en == 1)?`) and
+`finish_boot` (`(booted == 0)? (boot_done == 1)? booted := 1`). `step` and `refill` each
+gained a leading `(booted == 1)? ` guard. No new emitter machinery needed — same as
+`PortRam`, this is entirely ordinary guards/regs/ports composing, so the only real
+content of this pass was the design decision and the schedule directives it implies:
+`finish_boot` (writes `booted`) conflicts with every rule that reads `booted` in a guard
+(`load`, `step`'s first segment, `refill`), and `load` conflicts with every rule
+touching `m` (all of `step`'s segments, `refill`) — six `urgency` directives make the
+whole ordering explicit rather than falling back to declaration-order tie-breaking.
+Confirmed against real `--explain-schedule` output before writing the example into this
+doc, not assumed: exactly those conflicts are derived, and — worth noting for the next
+time a guard is added to a rule with existing effect-row annotations — `refill`'s
+existing `<reads {pc, m}, writes {ir}>` needed `booted` added to its `reads` set once its
+guard started reading it, since stated effect rows are checked assertions, not just
+documentation.
+
+**The negative case was verified for real, not assumed:** `sim/subleq_boot_tb.v`
+deliberately loads the program in two halves with an idle gap in the MIDDLE (memory only
+half-written) rather than straight through — a straight-through load never actually
+exercises the `booted` guard, since `load`'s own urgency over `step` already blocks
+`step` for free on every cycle `load_en` is asserted; only a gap with *incomplete*
+memory and `load_en` deasserted tests the guard itself. First testbench draft (no gap)
+was re-run against a variant with the `(booted == 1)?` guard removed from `step` alone
+and it still reported PASSED — the broken variant happened to finish loading before
+`step` got a chance to fire, so the missing guard was never actually exercised. Adding
+the mid-load gap and checking `dut.__cont_step` (not just `dut.pc`, which doesn't move
+until `step`'s 6-cycle sequence completes its first pass) made the SAME broken variant
+fail as predicted (`pc=0, cont=3` mid-gap — the FSM had silently started executing a
+half-loaded program). **The final pc/mem assertions alone do NOT discriminate this
+breakage** — the broken variant still settles at the correct `pc=6`/`mem[11]=5`, since
+the missing guard only corrupts *timing* (step stalls under `load`'s own urgency once it
+catches back up to the still-unloaded second half) rather than this particular program's
+eventual result; the mid-gap `__cont_step` check is the one load-bearing assertion,
+recorded in the testbench's own comment so a future cleanup pass doesn't strip it as
+"redundant." `sim/subleq_tb.v` and `examples/subleq.tr` are UNCHANGED — they remain the
+simpler, no-ports SUBLEQ milestone; `subleq_boot.tr` is a separate example proving the
+boot-load capability, not a replacement.
+
+**Known edge case, not guarded against:** `urgency finish_boot > load` means a loader
+that asserts `load_en` and `boot_done` on the SAME cycle drops that cycle's word (
+`finish_boot` wins, `load` doesn't fire). `sim/subleq_boot_tb.v` deasserts `load_en`
+before pulsing `boot_done`, so it never hits this — but since this pattern is offered as
+a general one (any future UART/SPI loader), a real loader must do the same: deassert
+`load_en` (or otherwise stop writing) before signaling done.
 
 **Memory writes nested in `if`/`else`, added 2026-07-31.** A memory write used to be
 restricted to a rule's top level — `m[addr] := data` had to be unconditional (given the

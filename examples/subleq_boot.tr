@@ -1,0 +1,62 @@
+-- SUBLEQ with a real boot-load phase, closing the gap DESIGN.md's
+-- "SUBLEQ boot loading" section left open: `sim/subleq_tb.v` still
+-- pokes `m_ext.Memory[i]` directly because `step`/`refill` start
+-- firing the instant `reset` clears, racing any port-driven load. A
+-- `booted` reg gates the CPU rules off until a `boot_done` pulse says
+-- loading finished -- a loader (this testbench, or later a real UART/
+-- SPI-flash controller) writes words through ordinary
+-- load_addr/load_data/load_en ports, exactly PortRam's pattern, with
+-- no assumption about program length or word count.
+module SubleqBoot {
+    reg pc : bits[16] = 0
+    reg ir : bits[16] = 0
+    mem m  : bits[16][4096]
+    reg booted : bits[1] = 0
+
+    input load_addr : bits[16]
+    input load_data : bits[16]
+    input load_en : bits[1]
+    input boot_done : bits[1]
+
+    rule load {
+        (booted == 0)?
+        (load_en == 1)?
+        m[load_addr] := load_data
+    }
+
+    rule finish_boot {
+        (booted == 0)?
+        (boot_done == 1)?
+        booted := 1
+    }
+
+    rule step <sequences> {
+        (booted == 1)?
+        a := m[pc]
+        tick
+        b := m[pc + 1]
+        tick
+        c := m[pc + 2]
+        tick
+        va := m[a]
+        tick
+        r := m[b] - va       -- second operand read; one array access per tick
+        tick
+        m[b] := r
+        if r <= 0 { pc := c } else { pc := pc + 3 }
+    }
+
+    rule refill <reads {pc, m, booted}, writes {ir}> {
+        (booted == 1)?
+        ir := m[pc]
+    }
+
+    schedule {
+        urgency finish_boot > load
+        urgency finish_boot > step
+        urgency finish_boot > refill
+        urgency load > step
+        urgency load > refill
+        urgency step > refill
+    }
+}

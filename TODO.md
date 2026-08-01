@@ -58,14 +58,6 @@
 - A local reassigned within one emitted rule is rejected (inlining picks
   the wrong binding otherwise — see DESIGN.md's "sharp edge" note).
 
-## SUBLEQ / boot sequencing
-
-- `sim/subleq_tb.v` still pokes `mem` via hierarchical paths. Port-based
-  memory access works in general (`examples/port_ram.tr`) but only
-  per-word, on demand — SUBLEQ needs to bulk-load a whole program before
-  `step`/`refill` start firing at reset. Needs a real design decision
-  (some kind of boot/load mode), not just an emitter fix.
-
 ## Language features with no synthesis path yet
 
 - `spawn`/`sync`/`race`: parse and effect-check, but `lower.rs` and

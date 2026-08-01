@@ -913,3 +913,46 @@ fn fifo_passthrough_runs_through_real_ports() {
         "fifo-passthrough results did not match expectations:\n{output}"
     );
 }
+
+/// Proves the SUBLEQ boot-load design end to end: unlike
+/// `subleq_runs_and_computes_the_right_answer` above (which pokes
+/// `mem` directly before reset even clears), this loads the identical
+/// program through real load_addr/load_data/load_en ports while
+/// `booted == 0`, with a deliberate idle gap in the MIDDLE of loading
+/// (memory only half-written), then pulses `boot_done` and expects
+/// the same correct halt state. sim/subleq_boot_tb.v's own doc
+/// comment records that this test was confirmed to actually fail (not
+/// vacuously pass) against a variant with the `booted` guard removed
+/// from `step`/`refill`, before being trusted as a real regression
+/// test.
+#[test]
+fn subleq_boot_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/subleq_boot.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    // No output ports (only the loader side gained ports), so, same
+    // as subleq.tr, firtool would DCE the whole design without this.
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/subleq_boot_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: pc=6"),
+        "pc did not settle at the halt address:\n{output}"
+    );
+    assert!(
+        output.contains("mem[11]=5"),
+        "mem[11] should hold 8 - 3 == 5:\n{output}"
+    );
+}
