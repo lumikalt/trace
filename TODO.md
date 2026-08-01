@@ -89,6 +89,46 @@
   design (see DESIGN.md's "Module ports"), so a pure function of inputs
   can't be expressed without a cycle of delay.
 
+## Cost model and formal verification (design-level, not scheduled)
+
+- Multi-cycle `<sequences>` transactions (`tick`/`spawn`/`sync`) hide the
+  real cost of what they express: rollback within one cycle is free
+  (nothing has committed yet), but rolling back a transaction that has
+  already crossed a `tick` needs real checkpoint/squash machinery — the
+  same thing an out-of-order core builds, and it's expensive. The
+  language currently lets a five-cycle atomic transaction be written as
+  casually as a single-cycle write, with the effect system tracking
+  correctness but not cost — the standard "cost opacity" criticism of
+  HLS tools generally, and there's no reason to expect trace is immune
+  to it once designs get larger.
+- Closest research precedents, if this is ever addressed structurally
+  rather than by convention: Filament (Cornell CAPRA) — "timeline
+  types" encode which cycle each signal is valid in directly in the
+  type system, rather than as a side effect-system check the way
+  trace's `mutually_exclusive`/`conflict_free` directives do now; Dahlia
+  — affine types for predictable memory banking, relevant to v0 arrays'
+  current one-conflict-resource-per-array limit (see "Scheduler /
+  arrays" below); Kôika — a Coq-verified one-rule-at-a-time Bluespec
+  descendant, the closest existing precedent for formally proving this
+  project's own scheduling model correct rather than trusting it by
+  testing alone.
+- Formal verification of the scheduler/conflict semantics specifically
+  (not the whole compiler) looks like the highest-value next step if
+  this is ever picked up: a small satellite Lean/Coq model of just
+  `schedule.rs`'s `mutually_exclusive`/`conflict_free` arbitration,
+  validated against the Rust implementation via generated test vectors
+  — not a full rewrite, and not an attempt to encode cycle-validity in
+  Rust's own type system, which (unlike Lean's) isn't dependently typed
+  and can't express "valid in cycle n" natively.
+- Not scheduled, no plan to act on this now — trace's actual discipline
+  today (real firtool/Icarus runs, discriminating negative tests) is
+  substituting empirical verification for formal proof, case by case
+  rather than once and for all. If this is ever worth addressing head
+  on, porting just the scheduler/cost-model layer to a language built
+  for it wouldn't be a large loss — the conflict matrix and urgency
+  logic already live in one fairly self-contained module,
+  `schedule.rs`.
+
 ## Scheduler / arrays
 
 - v0 arrays are one conflict resource each — no partial disjointness
