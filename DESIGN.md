@@ -60,7 +60,9 @@ the point) — none of those need `?`, and writing one there wouldn't add
 anything. Anything else bare must be `bits[1]`, the same requirement an
 `if`/`while` condition already has; a bare non-`bits[1]` expression (its
 value computed and discarded for no reason) is a compile-time error rather
-than silently doing nothing.
+than silently doing nothing. Both `?` and its bare-statement sugar are only
+legal in a failure context (a rule, always; a `fn`/`impl`/`spec` only if it
+declares `fails`) — see "`fails`: fallibility" below.
 
 ## Effects
 
@@ -145,9 +147,16 @@ rule refill <reads {pc, mem}, writes {ir}> {
 ### `fails`: fallibility
 
 Code that can fail carries `fails`: a guard `?`, a fifo operation, or a call to
-failing code. The compiler infers it bottom-up through the call graph. A rule's
-derived ready logic is the conjunction of guards from every failing call in its
-body, however deep.
+failing code. The compiler infers it bottom-up through the call graph, exactly
+as it always has — inference doesn't change based on what's declared. What's
+checked is different: unlike `reads`/`writes` (opt-in — only checked against
+the inferred set if declared at all), `fails` is mandatory. A `fn`/`impl`/
+`spec` whose computed `fails` ends up true — because of a guard anywhere in
+its own body, a fifo operation, or a call to something that itself fails —
+must declare `fails` itself, or it's a compile error, not a silently-inferred
+color. This holds all the way up a propagating call chain: a function that
+merely calls a failing function and returns its result also fails, and also
+needs the declaration, not just the site with the `?`.
 
 ```trace
 Classify(x : bits[8]) : bits[2] <combines, fails> {
@@ -160,10 +169,24 @@ rule step {
 }
 ```
 
+A rule's derived ready logic is the conjunction of guards from every failing
+call in its body, however deep.
+
 Context rules:
 
 - A rule body is always a failure context. Failure aborts the cycle and retries.
-  Rules never need to declare `fails`.
+  Rules never need to declare `fails`, at any depth of a call chain reaching
+  into one — a rule is where the chain necessarily ends, since nothing calls a
+  rule.
+- Whether an item is a failure context at all (able to itself contain `?`, a
+  fifo op, or a call to a failing function, before even asking whether its own
+  computed `fails` matches what's declared) is checked syntactically, off the
+  declared `<...>` list itself, not inferred from the body: inferring it would
+  let a bare condition's own presence bootstrap failure-context status for
+  itself. Matches Verse's own model, where a failable expression may only
+  appear in a context the language knows how to handle both outcomes of —
+  there, that context is `<decides>`; here, it's `fails` (declared, or a
+  rule).
 - Elaboration positions are never failure contexts. There is no transaction to
   abort. Guards and fifo ops in `elaborates` bodies, state types, and
   initializers are errors.
@@ -345,7 +368,7 @@ variable in a model checker, like SVA `$anyseq`. Implementations are checked as
 refinements of specs that declare `chooses`.
 
 ```trace
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
+spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses, fails> {
     i := any(0..N-1)          -- free variable: the checker picks
     reqs[i]?                  -- constrained: the pick must be a requester
     return i

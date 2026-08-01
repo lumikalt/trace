@@ -1,7 +1,7 @@
 -- Choice example from DESIGN.md: a spec uses nondeterministic choice
 -- (`any`); the impl is checked as a refinement of it. `chooses` marks
 -- spec-only code.
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
+spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses, fails> {
     i := any(0..N-1)          -- free variable: the checker picks
     reqs[i]?                  -- constrained: the pick must be a requester
     return i

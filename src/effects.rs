@@ -87,6 +87,26 @@ struct Checker<'a> {
 
 const COLOR_EFFECTS: &[&str] = &["combines", "sequences", "elaborates", "chooses", "fails"];
 
+/// A `rule` is always a failure context (`fails` needs no declaration —
+/// matching Verse's implicit top-level transaction). A `fn`/`impl`/
+/// `spec` is one only if it explicitly declares `<fails>` in its own
+/// `<...>` list — a SYNTACTIC check read straight off the AST, not
+/// inferred from the body: inferring it would let a bare condition's
+/// own presence bootstrap failure-context status for itself (and any
+/// sibling bare condition), the self-reference an author-declared gate
+/// (Verse's `<decides>`) exists specifically to avoid. `check_fails_
+/// declared` (below) uses this to reject a computed-`fails` item that
+/// never declared it — matching Verse's own "unhandled failure" error
+/// rather than silently letting it compile, and this codebase's own
+/// standing preference for an explicit error over a silent no-op.
+fn is_failure_context(ast: &Ast, item: ItemId) -> bool {
+    match ast.item(item) {
+        Item::Rule { .. } => true,
+        Item::Fn { effects, .. } => effects.iter().any(|e| e.name.text == "fails"),
+        _ => false,
+    }
+}
+
 impl<'a> Checker<'a> {
     fn error(&mut self, span: Span, message: String) {
         self.errors.push(EffectError { span, message });
@@ -410,6 +430,7 @@ impl<'a> Checker<'a> {
             self.check_stmt(stmt, id, &sig, elab);
         }
         self.check_rows(id, &sig);
+        self.check_fails_declared(id, &sig);
     }
 
     fn check_stmt(&mut self, id: StmtId, item: ItemId, sig: &EffectSig, elab: bool) {
@@ -440,8 +461,15 @@ impl<'a> Checker<'a> {
             Stmt::Expr(e) => {
                 // Explicit `e?` gets this same error from `Expr::Guard`'s
                 // own arm below (via the recursive `check_expr` call);
-                // excluded here so an elaboration-time guard doesn't
-                // get reported twice.
+                // excluded here so an elaboration-time guard doesn't get
+                // reported twice. Whether this (or an explicit `?`) is
+                // legal at all in this item without a `<fails>`
+                // declaration is checked once, item-wide, by `check_
+                // fails_declared` — not here per-statement (see its own
+                // doc comment for why one check covering all three
+                // fails-inducing constructs uniformly, mirroring `check_
+                // rows`, is better than a scattered per-site version of
+                // the same question).
                 if elab
                     && is_guard_like(self.ast, self.res, e)
                     && !matches!(self.ast.expr(e), Expr::Guard(_))
@@ -690,6 +718,40 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// Unlike the rows check above (opt-in: only checked if the
+    /// interface was stated at all), this one is mandatory: any
+    /// `fn`/`impl`/`spec` whose computed `sig.fails` is true — because
+    /// of a guard, a fifo operation, or a call to another failing
+    /// item, DESIGN.md's own "fails" section lists all three together
+    /// as equally fails-inducing — must itself declare `<fails>`,
+    /// matching Verse's own `<decides>` requirement (a failure
+    /// construct needs an author-declared context able to handle it,
+    /// wherever it's reached from, not just where it's written).
+    /// Skipped for `<elaborates>` items: those get their own, more
+    /// specific "cannot fail at elaboration time" error straight from
+    /// `check_expr`/`check_stmt`'s Guard-arm elab checks, so this
+    /// mustn't ALSO fire and double-report the same body. Rules are
+    /// exempt — `is_failure_context` already treats them as always
+    /// failure contexts, needing no declaration.
+    fn check_fails_declared(&mut self, id: ItemId, sig: &EffectSig) {
+        if sig.elaborates || !sig.fails || is_failure_context(self.ast, id) {
+            return;
+        }
+        let name = match self.ast.item(id) {
+            Item::Rule { name, .. } | Item::Fn { name, .. } => name.text.clone(),
+            _ => return,
+        };
+        let span = self.ast.item_spans[id.0 as usize].clone();
+        self.error(
+            span,
+            format!(
+                "`{name}` can fail (a guard, a fifo operation, or a call to failing \
+                 code somewhere in its body) but does not declare `<fails>` — add it \
+                 to this item's own effect list"
+            ),
+        );
     }
 
     /// State types and initializers are elaboration positions: no failure.

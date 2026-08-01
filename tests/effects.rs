@@ -150,13 +150,20 @@ rule r {
 
 #[test]
 fn fails_infers_through_calls() {
+    // Full-Verse gating: EVERY item whose computed `fails` is true
+    // must itself declare `<fails>`, all the way up a propagating call
+    // chain -- `Wrap` calls `Classify` (which fails) and does nothing
+    // to catch that, so `Wrap` also fails and also needs `<fails>`.
+    // Inference itself is unaffected: `sig.fails` still ends up true
+    // for both regardless of what's declared, same as before this
+    // gate existed -- only the DECLARATION requirement is new.
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines> {
+Classify(x : bits[8]) : bits[8] <combines, fails> {
     (x != 0)?
     return x
 }
 
-Wrap(x : bits[8]) : bits[8] <combines> {
+Wrap(x : bits[8]) : bits[8] <combines, fails> {
     return Classify(x)
 }
 ";
@@ -166,6 +173,98 @@ Wrap(x : bits[8]) : bits[8] <combines> {
         fx.sigs[&item_named(&ast, "Wrap")].fails,
         "fails must propagate through the call"
     );
+}
+
+#[test]
+fn fails_must_be_declared_wherever_it_ends_up_true() {
+    // Explicit `?`, undeclared `<fails>`: an error, matching Verse's
+    // own "unhandled failure" (a bare failing expression outside a
+    // `<decides>` context does not compile there either).
+    let (_, _, errors) =
+        run("Classify(x : bits[8]) : bits[8] <combines> {\n (x != 0)?\n return x\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+
+    // The implicit (bare, no `?`) case gets the identical requirement.
+    let (_, _, errors) =
+        run("Classify(x : bits[8]) : bits[8] <combines> {\n x != 0\n return x\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+
+    // A fifo op, same requirement -- one of the three constructs
+    // DESIGN.md's own `fails` section lists side by side with a guard.
+    let (_, _, errors) = run(
+        "module M {\n fifo f : bits[8]\n Drain() : bits[8] <combines> {\n return f.Deq[]\n }\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+
+    // Calling a `<fails>` function and letting its failure propagate,
+    // without declaring `<fails>` on the CALLER too -- the third
+    // construct, and the one with the widest blast radius (every
+    // propagating caller up the chain needs it, not just the site
+    // that directly uses `?`/a fifo op).
+    let (_, _, errors) = run(
+        "Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x != 0)?\n return x\n}\n\
+         Wrap(x : bits[8]) : bits[8] <combines> {\n return Classify(x)\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`Wrap`"));
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+
+    // Declaring `<fails>` is exactly what's needed to make any of the
+    // above legal.
+    run_ok("Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x != 0)?\n return x\n}\n");
+    run_ok("Classify(x : bits[8]) : bits[8] <combines, fails> {\n x != 0\n return x\n}\n");
+    run_ok(
+        "module M {\n fifo f : bits[8]\n Drain() : bits[8] <combines, fails> {\n return f.Deq[]\n }\n}\n",
+    );
+
+    // A rule needs no declaration at all -- always a failure context,
+    // for any of the three constructs, including calling a `<fails>`
+    // function directly.
+    run_ok("module M {\n fifo f : bits[8]\n rule r {\n x := f.Deq[]\n x != 0\n }\n}\n");
+    run_ok(
+        "Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x != 0)?\n return x\n}\n\
+         module M {\n out result : bits[8] = 0\n rule r {\n result := Classify(1)\n }\n}\n",
+    );
+}
+
+#[test]
+fn fails_must_be_declared_on_an_impl_too() {
+    // `impl` shares the same `Item::Fn` shape as `fn`/`spec` under the
+    // hood -- confirms the declaration requirement isn't accidentally
+    // fn-only.
+    let src = "\
+spec AnyNonZero(x : bits[8]) : bits[8] <combines, chooses> {
+    return x
+}
+
+impl PickNonZero(x : bits[8]) : bits[8] <combines>
+    refines AnyNonZero
+{
+    (x != 0)?
+    return x
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`PickNonZero`"));
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+
+    let src_ok = "\
+spec AnyNonZero(x : bits[8]) : bits[8] <combines, chooses> {
+    return x
+}
+
+impl PickNonZero(x : bits[8]) : bits[8] <combines, fails>
+    refines AnyNonZero
+{
+    (x != 0)?
+    return x
+}
+";
+    run_ok(src_ok);
 }
 
 #[test]
