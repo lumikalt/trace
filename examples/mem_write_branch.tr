@@ -11,12 +11,12 @@
 module MemWriteBranch {
     mem m : bits[8][16]
 
-    input we : bits[1]
-    input addr : bits[4]
-    input data : bits[8]
-    input read_addr : bits[4]
-    output read_data : bits[8] = 0
-    output count : bits[8] = 0
+    in we : bits[1]
+    in addr : bits[4]
+    in data : bits[8]
+    in read_addr : bits[4]
+    out read_data : bits[8] = 0
+    out count : bits[8] = 0
 
     rule step {
         count := count + 1

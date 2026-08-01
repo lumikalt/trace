@@ -9,7 +9,7 @@
 module CallFifoBridge {
     fifo input : bits[8]
     fifo output : bits[8]
-    output last : bits[8] = 0
+    out last : bits[8] = 0
 
     Bridge() : bits[8] <combines, fails> {
         let x = input.Deq[]

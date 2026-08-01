@@ -1,0 +1,23 @@
+-- `>>>` (`BinOp::AShr`): sign-extending arithmetic right shift, distinct
+-- from `>>`'s zero-filling logical shift. This language has no signed
+-- type (see TODO.md), so the interpretation is a per-operator choice:
+-- `x >>> n` treats `x`'s own top bit as a sign bit and replicates it
+-- into the vacated high bits; `x >> n` always fills with zero. Static
+-- (literal amount) and dynamic (runtime amount) both covered --
+-- sim/arith_shift_tb.v drives a value with its sign bit SET so the two
+-- operators' results genuinely differ, not just a shift amount of 0.
+module Top {
+    in x : bits[8]
+    in n : bits[3]
+    out shr_static : bits[8] = 0
+    out ashr_static : bits[8] = 0
+    out shr_dynamic : bits[8] = 0
+    out ashr_dynamic : bits[8] = 0
+
+    rule compute {
+        shr_static := x >> 3
+        ashr_static := x >>> 3
+        shr_dynamic := x >> n
+        ashr_dynamic := x >>> n
+    }
+}

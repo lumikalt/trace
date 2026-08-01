@@ -12,11 +12,11 @@ AdderTree(xs : list[bits[32]]) : bits[32] <elaborates> {
 }
 
 module Top {
-    input a : bits[32]
-    input b : bits[32]
-    input c : bits[32]
-    input d : bits[32]
-    output total : bits[32] = 0
+    in a : bits[32]
+    in b : bits[32]
+    in c : bits[32]
+    in d : bits[32]
+    out total : bits[32] = 0
 
     rule sum {
         total := AdderTree([a, b, c, d])

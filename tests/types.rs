@@ -80,6 +80,32 @@ module M {
 }
 
 #[test]
+fn arith_shift_keeps_the_left_operands_width_like_shr() {
+    // `>>>` must NOT fall into the generic "mixed bits operands" rule
+    // (max of both widths) the way an unlisted BinOp would -- it keeps
+    // `x`'s own width exactly like `>>`/`<<` do, regardless of the
+    // shift-amount operand's width.
+    run_ok(
+        "module M {\n reg x : bits[8] = 0\n reg n : bits[3] = 0\n reg y : bits[8] = 0\n \
+         rule r {\n y := x >>> n\n }\n}\n",
+    );
+    let src = "\
+module M {
+    reg x : bits[8] = 0
+    reg n : bits[3] = 0
+    reg y : bits[7] = 0
+
+    rule r {
+        y := x >>> n
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("bits[8]"), "{errors:?}");
+}
+
+#[test]
 fn fifo_element_types_check() {
     let src = "\
 module M {
@@ -142,10 +168,10 @@ fn dynamic_slice_bounds_are_a_type_error() {
     // passed `check_assignable` without complaint).
     let src = "\
 module M {
-    input x : bits[8]
-    input a : bits[3]
-    input b : bits[3]
-    output y : bits[8] = 0
+    in x : bits[8]
+    in a : bits[3]
+    in b : bits[3]
+    out y : bits[8] = 0
     rule r {
         y := x[a..b]
     }
@@ -162,7 +188,7 @@ module M {
     // A single dynamic index is unaffected -- still well-typed as
     // bits[1], same as a static one.
     run_ok(
-        "module M {\n input x : bits[8]\n input i : bits[3]\n output y : bits[1] = 0\n \
+        "module M {\n in x : bits[8]\n in i : bits[3]\n out y : bits[1] = 0\n \
          rule r {\n y := x[i]\n }\n}\n",
     );
 }
@@ -174,20 +200,20 @@ fn indexed_part_select_types_by_its_static_width_regardless_of_a_dynamic_base() 
     // the RESULT's width is fixed even though the start position isn't
     // known until runtime.
     run_ok(
-        "module M {\n input x : bits[8]\n input base : bits[3]\n output y : bits[4] = 0\n \
+        "module M {\n in x : bits[8]\n in base : bits[3]\n out y : bits[4] = 0\n \
          rule r {\n y := x[base +: 4]\n }\n}\n",
     );
     run_ok(
-        "module M {\n input x : bits[8]\n input base : bits[3]\n output y : bits[4] = 0\n \
+        "module M {\n in x : bits[8]\n in base : bits[3]\n out y : bits[4] = 0\n \
          rule r {\n y := x[base -: 4]\n }\n}\n",
     );
 
     let src = "\
 module M {
-    input x : bits[8]
-    input base : bits[3]
-    input w : bits[3]
-    output y : bits[4] = 0
+    in x : bits[8]
+    in base : bits[3]
+    in w : bits[3]
+    out y : bits[4] = 0
     rule r {
         y := x[base +: w]
     }
@@ -290,7 +316,7 @@ fn logical_not_needs_a_bits_1_operand() {
     let src = "\
 module M {
     reg a : bits[8] = 0
-    output b : bits[8] = 0
+    out b : bits[8] = 0
 
     rule r {
         b := !a
@@ -303,7 +329,7 @@ module M {
 
     // A genuine bits[1] value -- a comparison's own result -- is fine.
     run_ok(
-        "module M {\n reg a : bits[8] = 0\n output b : bits[1] = 0\n rule r {\n b := !(a == 0)\n }\n}\n",
+        "module M {\n reg a : bits[8] = 0\n out b : bits[1] = 0\n rule r {\n b := !(a == 0)\n }\n}\n",
     );
 }
 
@@ -362,8 +388,7 @@ fn sized_literals_type_directly_and_check_their_own_width() {
     // Unlike a bare literal, `4'd20` has a definite width of its own —
     // checked immediately against ITS OWN declared width, not deferred
     // to wherever it's later used.
-    let (_, _, errors) =
-        run("module M {\n output a : bits[8] = 0\n rule r {\n a := 4'd20\n }\n}\n");
+    let (_, _, errors) = run("module M {\n out a : bits[8] = 0\n rule r {\n a := 4'd20\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("20 does not fit in bits[4]"));
 
@@ -371,7 +396,7 @@ fn sized_literals_type_directly_and_check_their_own_width() {
     // combining it with a wider value widens to the max, the same rule
     // two differently-sized real registers already get, not an error.
     run_ok(
-        "module M {\n input x : bits[16]\n output result : bits[16] = 0\n rule r {\n \
+        "module M {\n in x : bits[16]\n out result : bits[16] = 0\n rule r {\n \
          result := x + 8'd6\n }\n}\n",
     );
 }
@@ -386,12 +411,12 @@ fn reg_and_output_infer_type_from_a_sized_literal_init() {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("300 does not fit in bits[8]"));
 
-    run_ok("module M {\n reg a = 8'd6\n output b = 16'hFF00\n}\n");
+    run_ok("module M {\n reg a = 8'd6\n out b = 16'hFF00\n}\n");
 }
 
 #[test]
 fn instance_ports_check_direction_and_width() {
-    let child = "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
+    let child = "module Child {\n in a : bits[8]\n out b : bits[8] = 0\n \
                   rule r {\n b := a\n}\n}\n";
 
     // Writing an input, reading an output: fine.
@@ -438,7 +463,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 }
 
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
 
     rule r <sequences> {
         h := spawn Slow(1)
@@ -480,7 +505,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 }
 
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
 
     rule r <sequences> {
         h := spawn Slow(1)
@@ -500,8 +525,8 @@ fn list_literal_types_as_list_of_its_element_type() {
              return xs[0]\n\
          }\n\
          module M {\n\
-             input a : bits[8]\n\
-             output r : bits[8] = 0\n\
+             in a : bits[8]\n\
+             out r : bits[8] = 0\n\
              rule go {\n\
                  r := Sum([a])\n\
              }\n\
@@ -515,9 +540,9 @@ fn list_literal_element_type_mismatch_is_an_error() {
                    return xs[0]\n\
                }\n\
                module M {\n\
-                   input a : bits[8]\n\
-                   input w : bits[16]\n\
-                   output r : bits[8] = 0\n\
+                   in a : bits[8]\n\
+                   in w : bits[16]\n\
+                   out r : bits[8] = 0\n\
                    rule go {\n\
                        r := Sum([a, w])\n\
                    }\n\
@@ -532,7 +557,7 @@ fn list_literal_element_type_mismatch_is_an_error() {
 #[test]
 fn an_empty_list_literal_is_an_error() {
     let src = "module M {\n\
-                   output r : bits[8] = 0\n\
+                   out r : bits[8] = 0\n\
                    rule go {\n\
                        let xs = []\n\
                    }\n\

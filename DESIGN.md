@@ -202,8 +202,8 @@ finish, and permanently blocks every other named one from ever completing.
 module Fetch2 {
     mem bank0 : bits[16][8]
     mem bank1 : bits[16][8]
-    input pc : bits[16]
-    output ir : bits[32] = 0
+    in pc : bits[16]
+    out ir : bits[32] = 0
 
     ReadBank0(addr : bits[16]) : bits[16] <sequences> {
         v := bank0[addr]
@@ -249,8 +249,8 @@ larger expression — the idiomatic place is directly after `tick`
 
 ```trace
 module FirstWins {
-    input trigger : bits[1]
-    output out : bits[8] = 0
+    in trigger : bits[1]
+    out result : bits[8] = 0
 
     Fast(x : bits[8]) : bits[8] <sequences> {
         tick
@@ -269,9 +269,9 @@ module FirstWins {
         tick
         race[hf, hs]                        -- waits until either finishes
         if hf.done == 1 {
-            out := hf.result
+            result := hf.result
         } else {
-            out := hs.result
+            result := hs.result
         }
     }
 }
@@ -295,8 +295,8 @@ directly, with no `if`/`else` of your own needed:
 
 ```trace
 module RaceValue {
-    input trigger : bits[1]
-    output out : bits[8] = 0
+    in trigger : bits[1]
+    out result : bits[8] = 0
 
     A(x : bits[8]) : bits[8] <sequences> {
         tick
@@ -311,7 +311,7 @@ module RaceValue {
         trigger?
         ha := spawn A(1)
         hb := spawn B(1)
-        out := tick race[ha, hb]
+        result := tick race[ha, hb]
     }
 }
 ```
@@ -362,10 +362,11 @@ example `8'd6`, `8'hFF`, `8'b1010`, `8'o17`, or `8'6` (defaults to decimal). A
 sized literal types directly as `bits[width]` and is range-checked immediately,
 against its own declared width — `4'd20` is an error even in a context that
 could absorb a wider value. Overflow is always a compile error, never silent
-truncation. `reg`/`output` may omit an explicit `: ty` when the initializer is a
+truncation. `reg`/`out` may omit an explicit `: ty` when the initializer is a
 sized literal: `reg a = 8'd6` declares `bits[8]`.
 
-`bit` is sugar for `bits[1]`. `bit[N]` means `bits[1][N]`.
+`bit` is sugar for `bits[1]`. `bit[N]` means `bits[1][N]`. `uN` (`u8`, `u16`,
+`u32`, ...) is sugar for `bits[N]`: `reg a : u8` means `reg a : bits[8]`.
 
 Arithmetic and bitwise operators follow Chisel-style modular width rules:
 
@@ -377,6 +378,12 @@ Arithmetic and bitwise operators follow Chisel-style modular width rules:
 - `<<`/`>>` keep the left operand's own width, matching Verilog's fixed-width
   shift rather than growing or shrinking it. The shift amount may be a literal or
   a runtime value.
+- `>>>` is `>>`'s sign-extending sibling: same width rule, but the vacated high
+  bits repeat the operand's own top bit instead of filling with zero. This
+  language has no signed type (see TODO.md), so arithmetic-vs-logical shift is
+  a per-operator choice, not a property of the operand's own type — `x >>> n`
+  and `x >> n` are both legal on the same `bits[N]` value, with different
+  results whenever the top bit is set.
 - Comparisons produce `bits[1]`.
 - Unary `-` is two's-complement negate, wrapping within the operand's width.
   Unary `~` is bitwise complement.
@@ -409,26 +416,26 @@ not configurable — there is no separate `..=` form.
 Two declarations, alongside `reg`/`mem`/`fifo`:
 
 ```trace
-input inc : bits[8]           -- external combinational signal, read-only
-output sum : bits[8] = 0      -- register-backed, exposed as a port
+in inc : bits[8]              -- external combinational signal, read-only
+out sum : bits[8] = 0         -- register-backed, exposed as a port
 ```
 
-`input` is a pure wire driven from outside the module. Reading one inside a rule
+`in` is a pure wire driven from outside the module. Reading one inside a rule
 reads this cycle's value. Writing one is an error.
 
-`output` behaves like a plain `reg` inside a rule — same `:=` write, same effect
+`out` behaves like a plain `reg` inside a rule — same `:=` write, same effect
 row, same scheduling — and is also exposed as a module port. It is
 **register-backed, never combinational**: a rule's writes are speculative until
 the clock edge, and a combinational output would leak that speculative value
-outside the module. So `output x` is an ordinary internal register connected
+outside the module. So `out x` is an ordinary internal register connected
 unconditionally to a port; the outside world sees the committed value one cycle
 after it is computed. A purely combinational module, with no state at all, is not
 expressible in v0.
 
 ```trace
 module Accumulator {
-    input inc : bits[8]
-    output sum : bits[8] = 0
+    in inc : bits[8]
+    out sum : bits[8] = 0
 
     rule accumulate {
         sum := sum + inc
@@ -538,9 +545,9 @@ Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
 }
 
 module Top {
-    input a : bits[8]
-    input b : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    in b : bits[8]
+    out result : bits[8] = 0
 
     rule compute {
         result := Avg(a, b)
@@ -1007,9 +1014,9 @@ this specific pairing, not weakened.
 module FifoPassthrough {
     fifo f : bits[8]
 
-    input seed : bits[1]
-    input seed_value : bits[8]
-    output last_out : bits[8] = 0
+    in seed : bits[1]
+    in seed_value : bits[8]
+    out last_out : bits[8] = 0
 
     rule load {
         (seed == 1)?
@@ -1035,17 +1042,17 @@ used later), is inlined by recompiling whatever it was bound to — FIRRTL has n
 ## Port-based memory access
 
 Loading and observing a `mem` through ordinary module ports needs no dedicated
-compiler machinery: it falls out of `input`/`output` plus an ordinary guarded
+compiler machinery: it falls out of `in`/`out` plus an ordinary guarded
 write.
 
 ```trace
 module PortRam {
     mem m : bits[16][256]
 
-    input addr : bits[8]
-    input write_data : bits[16]
-    input write_en : bits[1]
-    output read_data : bits[16] = 0
+    in addr : bits[8]
+    in write_data : bits[16]
+    in write_en : bits[1]
+    out read_data : bits[16] = 0
 
     rule write {
         (write_en == 1)?
@@ -1100,7 +1107,7 @@ since FIRRTL requires every instance input driven on every path; every other
 input port defaults to 0, then the firing rule (at most one) that writes it
 overrides via last-connect.
 
-A child's `output` is one cycle behind its inputs, like any `output`; a
+A child's `out` is one cycle behind its inputs, like any `out`; a
 parent's own output built from a child's output is a second register hop behind
 that. Latency compounds once per hop through the hierarchy — a real,
 honestly-modeled consequence of composition.
@@ -1291,9 +1298,10 @@ noted:
   cancellation (`examples/race.tr`, `examples/race_value.tr`).
 - `chooses`/`any`/spec refinement (checked, not synthesized).
 - The full expression surface: arithmetic, bitwise ops, static and dynamic
-  shifts, unary negate/complement/not, bit-select and slice, indexed
-  part-select, sized literals, `bit`.
-- Module ports (`input`/`output`), including boot-loading a memory through
+  shifts including arithmetic (sign-extending) `>>>`, unary negate/complement/
+  not, bit-select and slice, indexed part-select, sized literals, `bit`/`uN`
+  sugar for `bits[1]`/`bits[N]`.
+- Module ports (`in`/`out`), including boot-loading a memory through
   ports with a `boot_done` handshake (`examples/subleq_boot.tr`).
 - FIFO synthesis, including the enqueue/dequeue pass-through case
   (`examples/fifo_bridge.tr`, `examples/fifo_passthrough.tr`).
@@ -1319,7 +1327,7 @@ adder_tree.tr`, DESIGN.md's own `AdderTree`).
 
 Not yet implemented:
 
-- **Combinational-only (stateless) modules.** `output` is register-backed by
+- **Combinational-only (stateless) modules.** `out` is register-backed by
   design, so a pure function of inputs cannot be expressed without a cycle of
   delay.
 - **Array banking / provable disjointness (tier 3).** v0 arrays are one

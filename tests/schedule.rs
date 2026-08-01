@@ -307,9 +307,9 @@ fn different_instance_ports_do_not_conflict() {
     // disjointness proof is needed to tell them apart).
     let src = "\
 module Child {
-    input a : bits[8]
-    input b : bits[8]
-    output c : bits[8] = 0
+    in a : bits[8]
+    in b : bits[8]
+    out c : bits[8] = 0
     rule pass {
         c := a
     }
@@ -343,8 +343,8 @@ fn same_instance_port_conflicts() {
     // instance.
     let src = "\
 module Child {
-    input a : bits[8]
-    output c : bits[8] = 0
+    in a : bits[8]
+    out c : bits[8] = 0
     rule pass {
         c := a
     }
@@ -381,8 +381,8 @@ module Top {
 fn writing_a_port_and_reading_a_different_port_do_not_conflict() {
     let src = "\
 module Child {
-    input a : bits[8]
-    output c : bits[8] = 0
+    in a : bits[8]
+    out c : bits[8] = 0
     rule pass {
         c := a
     }

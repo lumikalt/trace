@@ -13,10 +13,10 @@ module SubleqBoot {
     mem m  : bits[16][4096]
     reg booted : bits[1] = 0
 
-    input load_addr : bits[16]
-    input load_data : bits[16]
-    input load_en : bits[1]
-    input boot_done : bits[1]
+    in load_addr : bits[16]
+    in load_data : bits[16]
+    in load_en : bits[1]
+    in boot_done : bits[1]
 
     rule load {
         (booted == 0)?

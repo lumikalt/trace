@@ -310,7 +310,7 @@ impl<'a> Emitter<'a> {
         lhs: ExprId,
         rhs: ExprId,
     ) -> Result<String, ()> {
-        if matches!(op, BinOp::Shl | BinOp::Shr) {
+        if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::AShr) {
             return self.compile_shift(op, lhs, rhs);
         }
         let known_width = |types: &Types, e: ExprId| {
@@ -439,18 +439,18 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// Both static (literal-amount) and dynamic (runtime-amount) shifts.
-    /// types.rs keeps the LEFT operand's width for `<<`/`>>` either way
-    /// (matching Verilog's fixed-width shift semantics, not FIRRTL's own
-    /// `shl`/`dshl`/`dshr`, which each grow or shrink) — so every case
-    /// below ends by bringing the FIRRTL primop's own result back to
-    /// `w`, the same shape whether the amount is known at compile time
-    /// or not.
+    /// Both static (literal-amount) and dynamic (runtime-amount) shifts,
+    /// covering `<<`/`>>`/`>>>`. types.rs keeps the LEFT operand's width
+    /// for all three either way (matching Verilog's fixed-width shift
+    /// semantics, not FIRRTL's own `shl`/`dshl`/`shr`/`dshr`, which each
+    /// grow or shrink) — so every case below ends by bringing the FIRRTL
+    /// primop's own result back to `w`, the same shape whether the
+    /// amount is known at compile time or not.
     ///
     /// Static: `shl` grows the width BY the (literal) shift amount,
-    /// `shr` shrinks it by that same amount — brought back to `w` by
-    /// dropping the high bits that fell off (`shl`) or zero-padding back
-    /// up (`shr`).
+    /// `shr`/`ashr` shrink it by that same amount — brought back to `w`
+    /// by dropping the high bits that fell off (`shl`) or padding back
+    /// up (`shr`/`ashr`).
     ///
     /// Dynamic: FIRRTL's `dshl(a, b)`/`dshr(a, b)` widths were confirmed
     /// against real firtool, not assumed from the spec text (a `node`,
@@ -468,6 +468,19 @@ impl<'a> Emitter<'a> {
     /// `tail` trims it back down — not restricted here, the same
     /// "compile what's asked" stance the rest of this emitter takes
     /// toward hardware size.
+    ///
+    /// `>>>` (`AShr`): this language has no signed type (TODO.md), so
+    /// arithmetic shift is a per-operator choice, not a property of the
+    /// operand's own type — the sign-extending behavior comes entirely
+    /// from wrapping the shift in `asSInt`/`asUInt` at emission time.
+    /// Confirmed against real firtool + a real simulation, not assumed
+    /// from spec text: `asUInt(pad(shr(asSInt(l), n), w))` for the
+    /// static case (the inner `shr` shrinks exactly like unsigned `shr`
+    /// does, and `pad` on an `SInt` sign-extends, unlike `pad` on a
+    /// `UInt`, which is why the cast has to happen before the pad, not
+    /// after); `asUInt(dshr(asSInt(l), r))` for the dynamic case, with
+    /// no pad needed, for the identical reason unsigned `dshr` needs
+    /// none — width already stays `w(a)` regardless of sign.
     pub(crate) fn compile_shift(
         &mut self,
         op: BinOp,
@@ -480,7 +493,8 @@ impl<'a> Emitter<'a> {
             return Ok(match op {
                 BinOp::Shl => format!("tail(shl({l}, {n}), {n})"),
                 BinOp::Shr => format!("pad(shr({l}, {n}), {w})"),
-                _ => unreachable!("compile_shift only called for Shl/Shr"),
+                BinOp::AShr => format!("asUInt(pad(shr(asSInt({l}), {n}), {w}))"),
+                _ => unreachable!("compile_shift only called for Shl/Shr/AShr"),
             });
         }
         let rw = self.width_of(rhs);
@@ -491,7 +505,8 @@ impl<'a> Emitter<'a> {
                 format!("tail(dshl({l}, {r}), {grown})")
             }
             BinOp::Shr => format!("dshr({l}, {r})"),
-            _ => unreachable!("compile_shift only called for Shl/Shr"),
+            BinOp::AShr => format!("asUInt(dshr(asSInt({l}), {r}))"),
+            _ => unreachable!("compile_shift only called for Shl/Shr/AShr"),
         })
     }
 }

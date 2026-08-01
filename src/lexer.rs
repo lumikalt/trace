@@ -32,9 +32,9 @@ pub enum TokenKind {
     /// user-declared name the way an ordinary identifier could.
     #[token("bit")]
     Bit,
-    #[token("input")]
+    #[token("in")]
     Input,
-    #[token("output")]
+    #[token("out")]
     Output,
     #[token("inst")]
     Inst,
@@ -98,6 +98,12 @@ pub enum TokenKind {
     Ge,
     #[token("<<")]
     Shl,
+    /// Arithmetic (sign-extending) right shift, distinct from `Shr`'s
+    /// logical (zero-filling) right shift — matched before `>>` since
+    /// logos's own longest-match rule always prefers a 3-character
+    /// token over a 2-character prefix of it.
+    #[token(">>>")]
+    AShr,
     #[token(">>")]
     Shr,
     #[token("<")]

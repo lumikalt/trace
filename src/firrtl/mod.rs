@@ -16,7 +16,7 @@
 //!   the whole file must be uninstantiated (the "top"); the rest must be
 //!   reachable from it via `inst`, with no cycle. Modules share no state
 //!   with each other regardless of nesting — a rule may only reference
-//!   `reg`/`mem`/`fifo`/`input`/`output`/`inst` declared in its OWN
+//!   `reg`/`mem`/`fifo`/`in`/`out`/`inst` declared in its OWN
 //!   module, an explicit resolve-time error otherwise (resolve.rs's
 //!   `check_module_boundary`), since a name from a different module has
 //!   no counterpart in the emitted FIRRTL text this pass produces for

@@ -58,7 +58,7 @@ fn infix_bp(kind: TokenKind) -> Option<(u8, u8)> {
         Pipe => (5, 6),
         Caret => (7, 8),
         Amp => (9, 10),
-        Shl | Shr => (11, 12),
+        Shl | Shr | AShr => (11, 12),
         Plus | Minus => (13, 14),
         Star | Slash | Percent => (15, 16),
         _ => return None,
@@ -92,6 +92,7 @@ fn binop_of(kind: TokenKind) -> BinOp {
         Amp => BinOp::BitAnd,
         Shl => BinOp::Shl,
         Shr => BinOp::Shr,
+        AShr => BinOp::AShr,
         Plus => BinOp::Add,
         Minus => BinOp::Sub,
         Star => BinOp::Mul,
@@ -230,7 +231,7 @@ impl<'a> Parser<'a> {
             Some(Schedule) => self.parse_schedule(),
             _ => {
                 self.error_here(
-                    "expected an item (module, reg, mem, fifo, input, output, rule, schedule, or a function)"
+                    "expected an item (module, reg, mem, fifo, in, out, rule, schedule, or a function)"
                         .to_string(),
                 );
                 self.sync();
@@ -275,10 +276,10 @@ impl<'a> Parser<'a> {
     }
 
     /// `reg name : ty (= init)?` / `mem name : ty` / `fifo name : ty` /
-    /// `input name : ty` / `output name : ty (= init)?` /
+    /// `in name : ty` / `out name : ty (= init)?` /
     /// `inst name : Module`
     ///
-    /// `reg`/`output` may omit `: ty` when initialized with a sized literal
+    /// `reg`/`out` may omit `: ty` when initialized with a sized literal
     /// (`reg a = 8'd6`) — the literal's own width becomes the declared
     /// type, synthesized as the same `bits[width]` expression the explicit
     /// syntax would parse to, so nothing downstream of the parser needs to
@@ -369,7 +370,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Synthesizes the `bits[width]` type expression a sized literal's own
-    /// width implies, for a `reg`/`output` declaration that omitted `: ty`.
+    /// width implies, for a `reg`/`out` declaration that omitted `: ty`.
     /// Errors if the initializer isn't literally a sized literal — a bare
     /// `Int` has no width of its own (it absorbs one from context, which
     /// doesn't exist yet at this declaration), and a larger expression's
@@ -582,7 +583,7 @@ impl<'a> Parser<'a> {
         Some(effects)
     }
 
-    /// Name positions accept `reg`/`mem`/`fifo`/`input`/`output` too: they
+    /// Name positions accept `reg`/`mem`/`fifo`/`in`/`out` too: they
     /// are keywords only at item-declaration position. DESIGN.md itself
     /// writes `reads {mem}`.
     fn at_name(&self) -> bool {
@@ -783,10 +784,24 @@ impl<'a> Parser<'a> {
             Some(Ident) => {
                 let span = self.bump().unwrap().span;
                 let name = self.text(&span).to_string();
-                self.ast.push_expr(Expr::Ident(name), span)
+                // `uN` (`u8`, `u32`, ...) is pure sugar for `bits[N]`,
+                // same desugaring `bit` gets below, and for the same
+                // reason: everything downstream sees the identical
+                // `Bracket { Ident("bits"), [N] }` shape a literal
+                // `bits[N]` would produce. Unlike `bit`, this isn't a
+                // fixed keyword (`N` is unbounded) so it can't live in
+                // the lexer's token set — matched here on the already-
+                // lexed identifier's own text instead. Like `bit`, it has
+                // no user-name fallback: `u8`/`u16`/... are reserved by
+                // this pattern, not available as ordinary identifiers.
+                if let Some(width) = u_width(&name) {
+                    self.synth_bits_ty(width, span)
+                } else {
+                    self.ast.push_expr(Expr::Ident(name), span)
+                }
             }
             // `sync`/`race` are keywords but appear in call position, and
-            // `reg`/`mem`/`fifo`/`input`/`output` are keywords only at
+            // `reg`/`mem`/`fifo`/`in`/`out` are keywords only at
             // declaration position (`mem[addr]` is an ordinary read). All
             // become plain idents.
             Some(Sync) | Some(Race) | Some(Reg) | Some(Mem) | Some(Fifo) | Some(Input)
@@ -804,7 +819,7 @@ impl<'a> Parser<'a> {
             // downstream (resolve/effects/types/emission) sees the exact
             // same `Bracket { Ident("bits"), [1] }` shape a literal
             // `bits[1]` would produce, so it needs no awareness `bit` was
-            // ever written. Unlike `reg`/`mem`/`fifo`/`input`/`output`
+            // ever written. Unlike `reg`/`mem`/`fifo`/`in`/`out`
             // (contextual keywords that fall back to `Expr::Ident` in
             // expression position, for the case where a user's own item
             // happens to be named that word), `bit` has no such fallback:
@@ -1021,6 +1036,17 @@ fn parse_int(text: &str) -> Option<u64> {
     } else {
         text.parse().ok()
     }
+}
+
+/// `u` followed by one or more digits (`u8`, `u32`, ...) is sugar for
+/// `bits[N]`; anything else (`u`, `unused`, `u8x`) is an ordinary
+/// identifier.
+fn u_width(text: &str) -> Option<u64> {
+    let digits = text.strip_prefix('u')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// `<width>'<radix?><value>` — e.g. `8'd6`, `8'hFF`, `8'b1010`, `8'o17`,

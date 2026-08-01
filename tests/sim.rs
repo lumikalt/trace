@@ -850,6 +850,36 @@ fn dynamic_shift_runs_through_real_ports() {
     );
 }
 
+/// Proves `>>>` (arithmetic, sign-extending right shift) genuinely
+/// differs from `>>` (logical, zero-filling) for a value with its sign
+/// bit set, both statically and dynamically shifted -- see
+/// sim/arith_shift_tb.v's own comment.
+#[test]
+fn arith_shift_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/arith_shift.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/arith_shift_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: static shr=1c ashr=fc; n5 shr=7 ashr=ff"),
+        "arithmetic shift results did not match expectations:\n{output}"
+    );
+}
+
 /// Proves all three dynamic bit-select shapes end to end: a single index
 /// (`x[i]`), and Verilog-style indexed part-select (`x[i +: 4]`/
 /// `x[i -: 4]`). `x` stays fixed at 0xE3 while `i` changes between two

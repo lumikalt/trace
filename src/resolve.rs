@@ -429,7 +429,7 @@ impl<'a> Resolver<'a> {
                     Some(def) if !self.res.def(def).kind.is_state() => self.error(
                         arg.span.clone(),
                         format!(
-                            "`{}` is {}, not state (reg, mem, fifo, input, output, or inst)",
+                            "`{}` is {}, not state (reg, mem, fifo, in, out, or inst)",
                             arg.text,
                             self.res.def(def).kind.describe()
                         ),

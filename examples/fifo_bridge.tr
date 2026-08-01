@@ -6,6 +6,6 @@ module FifoBridge {
 
     rule transfer {
         x := input.Deq[]      -- fails when input is empty
-        output.Enq[x]         -- fails when output is full
+        output.Enq[x]      -- fails when output is full
     }
 }

@@ -11,9 +11,9 @@
 module FifoPassthrough {
     fifo f : bits[8]
 
-    input seed : bits[1]
-    input seed_value : bits[8]
-    output last_out : bits[8] = 0
+    in seed : bits[1]
+    in seed_value : bits[8]
+    out last_out : bits[8] = 0
 
     rule load {
         (seed == 1)?

@@ -220,7 +220,7 @@ impl<'a> TypeChecker<'a> {
         self.types.state_tys = self.state_tys.clone();
     }
 
-    /// Every module's port list (its direct `input`/`output` children) and
+    /// Every module's port list (its direct `in`/`out` children) and
     /// every `inst`'s target module, keyed off `state_tys` already built
     /// by `collect_state`. Must run after it.
     fn collect_module_ports(&mut self) {
@@ -875,7 +875,7 @@ impl<'a> TypeChecker<'a> {
                     (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
                     _ => Width::Unknown,
                 }),
-                Shl | Shr => Ty::Bits(a),
+                Shl | Shr | AShr => Ty::Bits(a),
                 _ => Ty::Bits(match (a, b) {
                     (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y)),
                     _ => Width::Unknown,

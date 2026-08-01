@@ -71,15 +71,18 @@
     start, static width) instead.
 
   Everything else is implemented: arithmetic/bitwise/compare ops, static
-  AND dynamic-amount shifts, unary `-`/`~`/`!`, `/`/`%`, static AND
-  dynamic bit-select/indexed part-select, Verilog-style sized literals
-  (+ inferred `reg`/`output` types from one), `bit` sugar for `bits[1]`.
+  AND dynamic-amount shifts (logical `<<`/`>>` and arithmetic
+  sign-extending `>>>`), unary `-`/`~`/`!`, `/`/`%`, static AND dynamic
+  bit-select/indexed part-select, Verilog-style sized literals (+
+  inferred `reg`/`out` types from one), `bit` sugar for `bits[1]`, `uN`
+  (`u8`, `u32`, ...) sugar for `bits[N]`.
   See DESIGN.md's "Expression surface" section for the full history and
   width-rule derivations (several confirmed empirically against real
   firtool, not assumed from spec text); `examples/alu.tr`,
-  `examples/dynamic_shift.tr`, `examples/div_rem.tr`,
-  `examples/sized_literal.tr`, `examples/infer_reg_ty.tr`,
-  `examples/dynamic_bit_select.tr` for coverage.
+  `examples/dynamic_shift.tr`, `examples/arith_shift.tr`,
+  `examples/div_rem.tr`, `examples/sized_literal.tr`,
+  `examples/infer_reg_ty.tr`, `examples/dynamic_bit_select.tr` for
+  coverage.
 - Fifos are depth-1 only (one data reg + one valid bit); no depth syntax
   exists. A rule may `Enq`+`Deq` the SAME fifo now (a pass-through —
   `Deq` reads the old value, `Enq` writes the new one, `valid` stays 1;
@@ -122,9 +125,17 @@
 
 ## Language features with no synthesis path yet
 
-- Combinational-only (stateless) modules: `output` is register-backed by
+- Combinational-only (stateless) modules: `out` is register-backed by
   design (see DESIGN.md's "Module ports"), so a pure function of inputs
   can't be expressed without a cycle of delay.
+- A real signed type (proper sign extension/preservation through
+  arithmetic, comparisons, truncation, and casts — a second dimension
+  cutting across the whole type system, not a small addition).
+  Deliberately deferred in favor of the narrower `>>>` (arithmetic,
+  sign-extending shift) operator, added as a per-operator choice on
+  ordinary `bits[N]` rather than a new type. Revisit only if a real
+  design needs more than a shift — signed compare/add/mul, or
+  sign-aware truncation/widening.
 
 ## Cost model and formal verification (design-level, not scheduled)
 

@@ -66,7 +66,7 @@ fn unresolved_name_is_an_error() {
 
 #[test]
 fn input_ports_are_read_only() {
-    let (_, _, errors) = run("module M {\n input x : bits[8]\n \
+    let (_, _, errors) = run("module M {\n in x : bits[8]\n \
          rule r {\n x := x + 1\n}\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("input port"));
@@ -76,7 +76,7 @@ fn input_ports_are_read_only() {
 #[test]
 fn output_ports_are_writable_state() {
     let (_, res) = run_ok(
-        "module M {\n output x : bits[8] = 0\n \
+        "module M {\n out x : bits[8] = 0\n \
          rule r {\n x := x + 1\n}\n}\n",
     );
     assert!(resolved_kinds(&res).contains(&DefKind::Output));
@@ -85,7 +85,7 @@ fn output_ports_are_writable_state() {
 #[test]
 fn inst_resolves_to_a_module_and_ports_are_fields() {
     let (_, res) = run_ok(
-        "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
+        "module Child {\n in a : bits[8]\n out b : bits[8] = 0\n \
          rule r {\n b := a\n}\n}\n\
          module Top {\n inst c : Child\n reg v : bits[8] = 0\n \
          rule w {\n c.a := v\n v := c.b\n}\n}\n",
@@ -96,7 +96,7 @@ fn inst_resolves_to_a_module_and_ports_are_fields() {
 #[test]
 fn nested_module_resolves_and_can_be_instantiated_from_its_parent() {
     let (_, res) = run_ok(
-        "module Top {\n module Adder {\n input a : bits[8]\n output b : bits[8] = 0\n \
+        "module Top {\n module Adder {\n in a : bits[8]\n out b : bits[8] = 0\n \
          rule r {\n b := a\n}\n}\n \
          inst c : Adder\n reg v : bits[8] = 0\n \
          rule w {\n c.a := v\n v := c.b\n}\n}\n",
@@ -116,7 +116,7 @@ fn nested_module_is_not_visible_outside_its_lexical_scope() {
     // name it, same as a `reg`/`rule` declared inside one module was
     // already invisible to another.
     let (_, _, errors) = run(
-        "module Top {\n module Adder {\n input a : bits[8]\n}\n inst c : Adder\n}\n\
+        "module Top {\n module Adder {\n in a : bits[8]\n}\n inst c : Adder\n}\n\
          module Sibling {\n inst also_adder : Adder\n}\n",
     );
     assert!(errors.iter().any(|e| e.message.contains("cannot find")));
@@ -130,7 +130,7 @@ fn nested_module_cannot_read_its_parents_state() {
     // be a clean resolve-time error, not a name that silently resolves
     // and only fails once it's invalid FIRRTL text firtool rejects.
     let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
-         module Adder {\n input a : bits[8]\n output sum : bits[8] = 0\n \
+         module Adder {\n in a : bits[8]\n out sum : bits[8] = 0\n \
          rule add {\n sum := a + v\n}\n}\n inst c : Adder\n}\n");
     assert!(
         errors
@@ -142,7 +142,7 @@ fn nested_module_cannot_read_its_parents_state() {
 #[test]
 fn nested_module_cannot_write_its_parents_state() {
     let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
-         module Adder {\n input a : bits[8]\n rule set {\n v := a\n}\n}\n inst c : Adder\n}\n");
+         module Adder {\n in a : bits[8]\n rule set {\n v := a\n}\n}\n inst c : Adder\n}\n");
     assert!(
         errors
             .iter()
@@ -237,7 +237,7 @@ fn inst_port_accesses_share_one_resource() {
     // this: two rules touching the same port need to land on one DefId,
     // not two distinct ones that happen to share a name).
     let (ast, res) = run_ok(
-        "module Child {\n input a : bits[8]\n output b : bits[8] = 0\n \
+        "module Child {\n in a : bits[8]\n out b : bits[8] = 0\n \
          rule r {\n b := a\n}\n}\n\
          module Top {\n inst c : Child\n reg v : bits[8] = 0\n reg w : bits[8] = 0\n \
          rule p {\n c.a := v\n}\n rule q {\n c.a := w\n}\n}\n",
@@ -261,7 +261,7 @@ fn inst_target_must_be_a_module() {
 
 #[test]
 fn inst_cannot_be_assigned_directly() {
-    let (_, _, errors) = run("module Child {\n input a : bits[8]\n}\n\
+    let (_, _, errors) = run("module Child {\n in a : bits[8]\n}\n\
          module Top {\n inst c : Child\n rule w {\n c := c\n}\n}\n");
     assert!(errors.iter().any(|e| e.message.contains("module instance")));
 }

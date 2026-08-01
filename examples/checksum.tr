@@ -11,7 +11,7 @@
 -- the literal's own (nonexistent) natural one.
 module Checksum {
     mem m : bits[16][4]
-    output result : bits[16] = 0
+    out result : bits[16] = 0
 
     rule sum {
         s := 0

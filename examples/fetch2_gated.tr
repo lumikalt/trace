@@ -7,9 +7,9 @@
 module Fetch2Gated {
     mem bank0 : bits[16][8]
     mem bank1 : bits[16][8]
-    input pc : bits[16]
-    input go : bits[1]
-    output ir : bits[32] = 0
+    in pc : bits[16]
+    in go : bits[1]
+    out ir : bits[32] = 0
 
     ReadBank0(addr : bits[16]) : bits[16] <sequences> {
         v := bank0[addr]

@@ -29,11 +29,11 @@ fn adder_tree_reduces_to_a_left_associated_sum_at_each_call_site() {
                    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])\n\
                }\n\
                module M {\n\
-                   input a : bits[32]\n\
-                   input b : bits[32]\n\
-                   input c : bits[32]\n\
-                   input d : bits[32]\n\
-                   output total : bits[32] = 0\n\
+                   in a : bits[32]\n\
+                   in b : bits[32]\n\
+                   in c : bits[32]\n\
+                   in d : bits[32]\n\
+                   out total : bits[32] = 0\n\
                    rule go {\n\
                        total := AdderTree([a, b, c, d])\n\
                    }\n\
@@ -59,10 +59,10 @@ fn an_odd_length_list_exercises_the_asymmetric_split() {
                    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])\n\
                }\n\
                module M {\n\
-                   input a : bits[32]\n\
-                   input b : bits[32]\n\
-                   input c : bits[32]\n\
-                   output total : bits[32] = 0\n\
+                   in a : bits[32]\n\
+                   in b : bits[32]\n\
+                   in c : bits[32]\n\
+                   out total : bits[32] = 0\n\
                    rule go {\n\
                        total := AdderTree([a, b, c])\n\
                    }\n\
@@ -82,8 +82,8 @@ fn a_single_element_list_reduces_to_that_element_with_no_addition() {
                    return xs[0]\n\
                }\n\
                module M {\n\
-                   input a : bits[8]\n\
-                   output total : bits[8] = 0\n\
+                   in a : bits[8]\n\
+                   out total : bits[8] = 0\n\
                    rule go {\n\
                        total := One([a])\n\
                    }\n\
@@ -103,8 +103,8 @@ fn an_out_of_bounds_list_slice_is_a_compile_error_not_a_panic() {
                    return xs[5]\n\
                }\n\
                module M {\n\
-                   input a : bits[8]\n\
-                   output total : bits[8] = 0\n\
+                   in a : bits[8]\n\
+                   out total : bits[8] = 0\n\
                    rule go {\n\
                        total := Bad([a])\n\
                    }\n\
@@ -122,8 +122,8 @@ fn a_non_terminating_elaborates_function_hits_the_depth_cap_instead_of_hanging()
                    return Loopy(x)\n\
                }\n\
                module M {\n\
-                   input a : bits[8]\n\
-                   output total : bits[8] = 0\n\
+                   in a : bits[8]\n\
+                   out total : bits[8] = 0\n\
                    rule go {\n\
                        total := Loopy(a)\n\
                    }\n\
@@ -148,8 +148,8 @@ fn an_elaborates_call_composes_with_an_unrelated_state_write_in_the_same_rule() 
                }\n\
                module M {\n\
                    reg r : bits[8] = 0\n\
-                   input a : bits[8]\n\
-                   output total : bits[8] = 0\n\
+                   in a : bits[8]\n\
+                   out total : bits[8] = 0\n\
                    rule go {\n\
                        r := a\n\
                        total := Id(a)\n\

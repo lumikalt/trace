@@ -877,6 +877,10 @@ fn eval_elab_int_binop(op: BinOp, l: u64, r: u64) -> Option<u64> {
         BinOp::Le => Some((l <= r) as u64),
         BinOp::Gt => Some((l > r) as u64),
         BinOp::Ge => Some((l >= r) as u64),
+        // An elaboration-time integer has no fixed bit-width, so there's
+        // no "sign bit" position to shift relative to — arithmetic shift
+        // genuinely can't be folded here, unlike `Shl`/`Shr`.
+        BinOp::AShr => None,
         BinOp::Range | BinOp::PlusColon | BinOp::MinusColon => None,
     }
 }

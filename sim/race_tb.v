@@ -2,7 +2,7 @@
 // actually cancels the loser rather than just letting it finish
 // unobserved: Fast (1 tick) always beats Slow (2 ticks), and this
 // checks the LOSER's own internal `done`/`result` registers directly by
-// hierarchical path, not just the observable `out` port -- `out`
+// hierarchical path, not just the observable `result` port -- `result`
 // alone can't tell "the loser was blocked" apart from "the loser
 // finished too, but nobody happened to read its result", which is
 // exactly the "losers run free" alternative design this test needs to
@@ -13,13 +13,13 @@ module race_tb;
   reg clock = 0;
   reg reset = 1;
   reg trigger = 0;
-  wire [7:0] out;
+  wire [7:0] result;
 
   Race dut (
     .clock(clock),
     .reset(reset),
     .trigger(trigger),
-    .out(out)
+    .result(result)
   );
 
   always #5 clock = ~clock;
@@ -46,11 +46,11 @@ module race_tb;
     repeat (8) @(posedge clock);
     #1;
 
-    $display("final: out=%0d done_hf=%0d done_hs=%0d result_hs=%0d",
-              out, dut.__done_pick_hf, dut.__done_pick_hs, dut.__result_pick_hs);
+    $display("final: result=%0d done_hf=%0d done_hs=%0d result_hs=%0d",
+              result, dut.__done_pick_hf, dut.__done_pick_hs, dut.__result_pick_hs);
 
-    if (out !== 8'd2) begin
-      $display("FAIL: expected out == 2 (Fast(1) == 1+1), got %0d", out);
+    if (result !== 8'd2) begin
+      $display("FAIL: expected result == 2 (Fast(1) == 1+1), got %0d", result);
       failed = 1;
     end
     if (dut.__done_pick_hf !== 1'b1) begin

@@ -47,6 +47,11 @@ pub enum BinOp {
     Rem,
     Shl,
     Shr,
+    /// Arithmetic right shift (`>>>`): sign-extends the vacated high bits
+    /// instead of `Shr`'s zero-fill — the interpretation is a per-
+    /// operator choice, not a property of a signed type, since this
+    /// language has no signed type (see TODO.md).
+    AShr,
     BitAnd,
     BitOr,
     BitXor,
@@ -75,6 +80,7 @@ impl BinOp {
             BinOp::Rem => "%",
             BinOp::Shl => "<<",
             BinOp::Shr => ">>",
+            BinOp::AShr => ">>>",
             BinOp::BitAnd => "&",
             BinOp::BitOr => "|",
             BinOp::BitXor => "^",
@@ -238,12 +244,12 @@ pub enum Item {
         name: Name,
         ty: ExprId,
     },
-    /// `input name : ty` — external combinational signal, read-only.
+    /// `in name : ty` — external combinational signal, read-only.
     Input {
         name: Name,
         ty: ExprId,
     },
-    /// `output name : ty (= init)?` — register-backed, exposed as a port.
+    /// `out name : ty (= init)?` — register-backed, exposed as a port.
     Output {
         name: Name,
         ty: ExprId,
@@ -403,10 +409,10 @@ impl Ast {
                 out.push_str(&format!("{pad}fifo {name} : {}\n", self.expr_sexpr(*ty)));
             }
             Item::Input { name, ty } => {
-                out.push_str(&format!("{pad}input {name} : {}\n", self.expr_sexpr(*ty)));
+                out.push_str(&format!("{pad}in {name} : {}\n", self.expr_sexpr(*ty)));
             }
             Item::Output { name, ty, init } => {
-                out.push_str(&format!("{pad}output {name} : {}", self.expr_sexpr(*ty)));
+                out.push_str(&format!("{pad}out {name} : {}", self.expr_sexpr(*ty)));
                 if let Some(init) = init {
                     out.push_str(&format!(" = {}", self.expr_sexpr(*init)));
                 }

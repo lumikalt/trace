@@ -1,7 +1,7 @@
 module Top {
-    input a : bits[8]
-    output result : bits[8] = 0
-    output v_out : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
+    out v_out : bits[8] = 0
 
     Bump(x : bits[8]) : bits[8] <combines> {
         v_out := x

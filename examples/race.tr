@@ -2,8 +2,8 @@
 -- together; whichever finishes first wins, and the loser's own FSM is
 -- permanently blocked from ever completing (see "Race lowering").
 module Race {
-    input trigger : bits[1]
-    output out : bits[8] = 0
+    in trigger : bits[1]
+    out result : bits[8] = 0
 
     Fast(x : bits[8]) : bits[8] <sequences> {
         tick
@@ -22,9 +22,9 @@ module Race {
         tick
         race[hf, hs]
         if hf.done == 1 {
-            out := hf.result
+            result := hf.result
         } else {
-            out := hs.result
+            result := hs.result
         }
     }
 }

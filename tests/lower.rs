@@ -297,7 +297,7 @@ fn rejects_let_bound_value_crossing_a_tick() {
     // permanently stuck at its reset value -- see TODO.md.
     let src = "\
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
     rule r <sequences> {
         let v = 8'd5
         tick
@@ -323,7 +323,7 @@ Foo() : bits[8] <sequences> {
 }
 
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
     rule r <sequences> {
         h := spawn Foo()
         tick sync[h]
@@ -342,7 +342,7 @@ fn let_bound_value_within_one_segment_is_unaffected() {
     // -- only a `let` that must survive past a tick is rejected.
     let src = "\
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
     rule r <sequences> {
         let v = 8'd5
         out := v + 1
@@ -368,7 +368,7 @@ Foo() : bits[8] <sequences> {
 }
 
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
     rule r <sequences> {
         let h = spawn Foo()
         tick sync[h]
@@ -393,8 +393,8 @@ const FETCH2: &str = "\
 module Fetch2 {
     mem bank0 : bits[16][8]
     mem bank1 : bits[16][8]
-    input pc : bits[16]
-    output ir : bits[32] = 0
+    in pc : bits[16]
+    out ir : bits[32] = 0
 
     ReadBank0(addr : bits[16]) : bits[16] <sequences> {
         v := bank0[addr]
@@ -517,7 +517,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 }
 
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
     rule r <sequences> {
         h1 := spawn Slow(1)
         h2 := spawn Slow(2)
@@ -617,7 +617,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 }
 
 module M {
-    output out : bits[8] = 0
+    out out : bits[8] = 0
     rule pick <sequences> {
         hf := spawn Fast(1)
         hs := spawn Slow(1)

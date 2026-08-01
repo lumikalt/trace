@@ -452,8 +452,8 @@ fn reassigned_local_write_between_two_bindings_sees_old_then_new() {
     // would give) fails this by making `before` ALSO read `b`.
     let src = "\
 module M {
-    input a : bits[8]
-    input b : bits[8]
+    in a : bits[8]
+    in b : bits[8]
     reg before : bits[8] = 0
     reg after : bits[8] = 0
     rule r {
@@ -480,7 +480,7 @@ fn reassigned_local_chain_resolves_each_reference_at_its_own_position() {
     let src = "\
 module M {
     mem m : bits[16][4]
-    output result : bits[16] = 0
+    out result : bits[16] = 0
     rule r {
         z := m[0]
         y := z + m[1]
@@ -597,8 +597,8 @@ fn a_second_unconditional_mem_write_in_one_rule_is_an_error() {
     let src = "\
 module M {
     mem m : bits[8][256]
-    input addr0 : bits[8]
-    input addr1 : bits[8]
+    in addr0 : bits[8]
+    in addr1 : bits[8]
 
     rule r {
         m[addr0] := 8'd11
@@ -621,9 +621,9 @@ fn an_unconditional_mem_write_after_a_conditional_one_is_also_an_error() {
     let src = "\
 module M {
     mem m : bits[8][256]
-    input cond : bits[1]
-    input addr0 : bits[8]
-    input addr1 : bits[8]
+    in cond : bits[1]
+    in addr0 : bits[8]
+    in addr1 : bits[8]
 
     rule r {
         if cond == 1 {
@@ -650,10 +650,10 @@ fn two_conditional_writes_to_the_same_mem_chain_correctly_and_are_not_an_error()
     let src = "\
 module M {
     mem m : bits[8][256]
-    input condA : bits[1]
-    input condB : bits[1]
-    input addrA : bits[8]
-    input addrB : bits[8]
+    in condA : bits[1]
+    in condB : bits[1]
+    in addrA : bits[8]
+    in addrB : bits[8]
 
     rule r {
         if condA == 1 {
@@ -682,9 +682,9 @@ fn an_unconditional_write_followed_by_a_conditional_one_is_not_an_error() {
     let src = "\
 module M {
     mem m : bits[8][256]
-    input cond : bits[1]
-    input addr0 : bits[8]
-    input addr1 : bits[8]
+    in cond : bits[1]
+    in addr0 : bits[8]
+    in addr1 : bits[8]
 
     rule r {
         m[addr0] := 8'd11
@@ -709,8 +709,8 @@ fn let_bound_mem_read_emits_a_real_read_port() {
     let src = "\
 module M {
     mem m : bits[8][256]
-    input addr : bits[8]
-    output out : bits[8] = 0
+    in addr : bits[8]
+    out out : bits[8] = 0
 
     rule r {
         let v = m[addr]
@@ -786,8 +786,8 @@ fn nested_inst_write_threads_through_a_mux() {
     // (same claim as `subleq_emits_and_compiles`'s `pc` mux, for a port).
     let src = "\
 module Child {
-    input a : bits[8]
-    output b : bits[8] = 0
+    in a : bits[8]
+    out b : bits[8] = 0
     rule pass {
         b := a
     }
@@ -817,8 +817,8 @@ fn inst_write_on_only_one_side_of_an_if_falls_back_to_the_default() {
     // (a port has no memory of its own, unlike a register).
     let src = "\
 module Child {
-    input a : bits[8]
-    output b : bits[8] = 0
+    in a : bits[8]
+    out b : bits[8] = 0
     rule pass {
         b := a
     }
@@ -867,9 +867,9 @@ fn emits_multiple_instances_of_the_same_module() {
     // name, are the risk this pins).
     let src = "\
 module Adder {
-    input a : bits[8]
-    input b : bits[8]
-    output sum : bits[8] = 0
+    in a : bits[8]
+    in b : bits[8]
+    out sum : bits[8] = 0
     rule add {
         sum := a + b
     }
@@ -877,9 +877,9 @@ module Adder {
 module Top {
     inst a1 : Adder
     inst a2 : Adder
-    input x : bits[8]
-    output r1 : bits[8] = 0
-    output r2 : bits[8] = 0
+    in x : bits[8]
+    out r1 : bits[8] = 0
+    out r2 : bits[8] = 0
     rule wire {
         a1.a := x
         a1.b := x
@@ -916,17 +916,17 @@ fn nested_module_emits_as_its_own_top_level_firrtl_block() {
     let src = "\
 module Top {
     module Adder {
-        input a : bits[8]
-        input b : bits[8]
-        output sum : bits[8] = 0
+        in a : bits[8]
+        in b : bits[8]
+        out sum : bits[8] = 0
         rule add {
             sum := a + b
         }
     }
     inst adder : Adder
-    input x : bits[8]
-    input y : bits[8]
-    output result : bits[8] = 0
+    in x : bits[8]
+    in y : bits[8]
+    out result : bits[8] = 0
     rule wire {
         adder.a := x
         adder.b := y
@@ -980,8 +980,8 @@ fn multiply_by_a_literal_truncates_back_to_the_declared_width() {
     // here, not a constant 1).
     let src = "\
 module M {
-    input x : bits[8]
-    output y : bits[8] = 0
+    in x : bits[8]
+    out y : bits[8] = 0
     rule r {
         y := x * 3
     }
@@ -996,10 +996,10 @@ module M {
 fn sized_literal_emits_its_own_declared_width() {
     let src = "\
 module M {
-    output a : bits[8] = 0
-    output b : bits[8] = 0
-    output c : bits[8] = 0
-    output d : bits[8] = 0
+    out a : bits[8] = 0
+    out b : bits[8] = 0
+    out c : bits[8] = 0
+    out d : bits[8] = 0
     rule r {
         a := 8'd6
         b := 8'hFF
@@ -1026,10 +1026,10 @@ fn bit_emits_byte_identical_firrtl_to_bits_1() {
     // the module's own name.
     let bit_src = "\
 module Bit {
-    input a : bit
+    in a : bit
     reg v : bit = 0
     mem m : bit[16]
-    output o : bit = 0
+    out o : bit = 0
     rule r {
         v := a
         o := v
@@ -1038,10 +1038,10 @@ module Bit {
 ";
     let bits_src = "\
 module Bits {
-    input a : bits[1]
+    in a : bits[1]
     reg v : bits[1] = 0
     mem m : bits[1][16]
-    output o : bits[1] = 0
+    out o : bits[1] = 0
     rule r {
         v := a
         o := v
@@ -1067,8 +1067,8 @@ fn sized_literal_widens_in_arithmetic_against_a_wider_operand() {
     // `Int` literal would.
     let src = "\
 module M {
-    input x : bits[16]
-    output result : bits[16] = 0
+    in x : bits[16]
+    out result : bits[16] = 0
     rule r {
         result := x + 8'd6
     }
@@ -1083,9 +1083,9 @@ module M {
 fn sized_literal_works_as_a_bit_select_bound_and_a_shift_amount() {
     let src = "\
 module M {
-    input x : bits[16]
-    output bit3 : bits[1] = 0
-    output shifted : bits[16] = 0
+    in x : bits[16]
+    out bit3 : bits[1] = 0
+    out shifted : bits[16] = 0
     rule r {
         bit3 := x[8'd3]
         shifted := x << 4'd2
@@ -1103,7 +1103,7 @@ fn reg_and_output_emit_using_their_inferred_width() {
     let src = "\
 module M {
     reg a = 8'd6
-    output b = 16'hFF00
+    out b = 16'hFF00
     rule r {
         a := a + 1
         b := 1
@@ -1128,7 +1128,7 @@ fn sized_literal_widens_via_a_bare_connect_into_a_wider_target() {
     // width here (not the sink's) is correct, not a gap.
     let src = "\
 module M {
-    output result : bits[16] = 0
+    out result : bits[16] = 0
     rule r {
         result := 8'd6
     }
@@ -1148,8 +1148,8 @@ fn sized_literal_compares_against_a_wider_operand() {
     // what the sized literal already does (emit at its own width).
     let src = "\
 module M {
-    input x : bits[16]
-    output eq : bits[1] = 0
+    in x : bits[16]
+    out eq : bits[1] = 0
     rule r {
         eq := x == 8'd6
     }
@@ -1173,10 +1173,10 @@ fn dynamic_shift_grows_then_trims_shl_but_shr_needs_no_adjustment() {
     // in this file.
     let src = "\
 module M {
-    input x : bits[8]
-    input n : bits[3]
-    output shl_out : bits[8] = 0
-    output shr_out : bits[8] = 0
+    in x : bits[8]
+    in n : bits[3]
+    out shl_out : bits[8] = 0
+    out shr_out : bits[8] = 0
     rule r {
         shl_out := x << n
         shr_out := x >> n
@@ -1190,6 +1190,35 @@ module M {
 }
 
 #[test]
+fn arith_shift_wraps_in_as_sint_as_uint_confirmed_against_real_firtool() {
+    // `>>>` has no signed type to lean on (this language doesn't have
+    // one) -- the sign-extending behavior comes entirely from wrapping
+    // the shift in `asSInt`/`asUInt` at emission time. Static: `pad`
+    // must run BEFORE `asUInt`, not after, since `pad` on an `SInt`
+    // sign-extends but `pad` on a `UInt` zero-extends. Dynamic: no `pad`
+    // needed at all, the same reason unsigned `dshr` needs none (width
+    // already stays `w(a)` regardless of sign) -- both confirmed against
+    // real firtool output AND a real simulation (see
+    // examples/arith_shift.tr's own sim/arith_shift_tb.v).
+    let src = "\
+module M {
+    in x : bits[8]
+    in n : bits[3]
+    out static_out : bits[8] = 0
+    out dynamic_out : bits[8] = 0
+    rule r {
+        static_out := x >>> 3
+        dynamic_out := x >>> n
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_static_out, asUInt(pad(shr(asSInt(x), 3), 8))"));
+    assert!(fir.contains("connect __out_dynamic_out, asUInt(dshr(asSInt(x), n))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn dynamic_single_index_select_compiles_to_a_dynamic_shift() {
     // A single index is always exactly 1 bit whether it's a compile-time
     // constant or a genuine runtime value -- `x[i]` with a dynamic `i`
@@ -1197,9 +1226,9 @@ fn dynamic_single_index_select_compiles_to_a_dynamic_shift() {
     // rather than erroring the way it used to (v0 restriction lifted).
     let src = "\
 module M {
-    input x : bits[8]
-    input i : bits[8]
-    output y : bits[1] = 0
+    in x : bits[8]
+    in i : bits[8]
+    out y : bits[1] = 0
     rule r {
         y := x[i]
     }
@@ -1224,10 +1253,10 @@ fn indexed_part_select_up_and_down_use_dshr_plus_a_static_truncate() {
     // tests/types.rs).
     let src = "\
 module M {
-    input x : bits[8]
-    input base : bits[3]
-    output up : bits[4] = 0
-    output down : bits[4] = 0
+    in x : bits[8]
+    in base : bits[3]
+    out up : bits[4] = 0
+    out down : bits[4] = 0
     rule r {
         up := x[base +: 4]
         down := x[base -: 4]
@@ -1253,9 +1282,9 @@ fn indexed_part_select_width_folds_a_non_literal_constant_expression() {
     // erroring or using the real width.
     let src = "\
 module M {
-    input x : bits[8]
-    input base : bits[3]
-    output y : bits[4] = 0
+    in x : bits[8]
+    in base : bits[3]
+    out y : bits[4] = 0
     rule r {
         y := x[base +: 2 + 2]
     }
@@ -1274,8 +1303,8 @@ fn reversed_slice_bounds_are_an_error_not_invalid_firrtl() {
     // rejects with no span back into the .tr source.
     let src = "\
 module M {
-    input x : bits[8]
-    output y : bits[4] = 0
+    in x : bits[8]
+    out y : bits[4] = 0
     rule r {
         y := x[0..3]
     }
@@ -1297,9 +1326,9 @@ fn logical_not_compiles_identically_to_bitwise_not_on_a_bits_1_value() {
     // by asserting both compile to the exact same FIRRTL text.
     let src = "\
 module M {
-    input x : bits[8]
-    output bang : bits[1] = 0
-    output tilde : bits[1] = 0
+    in x : bits[8]
+    out bang : bits[1] = 0
+    out tilde : bits[1] = 0
     rule r {
         bang := !(x == 0)
         tilde := ~(x == 0)
@@ -1324,10 +1353,10 @@ fn div_and_rem_of_equal_width_operands_need_no_pad() {
     // extends up from `min`, never keeps the full width automatically.
     let src = "\
 module M {
-    input x : bits[8]
-    input y : bits[8]
-    output q : bits[8] = 0
-    output r : bits[8] = 0
+    in x : bits[8]
+    in y : bits[8]
+    out q : bits[8] = 0
+    out r : bits[8] = 0
     rule rule1 {
         q := x / y
         r := x % y
@@ -1352,12 +1381,12 @@ fn div_and_rem_of_differing_width_operands_pad_up_to_the_wider_target() {
     // needs padding up to 8 even though the DIVIDEND already matches.
     let src = "\
 module M {
-    input a : bits[8]
-    input b : bits[4]
-    output q1 : bits[8] = 0
-    output q2 : bits[8] = 0
-    output r1 : bits[8] = 0
-    output r2 : bits[8] = 0
+    in a : bits[8]
+    in b : bits[4]
+    out q1 : bits[8] = 0
+    out q2 : bits[8] = 0
+    out r1 : bits[8] = 0
+    out r2 : bits[8] = 0
     rule rule1 {
         q1 := a / b
         q2 := b / a
@@ -1406,10 +1435,10 @@ Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
     return a - b
 }
 module Top {
-    input x : bits[8]
-    input y : bits[8]
-    input z : bits[8]
-    output result : bits[8] = 0
+    in x : bits[8]
+    in y : bits[8]
+    in z : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := Avg(Avg(x, y), z)
     }
@@ -1429,8 +1458,8 @@ fn call_to_a_same_module_fn_that_reads_state_still_works() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Bump(x : bits[8]) : bits[8] <combines> {
         return v + x
@@ -1460,8 +1489,8 @@ module M {
     reg v : bits[8] = 0
     Bump(x : bits[8]) : bits[8] <combines> { return v + x }
     module N {
-        input a : bits[8]
-        output result : bits[8] = 0
+        in a : bits[8]
+        out result : bits[8] = 0
         rule r { result := Bump(a) }
     }
     inst n : N
@@ -1489,8 +1518,8 @@ Outer(x : bits[8]) : bits[8] <combines> {
     return doubled
 }
 module M {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := Outer(a)
     }
@@ -1519,8 +1548,8 @@ Outer(x : bits[8]) : bits[8] <combines> {
     return a + b
 }
 module M {
-    input x : bits[8]
-    output result : bits[8] = 0
+    in x : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := Outer(x)
     }
@@ -1579,8 +1608,8 @@ B(x : bits[8]) : bits[8] <combines> {
     return A(x)
 }
 module M {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := A(a)
     }
@@ -1623,7 +1652,7 @@ fn a_nested_call_used_as_a_let_value_that_writes_state_is_still_an_error() {
     let src = "\
 module M {
     reg w : bits[8] = 0
-    output result : bits[8] = 0
+    out result : bits[8] = 0
 
     Inner(x : bits[8]) : bits[8] <combines, writes {w}> {
         w := x
@@ -1666,8 +1695,8 @@ fn a_nested_writing_call_used_as_a_bare_statement_threads_its_write_through() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Inner(x : bits[8]) : bits[8] <combines, writes {v}> {
         v := x
@@ -1699,8 +1728,8 @@ fn a_state_writing_callee_may_still_call_a_pure_helper() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Helper(x : bits[8]) : bits[8] <combines> {
         return x + 1
@@ -1729,8 +1758,8 @@ fn a_pure_nested_bare_statement_call_compiles_away_harmlessly() {
     // hardware: `result` depends only on `Outer`'s own `return x + 1`.
     let src = "\
 module M {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Inner(x : bits[8]) : bits[8] <combines> {
         return x + 1
@@ -1761,8 +1790,8 @@ fn call_inlines_a_function_that_writes_state_and_returns_a_value() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Bump(x : bits[8]) : bits[8] <combines> {
         v := x
@@ -1785,7 +1814,7 @@ fn call_to_a_writing_function_as_a_bare_statement_discards_the_return_value() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
+    in a : bits[8]
 
     Bump(x : bits[8]) : bits[8] <combines> {
         v := x
@@ -1814,7 +1843,7 @@ fn call_writes_state_conditionally_inside_its_own_if_else() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
+    in a : bits[8]
 
     Bump(x : bits[8]) : bits[8] <combines> {
         if x > 10 {
@@ -1850,8 +1879,8 @@ fn call_to_a_conditionally_writing_function_whose_return_value_is_used_requires_
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Bump(x : bits[8]) : bits[8] <combines> {
         if x > 10 {
@@ -1879,9 +1908,9 @@ fn same_writing_function_called_from_two_rules_gates_each_write_separately() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    input b : bits[8]
-    input sel : bits[1]
+    in a : bits[8]
+    in b : bits[8]
+    in sel : bits[1]
 
     Bump(x : bits[8]) : bits[8] <combines> {
         v := x
@@ -1908,15 +1937,15 @@ module M {
 fn call_writes_an_instance_port() {
     let src = "\
 module Child {
-    input a : bits[8]
-    output b : bits[8] = 0
+    in a : bits[8]
+    out b : bits[8] = 0
     rule pass {
         b := a
     }
 }
 module Top {
     inst c : Child
-    input x : bits[8]
+    in x : bits[8]
 
     Drive(v : bits[8]) : bits[8] <combines> {
         c.a := v
@@ -1944,8 +1973,8 @@ fn a_writing_call_nested_in_a_larger_expression_is_an_error_not_a_dropped_write(
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Bump(x : bits[8]) : bits[8] <combines> {
         v := x
@@ -1969,8 +1998,8 @@ fn a_writing_call_bound_to_a_let_is_an_error_not_a_dropped_write() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Bump(x : bits[8]) : bits[8] <combines> {
         v := x
@@ -2005,8 +2034,8 @@ Classify(x : bits[8]) : bits[8] <combines, fails> {
     return y
 }
 module Top {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule compute {
         result := Classify(a)
     }
@@ -2030,8 +2059,8 @@ Classify(x : bits[8]) : bits[8] <combines, fails> {
     return x
 }
 module Top {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule compute {
         result := Classify(a)
     }
@@ -2055,8 +2084,8 @@ fn call_folds_a_guard_and_threads_a_state_write_from_the_same_callee() {
     let src = "\
 module M {
     reg v : bits[8] = 0
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     Bump(x : bits[8]) : bits[8] <combines, fails> {
         (x != 0)?
         v := x
@@ -2092,8 +2121,8 @@ Classify(x : bits[8]) : bits[8] <combines, fails> {
     return x
 }
 module Top {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule compute {
         result := Classify(a) + 1
     }
@@ -2125,9 +2154,9 @@ Classify(x : bits[8], flag : bits[1]) : bits[8] <combines, fails> {
     }
 }
 module Top {
-    input a : bits[8]
-    input f : bits[1]
-    output result : bits[8] = 0
+    in a : bits[8]
+    in f : bits[1]
+    out result : bits[8] = 0
     rule compute {
         result := Classify(a, f)
     }
@@ -2150,8 +2179,8 @@ fn call_folds_a_callees_fifo_op_into_the_callers_own_guard() {
     let src = "\
 module Top {
     fifo buf : bits[8]
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
 
     Classify(x : bits[8]) : bits[8] <combines, fails> {
         buf.Enq[x]
@@ -2179,8 +2208,8 @@ fn call_folds_both_a_guard_and_a_fifo_op_from_the_same_callee() {
     let src = "\
 module Top {
     fifo buf : bits[8]
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     Push(x : bits[8]) : bits[8] <combines, fails> {
         (x != 0)?
         buf.Enq[x]
@@ -2206,9 +2235,9 @@ fn a_rule_enqueuing_directly_and_via_a_callee_is_still_a_double_enq_error() {
     let src = "\
 module Top {
     fifo buf : bits[8]
-    input a : bits[8]
-    input b : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    in b : bits[8]
+    out result : bits[8] = 0
 
     Classify(x : bits[8]) : bits[8] <combines, fails> {
         buf.Enq[x]
@@ -2241,9 +2270,9 @@ fn a_direct_deq_and_a_via_callee_enq_combine_into_one_pass_through() {
     let src = "\
 module Top {
     fifo buf : bits[8]
-    input a : bits[8]
-    output result : bits[8] = 0
-    output val : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
+    out val : bits[8] = 0
 
     Classify(x : bits[8]) : bits[8] <combines, fails> {
         buf.Enq[x]
@@ -2282,8 +2311,8 @@ Outer(x : bits[8]) : bits[8] <combines, fails> {
     return Inner(x)
 }
 module Top {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule compute {
         result := Outer(a)
     }
@@ -2310,9 +2339,9 @@ Classify(x : bits[8]) : bits[8] <combines, fails> {
     return x
 }
 module Top {
-    input a : bits[8]
-    input cond : bits[1]
-    output result : bits[8] = 0
+    in a : bits[8]
+    in cond : bits[1]
+    out result : bits[8] = 0
     rule compute {
         if cond == 1 {
             result := Classify(a)
@@ -2337,7 +2366,7 @@ Classify(x : bits[8]) : bits[8] <combines, fails> {
     return x
 }
 module Top {
-    input a : bits[8]
+    in a : bits[8]
     reg r : bits[8] = 0
     rule compute {
         r := a
@@ -2367,7 +2396,7 @@ fn a_write_transitively_reached_through_a_bare_statement_call_threads_through() 
 module M {
     reg v : bits[8] = 0
     reg w : bits[8] = 0
-    input a : bits[8]
+    in a : bits[8]
     Inner(y : bits[8]) : bits[8] <combines> {
         w := y
         return y
@@ -2402,8 +2431,8 @@ Pick(x : bits[8]) : bits[8] <combines> {
     return 0
 }
 module M {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := Pick(a)
     }
@@ -2427,9 +2456,9 @@ Max(a : bits[8], b : bits[8]) : bits[8] <combines> {
     }
 }
 module M {
-    input x : bits[8]
-    input y : bits[8]
-    output result : bits[8] = 0
+    in x : bits[8]
+    in y : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := Max(x, y)
     }
@@ -2449,8 +2478,8 @@ Pick(x : bits[8]) : bits[8] <combines> {
     }
 }
 module M {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := Pick(a)
     }
@@ -2482,9 +2511,9 @@ Pick(a : bits[8], b : bits[8]) : bits[8] <combines> {
     }
 }
 module M {
-    input x : bits[8]
-    input y : bits[8]
-    output result : bits[8] = 0
+    in x : bits[8]
+    in y : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := Pick(x, y)
     }
@@ -2504,8 +2533,8 @@ fn call_to_an_unsynthesizable_builtin_is_still_an_error() {
     // that it doesn't get conflated with the others.
     let src = "\
 module M {
-    input a : bits[8]
-    output result : bits[8] = 0
+    in a : bits[8]
+    out result : bits[8] = 0
     rule r {
         result := clog2(a)
     }
@@ -2522,9 +2551,9 @@ module M {
 fn pack_concatenates_msb_first() {
     let src = "\
 module M {
-    input a : bits[8]
-    input b : bits[8]
-    output result : bits[16] = 0
+    in a : bits[8]
+    in b : bits[8]
+    out result : bits[16] = 0
     rule r {
         result := pack(a, b)
     }
@@ -2539,10 +2568,10 @@ module M {
 fn pack_of_three_folds_left_to_right() {
     let src = "\
 module M {
-    input a : bits[8]
-    input b : bits[8]
-    input c : bits[8]
-    output result : bits[24] = 0
+    in a : bits[8]
+    in b : bits[8]
+    in c : bits[8]
+    out result : bits[24] = 0
     rule r {
         result := pack(a, b, c)
     }
@@ -2559,9 +2588,9 @@ fn pack_inlines_through_a_user_fn_that_wraps_it() {
     // enclosing callee from inlining.
     let src = "\
 module M {
-    input a : bits[8]
-    input b : bits[8]
-    output result : bits[16] = 0
+    in a : bits[8]
+    in b : bits[8]
+    out result : bits[16] = 0
 
     Combine(x : bits[8], y : bits[8]) : bits[16] <combines> {
         return pack(x, y)
@@ -2581,8 +2610,8 @@ module M {
 fn trunc_takes_the_low_bits() {
     let src = "\
 module M {
-    input a : bits[16]
-    output result : bits[8] = 0
+    in a : bits[16]
+    out result : bits[8] = 0
     rule r {
         result := trunc(a, 8)
     }
@@ -2600,8 +2629,8 @@ fn trunc_inlines_through_a_user_fn_that_wraps_it() {
     // still does.
     let src = "\
 module M {
-    input a : bits[16]
-    output result : bits[8] = 0
+    in a : bits[16]
+    out result : bits[8] = 0
 
     Narrow(x : bits[16]) : bits[8] <combines> {
         return trunc(x, 8)
@@ -2621,8 +2650,8 @@ module M {
 fn prio_encodes_the_lowest_set_bit_as_a_priority_mux_chain() {
     let src = "\
 module M {
-    input reqs : bits[4]
-    output grant : bits[2] = 0
+    in reqs : bits[4]
+    out grant : bits[2] = 0
     rule r {
         grant := prio(reqs)
     }
@@ -2646,8 +2675,8 @@ fn prio_inlines_through_a_user_fn_that_wraps_it() {
     // `nested_user_call_inside_a_builtins_argument_still_disqualifies`).
     let src = "\
 module M {
-    input reqs : bits[4]
-    output grant : bits[2] = 0
+    in reqs : bits[4]
+    out grant : bits[2] = 0
 
     RoundRobin(r : bits[4]) : bits[2] <combines> {
         return prio(r)
@@ -2673,8 +2702,8 @@ fn user_call_nested_inside_a_builtins_argument_composes() {
     // `Mask` actually ran first, not just that emission succeeded.
     let src = "\
 module M {
-    input reqs : bits[4]
-    output grant : bits[2] = 0
+    in reqs : bits[4]
+    out grant : bits[2] = 0
 
     Mask(x : bits[4]) : bits[4] <combines> {
         return x & 4'd7
@@ -2704,8 +2733,8 @@ fn mutually_exclusive_claim_emits_a_simulation_assertion() {
 module M {
     reg a : bits[8] = 0
     reg b : bits[8] = 0
-    input we_a : bits[1]
-    input we_b : bits[1]
+    in we_a : bits[1]
+    in we_b : bits[1]
 
     rule set_a {
         (we_a == 1)?
@@ -2749,8 +2778,8 @@ fn conflict_free_claim_waives_the_stall_but_emits_no_assertion() {
 module M {
     reg a : bits[8] = 0
     reg b : bits[8] = 0
-    input we_a : bits[1]
-    input we_b : bits[1]
+    in we_a : bits[1]
+    in we_b : bits[1]
 
     rule set_a {
         (we_a == 1)?
@@ -2820,7 +2849,7 @@ fn mem_read_address_is_a_local_bound_to_an_input() {
     let src = "\
 module M {
     mem m : bits[16][256]
-    input addr : bits[8]
+    in addr : bits[8]
     reg out : bits[16] = 0
     rule r {
         x := addr

@@ -1,8 +1,8 @@
 module Top {
     module Adder {
-        input a : bits[8]
-        input b : bits[8]
-        output sum : bits[8] = 0
+        in a : bits[8]
+        in b : bits[8]
+        out sum : bits[8] = 0
 
         rule add {
             sum := a + b
@@ -11,9 +11,9 @@ module Top {
 
     inst adder : Adder
 
-    input x : bits[8]
-    input y : bits[8]
-    output result : bits[8] = 0
+    in x : bits[8]
+    in y : bits[8]
+    out result : bits[8] = 0
 
     rule wire {
         adder.a := x

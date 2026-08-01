@@ -56,6 +56,15 @@ fn precedence_matches_rust_not_c() {
 }
 
 #[test]
+fn arith_shift_parses_at_the_same_precedence_as_shl_shr() {
+    // `>>>` is lexed greedily before `>>` (logos's own longest-match
+    // rule, not a manual priority) and shares `<<`/`>>`'s binding power.
+    assert_eq!(stmt_sexpr("x := a >>> 3"), "(:= x (>>> a 3))");
+    assert_eq!(stmt_sexpr("x := a >>> 1 + b"), "(:= x (>>> a (+ 1 b)))");
+    assert_eq!(stmt_sexpr("x := a >> 1 >>> 2"), "(:= x (>>> (>> a 1) 2))");
+}
+
+#[test]
 fn range_binds_loosest() {
     assert_eq!(stmt_sexpr("x := 0..N-1"), "(:= x (.. 0 (- N 1)))");
 }
@@ -359,13 +368,13 @@ module M
 fn reg_and_output_infer_type_from_a_sized_literal_init() {
     // Omitting `: ty` when initialized with a sized literal synthesizes
     // the identical `bits[width]` an explicit annotation would parse to.
-    let ast = parse_ok("module M {\n reg a = 8'd6\n output b = 16'hFF00\n}\n");
+    let ast = parse_ok("module M {\n reg a = 8'd6\n out b = 16'hFF00\n}\n");
     assert_eq!(
         ast.dump(),
         "\
 module M
   reg a : (index bits 8) = 8'd6
-  output b : (index bits 16) = 16'd65280
+  out b : (index bits 16) = 16'd65280
 ",
     );
 }
@@ -380,13 +389,13 @@ fn reg_without_type_or_sized_literal_init_is_an_error() {
 }
 
 #[test]
-fn mem_fifo_input_inst_still_require_an_explicit_type() {
-    // Type inference is reg/output-only (the only decls with an `= init`);
+fn mem_fifo_in_inst_still_require_an_explicit_type() {
+    // Type inference is reg/out-only (the only decls with an `= init`);
     // every other decl kind must still spell `: ty` out.
     for src in [
         "module M {\n mem m 8\n}\n",
         "module M {\n fifo f 8\n}\n",
-        "module M {\n input i 8\n}\n",
+        "module M {\n in i 8\n}\n",
         "module M {\n inst i Child\n}\n",
     ] {
         let (tokens, _) = lexer::lex(src);
@@ -402,15 +411,15 @@ fn mem_fifo_input_inst_still_require_an_explicit_type() {
 #[test]
 fn input_output_ports() {
     let ast = parse_ok(
-        "module M {\n input inc : bits[8]\n output sum : bits[8] = 0\n\
+        "module M {\n in inc : bits[8]\n out sum : bits[8] = 0\n\
          rule r {\n sum := sum + inc\n}\n}\n",
     );
     assert_eq!(
         ast.dump(),
         "\
 module M
-  input inc : (index bits 8)
-  output sum : (index bits 8) = 0
+  in inc : (index bits 8)
+  out sum : (index bits 8) = 0
   rule r
     (:= sum (+ sum inc))
 ",
@@ -476,6 +485,32 @@ fn bit_is_pure_sugar_for_bits_1() {
     // Bracket-applied, `bit` behaves as a mem element type exactly like
     // `bits[1]` would (`mem m : bit[16]` == `mem m : bits[1][16]`).
     assert_eq!(stmt_sexpr("x := bit[16]"), stmt_sexpr("x := bits[1][16]"));
+}
+
+#[test]
+fn u_n_is_sugar_for_bits_n() {
+    // `u8`/`u16`/... desugar to the identical `Bracket { Ident("bits"),
+    // [N] }` shape a literal `bits[N]` would produce -- same treatment
+    // as `bit`, but matched on an already-lexed `Ident`'s own text
+    // (`u_width`, parser.rs) rather than a fixed keyword, since `N` is
+    // unbounded.
+    assert_eq!(stmt_sexpr("x := u8"), stmt_sexpr("x := bits[8]"));
+    assert_eq!(stmt_sexpr("x := u32"), stmt_sexpr("x := bits[32]"));
+    // Not sugar: no digits, or a non-digit suffix -- an ordinary ident.
+    assert_eq!(stmt_sexpr("x := u"), "(:= x u)");
+    assert_eq!(stmt_sexpr("x := unused"), "(:= x unused)");
+    assert_eq!(stmt_sexpr("x := u8x"), "(:= x u8x)");
+}
+
+#[test]
+fn in_out_are_contextual_like_mem() {
+    // `in`/`out` are keywords only at declaration position, the same
+    // fallback `mem`/`fifo`/`reg` already get (see
+    // `decl_keywords_are_contextual`) -- a fifo literally named `in`/
+    // `out` (DESIGN.md's own `FifoBridge`-style naming, just shorter)
+    // still resolves as a plain identifier everywhere else.
+    assert_eq!(stmt_sexpr("out.Enq[x]"), "(index (. out Enq) x)");
+    assert_eq!(stmt_sexpr("x := in.Deq[]"), "(:= x (index (. in Deq)))");
 }
 
 #[test]

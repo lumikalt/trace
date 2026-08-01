@@ -14,11 +14,11 @@
 module ConflictFreeMem {
     mem m : bits[16][256]
 
-    input write_addr : bits[8]
-    input write_data : bits[16]
-    input write_en : bits[1]
-    input read_addr : bits[8]
-    output read_data : bits[16] = 0
+    in write_addr : bits[8]
+    in write_data : bits[16]
+    in write_en : bits[1]
+    in read_addr : bits[8]
+    out read_data : bits[16] = 0
 
     rule write {
         (write_en == 1)?

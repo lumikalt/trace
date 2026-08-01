@@ -1,11 +1,11 @@
 -- DESIGN.md's value-producing `race`: `A` and `B` both take exactly one
 -- tick, so they finish on the SAME cycle every time -- a genuine tie,
 -- not a timing accident. `race`'s tie-break (declared-first wins, same
--- convention as `prio`) means `out` must always come from `A`, never
+-- convention as `prio`) means `result` must always come from `A`, never
 -- `B`, no matter how many times this rule fires.
 module RaceValue {
-    input trigger : bits[1]
-    output out : bits[8] = 0
+    in trigger : bits[1]
+    out result : bits[8] = 0
 
     A(x : bits[8]) : bits[8] <sequences> {
         tick
@@ -20,6 +20,6 @@ module RaceValue {
         trigger?
         ha := spawn A(1)
         hb := spawn B(1)
-        out := tick race[ha, hb]
+        result := tick race[ha, hb]
     }
 }

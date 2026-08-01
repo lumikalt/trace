@@ -15,8 +15,8 @@ Outer(x : bits[8]) : bits[8] <combines> {
 }
 
 module Top {
-    input x : bits[8]
-    output result : bits[8] = 0
+    in x : bits[8]
+    out result : bits[8] = 0
 
     rule compute {
         result := Outer(x)
