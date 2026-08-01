@@ -263,6 +263,125 @@ module M {
 }
 
 #[test]
+fn fifo_enqueued_twice_in_one_rule_is_an_error() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg x : bits[8] = 0
+    rule r {
+        f.Enq[x]
+        f.Enq[x + 1]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("appears more than once") && e.message.contains("Enq"))
+    );
+}
+
+#[test]
+fn fifo_dequeued_twice_in_one_rule_is_an_error() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    rule r {
+        x := f.Deq[]
+        y := f.Deq[]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("appears more than once") && e.message.contains("Deq"))
+    );
+}
+
+#[test]
+fn let_bound_fifo_op_gates_the_rule() {
+    // A fifo op's failure condition must fold into the rule's guard
+    // whether it's bound with `:=` or `let` -- these are equally legal
+    // binding forms (DESIGN.md's "Locals"), and `let x = f.Deq[]` used
+    // to compile to an UNGATED rule (`fires_r = UInt<1>(1)`), silently
+    // reading __fifo_f_data even while the fifo was empty.
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg out : bits[8] = 0
+    rule r {
+        let x = f.Deq[]
+        out := x + 1
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = __fifo_f_valid"));
+    assert!(fir.contains("connect __fifo_f_valid, UInt<1>(0)"));
+}
+
+#[test]
+fn fifo_dequeued_twice_via_let_is_also_an_error() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg out : bits[8] = 0
+    rule r {
+        let x = f.Deq[]
+        let y = f.Deq[]
+        out := x + y
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("appears more than once") && e.message.contains("Deq"))
+    );
+}
+
+#[test]
+fn fifo_enqueued_twice_on_different_fifos_is_fine() {
+    // The check counts occurrences per fifo, not per rule -- enqueuing
+    // two DIFFERENT fifos once each is ordinary, unrelated work.
+    let src = "\
+module M {
+    fifo f : bits[8]
+    fifo g : bits[8]
+    reg x : bits[8] = 0
+    rule r {
+        f.Enq[x]
+        g.Enq[x]
+    }
+}
+";
+    emit_from_source(src).expect("emission should succeed");
+}
+
+#[test]
+fn let_bound_fifo_op_nested_in_if_is_an_error() {
+    // Same restriction as an `:=`-bound fifo op nested in if/while, but
+    // through the `let` binding form -- this used to compile silently
+    // (no error, no guard contribution at all) when the local was never
+    // referenced again, since `contains_fifo_op`'s nesting scan didn't
+    // look inside a `Stmt::Let`.
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg cond : bits[1] = 0
+    rule r {
+        if cond == 1 {
+            let x = f.Deq[]
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("nested in if/while")));
+}
+
+#[test]
 fn fifo_op_nested_in_if_is_an_error() {
     let src = "\
 module M {

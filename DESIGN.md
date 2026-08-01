@@ -371,9 +371,12 @@ Both failure conditions fold into the rule's guard exactly like an explicit `?`.
 sit at a rule's top level. A rule that both `Enq`s and `Deq`s the same fifo is a
 pass-through: this cycle's `Deq` reads the old value, this cycle's `Enq` writes
 the new one, and the combined guard is just "the fifo currently holds a value" —
-the `Enq` side's own guard is dropped for this specific pairing. Enqueuing (or
-dequeuing) the same fifo more than once in one rule is not guarded against: it is
-invalid input, and only the last operation's value survives.
+the `Enq` side's own guard is dropped for this specific pairing. Enqueuing, or
+dequeuing, the same fifo more than once in one rule is a compile-time error: a
+depth-1 buffer holds one word, so a second `Enq` would silently discard the
+first candidate value, and a second `Deq` would silently re-read the same
+value rather than advance to a new one. Use a `reg` instead if a rule needs to
+hold more than one candidate value in a cycle.
 
 An instance's ports are read and written through `.`: `adder.a := x` writes a
 child's input port; `result := adder.sum` reads a child's output port. Writing an

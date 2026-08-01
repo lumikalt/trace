@@ -254,6 +254,40 @@ module M {
 }
 
 #[test]
+fn fifo_contention_conflicts_through_a_let_binding_too() {
+    // Same contention as `fifo_contention_conflicts`, but bound with
+    // `let` instead of `:=` -- effects.rs's `infer_stmt` already walks
+    // into a `Stmt::Let`'s init generically, so this was never actually
+    // broken, unlike the firrtl.rs-level guard-gating gap the same
+    // `let`-binding form exposed there.
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg x : bits[8] = 0
+    reg y : bits[8] = 0
+    rule p {
+        let a = f.Deq[]
+        x := a
+    }
+    rule q {
+        let b = f.Deq[]
+        y := b
+    }
+}
+";
+    let (_, res, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    let on: Vec<&str> = group.conflicts[0]
+        .on
+        .iter()
+        .map(|d| res.def(*d).name.as_str())
+        .collect();
+    assert_eq!(on, ["f"]);
+}
+
+#[test]
 fn explain_names_the_derived_stall() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/subleq.tr"))
         .unwrap();

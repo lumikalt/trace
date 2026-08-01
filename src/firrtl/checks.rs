@@ -1,6 +1,7 @@
 //! Pre-compilation validation, run once per rule before any expression is
-//! compiled: guard/fifo-op placement (`check_guard_placement`) and a
-//! state-writing call only in an allowed position
+//! compiled: guard/fifo-op placement (`check_guard_placement`), at most
+//! one `Enq` and at most one `Deq` per fifo (`check_fifo_op_counts`), and
+//! a state-writing call only in an allowed position
 //! (`check_writing_call_positions`). Each violation is an explicit
 //! `Emitter::error`, never a silent skip — see mod.rs's module doc
 //! comment. A memory write MAY nest in `if`/`else` (threaded through a
@@ -10,10 +11,12 @@
 //! checked either. A rule enqueueing AND dequeueing the SAME fifo is
 //! likewise no longer a preflight rejection (see fifo.rs's module doc
 //! comment for the pass-through semantics `compile_guard`, not a check
-//! here, computes). A local reassigned at a rule's top level is no
-//! longer a preflight rejection either — `enter_rule`/`set_pos`
-//! (writes.rs) resolve each reference against a position-correct
-//! snapshot instead (see DESIGN.md's "Reassigned locals" section).
+//! here, computes) — but two `Enq`s (or two `Deq`s) of that same fifo
+//! still is one, since neither has a coherent meaning for a depth-1
+//! buffer. A local reassigned at a rule's top level is no longer a
+//! preflight rejection either — `enter_rule`/`set_pos` (writes.rs)
+//! resolve each reference against a position-correct snapshot instead
+//! (see DESIGN.md's "Reassigned locals" section).
 
 use super::Emitter;
 use super::calls::*;
@@ -21,6 +24,7 @@ use super::fifo::*;
 use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
 use crate::resolve::{DefKind, Resolution};
+use std::collections::HashMap;
 
 pub(crate) fn is_mem_write_to(ast: &Ast, res: &Resolution, stmt: StmtId, mem_name: &str) -> bool {
     let Stmt::Assign { lhs, .. } = ast.stmt(stmt) else {
@@ -71,6 +75,16 @@ impl<'a> Emitter<'a> {
                         );
                     }
                 }
+                Stmt::Let { init, .. } => {
+                    if self.fifo_op(init).is_some() && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a fifo operation after a state write is not yet supported \
+                             (v0 restriction): it must gate the whole rule"
+                                .to_string(),
+                        );
+                    }
+                }
                 Stmt::If { .. } | Stmt::While { .. } => {
                     if contains_guard(self.ast, *stmt) {
                         self.error(
@@ -89,6 +103,56 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// At most one `Enq` and at most one `Deq` per fifo per rule — a
+    /// second `Enq[x]` on the same fifo silently discards the first
+    /// candidate value (the buffer holds one word, so only the last
+    /// write lands), and a second `Deq[]` does not dequeue a second
+    /// value (there is nothing left to advance to); both are almost
+    /// certainly a mistake, not the one-`Enq`-plus-one-`Deq`
+    /// pass-through this emitter does support (fifo.rs's module doc
+    /// comment). Enqueuing one fifo and dequeuing a DIFFERENT one is
+    /// unaffected — this counts occurrences per fifo, not per rule.
+    pub(crate) fn check_fifo_op_counts(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        let mut enqs: HashMap<String, Vec<StmtId>> = HashMap::new();
+        let mut deqs: HashMap<String, Vec<StmtId>> = HashMap::new();
+        for stmt in &body {
+            let Some((fifo, is_enq, _)) = self.fifo_op_stmt(*stmt) else {
+                continue;
+            };
+            let bucket = if is_enq { &mut enqs } else { &mut deqs };
+            bucket.entry(fifo).or_default().push(*stmt);
+        }
+        for (kind, map, message) in [
+            (
+                "Enq",
+                &enqs,
+                "only the last value would land, silently discarding the earlier \
+                 one(s); use a `reg` if you need to hold more than one candidate \
+                 value in a cycle",
+            ),
+            (
+                "Deq",
+                &deqs,
+                "every `Deq[]` this cycle reads the same value rather than \
+                 advancing to a new one; bind it to a local once and reuse that \
+                 local",
+            ),
+        ] {
+            let mut fifos: Vec<&String> = map.keys().collect();
+            fifos.sort();
+            for fifo in fifos {
+                let stmts = &map[fifo];
+                if stmts.len() > 1 {
+                    self.error(
+                        self.ast.stmt_spans[stmts[1].0 as usize].clone(),
+                        format!("`{fifo}.{kind}` appears more than once in this rule; {message}"),
+                    );
+                }
             }
         }
     }

@@ -300,7 +300,7 @@ impl<'a> Emitter<'a> {
                         conds.push(rule_fifo_guard_cond(&fifo, saw_enq, saw_deq));
                     }
                 }
-                Stmt::Assign { rhs, .. } => {
+                Stmt::Assign { rhs, .. } | Stmt::Let { init: rhs, .. } => {
                     if let Some((fifo, ..)) = self.fifo_op(rhs)
                         && fifo_conds_emitted.insert(fifo.clone())
                     {

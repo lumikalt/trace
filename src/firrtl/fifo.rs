@@ -70,7 +70,7 @@ pub(crate) fn is_fifo_op(ast: &Ast, res: &Resolution, expr: ExprId) -> bool {
 pub(crate) fn contains_fifo_op(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool {
     match ast.stmt(stmt) {
         Stmt::Expr(e) => is_fifo_op(ast, res, *e),
-        Stmt::Assign { rhs, .. } => is_fifo_op(ast, res, *rhs),
+        Stmt::Assign { rhs, .. } | Stmt::Let { init: rhs, .. } => is_fifo_op(ast, res, *rhs),
         Stmt::If {
             then_body,
             else_body,
@@ -108,13 +108,16 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The fifo op directly reachable from `stmt`, if any — the two
-    /// shapes DESIGN.md's examples use: `x := f.Deq[]` and a bare
-    /// `f.Enq[x]` statement.
+    /// The fifo op directly reachable from `stmt`, if any — the shapes
+    /// DESIGN.md's examples use (`x := f.Deq[]`, a bare `f.Enq[x]`
+    /// statement) plus `let x = f.Deq[]`, an equally legal binding form
+    /// (see DESIGN.md's "Locals") that must resolve to the identical fifo
+    /// op its `:=` counterpart would.
     pub(crate) fn fifo_op_stmt(&self, stmt: StmtId) -> Option<(String, bool, Option<ExprId>)> {
         let expr = match self.ast.stmt(stmt) {
             Stmt::Expr(e) => *e,
             Stmt::Assign { rhs, .. } => *rhs,
+            Stmt::Let { init, .. } => *init,
             _ => return None,
         };
         self.fifo_op(expr)
