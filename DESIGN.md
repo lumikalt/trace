@@ -204,25 +204,118 @@ compiler reports the cost: how many segments, how many saved bits.
 
 These three constructs compose sequenced code. All three lower to rules and registers.
 
-**`spawn`** starts a parallel FSM. It allocates a new continuation register. Spawn
-counts must be static, because dynamic allocation needs `elaborates`. A spawn inside a
-circuit-value loop is a type error.
+**Design pass, 2026-08-01 — concretizing this section from prose into an actual
+lowering algorithm (three real forks, not derived from
+recollection) before any implementation started.** Recon (an Explore agent, plus
+advisor review of its findings) established that unlike every other gap closed this
+session, this one has NO small end-to-end-provable slice: a meaningful `spawn` needs
+its callee to be its own multi-cycle `<sequences>` computation with an independent
+continuation FSM, so the minimum that reaches real Verilog is spawn + sync + handle
+typing + generalizing the tick-lowering machinery all at once. The three forks below
+are now DECIDED; the algorithm that follows reflects them. Implementation has not
+started as of this writing — this section is the design-pass deliverable, written
+before touching `lower.rs`/`types.rs`/`effects.rs`.
 
-**`sync`** joins parallel FSMs. It lowers to a rule guarded on the conjunction of the
-joined continuations reaching their end states.
+**Fork 1 — cycle boundaries: explicit `tick`, `sync` is sugar for a guard.** The
+original sketch below had zero `tick`s, implying `sync` itself was some kind of
+implicit segment boundary. Decided against that: `sync(h1, h2)` instead lowers to two
+ordinary guards, `(h1_done == 1)? (h2_done == 1)?`, inserted into whatever segment it
+already occupies — reusing the "blocked step" semantics this document already
+establishes for a tick segment ("a guard inside the segment fails, the rule aborts for
+this cycle, the continuation register keeps its value, the segment retries next
+cycle... not a new concept"). This needs zero new segmentation-trigger machinery; the
+only cost is that the example below now needs an explicit `tick` between the spawns
+and the sync+use, matching how every other multi-cycle boundary in this language is
+already written.
 
-**`race`** takes the first of several sequenced computations to complete. The
-competing continuations write the same result register. They become conflicting rules.
-Arbitration falls out of the ordinary scheduler; there is no separate arbiter construct.
+**Fork 2 — handle typing: a new `Ty::Handle(Box<Ty>)`.** `h1 := spawn ReadBank(...)`
+types `h1` as `Ty::Handle(ReadBank's return type)`. Field access on a
+`Ty::Handle`-typed base is a small addition next to `types.rs`'s existing
+instance-port `Expr::Field` special case (`instance_module_of`) — `.result` yields the
+wrapped type directly, `.done` (needed internally for `sync`'s lowering, and exposed
+to the user for free) yields `bits[1]`. This replaces the current "fields on handles
+are untyped in v0, always `Ty::Unknown`" behavior.
+
+**Fork 3 — `race`'s destination: an ordinary builtin call, inferred from `:=`.**
+`winner := race(h1, h2)` — `winner` becomes the shared register every racing handle's
+own final segment writes to, matching how every other builtin in this language
+(`prio`, `trunc`, `pack`) already infers its target from an enclosing `:=` rather than
+needing dedicated statement syntax. Arbitration is genuinely just the ordinary
+scheduler: both racing handles' final segments conditionally write `winner` (gated on
+their own `done` flipping this cycle), which is an ordinary WriteWrite conflict the
+existing urgency/derived-stall machinery already resolves — DESIGN.md's own framing
+("arbitration falls out of the ordinary scheduler; there is no separate arbiter
+construct") holds exactly, no new scheduling concept needed.
+
+**The lowering algorithm, spawn.** `spawn Callee(args)` requires `Callee` to be a
+`<sequences>`-declared `fn` (the one genuinely new callable shape this introduces —
+every other synthesizable call today is combinational, inlined by `calls.rs`).
+Spawning is macro-expansion, not module instantiation, consistent with how this
+compiler already inlines every other call: at the spawn's call site, `Callee`'s own
+body (its own `tick`s) gets cut into segments by the SAME segmentation/capture
+algorithm `lower.rs` already runs per rule (`plan_rule`'s `Segment`/`CapturedLocal`
+machinery), but scoped to a FRESH continuation register unique to this spawn
+occurrence (named from the bound local, e.g. `__cont_h1`), with `Callee`'s parameters
+substituted from the call site's own arguments (the same substitution `calls.rs`
+already does for combinational calls, just carried across the spawned body's ticks
+instead of resolved in one step). Two new per-spawn registers, alongside the usual
+per-capture save registers: `__done_h1 : bits[1]` (starts / resets to 0 whenever the
+spawn is (re)triggered, set to 1 by the callee's own LAST segment — kept separate from
+the continuation counter specifically to avoid the "cont == 0" ambiguity between
+"never started" and "just wrapped after finishing") and `__result_h1 : <Callee's
+return type>` (written by the callee's last segment's `return` expression, the same
+"save register" pattern `CapturedLocal` already uses for a value crossing a tick, just
+for the return value specifically). `h1.result` reads `__result_h1`; `h1.done` (used
+internally by `sync`, see below) reads `__done_h1`.
+
+**`spawn` must stay top-level in its enclosing segment** — the SAME restriction
+`tick` already has (no nesting in `if`/`while`) — which is what makes "spawn counts
+are static" (DESIGN.md's original constraint) fall out for free: no loop construct can
+ever contain a spawn, so there is no dynamic spawn count to reason about, and no new
+check is needed beyond the existing nested-tick/nested-construct scan `lower.rs`
+already runs.
+
+**`sync(h1, h2)`** lowers, per fork 1, to `(h1.done == 1)? (h2.done == 1)?` — two
+ordinary guards inserted in place of the call, gating the segment they're written in
+exactly like any other guard. The segment containing `sync` therefore doesn't fire
+(and doesn't advance its OWN enclosing continuation) until both spawned FSMs have
+finished; this is the existing "blocked step" retry semantics, unchanged.
 
 ```
 Fetch2(pc : bits[16]) <sequences> {
     h1 := spawn ReadBank(bank0, pc)
     h2 := spawn ReadBank(bank1, pc + 1)
-    sync(h1, h2)                        -- both reads have landed
+    tick
+    sync(h1, h2)                        -- guards this segment; retries until both land
     ir := pack(h1.result, h2.result)
 }
 ```
+
+**`race(h1, h2)` is DEFERRED — fork 3's "ordinary scheduler" framing turned out to be
+wrong, caught by advisor review before implementation started.** The scheduler's
+urgency/derived-stall machinery only arbitrates a *same-cycle* write conflict; race's
+actual semantics is "*first* handle to complete wins," a cross-cycle property the
+scheduler does nothing about. Concrete failure: h1 completes on cycle 5 and writes
+`winner`; h2 completes on cycle 8 and unconditionally overwrites it — race silently
+returns the second finisher, not the first. Gating each write on "my own `done` flipped
+this cycle" doesn't fix it; a genuinely correct lowering needs a latch ("has any racer
+already won?") that permanently blocks every loser's write, including a loser that
+retries into the same segment on a later cycle under the blocked-step model. That
+latch/cancellation story isn't designed yet, and there is no `race` example anywhere in
+this document to prove one against — so `race` stays out of scope for the coming
+implementation pass. Revisit once spawn+sync are real and there's a concrete multi-spawn
+example to design the cancellation latch against.
+
+**Not yet implemented: this is the concretized design for `spawn` + `sync`, not shipped
+code.** `race` is explicitly excluded per above. The next step is `types.rs`'s
+`Ty::Handle` addition, `lower.rs`'s per-spawn segmentation (the largest single piece —
+it reuses `plan_rule`'s machinery but needs it callable at an arbitrary spawn site, not
+just once per rule, and needs the callee's own internal save/capture registers prefixed
+per spawn occurrence so two spawns of the same callee — e.g. Fetch2's two `ReadBank`
+spawns — don't collide on shared register names), and `effects.rs` gaining a real check
+that a `spawn`'s callee is actually `<sequences>`-declared (today `spawn` accepts any
+expression). Each piece needs its own real end-to-end proof through firtool + Icarus,
+per this document's usual bar — there is no smaller slice to prove first.
 
 ## `chooses`: specification, not synthesis
 
@@ -763,9 +856,9 @@ a RAM, not for booting a CPU from a cold `mem`, since `step`/`refill` start firi
 instant `reset` clears, racing any port-driven load sequence. The actual open design
 question was never "can this be built" (an extra `input` gating the CPU rules' guards
 was already sketched above as structurally obvious) but "how does loading ever finish" —
-put to Lumi via AskUserQuestion since it's a real design fork, not a fact to derive:
+since it's a real design fork, not a fact to derive:
 a fixed word count baked into the hardware (auto-completing after N loads) vs. an
-external `boot_done` pulse the loader asserts whenever it's actually done. **Lumi picked
+external `boot_done` pulse the loader asserts whenever it's actually done. **Picked
 the pulse** — it makes no assumption about program length or how the words arrive (a
 real UART or SPI-flash loader has no reason to know the count up front, or to write
 every word contiguously with zero gaps).
@@ -919,8 +1012,7 @@ verified against real firtool.
 **Achieved 2026-08-01.** A local reassigned at a rule's top level (`x := a  ...  x := b`)
 now resolves each reference against whatever binding was active AT THAT READ'S OWN
 TEXTUAL POSITION, not the local's final one — closing the gap the previous section left
-as an explicit v0 error. Picked directly off TODO.md, alongside two other candidates
-(spawn/sync/race synthesis, a much larger feature) offered via AskUserQuestion.
+as an explicit v0 error.
 
 **Why the old design couldn't just drop its rejection.** `Emitter::locals:
 HashMap<DefId, ExprId>` mapped each local to ONE binding, built by a single up-front
@@ -1216,8 +1308,7 @@ BY CONSTRUCTION: it types directly as `Ty::Bits(Width::Known(width))` and is
 range-checked immediately, against its OWN declared width, right where it's written —
 `4'd20` is an error ("20 does not fit in bits[4]") even in a context that could
 otherwise absorb a wider value, and this doesn't defer to `check_literal_fits` the way
-a bare `Int` would. Confirmed with Lumi via AskUserQuestion before implementing:
-overflow is a compile error, not silent truncation like Verilog's own `4'd20` = 4 —
+a bare `Int` would. Overflow is a compile error, not silent truncation like Verilog's own `4'd20` = 4 —
 keeping trace's existing anti-silent-truncation stance (the same reasoning behind
 requiring an explicit `trunc()` call elsewhere) rather than adopting Verilog's
 behavior just because the syntax is borrowed from it.
@@ -1322,8 +1413,7 @@ its own atomic token (`BangEq`), never composed from unary `!` + `=`, so nothing
 way, that would be a pure surface-syntax aesthetic choice, not a technical consequence.
 
 Given a genuine choice between "`!` is pure sugar for `~`" and "`!` is a distinct
-operator that additionally REQUIRES `bits[1]`," Lumi picked the latter via
-AskUserQuestion — a real guardrail, not just an alternate spelling: `!x` on a `bits[8]`
+operator that additionally REQUIRES `bits[1]`," `!x` on a `bits[8]`
 almost certainly means "did you mean a comparison, or `~`?", not "flip every bit," and
 now gets caught at type-check time instead of silently compiling to a bitwise complement
 nobody intended. Mechanism: `types.rs`'s `Expr::Unary` arm (previously ignoring `op`
