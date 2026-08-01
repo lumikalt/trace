@@ -32,7 +32,7 @@ use super::fifo::*;
 use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
 use crate::lexer::Span;
-use crate::resolve::{DefKind, Resolution};
+use crate::resolve::{DefKind, Resolution, is_guard_like};
 use std::collections::HashMap;
 
 pub(crate) fn is_mem_write_to(ast: &Ast, res: &Resolution, stmt: StmtId, mem_name: &str) -> bool {
@@ -76,7 +76,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 Stmt::Expr(e) => {
-                    if matches!(self.ast.expr(e), Expr::Guard(_)) && seen_write {
+                    if is_guard_like(self.ast, self.res, e) && seen_write {
                         self.error(
                             self.ast.expr_spans[e.0 as usize].clone(),
                             "a guard after a state write is not yet supported (v0 \
@@ -119,7 +119,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 Stmt::If { .. } | Stmt::While { .. } => {
-                    if contains_guard(self.ast, *stmt) {
+                    if contains_guard(self.ast, self.res, *stmt) {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
                             "a guard nested in if/while is not yet supported (v0 restriction)"
@@ -418,12 +418,12 @@ impl<'a> Emitter<'a> {
         let top_level_guards = body
             .iter()
             .filter(|s| {
-                matches!(self.ast.stmt(**s), Stmt::Expr(e) if matches!(self.ast.expr(*e), Expr::Guard(_)))
+                matches!(self.ast.stmt(**s), Stmt::Expr(e) if is_guard_like(self.ast, self.res, *e))
             })
             .count();
         let any_guards = body
             .iter()
-            .filter(|s| contains_guard(self.ast, **s))
+            .filter(|s| contains_guard(self.ast, self.res, **s))
             .count();
         let top_level_fifo_ops = body
             .iter()
@@ -515,20 +515,20 @@ pub(crate) fn is_state_write(ast: &Ast, res: &Resolution, lhs: ExprId) -> bool {
     }
 }
 
-pub(crate) fn contains_guard(ast: &Ast, stmt: StmtId) -> bool {
+pub(crate) fn contains_guard(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool {
     match ast.stmt(stmt) {
-        Stmt::Expr(e) => matches!(ast.expr(*e), Expr::Guard(_)),
+        Stmt::Expr(e) => is_guard_like(ast, res, *e),
         Stmt::If {
             then_body,
             else_body,
             ..
         } => {
-            then_body.iter().any(|s| contains_guard(ast, *s))
+            then_body.iter().any(|s| contains_guard(ast, res, *s))
                 || else_body
                     .as_ref()
-                    .is_some_and(|b| b.iter().any(|s| contains_guard(ast, *s)))
+                    .is_some_and(|b| b.iter().any(|s| contains_guard(ast, res, *s)))
         }
-        Stmt::While { body, .. } => body.iter().any(|s| contains_guard(ast, *s)),
+        Stmt::While { body, .. } => body.iter().any(|s| contains_guard(ast, res, *s)),
         _ => false,
     }
 }

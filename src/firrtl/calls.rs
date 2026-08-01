@@ -17,7 +17,7 @@ use super::Emitter;
 use super::writes::item_name;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::lexer::Span;
-use crate::resolve::{DefId, DefKind, Resolution};
+use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
 
 /// Every `fn`/`impl` item directly called anywhere within `stmts` — a
 /// `let`'s init, the tail return expression, a state write's RHS, an
@@ -670,13 +670,20 @@ impl<'a> Emitter<'a> {
         let saved = self.bind_callee_context(&params, args, &body);
         let mut conds = Vec::new();
         for stmt in &body {
-            if let Stmt::Expr(e) = self.ast.stmt(*stmt)
-                && let Expr::Guard(inner) = self.ast.expr(*e)
-            {
-                conds.push(
-                    self.compile_expr(*inner)
-                        .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
-                );
+            if let Stmt::Expr(e) = self.ast.stmt(*stmt).clone() {
+                if let Expr::Guard(inner) = self.ast.expr(e) {
+                    conds.push(
+                        self.compile_expr(*inner)
+                            .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
+                    );
+                } else if is_guard_like(self.ast, self.res, e) {
+                    // An implicit guard: `e` itself IS the condition,
+                    // no `Guard` wrapper to unwrap.
+                    conds.push(
+                        self.compile_expr(e)
+                            .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
+                    );
+                }
             }
         }
         self.restore_callee_context(saved);
@@ -712,12 +719,14 @@ impl<'a> Emitter<'a> {
             Stmt::Let { .. } | Stmt::Assign { .. } => true,
             // A bare-statement CALL (its return value unused, e.g. for a
             // side-effecting write) is allowed; nothing else bare — a
-            // guard or fifo op would already have set `sig.fails`,
-            // rejected by `validate_call` before this ever runs, so
-            // this is deliberately narrower than "any Expr statement".
+            // guard (explicit `?` or implicit, `resolve::is_guard_like`)
+            // or fifo op would already have set `sig.fails`, rejected
+            // by `validate_call` before this ever runs, so this is
+            // deliberately narrower than "any Expr statement".
             Stmt::Expr(e) => {
-                matches!(self.ast.expr(*e), Expr::Call { .. } | Expr::Guard(_))
+                matches!(self.ast.expr(*e), Expr::Call { .. })
                     || self.fifo_op(*e).is_some()
+                    || is_guard_like(self.ast, self.res, *e)
             }
             _ => false,
         }) {

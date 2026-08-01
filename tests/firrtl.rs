@@ -2163,6 +2163,112 @@ module Top {
 }
 
 #[test]
+fn a_bare_condition_implicitly_folds_into_the_rule_guard() {
+    // `a != 0` alone (no `?`) means the same thing as `(a != 0)?`.
+    let src = "\
+module M {
+    in a : bits[8]
+    out result : bits[8] = 0
+    rule compute {
+        a != 0
+        result := a
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_compute = neq(a, UInt<8>(0))"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn a_bare_bit_select_implicitly_folds_into_the_rule_guard() {
+    // The OTHER example from the request that motivated this feature
+    // (`A[b]` alongside `a == 1`): a single (non-slice) bit-select is
+    // always exactly bits[1] by construction, so `flags[i]` alone
+    // means the same thing as `(flags[i])?` -- a different code path
+    // through `is_guard_like` than a comparison (`Expr::Bracket`, not
+    // `Expr::Binary`), and a different one again from a fifo op's own
+    // `Enq`/`Deq` Bracket shape.
+    let src = "\
+module M {
+    in flags : bits[8]
+    in i : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        flags[i]
+        result := flags
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = bits(dshr(flags, i), 0, 0)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_callees_bare_implicit_guard_also_folds_into_the_callers_guard() {
+    // Same fold as `call_folds_a_callees_bare_guard_into_the_callers_
+    // own_guard` above, but the callee's condition has no `?` -- proves
+    // `callee_fail_cond` (calls.rs) handles the implicit case too, not
+    // just an explicit `Expr::Guard`.
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    x != 0
+    return x
+}
+module Top {
+    in a : bits[8]
+    out result : bits[8] = 0
+    rule compute {
+        result := Classify(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_compute = neq(a, UInt<8>(0))"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn a_bare_condition_after_a_state_write_is_an_error() {
+    let src = "\
+module M {
+    reg a : bits[1] = 0
+    reg b : bits[1] = 0
+    rule r {
+        b := 1
+        a == 1
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("guard") && e.message.contains("state write"))
+    );
+}
+
+#[test]
+fn a_bare_condition_nested_in_if_is_an_error() {
+    let src = "\
+module M {
+    reg a : bits[1] = 0
+    reg b : bits[1] = 0
+    rule r {
+        if a == 1 {
+            b == 1
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("guard") && e.message.contains("if/while"))
+    );
+}
+
+#[test]
 fn call_folds_a_guard_and_threads_a_state_write_from_the_same_callee() {
     // The untested intersection between the guard fold and the
     // existing write-hunt: `Bump`'s body both guards AND writes `v` —

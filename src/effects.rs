@@ -25,7 +25,7 @@
 
 use crate::ast::{Ast, Effect, Expr, ExprId, FnKind, Item, ItemId, Stmt, StmtId};
 use crate::lexer::Span;
-use crate::resolve::{DefId, DefKind, Resolution};
+use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -226,7 +226,18 @@ impl<'a> Checker<'a> {
 
     fn infer_stmt(&self, id: StmtId, sig: &mut EffectSig) {
         match self.ast.stmt(id) {
-            Stmt::Expr(e) => self.infer_expr(*e, sig),
+            Stmt::Expr(e) => {
+                // A bare expression whose value is left unused — not a
+                // call, fifo op, or spawn, each of which already has
+                // its own independent bare-statement meaning —
+                // implicitly gates this rule, the same as an explicit
+                // `e?` would (whose own `Expr::Guard` arm below also
+                // sets this, redundantly but harmlessly).
+                if is_guard_like(self.ast, self.res, *e) {
+                    sig.fails = true;
+                }
+                self.infer_expr(*e, sig);
+            }
             Stmt::Assign { lhs, rhs } => {
                 self.infer_expr(*rhs, sig);
                 self.infer_write(*lhs, sig);
@@ -426,7 +437,25 @@ impl<'a> Checker<'a> {
                     self.check_stmt(s, item, sig, elab);
                 }
             }
-            Stmt::Expr(e) => self.check_expr(e, item, sig, elab),
+            Stmt::Expr(e) => {
+                // Explicit `e?` gets this same error from `Expr::Guard`'s
+                // own arm below (via the recursive `check_expr` call);
+                // excluded here so an elaboration-time guard doesn't
+                // get reported twice.
+                if elab
+                    && is_guard_like(self.ast, self.res, e)
+                    && !matches!(self.ast.expr(e), Expr::Guard(_))
+                {
+                    self.error(
+                        span,
+                        "an unused value here implicitly guards the enclosing scope \
+                         (the same thing writing `?` would do), which cannot fail at \
+                         elaboration time (no transaction to abort)"
+                            .to_string(),
+                    );
+                }
+                self.check_expr(e, item, sig, elab)
+            }
             Stmt::Assign { lhs, rhs } => {
                 self.check_expr(lhs, item, sig, elab);
                 self.check_expr(rhs, item, sig, elab);

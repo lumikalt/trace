@@ -49,6 +49,19 @@ rule drain {
 }
 ```
 
+`?` is optional sugar, not required: any expression sitting alone as a
+statement — its value computed and then left unused — implicitly guards the
+rule the same way, so `mode == Draining` alone means the same thing as
+`(mode == Draining)?`. This applies to a fifo op, a call, and a `spawn` too
+in the sense that each already has its own established meaning as a bare
+statement (a call may or may not fail on its own terms; a fifo op's fail
+condition already folds in on its own; a `spawn`'s handle being unused is
+the point) — none of those need `?`, and writing one there wouldn't add
+anything. Anything else bare must be `bits[1]`, the same requirement an
+`if`/`while` condition already has; a bare non-`bits[1]` expression (its
+value computed and discarded for no reason) is a compile-time error rather
+than silently doing nothing.
+
 ## Effects
 
 Effects give each piece of hardware a static "color". The type checker enforces

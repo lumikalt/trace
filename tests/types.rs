@@ -305,6 +305,80 @@ module M {
 }
 
 #[test]
+fn a_bare_condition_implicitly_guards_and_must_be_bits_1() {
+    // `a == 1` alone (no `?`, value unused) now means the same thing
+    // as `(a == 1)?` -- including the bits[1] enforcement `if`/`while`
+    // conditions already get.
+    run_ok(
+        "module M {\n reg a : bits[8] = 0\n reg b : bits[8] = 0\n rule r {\n a == 1\n b := 1\n }\n}\n",
+    );
+
+    // A bare non-bits[1] expression (its value computed and left
+    // unused) is now a type error instead of silently compiling to
+    // dead code.
+    let src = "\
+module M {
+    reg a : bits[8] = 0
+    reg b : bits[8] = 0
+
+    rule r {
+        a
+        b := 1
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("bits[1]"));
+}
+
+#[test]
+fn a_bare_mem_read_wider_than_one_bit_is_a_clean_type_error() {
+    // A mem read (`m[addr]`) is `Expr::Bracket`, the SAME AST shape a
+    // fifo op and a bit-select both use -- sitting bare, it's neither
+    // (not a fifo: `m` isn't a fifo def), so it's guard-like and must
+    // be bits[1]. Its element type here is bits[8], so this must be a
+    // clean type error, not a panic (e.g. in firrtl's read-port
+    // collection, which walks bare statements too).
+    let src = "\
+module M {
+    mem m : bits[8][256]
+    reg pc : bits[8] = 0
+    reg b : bits[8] = 0
+
+    rule r {
+        m[pc]
+        b := 1
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("bits[1]"));
+}
+
+#[test]
+fn an_explicit_guards_inner_expression_must_also_be_bits_1() {
+    // Closes a latent gap: `expr?`'s inner expression was previously
+    // never bits[1]-checked at all (passthrough typing). It now gets
+    // exactly the same enforcement the new implicit-guard case does.
+    let src = "\
+module M {
+    reg a : bits[8] = 0
+    reg b : bits[8] = 0
+
+    rule r {
+        a?
+        b := 1
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("bits[1]"));
+}
+
+#[test]
 fn logical_not_needs_a_bits_1_operand() {
     // `!` and `~` compile to the identical FIRRTL `not` primop (see
     // firrtl/expr.rs) -- what makes `!` a real, distinct operator rather

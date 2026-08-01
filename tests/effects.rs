@@ -249,6 +249,17 @@ fn guards_forbidden_at_elaboration_time() {
 }
 
 #[test]
+fn implicit_guards_forbidden_at_elaboration_time_too() {
+    // A bare (no `?`) condition implicitly guards, same as an explicit
+    // `expr?` -- and is rejected identically in an elaboration-time
+    // body, with exactly one error (not two: the explicit-Guard arm
+    // must not ALSO fire for this).
+    let (_, _, errors) = run("H(x : bits[8]) : bits[8] <elaborates> {\n x != 0\n return x\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("elaboration time"));
+}
+
+#[test]
 fn spawn_callee_must_itself_be_sequences() {
     let src = "\
 Fast(x : bits[8]) : bits[8] <combines> {

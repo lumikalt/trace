@@ -20,7 +20,7 @@
 
 use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Stmt, StmtId, UnOp};
 use crate::lexer::Span;
-use crate::resolve::{DefId, DefKind, Resolution};
+use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,7 +480,18 @@ impl<'a> TypeChecker<'a> {
     fn type_stmt(&mut self, id: StmtId, locals: &mut HashMap<DefId, Ty>, ret: Option<&Ty>) {
         match self.ast.stmt(id).clone() {
             Stmt::Expr(e) => {
-                self.type_expr(e, locals);
+                // A bare expression left unused implicitly guards the
+                // rule (`resolve::is_guard_like`) -- explicit `e?`
+                // included, since `type_expr(Guard(inner))` already
+                // passes through to `inner`'s own type -- so it gets
+                // the same bits[1] enforcement an `if`/`while`
+                // condition already gets. Anything else bare (a call,
+                // fifo op, spawn) keeps its own independent type.
+                if is_guard_like(self.ast, self.res, e) {
+                    self.check_cond(e, locals);
+                } else {
+                    self.type_expr(e, locals);
+                }
             }
             Stmt::Assign { lhs, rhs } => {
                 let rhs_ty = self.type_expr(rhs, locals);

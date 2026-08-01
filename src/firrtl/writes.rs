@@ -24,7 +24,7 @@ use super::Emitter;
 use super::checks::*;
 use super::fifo::*;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Stmt, StmtId};
-use crate::resolve::{DefId, DefKind, Resolution};
+use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
 use crate::types::{Ty, Width};
 use std::collections::HashMap;
 
@@ -313,6 +313,13 @@ impl<'a> Emitter<'a> {
                             && let Some(cond) = self.callee_fail_cond(e, callee, &args)
                         {
                             conds.push(cond);
+                        } else if is_guard_like(self.ast, self.res, e) {
+                            // An implicit guard: `e` itself IS the
+                            // condition, no `?` wrapper to unwrap.
+                            conds.push(
+                                self.compile_expr(e)
+                                    .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
+                            );
                         }
                     }
                 }

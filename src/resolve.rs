@@ -115,6 +115,62 @@ impl Resolution {
     }
 }
 
+/// A bare expression sitting alone at statement position implicitly
+/// gates its enclosing rule/callee body — the same thing an explicit
+/// `expr?` guard does — UNLESS it is already self-describing there: a
+/// call (may or may not fail on its own terms; already has
+/// independent, established bare-statement semantics that this must
+/// not silently change), a fifo op (`Enq`/`Deq`, whose own fail
+/// condition already folds into the guard on its own), a `spawn`
+/// (fire-and-forget is the whole point of an unused handle, not a
+/// condition to test), or a bracket-dispatched builtin (`sync[...]`/
+/// `race[...]`, which use brackets for the same fallibility-marking
+/// convention `Enq`/`Deq` do, and already have their own meaning as a
+/// bare statement). Anything else sitting bare — `a == 1`, a
+/// single bit-select `A[b]`, a bare boolean local — means the same
+/// thing whether or not it's written with `?`; `types.rs` separately
+/// enforces that it's actually `bits[1]` (the same check `if`/`while`
+/// conditions already get), so this predicate itself needs no type
+/// info and can run as early as effects.rs.
+///
+/// The single point every guard-placement/-folding question in the
+/// compiler routes through — effects.rs (`fails` inference), types.rs
+/// (the bits[1] check), and firrtl's guard-placement/-folding
+/// (`checks.rs`, `calls.rs`, `writes.rs`) all call this rather than
+/// each re-deriving "is this guard-like," the same rationale fifo.rs's
+/// `rule_fifo_ops` documents for fifo-touch questions: independent
+/// re-derivations drift out of agreement with each other.
+pub fn is_guard_like(ast: &Ast, res: &Resolution, expr: ExprId) -> bool {
+    match ast.expr(expr) {
+        Expr::Guard(_) => true,
+        Expr::Call { .. } | Expr::Spawn(_) => false,
+        Expr::Bracket { callee, .. } => {
+            // A builtin dispatched via brackets (`sync[h1, h2]`,
+            // `race[h1, h2]`) already has its own established bare-
+            // statement meaning — same exclusion rationale as `Call`,
+            // just reached through the bracket-for-fallibility
+            // convention instead of parens.
+            if res
+                .expr_defs
+                .get(callee)
+                .is_some_and(|d| res.def(*d).kind == DefKind::Builtin)
+            {
+                return false;
+            }
+            let Expr::Field { base, name } = ast.expr(*callee) else {
+                return true;
+            };
+            let is_fifo_op = matches!(name.as_str(), "Enq" | "Deq")
+                && res
+                    .expr_defs
+                    .get(base)
+                    .is_some_and(|d| res.def(*d).kind == DefKind::Fifo);
+            !is_fifo_op
+        }
+        _ => true,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveError {
     pub span: Span,
