@@ -123,9 +123,22 @@ pub struct ResolveError {
 
 /// Callable names with no user definition. `sync`/`race` parse as idents;
 /// `prio` is a priority encoder; the rest are the primitive vocabulary
-/// DESIGN.md examples assume.
+/// DESIGN.md examples assume. `__race_value` is compiler-internal —
+/// lower.rs's own rendering of a value-producing `race[...]`, never
+/// written by a user (see types.rs's `type_builtin_call`).
 const BUILTINS: &[&str] = &[
-    "bits", "wire", "list", "any", "clog2", "pack", "trunc", "len", "sync", "race", "prio",
+    "bits",
+    "wire",
+    "list",
+    "any",
+    "clog2",
+    "pack",
+    "trunc",
+    "len",
+    "sync",
+    "race",
+    "prio",
+    "__race_value",
 ];
 
 pub fn resolve(ast: &Ast) -> (Resolution, Vec<ResolveError>) {

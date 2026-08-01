@@ -186,7 +186,11 @@ opens does not fire until `<expr>` succeeds; until then, the rule retries every
 cycle without otherwise progressing. Bare `tick` is shorthand for a trailing
 expression that always succeeds. `<expr>` follows the same rule as any other
 fallible operation: an explicit `cond?` guard, or an already-fallible bracket
-operation such as `sync[h1, h2]` (see "`spawn` and `sync`" below).
+operation such as `sync[h1, h2]` (see "`spawn`, `sync`, and `race`" below).
+`tick` may also sit right after `:=`/`let name =`, letting it gate an
+assignment's own right-hand side instead of standing alone:
+`value := tick race[h1, h2]` is exactly `tick` followed by `value :=
+race[h1, h2]`, just spelled on one line.
 
 ### `spawn`, `sync`, and `race`
 
@@ -276,15 +280,49 @@ module FirstWins {
 `race[h1, h2, ...]` is a guard, same convention and same top-level-only
 restriction as `sync` — but it succeeds as soon as ANY named handle finishes,
 not all of them, and it permanently blocks every OTHER named handle from ever
-completing (v0: guard only, no value of its own — read whichever handle's
-`.done` came back 1 yourself, as `FirstWins` does above; a `winner := race[...]`
-value form is possible but not yet built, see Part 3). `race` does not un-write
-anything a loser already wrote before losing — only that loser's FUTURE
-segments are blocked, so a racer with a side effect beyond its own return value
-must not depend on losing having no effect. A simultaneous finish (both named
-handles ready the same cycle) is tie-broken by the ordinary scheduler's own
-declaration-order/`urgency` priority, the same as any other same-cycle
-conflict — exactly one handle ever actually completes, never both.
+completing. `race` does not un-write anything a loser already wrote before
+losing — only that loser's FUTURE segments are blocked, so a racer with a side
+effect beyond its own return value must not depend on losing having no effect.
+A simultaneous finish (both named handles ready the same cycle) is tie-broken
+by the ordinary scheduler's own declaration-order/`urgency` priority, the same
+as any other same-cycle conflict — exactly one handle ever actually completes,
+never both.
+
+Read as a bare statement (as above), `race` is a guard only — read whichever
+handle's `.done` came back 1 yourself. `value := race[h1, h2, ...]` is the
+value-producing form instead: `value` becomes whichever handle actually won,
+directly, with no `if`/`else` of your own needed:
+
+```
+module RaceValue {
+    input trigger : bits[1]
+    output out : bits[8] = 0
+
+    A(x : bits[8]) : bits[8] <sequences> {
+        tick
+        return x + 10
+    }
+    B(x : bits[8]) : bits[8] <sequences> {
+        tick
+        return x + 20
+    }
+
+    rule pick <sequences> {
+        trigger?
+        ha := spawn A(1)
+        hb := spawn B(1)
+        out := tick race[ha, hb]
+    }
+}
+```
+
+`race[...]`'s value, like a spawned handle's own `.result`/`.done`, is only
+meaningful once its own guard has succeeded — so its destination must be bound
+with `:=`, not `let`, the same restriction (and the same reason) `spawn`'s own
+handle has. `tick` optionally taking a trailing expression (`tick <expr>`)
+extends to this shape too: `value := tick race[...]` puts the tick right next
+to the expression it gates, folding `tick \n value := race[...]` onto one
+line — the idiomatic spelling, as `RaceValue` shows.
 
 ### `chooses`: specification, not synthesis
 
@@ -864,13 +902,36 @@ racing spawn reading another spawn's `done` is a genuinely new conflict shape
 (every existing case has the ENCLOSING rule reading a spawn's `done`, never one
 spawn reading another's).
 
-`race[...]` is guard-only in v0 (no value of its own): the natural
-value-producing lowering (splice an `if`/`else` picking the winner's result)
-does not work, since a local first bound INSIDE `if`/`else` does not resolve
-outside it in this language — confirmed empirically before ruling the approach
-out. A real value form would need `race[...]` compiled as a first-class
-expression straight to a FIRRTL `mux`, bypassing trace-source `if`/`else`
-entirely; not yet built (see Part 3).
+`value := race[h1, h2, ...]` (the value-producing form) lowers to the same
+guard PLUS one more line: `value := __race_value(h1.done, h1.result, h2.done,
+h2.result, ...)`, a compiler-internal builtin (never written by a user; it
+never survives a real `race[h1, h2]` reaching emission, same as `sync`) that
+`compile_race_value` (firrtl/calls.rs) compiles straight to a right-nested
+priority `mux` — `h1`'s pair outermost, so it wins a tie against a later pair,
+the same declared-first-wins convention `prio` uses. This is deliberately NOT
+the natural-looking lowering (splice an `if`/`else` picking the winner's
+result): a local first bound INSIDE `if`/`else` does not resolve outside it in
+this language — confirmed empirically before ruling that approach out. `mux`,
+unlike `if`/`else`, is an ordinary combinational expression with no statement-
+level scoping, so it composes correctly whether `value` stays an ordinary
+same-segment local (substituted as a string wherever read, true same-cycle
+semantics, no register) or gets promoted to a captured register (crosses a
+later `tick`) — both already-existing, already-generic mechanisms, no special
+casing needed for either.
+
+Honestly: this mux's own tie-break priority is unreachable dead code for
+handles racing each other. The cancellation mechanism above already makes any
+two of a race group's own final segments mutually conflict, so the ordinary
+scheduler guarantees at most one of them is EVER actually done — two `1`s
+reaching `__race_value` at once should never happen for this construct's real
+use. Built as a real priority mux anyway rather than left as an unchecked
+assumption (correct and cheap either way, and a safe fallback if that
+invariant is ever weakened later) — and confirmed unreachable by real
+simulation, not just reasoned about: `examples/race_value.tr` +
+`sim/race_value_tb.v` race two spawns that would be ready the identical cycle,
+and directly assert the loser's own `done` stays 0 (the scheduler picks
+exactly one to actually complete, by spawn declaration order) rather than
+`__race_value`'s own priority ever needing to break a real tie.
 
 ## FIFO synthesis emission
 
@@ -1070,7 +1131,8 @@ noted:
 - Guarded atomic rules, effects, `reads`/`writes` rows, `fails` inference.
 - `sequences`/`tick` lowering (`examples/rmw.tr`, `examples/subleq.tr`).
 - `spawn`/`sync` (`examples/fetch2.tr`, `examples/fetch2_gated.tr`).
-- `race`, guard-only, with true loser cancellation (`examples/race.tr`).
+- `race`, both guard-only and value-producing forms, with true loser
+  cancellation (`examples/race.tr`, `examples/race_value.tr`).
 - `chooses`/`any`/spec refinement (checked, not synthesized).
 - The full expression surface: arithmetic, bitwise ops, static and dynamic
   shifts, unary negate/complement/not, bit-select and slice, indexed
@@ -1094,11 +1156,6 @@ noted:
 
 Not yet implemented:
 
-- **`race`'s value-producing form** (`winner := race[...]`). The guard-only
-  form is done (see Part 2); a value form needs `race[...]` compiled as a
-  first-class expression to a FIRRTL `mux`, since the natural trace-source
-  `if`/`else` splice does not work (a local first bound inside `if`/`else`
-  does not resolve outside it).
 - **Combinational-only (stateless) modules.** `output` is register-backed by
   design, so a pure function of inputs cannot be expressed without a cycle of
   delay.

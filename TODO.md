@@ -91,16 +91,6 @@
 
 ## Language features with no synthesis path yet
 
-- `spawn`/`sync`/`race` are ACHIEVED (see DESIGN.md's "`spawn`, `sync`,
-  and `race`" and "Spawn, sync, and race lowering" sections,
-  `examples/fetch2.tr` + `sim/fetch2_tb.v`, `examples/race.tr` +
-  `sim/race_tb.v`). `race` is guard-only in v0: it correctly cancels
-  the loser (verified via real simulation, not just compiling) but
-  has no value form yet — `winner := race[...]` still isn't
-  recognized. Would need `race[...]` compiled as a first-class
-  expression straight to a FIRRTL `mux`, since the natural
-  trace-source `if`/`else` splice doesn't work (confirmed empirically:
-  a local first bound inside `if`/`else` doesn't resolve outside it).
 - Combinational-only (stateless) modules: `output` is register-backed by
   design (see DESIGN.md's "Module ports"), so a pure function of inputs
   can't be expressed without a cycle of delay.

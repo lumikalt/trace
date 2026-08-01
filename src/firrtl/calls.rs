@@ -397,6 +397,7 @@ impl<'a> Emitter<'a> {
             "prio" => self.compile_prio(id, args, hint),
             "trunc" => self.compile_trunc(id, args, hint),
             "pack" => self.compile_pack(id, args),
+            "__race_value" => self.compile_race_value(id, args, hint),
             name => {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
@@ -490,6 +491,64 @@ impl<'a> Emitter<'a> {
         for i in (0..n).rev() {
             let bit = format!("bits({reqs_str}, {i}, {i})");
             acc = format!("mux({bit}, UInt<{w}>({i}), {acc})");
+        }
+        Ok(acc)
+    }
+
+    /// `__race_value(d1, r1, d2, r2, ...)`: lower.rs's own rewrite of a
+    /// value-producing `race[...]` at render time (never written by a
+    /// user — a real `race[h1, h2]` in trace source never reaches this
+    /// point; it's macro-expanded away before emission, same as `sync`).
+    /// A right-nested priority `mux`, the same shape `compile_prio`
+    /// builds: `d1`'s pair is OUTERMOST, so it wins a tie against a
+    /// later pair, matching `race`'s own declared-first-wins convention.
+    /// The LAST pair's own `d` is never checked — by construction, the
+    /// segment this sits in already guarded on "at least one is done",
+    /// so if every earlier pair's `d` was false, the last one must be
+    /// true. This is why the trace-source `if`/`else` splice this
+    /// replaces doesn't work (a local first bound inside `if`/`else`
+    /// doesn't resolve outside it) but a raw FIRRTL `mux` does: `mux` is
+    /// an ordinary combinational expression, substitutable anywhere,
+    /// with none of `if`/`else`'s statement-level scoping.
+    ///
+    /// The tie-break priority this builds is, honestly, defensive: for
+    /// handles all named in ONE `race[...]` group, every one of their
+    /// own segments already reads every OTHER named handle's `done`
+    /// (the cancellation mechanism `render_rule` builds), which makes
+    /// any two of their own final segments mutually conflict in the
+    /// ordinary scheduler — so at most one of them can EVER actually
+    /// become done, full stop. Two `d`s both reading 1 here should
+    /// never actually happen for this construct's real use. Built as a
+    /// real priority mux anyway, not left as an unchecked assumption:
+    /// correct and cheap either way, and a safe fallback if that
+    /// invariant is ever weakened later. Confirmed via real simulation
+    /// that this path is unreachable today, not just reasoned about —
+    /// see sim/race_value_tb.v's own comment.
+    pub(crate) fn compile_race_value(
+        &mut self,
+        id: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        if args.len() < 2 || !args.len().is_multiple_of(2) {
+            self.error(
+                span,
+                "`__race_value` needs an even, non-empty list of (done, result) \
+                 pairs (a lower.rs codegen bug, not a source mistake — this \
+                 builtin is never user-written)"
+                    .to_string(),
+            );
+            return Err(());
+        }
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let pairs: Vec<(ExprId, ExprId)> = args.chunks(2).map(|c| (c[0], c[1])).collect();
+        let (&(_, last_result), rest) = pairs.split_last().expect("checked non-empty above");
+        let mut acc = self.compile_expr_hinted(last_result, Some(w))?;
+        for &(done, result) in rest.iter().rev() {
+            let done_str = self.compile_expr(done)?;
+            let result_str = self.compile_expr_hinted(result, Some(w))?;
+            acc = format!("mux(eq({done_str}, UInt<1>(1)), {result_str}, {acc})");
         }
         Ok(acc)
     }

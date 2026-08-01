@@ -505,11 +505,38 @@ module M {
 }
 
 #[test]
-fn race_value_producing_form_is_still_rejected() {
-    // `race[...]` is a guard, not a value (v0: no cancellation-safe way
-    // to hand back a value was designed) -- only the bare top-level
-    // statement shape lowers; `w := race[...]` still isn't recognized
-    // and falls through to the generic unsupported-construct message.
+fn race_value_form_lowers() {
+    // `w := race[...]` (assign-shaped) IS the value-producing form --
+    // no leading `tick` is structurally required (it's the segment's
+    // own guard, same as a bare `race[...]` statement never needed one
+    // either), though `tick w := race[...]` is the idiomatic spelling.
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    output out : bits[8] = 0
+    rule r <sequences> {
+        h1 := spawn Slow(1)
+        h2 := spawn Slow(2)
+        tick
+        w := race[h1, h2]
+        out := w
+    }
+}
+";
+    let c = run(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered[0].races.len(), 1);
+}
+
+#[test]
+fn race_bracket_used_elsewhere_is_still_rejected() {
+    // Only the two recognized statement shapes (bare `race[...]`,
+    // `w := race[...]`) lower -- embedded in a larger expression still
+    // falls through to the generic unsupported-construct message.
     let src = "\
 Slow(x : bits[8]) : bits[8] <sequences> {
     tick
@@ -521,7 +548,7 @@ module M {
         h1 := spawn Slow(1)
         h2 := spawn Slow(2)
         tick
-        w := race[h1, h2]
+        w := race[h1, h2] + 1
     }
 }
 ";
@@ -549,7 +576,7 @@ module M {
 ";
     let c = run(src);
     assert_eq!(c.errors.len(), 1);
-    assert!(c.errors[0].message.contains("has nothing to bind"));
+    assert!(c.errors[0].message.contains("bind it with `value := race"));
 }
 
 #[test]

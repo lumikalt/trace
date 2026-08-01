@@ -1085,6 +1085,40 @@ fn race_cancels_the_loser() {
     );
 }
 
+/// Proves the value-producing `race` form (`out := tick race[ha, hb]`)
+/// end to end: A and B both take exactly one tick, so they'd be READY
+/// the same cycle, but the cancellation mechanism's own mutual
+/// conflict means the scheduler always picks exactly one to actually
+/// complete (A, by spawn declaration order) -- `out` reflects THAT
+/// real winner, never a value from a handle that never finished. This
+/// is NOT evidence of `__race_value`'s own mux-level tie-break (that
+/// code path is structurally unreachable for handles racing each
+/// other, given the cancellation guarantee already rules out both
+/// being done at once) -- see sim/race_value_tb.v's own comment, which
+/// checks this directly (`done_hb` stays 0), not just that `out` came
+/// out right.
+#[test]
+fn race_value_reflects_the_scheduler_decided_winner() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/race_value.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/race_value_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves the `Checksum` motivating example (unrolled accumulation via
 /// a local reassigned four times in a row) through real firtool and
 /// Icarus, not just plausible-looking FIRRTL text. See

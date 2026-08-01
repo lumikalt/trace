@@ -237,10 +237,11 @@ fn plan_rule(
     if let Some(span) = find_let_bound_race(ast, res, body) {
         return Err(vec![LowerError {
             span,
-            message: "`race[...]` is a guard, not a value — it has nothing to bind; drop \
-                      the `let name = ` and write it as its own statement (or as a \
-                      `tick`'s trailing expression, `tick race[...]`), then read \
-                      whichever handle's `.done` is 1 yourself"
+            message: "`race[...]`'s value and its own guard (whether this segment fires at \
+                      all) come from the same statement, making it a segment-gating \
+                      construct like `spawn`'s trigger or `sync` — this language always \
+                      binds those with `:=` (or leaves them bare), never `let`; bind it \
+                      with `value := race[...]`, not `let value = race[...]`"
                 .to_string(),
         }]);
     }
@@ -297,6 +298,8 @@ fn plan_rule(
             } else if let Some(handles) = sync_call_shape(ast, res, *stmt) {
                 syncs.push((*stmt, handles));
             } else if let Some(handles) = race_call_shape(ast, res, *stmt) {
+                races.push((*stmt, handles));
+            } else if let Some(handles) = race_value_shape(ast, res, *stmt) {
                 races.push((*stmt, handles));
             }
         }
@@ -445,6 +448,27 @@ fn race_call_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefI
     handle_bracket_call_shape(ast, res, stmt, "race")
 }
 
+/// Recognizes `value := race[h1, h2, ...]` — the value-producing form:
+/// `value` gets whichever named handle actually won, instead of `race`
+/// only gating the segment. Assign-only, the same restriction `spawn`'s
+/// own trigger has (`h := spawn ...`, never `let`) — see
+/// `find_let_bound_race`'s doc comment for why. Still gets the SAME
+/// cancellation as the guard-only form (`plan_rule` folds this into the
+/// same `races` list, since cancellation doesn't care which shape named
+/// the handles) — see `render_rule`'s own doc comment on both.
+fn race_value_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefId>> {
+    let Stmt::Assign { lhs, rhs } = ast.stmt(stmt) else {
+        return None;
+    };
+    let Expr::Ident(_) = ast.expr(*lhs) else {
+        return None;
+    };
+    let Expr::Bracket { callee, args } = ast.expr(*rhs) else {
+        return None;
+    };
+    bracket_call_handles(ast, res, *callee, args, "race")
+}
+
 fn handle_bracket_call_shape(
     ast: &Ast,
     res: &Resolution,
@@ -457,7 +481,17 @@ fn handle_bracket_call_shape(
     let Expr::Bracket { callee, args } = ast.expr(*e) else {
         return None;
     };
-    let def = res.expr_defs.get(callee)?;
+    bracket_call_handles(ast, res, *callee, args, name)
+}
+
+fn bracket_call_handles(
+    ast: &Ast,
+    res: &Resolution,
+    callee: ExprId,
+    args: &[ExprId],
+    name: &str,
+) -> Option<Vec<DefId>> {
+    let def = res.expr_defs.get(&callee)?;
     let d = res.def(*def);
     if d.kind != DefKind::Builtin || d.name != name {
         return None;
@@ -1018,12 +1052,14 @@ fn find_let_bound_spawn(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
     None
 }
 
-/// Recognizes `let x = race[h1, h2, ...]` at a body's top level — `race`
-/// is a guard, not a value (`Ty::Unit`), so binding it to anything is a
-/// mistake; without this check it falls through to the generic
+/// Recognizes `let x = race[h1, h2, ...]` at a body's top level —
+/// `race[...]`'s value and its own guard come from the same statement,
+/// making it a segment-gating construct like `spawn`'s trigger or
+/// `sync`, always bound with `:=` (or left bare), never `let`, in this
+/// language. Without this check it falls through to the generic
 /// unsupported-construct scan below and gets reported as if `race[...]`
 /// itself were unsupported, rather than naming the real mistake (same
-/// shape as `find_let_bound_spawn` above, different underlying reason).
+/// shape as `find_let_bound_spawn` above, similar underlying reason).
 fn find_let_bound_race(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<Span> {
     for stmt in stmts {
         if let Stmt::Let { init, .. } = ast.stmt(*stmt)
@@ -1039,11 +1075,11 @@ fn find_let_bound_race(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<
 }
 
 /// Scans for anything this pass still can't handle: `spawn`/`sync`/
-/// `race` used in any shape other than the three legitimate ones
+/// `race` used in any shape other than the four legitimate ones
 /// (`h := spawn Callee(args)`, `sync[...]`/`race[...]` as their own
 /// statement — which also covers a `tick sync[...]`/`tick race[...]`'s
-/// desugared second statement) — those three are recognized and
-/// skipped by the caller before reaching here.
+/// desugared second statement — and `value := race[...]`) — those four
+/// are recognized and skipped by the caller before reaching here.
 fn find_unsupported_construct(
     ast: &Ast,
     res: &Resolution,
@@ -1054,6 +1090,7 @@ fn find_unsupported_construct(
         let is_spawn_trigger = top_level && spawn_trigger_shape(ast, res, *stmt).is_some();
         let is_sync_call = top_level && sync_call_shape(ast, res, *stmt).is_some();
         let is_race_call = top_level && race_call_shape(ast, res, *stmt).is_some();
+        let is_race_value = top_level && race_value_shape(ast, res, *stmt).is_some();
 
         if is_spawn_trigger {
             let Stmt::Assign { rhs, .. } = ast.stmt(*stmt) else {
@@ -1072,6 +1109,18 @@ fn find_unsupported_construct(
                 unreachable!()
             };
             let Expr::Bracket { args, .. } = ast.expr(*e) else {
+                unreachable!()
+            };
+            for arg in args {
+                if let Some(span) = find_unsupported_in_expr(ast, res, *arg) {
+                    return Some(span);
+                }
+            }
+        } else if is_race_value {
+            let Stmt::Assign { rhs, .. } = ast.stmt(*stmt) else {
+                unreachable!()
+            };
+            let Expr::Bracket { args, .. } = ast.expr(*rhs) else {
                 unreachable!()
             };
             for arg in args {
@@ -1519,6 +1568,25 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
                     .collect();
                 if !dones.is_empty() {
                     out.push_str(&format!("    (({}) == 1)?\n", dones.join(" | ")));
+                }
+                // Value-producing form (`value := race[...]`) additionally
+                // assigns the winner's own result — `__race_value` is the
+                // internal builtin firrtl/expr.rs compiles straight to a
+                // priority mux (see its own doc comment for why trace-
+                // source `if`/`else` can't do this instead). Guard-only
+                // form (`race[...]` as its own statement) stops above.
+                if let Stmt::Assign { lhs, .. } = ast.stmt(*stmt)
+                    && let Expr::Ident(name) = ast.expr(*lhs)
+                {
+                    let flat: Vec<&str> = handles
+                        .iter()
+                        .filter_map(|h| spawn_by_handle.get(h))
+                        .flat_map(|plan| [plan.done_name.as_str(), plan.result_name.as_str()])
+                        .collect();
+                    out.push_str(&format!(
+                        "    {name} := __race_value({})\n",
+                        flat.join(", ")
+                    ));
                 }
             } else {
                 let span = ast.stmt_spans[stmt.0 as usize].clone();

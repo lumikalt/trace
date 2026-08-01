@@ -675,9 +675,16 @@ impl<'a> Parser<'a> {
                     self.sync();
                     None
                 })?;
+                let leading_tick = self.eat_leading_tick();
                 let init = self.parse_expr(0)?;
                 self.expect_terminator();
-                Stmt::Let { name, init }
+                let let_id = self
+                    .ast
+                    .push_stmt(Stmt::Let { name, init }, lo..self.prev_end);
+                let mut out = Vec::new();
+                out.extend(leading_tick);
+                out.push(let_id);
+                return Some(out);
             }
             Some(Return) => {
                 self.bump();
@@ -699,9 +706,16 @@ impl<'a> Parser<'a> {
             _ => {
                 let lhs = self.parse_expr(0)?;
                 if self.eat(ColonEq) {
+                    let leading_tick = self.eat_leading_tick();
                     let rhs = self.parse_expr(0)?;
                     self.expect_terminator();
-                    Stmt::Assign { lhs, rhs }
+                    let assign_id = self
+                        .ast
+                        .push_stmt(Stmt::Assign { lhs, rhs }, lo..self.prev_end);
+                    let mut out = Vec::new();
+                    out.extend(leading_tick);
+                    out.push(assign_id);
+                    return Some(out);
                 } else {
                     self.expect_terminator();
                     Stmt::Expr(lhs)
@@ -712,6 +726,24 @@ impl<'a> Parser<'a> {
         let mut out = vec![id];
         out.extend(extra_guard);
         Some(out)
+    }
+
+    /// `lhs := tick <expr>` / `let name = tick <expr>`: a leading `tick`
+    /// right after `:=`/`=`, consumed and returned as its own statement
+    /// if present — sugar for writing the tick on its own line before
+    /// the assignment, letting `tick` sit next to the expression it
+    /// actually gates (e.g. `value := tick race[f1, f2]`, where the
+    /// value only makes sense once `race`'s own guard has succeeded).
+    /// Same "ordinary extra statement, no new AST shape" sugar as the
+    /// statement-initial `tick <expr>` form above, just recognized in a
+    /// different syntactic position.
+    fn eat_leading_tick(&mut self) -> Option<StmtId> {
+        if !matches!(self.peek(), Some(TokenKind::Tick)) {
+            return None;
+        }
+        let tick_lo = self.cur_span().start;
+        self.bump();
+        Some(self.ast.push_stmt(Stmt::Tick, tick_lo..self.prev_end))
     }
 
     fn parse_if(&mut self) -> Option<Stmt> {

@@ -1134,7 +1134,50 @@ impl<'a> TypeChecker<'a> {
                 Some(Ty::Bits(Width::Known(w))) => Ty::Bits(Width::Known(clog2(*w).max(1))),
                 _ => Ty::Bits(Width::Unknown),
             },
-            "sync" | "race" => Ty::Unit,
+            "sync" => Ty::Unit,
+            // Guard-only (`race[...]` as its own statement) never reads
+            // this type; value-producing (`value := race[...]`) does —
+            // the winner's own result type, once every named handle is
+            // confirmed to share one. Args are handles (`Ty::Handle(T)`),
+            // never the flattened internal form below (that's a DIFFERENT
+            // builtin name, `__race_value`, never spelled `race`).
+            "race" => {
+                let mut result: Option<Ty> = None;
+                for (arg, ty) in args.iter().zip(arg_tys) {
+                    match ty {
+                        Ty::Handle(inner) => match &result {
+                            None => result = Some((**inner).clone()),
+                            Some(prev) if prev != inner.as_ref() => {
+                                self.error(
+                                    self.expr_span(*arg),
+                                    format!(
+                                        "`race`'s handles must all share the same result \
+                                         type; this one is {inner}, an earlier one was {prev}"
+                                    ),
+                                );
+                            }
+                            _ => {}
+                        },
+                        Ty::Unknown => {}
+                        other => {
+                            self.error(
+                                self.expr_span(*arg),
+                                format!("`race` needs a spawned handle, not {other}"),
+                            );
+                        }
+                    }
+                }
+                result.unwrap_or(Ty::Unit)
+            }
+            // `__race_value[d1, r1, d2, r2, ...]` — lower.rs's own
+            // rewrite of a value-producing `race[...]` at render time:
+            // alternating done-flag/result-value pairs, already-renamed
+            // real registers, never written by a user. `race`'s own
+            // dispatch above already confirmed every result shares one
+            // type before this was ever generated, so this just reads it
+            // back off the first result arg — no arity/shape validation
+            // a real source mistake could ever trigger here.
+            "__race_value" => arg_tys.get(1).cloned().unwrap_or(Ty::Unknown),
             // any(range) is a model-checker free variable.
             "any" => Ty::Bits(Width::Unknown),
             _ => Ty::Unknown,
