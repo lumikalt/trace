@@ -22,7 +22,7 @@ Hardware is a set of **guarded atomic rules**, as in Bluespec. Each rule either
 commits fully at the cycle boundary or has no effect. The compiler derives all
 handshaking from failure. The user never writes a `ready` signal.
 
-```
+```trace
 module FifoBridge {
     fifo input  : bits[8]
     fifo output : bits[8]
@@ -41,7 +41,7 @@ appears in the source.
 
 A bare `?` tests a condition. Failure of the test aborts the rule.
 
-```
+```trace
 rule drain {
     (mode == Draining)?       -- guard: rule only fires in Draining mode
     x := input.Deq[]
@@ -54,16 +54,16 @@ rule drain {
 Effects give each piece of hardware a static "color". The type checker enforces
 the colors. Effect annotations sit in angle brackets after the signature.
 
-| Effect                  | Meaning                       | Hardware                         |
-| ----------------------- | ----------------------------- | -------------------------------- |
-| `combines`              | total, pure, terminates       | combinational logic              |
-| `sequences`             | crosses cycle boundaries      | FSM + registers                  |
-| `elaborates`            | runs at elaboration time only | no hardware; builds the circuit  |
-| `fails`                 | can fail (inferred)           | guard inputs to the handshake    |
-| `chooses`               | nondeterminism, spec-only     | none; model-checker free vars    |
-| `reads R` / `writes W`  | state access rows             | input to the scheduler           |
+| Effect                 | Meaning                       | Hardware                        |
+| ---------------------- | ----------------------------- | ------------------------------- |
+| `combines`             | total, pure, terminates       | combinational logic             |
+| `sequences`            | crosses cycle boundaries      | FSM + registers                 |
+| `elaborates`           | runs at elaboration time only | no hardware; builds the circuit |
+| `fails`                | can fail (inferred)           | guard inputs to the handshake   |
+| `chooses`              | nondeterminism, spec-only     | none; model-checker free vars   |
+| `reads R` / `writes W` | state access rows             | input to the scheduler          |
 
-The effect *names* are hardware-descriptive, not Verse's own vocabulary
+The effect _names_ are hardware-descriptive, not Verse's own vocabulary
 (`converges`, `suspends`, `allocates`, `decides`, `choice`). The semantics come
 from Verse; the words are chosen to read naturally in a hardware context.
 
@@ -83,7 +83,7 @@ Three Verse effects were considered and folded away:
 A `combines` function cannot recurse, loop on circuit values, or suspend. It
 always lowers to a pure combinational expression.
 
-```
+```trace
 Parity(x : bits[8]) : bits[1] <combines> {
     return x[0] ^ x[1] ^ x[2] ^ x[3] ^ x[4] ^ x[5] ^ x[6] ^ x[7]
 }
@@ -91,7 +91,7 @@ Parity(x : bits[8]) : bits[1] <combines> {
 
 The checker rejects circuit-value loops in `combines` code:
 
-```
+```trace
 Bad(x : bits[8]) : bits[8] <combines> {
     while x != 0 { x := x >> 1 }
     -- error[E012]: loop bound depends on a circuit value.
@@ -105,7 +105,7 @@ Bad(x : bits[8]) : bits[8] <combines> {
 `elaborates` code runs once, before synthesis. It builds the circuit. Recursion
 and dynamic allocation are legal here and only here.
 
-```
+```trace
 AdderTree(xs : list[wire[bits[32]]]) : wire[bits[32]] <elaborates> {
     if len(xs) == 1 { return xs[0] }        -- `if` on an elab value: unrolls
     mid := len(xs) / 2
@@ -123,7 +123,7 @@ mixtures that do not lower.
 Every rule gets a read set and a write set. The compiler infers them. Users can
 state them to assert an interface.
 
-```
+```trace
 rule refill <reads {pc, mem}, writes {ir}> {
     ir := mem[pc]
 }
@@ -136,7 +136,7 @@ failing code. The compiler infers it bottom-up through the call graph. A rule's
 derived ready logic is the conjunction of guards from every failing call in its
 body, however deep.
 
-```
+```trace
 Classify(x : bits[8]) : bits[2] <combines, fails> {
     (x != 0)?                 -- fallible: aborts the calling rule's cycle
     return clog2(x)
@@ -162,7 +162,7 @@ no checkpoint hardware. Each cycle is still its own one-cycle transaction.
 
 The `tick` statement marks a cycle boundary.
 
-```
+```trace
 Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
     v := mem[addr]
     tick
@@ -198,7 +198,7 @@ race[h1, h2]`, just spelled on one line.
 spawned computations to finish. `race` waits for the FIRST of two or more to
 finish, and permanently blocks every other named one from ever completing.
 
-```
+```trace
 module Fetch2 {
     mem bank0 : bits[16][8]
     mem bank1 : bits[16][8]
@@ -247,7 +247,7 @@ appear as its own statement, not nested inside `if`/`while` or embedded in a
 larger expression — the idiomatic place is directly after `tick`
 (`tick sync[h1, h2]`), so the wait and the cycle boundary read as one step.
 
-```
+```trace
 module FirstWins {
     input trigger : bits[1]
     output out : bits[8] = 0
@@ -293,7 +293,7 @@ handle's `.done` came back 1 yourself. `value := race[h1, h2, ...]` is the
 value-producing form instead: `value` becomes whichever handle actually won,
 directly, with no `if`/`else` of your own needed:
 
-```
+```trace
 module RaceValue {
     input trigger : bits[1]
     output out : bits[8] = 0
@@ -331,7 +331,7 @@ for specification and verification. Nondeterministic choice becomes a free
 variable in a model checker, like SVA `$anyseq`. Implementations are checked as
 refinements of specs that declare `chooses`.
 
-```
+```trace
 spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
     i := any(0..N-1)          -- free variable: the checker picks
     reqs[i]?                  -- constrained: the pick must be a requester
@@ -408,7 +408,7 @@ not configurable — there is no separate `..=` form.
 
 Two declarations, alongside `reg`/`mem`/`fifo`:
 
-```
+```trace
 input inc : bits[8]           -- external combinational signal, read-only
 output sum : bits[8] = 0      -- register-backed, exposed as a port
 ```
@@ -425,7 +425,7 @@ unconditionally to a port; the outside world sees the committed value one cycle
 after it is computed. A purely combinational module, with no state at all, is not
 expressible in v0.
 
-```
+```trace
 module Accumulator {
     input inc : bits[8]
     output sum : bits[8] = 0
@@ -438,7 +438,7 @@ module Accumulator {
 
 ## Memory, fifo, and submodule declarations
 
-```
+```trace
 reg   name : ty (= init)?     -- one register
 mem   name : ty                -- a memory: ty is elem[depth], e.g. bits[16][256]
 fifo  name : ty                -- a depth-1 fifo
@@ -450,7 +450,7 @@ free: it is wired unconditionally, independent of whether any rule fires, so it
 may appear anywhere an ordinary expression can. A write may nest inside
 `if`/`else` (see "Nested writes" below); outside of `if`/`else` it must sit at a
 rule's top level, same as any other statement. A memory has one write port: a
-second *unconditional* write to the same memory in one rule is a compile-time
+second _unconditional_ write to the same memory in one rule is a compile-time
 error, since it would silently discard the first — even to a different
 address, only one write can land per cycle. Two `if`-guarded writes to the same
 memory are fine and chain by priority (the later one wins when both fire); an
@@ -459,12 +459,13 @@ unconditional write becoming that `if`'s implicit fallback.
 
 A fifo has two operations, both fallible:
 
-```
+```trace
 x := f.Deq[]      -- fails when f is empty
 f.Enq[x]           -- fails when f is full
 ```
 
-Both failure conditions fold into the rule's guard exactly like an explicit `?`. `Enq`/`Deq` must
+Both failure conditions fold into the rule's guard exactly like an explicit
+`?`. `Enq`/`Deq` must
 sit at a rule's top level. A rule that both `Enq`s and `Deq`s the same fifo is a
 pass-through: this cycle's `Deq` reads the old value, this cycle's `Enq` writes
 the new one, and the combined guard is just "the fifo currently holds a value" —
@@ -489,10 +490,10 @@ A register write, an instance-port write, and a memory write may all live inside
 `if`/`else`, threaded through as a mux. A branch that does not write a register
 or a port holds that state's current value; a branch that does not write a
 memory leaves the write disabled entirely for that cycle, since a memory has no
-"hold" fallback. A memory *read*, and a fifo `Enq`/`Deq`, must still sit at a
+"hold" fallback. A memory _read_, and a fifo `Enq`/`Deq`, must still sit at a
 rule's top level.
 
-```
+```trace
 rule step {
     count := count + 1
     if we == 1 {
@@ -508,7 +509,7 @@ A local (`x := value`, or `let x = value`) may be reassigned within one rule. A
 later read sees whichever binding was active at that read's own position in the
 source, not the local's final value:
 
-```
+```trace
 rule r {
     x := a
     first_val := x    -- sees a
@@ -530,7 +531,7 @@ A rule may call a user `fn`/`impl` (not `spec` — those stay verification-only)
 so `return <expr>` at a rule's top level is a compile-time error rather than
 something to write here.
 
-```
+```trace
 Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
     let sum = a + b
     return sum >> 1
@@ -567,7 +568,7 @@ A callee's body **may** contain bare, top-level guards and/or fifo ops
 the caller's own rule guard, substituted against that call's actual
 arguments, exactly as if they had been written directly in the caller:
 
-```
+```trace
 Classify(x : bits[8]) : bits[8] <combines, fails> {
     (x != 0)?
     return x
@@ -588,7 +589,7 @@ rule enqueue {
 ```
 
 A callee's fifo ops combine with the caller's own (and with fifo ops reached
-through a *different* callee call in the same rule) using the identical
+through a _different_ callee call in the same rule) using the identical
 Enq+Deq pass-through rule a rule's own body already follows — a rule that
 directly `Deq`s a fifo while calling a callee that `Enq`s that SAME fifo gets
 one combined `valid`-only guard, not the separately-computed (and always
@@ -602,7 +603,7 @@ the position-snapshot machinery that makes rule-level `:=` reassignment work
 not-obviously-related "cannot find this local's binding" error; `let x =
 input.Deq[]` is required there.
 
-The fold only understands one shape: the callee's *entire* fail condition must
+The fold only understands one shape: the callee's _entire_ fail condition must
 reduce to bare guards and fifo ops sitting directly at its own top level —
 not nested inside one of its own `if`/`else` branches (legal syntax there,
 since both are ordinary allowed statements in a branch, but invisible to the
@@ -641,7 +642,7 @@ Two rules conflict when one writes what the other reads or writes. Conflicting
 rules cannot fire the same cycle; an urgency order picks the winner. The default
 order is declaration order. A `schedule` block overrides it:
 
-```
+```trace
 schedule {
     urgency writer_a > writer_b
     mutually_exclusive { writer_a, writer_b }   -- claim: never both fire; checked
@@ -678,7 +679,7 @@ In v0, a whole array (`mem`) is one conflict resource. Any two accesses to the
 same array conflict unless both are reads, even when the accessed indices are
 provably different at compile time:
 
-```
+```trace
 rule a { x := m[i] }      -- reads {m}
 rule b { m[j] := y }      -- writes {m}
 -- v0: a conflicts with b, even if i != j always holds.
@@ -734,7 +735,7 @@ logos lexer
 **Pass 1: parameter and type inference.** Ordinary unification. Runs at
 elaboration time, where recursion is legal.
 
-```
+```trace
 Fifo(depth : int, T : type) { ... }
 
 f := Fifo(_, bits[8])
@@ -747,7 +748,7 @@ Runs after elaboration, on the concrete circuit. Widths only grow; the pass
 terminates at the fixed point. A body that fails to reach a fixed point (widths
 growing without bound) is a compile error naming the enclosing item.
 
-```
+```trace
 let sum = a + b           -- |sum| = max(|a|, |b|); modular, Chisel-style
 let prod = a * b          -- |prod| = |a| + |b|
 let idx = pc + 3          -- an int literal absorbs the other width: bits[16]
@@ -765,8 +766,11 @@ final width instead of its own narrow one.
 The compiler builds a conflict matrix from the read/write rows. It reports its
 reasoning:
 
+```sh
+trace build cpu.tr --explain-schedule
 ```
-$ trace build cpu.tr --explain-schedule
+
+```
 rule step_s1 conflicts with rule refill:
     both write {mem}          (mem is one resource in v0; see Arrays)
 urgency: step_s1 > refill     (declaration order; no annotation given)
@@ -818,7 +822,7 @@ not v0.
 A `sequences` block is sugar. `tick` cuts it into segments; each segment
 lowers to an ordinary single-cycle rule, guarded on a continuation register.
 
-```
+```trace
 Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
     v := mem[addr]
     tick
@@ -828,7 +832,7 @@ Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
 
 lowers to (shown as source; the real lowering is internal):
 
-```
+```trace
 reg cont   : {S0, S1} = S0
 reg v_save : bits[8]
 
@@ -912,7 +916,7 @@ behind the rule's own mandatory `tick`.
 what makes "spawn counts are static" hold: no loop construct can contain a
 spawn, so there is no dynamic spawn count to reason about.
 
-`sync[h1, h2, ...]` lowers to one `(h{i}.done == 1)? ` guard per handle, inserted
+`sync[h1, h2, ...]` lowers to one `(h{i}.done == 1)?` guard per handle, inserted
 in place of the call, gating the segment it is written in exactly like any other
 guard. The segment containing `sync` does not fire, and does not advance its
 own enclosing continuation, until every named handle has finished.
@@ -924,7 +928,7 @@ sync[h1, h2]` and writing `tick` then `sync[h1, h2]` on the next line produce
 identical trees. Every pass downstream of parsing (segmentation, capture
 computation, sync detection, effect checking) sees only the desugared form.
 
-`race[h1, h2, ...]` lowers to one `((h1.done | h2.done | ...) == 1)? ` guard —
+`race[h1, h2, ...]` lowers to one `((h1.done | h2.done | ...) == 1)?` guard —
 the OR-mirror of `sync`'s AND — plus, for EVERY handle named in the group, an
 extra `(h{other}.done == 0)?` guard clause on EVERY ONE of that handle's own
 segment rules, for every OTHER handle in the same group. This needs no separate
@@ -999,7 +1003,7 @@ into one: `valid == 1` alone, since this cycle's `Deq` frees the slot this
 cycle's `Enq` refills. The `Enq` side's own `not(valid)` guard is dropped for
 this specific pairing, not weakened.
 
-```
+```trace
 module FifoPassthrough {
     fifo f : bits[8]
 
@@ -1034,7 +1038,7 @@ Loading and observing a `mem` through ordinary module ports needs no dedicated
 compiler machinery: it falls out of `input`/`output` plus an ordinary guarded
 write.
 
-```
+```trace
 module PortRam {
     mem m : bits[16][256]
 
@@ -1111,7 +1115,7 @@ A call's arguments bind to the callee's parameters the same way a local binds to
 its own value. Compiling a call saves and restores each parameter's previous
 binding around the call, making calls properly reentrant regardless of how
 deeply or indirectly they nest — including a call nested inside an argument to
-another call of the *same* function.
+another call of the _same_ function.
 
 Cycle detection on the call graph is a static property of a function's own body
 (which other functions it names, found by walking `let` inits, return
@@ -1139,7 +1143,7 @@ into the caller's rule guard in two independent pieces that both write into
   `compile_call` uses for a return value, run instead against the callee's
   own bare top-level guard expressions — params (AND the callee's own
   top-level `let`s, via the shared `bind_callee_context`/`restore_callee_
-  context` helpers, so a guard referencing a preceding callee-local resolves
+context` helpers, so a guard referencing a preceding callee-local resolves
   too, not just a parameter) bind to the call's actual arguments, the
   callee's guard conditions compile under that binding (so `(x != 0)?`
   compiles to `neq(a, 0)` when called `Classify(a)`, never a reference to the
@@ -1163,7 +1167,7 @@ into the caller's rule guard in two independent pieces that both write into
   `fifo_bridge.tr` pattern wrapped in a callee) resolves correctly too.
 
 `validate_call` gates both on `check_fails_is_foldable_guard`: a callee is
-only eligible when `sig.fails` is *entirely* explained by bare, top-level
+only eligible when `sig.fails` is _entirely_ explained by bare, top-level
 guards and/or fifo ops — checked by comparing "guards (or fifo ops) anywhere
 in the body, including inside `if`/`else` branches" against "guards (or fifo
 ops) at the top level only" (the shape the folds actually reach) and
@@ -1204,7 +1208,7 @@ Instead, `elaborate.rs` mirrors `lower.rs`'s own sequences-lowering pattern:
 `plan` walks ordinary (non-`<elaborates>`) code for the outermost reachable
 `<elaborates>` call, interprets it to completion with a real interpreter over
 `Stmt`/`Expr` (sequential execution, real `if`/`return` control flow, real
-list slicing and `len()`), and reduces it to a string of real trace *source*
+list slicing and `len()`), and reduces it to a string of real trace _source_
 syntax — not FIRRTL. `render` splices that text over the call expression's
 own span, the same text-splice-then-reparse round trip `lower::render` already
 uses. The caller re-runs the whole frontend (lex/parse/resolve/effects/types)
@@ -1311,7 +1315,7 @@ noted:
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/
-  adder_tree.tr`, DESIGN.md's own `AdderTree`).
+adder_tree.tr`, DESIGN.md's own `AdderTree`).
 
 Not yet implemented:
 
