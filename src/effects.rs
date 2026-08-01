@@ -14,7 +14,10 @@
 //! - Specs are verification-only: calling one from synthesizable code is
 //!   an error.
 //! - A call requires the callee's color: calling `<sequences>` code needs
-//!   `<sequences>`, calling `<elaborates>` code needs `<elaborates>`.
+//!   `<sequences>`. Calling `<elaborates>` code needs no particular
+//!   caller color — any call site can name one, since `elaborate.rs`
+//!   reduces every such call to a plain value in its own pre-pass, before
+//!   this checker ever runs on the result.
 //! - Recursion (direct self-call) requires `<elaborates>`.
 //! - Elaboration positions (state types, initializers, `<elaborates>`
 //!   bodies) are not failure contexts: guards are errors there.
@@ -344,6 +347,23 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Spawn(inner) => self.infer_expr(*inner, sig),
+            Expr::ListLit(items) => {
+                for item in items {
+                    self.infer_expr(*item, sig);
+                }
+            }
+            // A list-slice bound (`xs[..mid]`) is elaboration-time only —
+            // `mid`/etc reference elaboration-time locals inside an
+            // `<elaborates>` body, never a circuit state def, but walk
+            // them anyway for uniformity (harmless no-op if so).
+            Expr::Range { lo, hi } => {
+                if let Some(lo) = lo {
+                    self.infer_expr(*lo, sig);
+                }
+                if let Some(hi) = hi {
+                    self.infer_expr(*hi, sig);
+                }
+            }
         }
     }
 
@@ -534,6 +554,19 @@ impl<'a> Checker<'a> {
                 self.check_expr(rhs, item, sig, elab);
             }
             Expr::Field { base, .. } => self.check_expr(base, item, sig, elab),
+            Expr::ListLit(items) => {
+                for item_expr in items {
+                    self.check_expr(item_expr, item, sig, elab);
+                }
+            }
+            Expr::Range { lo, hi } => {
+                if let Some(lo) = lo {
+                    self.check_expr(lo, item, sig, elab);
+                }
+                if let Some(hi) = hi {
+                    self.check_expr(hi, item, sig, elab);
+                }
+            }
             Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
         }
     }
@@ -593,18 +626,9 @@ impl<'a> Checker<'a> {
                 let callee_sig = self.sigs[&target].clone();
                 if callee_sig.sequences && !sig.sequences {
                     self.error(
-                        span.clone(),
-                        format!(
-                            "calling `<sequences>` function `{}` requires `<sequences>`",
-                            callee_def.name
-                        ),
-                    );
-                }
-                if callee_sig.elaborates && !sig.elaborates {
-                    self.error(
                         span,
                         format!(
-                            "calling `<elaborates>` function `{}` requires `<elaborates>`",
+                            "calling `<sequences>` function `{}` requires `<sequences>`",
                             callee_def.name
                         ),
                     );

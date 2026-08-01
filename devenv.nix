@@ -67,7 +67,8 @@
     name="$1"
     dir=$(mktemp -d)
     trap 'rm -rf "$dir"' EXIT
-    cargo run -q -- "examples/$name.tr" --lower > "$dir/lowered.tr"
+    cargo run -q -- "examples/$name.tr" --elaborate > "$dir/elaborated.tr"
+    cargo run -q -- "$dir/elaborated.tr" --lower > "$dir/lowered.tr"
     cargo run -q -- "$dir/lowered.tr" --firrtl > "$dir/design.fir"
     firtool --disable-opt -lowering-options=disallowLocalVariables "$dir/design.fir" -o "$dir/design.v"
     iverilog -g2012 -DSYNTHESIS -o "$dir/sim" "sim/''${name}_tb.v" "$dir/design.v"

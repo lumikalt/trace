@@ -494,6 +494,57 @@ module M {
 }
 
 #[test]
+fn list_literal_types_as_list_of_its_element_type() {
+    run_ok(
+        "Sum(xs : list[bits[8]]) : bits[8] <elaborates> {\n\
+             return xs[0]\n\
+         }\n\
+         module M {\n\
+             input a : bits[8]\n\
+             output r : bits[8] = 0\n\
+             rule go {\n\
+                 r := Sum([a])\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn list_literal_element_type_mismatch_is_an_error() {
+    let src = "Sum(xs : list[bits[8]]) : bits[8] <elaborates> {\n\
+                   return xs[0]\n\
+               }\n\
+               module M {\n\
+                   input a : bits[8]\n\
+                   input w : bits[16]\n\
+                   output r : bits[8] = 0\n\
+                   rule go {\n\
+                       r := Sum([a, w])\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        !errors.is_empty(),
+        "expected a type error for mismatched list elements"
+    );
+}
+
+#[test]
+fn an_empty_list_literal_is_an_error() {
+    let src = "module M {\n\
+                   output r : bits[8] = 0\n\
+                   rule go {\n\
+                       let xs = []\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors.iter().any(|e| e.message.contains("empty")),
+        "expected an empty-list-literal error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn all_examples_type_check() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {

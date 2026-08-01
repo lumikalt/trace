@@ -134,6 +134,22 @@ pub enum Expr {
     },
     /// `spawn e` — start a parallel FSM.
     Spawn(ExprId),
+    /// `[e1, e2, ...]` — a `list[T]` literal; elaboration-time only (its
+    /// LENGTH is a compile-time fact, not a circuit value), each element
+    /// an ordinary `<combines>`-valued expression.
+    ListLit(Vec<ExprId>),
+    /// `..hi`, `lo..`, or `lo..hi` used as ONE bracket argument — a
+    /// list slice bound (`xs[..mid]`/`xs[mid..]`). Distinct from the
+    /// existing two-sided `BinOp::Range` (`Expr::Binary`), which stays
+    /// the required-both-sides bit-slice `x[hi..lo]`; this variant only
+    /// exists when at least one side is OMITTED, exclusively for
+    /// elaboration-time list slicing. `lo`/`hi` are never both `None`
+    /// (parser only constructs this when at least one side is absent)
+    /// nor both `Some` (that's the existing `Expr::Binary` shape).
+    Range {
+        lo: Option<ExprId>,
+        hi: Option<ExprId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +344,20 @@ impl Ast {
             Expr::Call { callee, args } => self.app_sexpr("call", *callee, args),
             Expr::Bracket { callee, args } => self.app_sexpr("index", *callee, args),
             Expr::Spawn(inner) => format!("(spawn {})", self.expr_sexpr(*inner)),
+            Expr::ListLit(items) => {
+                let mut out = "(list".to_string();
+                for item in items {
+                    out.push(' ');
+                    out.push_str(&self.expr_sexpr(*item));
+                }
+                out.push(')');
+                out
+            }
+            Expr::Range { lo, hi } => format!(
+                "(.. {} {})",
+                lo.map(|e| self.expr_sexpr(e)).unwrap_or_default(),
+                hi.map(|e| self.expr_sexpr(e)).unwrap_or_default(),
+            ),
         }
     }
 

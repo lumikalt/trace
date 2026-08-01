@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod effects;
+pub mod elaborate;
 pub mod firrtl;
 pub mod fmt;
 pub mod lexer;

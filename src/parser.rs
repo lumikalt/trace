@@ -856,6 +856,32 @@ impl<'a> Parser<'a> {
                 let inner = self.parse_expr(PREFIX_BP)?;
                 self.ast.push_expr(Expr::Spawn(inner), lo..self.prev_end)
             }
+            // `[a, b, c]` — a `list[T]` literal. A leading `[` is
+            // otherwise unused in primary position (postfix `x[...]` is
+            // handled separately, below, once `lhs` already exists), so
+            // this doesn't collide with bit-select/fifo-op/mem-index
+            // syntax.
+            Some(LBracket) => {
+                self.bump();
+                let items = self.parse_args(RBracket)?;
+                self.ast.push_expr(Expr::ListLit(items), lo..self.prev_end)
+            }
+            // `..hi` — an open-start list slice bound (`xs[..mid]`).
+            // Only meaningful as a bracket argument; `type_bracket`
+            // (types.rs) rejects it anywhere else. The closing `..`
+            // (`hi..`, open-ended) is handled in the infix loop below,
+            // since it needs an `lhs` to already exist.
+            Some(DotDot) => {
+                self.bump();
+                let hi = self.parse_expr(2)?;
+                self.ast.push_expr(
+                    Expr::Range {
+                        lo: None,
+                        hi: Some(hi),
+                    },
+                    lo..self.prev_end,
+                )
+            }
             Some(Minus) => self.parse_prefix(UnOp::Neg)?,
             Some(Bang) => self.parse_prefix(UnOp::Not)?,
             Some(Tilde) => self.parse_prefix(UnOp::BitNot)?,
@@ -904,6 +930,31 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     _ => {}
+                }
+            }
+
+            // `lhs..` — an open-end list slice bound (`xs[mid..]`), the
+            // trailing counterpart to the leading-`..` case in primary
+            // position above. Only recognized when NOTHING that could
+            // start an expression follows — a real two-sided range/
+            // bit-slice (`x[hi..lo]`) always has a genuine expression
+            // right after `..`, so this can never misfire on that,
+            // existing, required-both-sides shape.
+            if kind == DotDot && infix_bp(kind).is_some_and(|(l_bp, _)| l_bp >= min_bp) {
+                let starts_expr = !matches!(
+                    self.tokens.get(self.pos + 1).map(|t| t.kind),
+                    Some(RBracket) | Some(RParen) | Some(Comma) | None
+                );
+                if !starts_expr {
+                    self.bump();
+                    lhs = self.ast.push_expr(
+                        Expr::Range {
+                            lo: Some(lhs),
+                            hi: None,
+                        },
+                        lo..self.prev_end,
+                    );
+                    continue;
                 }
             }
 

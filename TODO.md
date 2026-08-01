@@ -18,10 +18,11 @@
     only), still reject outright, explicitly, rather than fold only
     part of the real condition. A callee-local feeding a `Deq` into a
     later `Enq` must be `let`-bound, not `:=` (see DESIGN.md's "Calling
-    a function from a rule"). Loops and `<elaborates>`
-    recursion/unrolling remain entirely unimplemented — no
-    unroll-and-splice machinery exists anywhere yet, not scoped to be
-    lifted, just not yet attempted (DESIGN.md's `AdderTree` example).
+    a function from a rule"). A `while` loop in an ordinary
+    (non-`<elaborates>`) callee body remains entirely unimplemented — no
+    unroll-and-splice machinery exists for it, not scoped to be lifted,
+    just not yet attempted. `<elaborates>` recursion/unrolling (DESIGN.md's
+    `AdderTree` example) is separate machinery, ACHIEVED — see below.
   - A nested call composes as a value, or as a state-writing bare
     statement / `:=` RHS, as long as it doesn't form a call cycle
     (static call-graph check) — nested any deeper than those two write
@@ -43,6 +44,23 @@
   `examples/call_trunc.tr`, `examples/call_pack.tr`,
   `examples/call_nested.tr`, `examples/call_nested_writes.tr`,
   `examples/call_guard.tr`, `examples/call_fifo.tr`.
+- `<elaborates>` recursion/unrolling (`src/elaborate.rs`) is ACHIEVED —
+  DESIGN.md's own `AdderTree` example (compile-time tree recursion over a
+  `list[bits[N]]`, one-sided slices `xs[..mid]`/`xs[mid..]`). Separate
+  machinery from ordinary callee inlining above: a real interpreter over
+  `Stmt`/`Expr` (sequential execution, real `if`/`return`, real list
+  slicing/`len()`) runs as its own text-splice pre-pass — same
+  parse/render/re-parse round trip `lower.rs` already uses for
+  `<sequences>` — reducing every top-level `<elaborates>` call to plain
+  trace source text before the real type-checking/emission passes ever
+  see it, so synthesized expressions get ordinary real type checking for
+  free. New `--elaborate` CLI flag; `devenv.nix`'s `simulate` script now
+  runs elaborate → lower → firrtl. `MAX_DEPTH` (64) is a hard compiler
+  backstop against non-terminating recursion — DESIGN.md states
+  termination is unchecked in v0 as a language guarantee, but the
+  compiler itself still won't hang. `while` inside `<elaborates>` code
+  stays unimplemented (v0 restriction: use recursion, `AdderTree` style).
+  See `examples/adder_tree.tr` + `sim/adder_tree_tb.v`.
 - Expression surface still excludes:
   - Field access other than `instance.port` (which is reads only; writes
     only as a whole statement's LHS).

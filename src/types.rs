@@ -44,6 +44,14 @@ pub enum Ty {
     Handle(Box<Ty>),
     /// Elaboration-time integer (literals, `int` params).
     Int,
+    /// `list[T]` — elaboration-time only, no runtime representation.
+    /// Never carries a length: a `list[T]` param/body is type-checked
+    /// generically (like a generic `bits[N]` body), the same length-
+    /// agnostic shape check for any call site; the actual element COUNT
+    /// only ever matters to the elaboration-time interpreter
+    /// (`firrtl/elaborate.rs`), which operates on the real call site's
+    /// `Expr::ListLit` directly, never through this type.
+    List(Box<Ty>),
     Unit,
     /// Recovery type: unifies with anything, silences cascades.
     Unknown,
@@ -58,6 +66,7 @@ impl std::fmt::Display for Ty {
             Ty::Fifo(elem) => write!(f, "fifo of {elem}"),
             Ty::Handle(inner) => write!(f, "handle of {inner}"),
             Ty::Int => write!(f, "int"),
+            Ty::List(elem) => write!(f, "list[{elem}]"),
             Ty::Unit => write!(f, "unit"),
             Ty::Unknown => write!(f, "?"),
         }
@@ -277,6 +286,16 @@ impl<'a> TypeChecker<'a> {
                         None => Ty::Bits(Width::Unknown),
                     };
                 }
+                if self.is_builtin(callee, "list") {
+                    if args.len() != 1 {
+                        self.error(
+                            self.expr_span(id),
+                            "`list` takes one element type, e.g. `list[bits[8]]`".to_string(),
+                        );
+                        return Ty::Unknown;
+                    }
+                    return Ty::List(Box::new(self.eval_ty(args[0], env)));
+                }
                 let elem = self.eval_ty(callee, env);
                 if matches!(elem, Ty::Unknown) {
                     return Ty::Unknown;
@@ -294,7 +313,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             // Tolerate builtin type constructors we do not model yet
-            // (wire, list); reject unknown identifiers as types.
+            // (wire); reject unknown identifiers as types.
             Expr::Ident(_) => {
                 let def = self.res.expr_defs.get(&id);
                 if def.is_some_and(|d| self.res.def(*d).kind == DefKind::Builtin) {
@@ -790,6 +809,39 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::Bracket { callee, args } => self.type_bracket(id, callee, &args, locals),
             Expr::Call { callee, args } => self.type_call(id, callee, &args, locals),
+            Expr::ListLit(items) => {
+                let Some((&first, rest)) = items.split_first() else {
+                    self.error(
+                        self.expr_span(id),
+                        "a list literal cannot be empty (its element type would be \
+                         unknowable)"
+                            .to_string(),
+                    );
+                    return Ty::Unknown;
+                };
+                let elem = self.type_expr(first, locals);
+                for &item in rest {
+                    let t = self.type_expr(item, locals);
+                    self.check_assignable(&t, &elem, self.expr_span(item), "list element");
+                }
+                Ty::List(Box::new(elem))
+            }
+            // Only meaningful as a list-slice `Bracket` argument
+            // (`type_bracket` re-matches the raw AST shape there for the
+            // real element-type/slice rule); reached here only via the
+            // generic per-subexpression walk `type_bracket` already does
+            // first, or if used somewhere illegal — `Unknown`, the same
+            // treatment the existing two-sided `BinOp::Range` gets in
+            // `type_binop` when it shows up outside a bracket.
+            Expr::Range { lo, hi } => {
+                if let Some(lo) = lo {
+                    self.type_expr(lo, locals);
+                }
+                if let Some(hi) = hi {
+                    self.type_expr(hi, locals);
+                }
+                Ty::Unknown
+            }
         }
     }
 
@@ -993,6 +1045,30 @@ impl<'a> TypeChecker<'a> {
                 // runtime value; unlike a slice, there's no ambiguity
                 // about the result's width to resolve either way.
                 Ty::Bits(Width::Known(1))
+            }
+            // `xs[i]` (an element) or `xs[..mid]`/`xs[mid..]` (a
+            // sub-list, `Expr::Range` — the one-sided form, exclusively
+            // used for list slicing, never `BinOp::Range`'s two-sided
+            // bit-slice shape). Both bounds/the index are checked for
+            // being elaboration-time constants by the interpreter
+            // (`firrtl/elaborate.rs`) once a real call site exists, not
+            // here — this pass only needs the SHAPE, since a `list[T]`
+            // body is checked once, generically, independent of any
+            // call site's actual length (exactly like a generic
+            // `bits[N]` body).
+            Ty::List(elem) => {
+                if args.len() != 1 {
+                    self.error(
+                        self.expr_span(id),
+                        "list index takes one argument".to_string(),
+                    );
+                    return Ty::Unknown;
+                }
+                if matches!(self.ast.expr(args[0]), Expr::Range { .. }) {
+                    Ty::List(elem)
+                } else {
+                    *elem
+                }
             }
             Ty::Unknown => Ty::Unknown,
             other => {

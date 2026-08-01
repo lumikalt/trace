@@ -146,6 +146,19 @@ pub(crate) fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
                 collect_calls(ast, *a, out);
             }
         }
+        Expr::ListLit(items) => {
+            for item in items {
+                collect_calls(ast, *item, out);
+            }
+        }
+        Expr::Range { lo, hi } => {
+            if let Some(lo) = lo {
+                collect_calls(ast, *lo, out);
+            }
+            if let Some(hi) = hi {
+                collect_calls(ast, *hi, out);
+            }
+        }
     }
 }
 
@@ -326,6 +339,7 @@ impl<'a> Emitter<'a> {
         hint: Option<u64>,
     ) -> Result<String, ()> {
         let span = self.ast.expr_spans[id.0 as usize].clone();
+
         let (_, params, fn_body) = self.validate_call(span.clone(), callee)?;
 
         // Bind params into `self.locals`, saving whatever was there before

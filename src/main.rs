@@ -1,9 +1,10 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{effects, firrtl, fmt, lexer, lower, parser, resolve, schedule, types};
+use trace::{effects, elaborate, firrtl, fmt, lexer, lower, parser, resolve, schedule, types};
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let explain = args.iter().any(|a| a == "--explain-schedule");
+    let show_elaborate = args.iter().any(|a| a == "--elaborate");
     let show_lower = args.iter().any(|a| a == "--lower");
     let show_firrtl = args.iter().any(|a| a == "--firrtl");
     let show_fmt = args.iter().any(|a| a == "--fmt");
@@ -13,8 +14,8 @@ fn main() -> std::process::ExitCode {
         .find(|a| !a.starts_with('-') || a.as_str() == "-")
     else {
         eprintln!(
-            "usage: trace <file.tr | -> [--explain-schedule] [--lower] [--firrtl] \
-             [--fmt [--write]]"
+            "usage: trace <file.tr | -> [--explain-schedule] [--elaborate] [--lower] \
+             [--firrtl] [--fmt [--write]]"
         );
         return std::process::ExitCode::FAILURE;
     };
@@ -68,7 +69,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    if !explain && !show_lower && !show_firrtl {
+    if !explain && !show_elaborate && !show_lower && !show_firrtl {
         print!("{}", ast.dump());
     }
 
@@ -86,6 +87,18 @@ fn main() -> std::process::ExitCode {
     }
     if !effect_errors.is_empty() {
         return std::process::ExitCode::FAILURE;
+    }
+
+    if show_elaborate {
+        let (edits, elab_errors) = elaborate::plan(&ast, &res, &fx, &src);
+        for err in &elab_errors {
+            report(&path, &src, err.span.clone(), &err.message);
+        }
+        if !elab_errors.is_empty() {
+            return std::process::ExitCode::FAILURE;
+        }
+        print!("{}", elaborate::render(&src, &edits));
+        return std::process::ExitCode::SUCCESS;
     }
 
     let (ty, type_errors) = types::check(&ast, &res);

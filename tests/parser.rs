@@ -477,3 +477,38 @@ fn bit_is_pure_sugar_for_bits_1() {
     // `bits[1]` would (`mem m : bit[16]` == `mem m : bits[1][16]`).
     assert_eq!(stmt_sexpr("x := bit[16]"), stmt_sexpr("x := bits[1][16]"));
 }
+
+#[test]
+fn list_literal_parses_as_a_list_node() {
+    assert_eq!(stmt_sexpr("x := [a, b, c]"), "(:= x (list a b c))");
+}
+
+#[test]
+fn one_sided_ranges_parse_with_the_omitted_side_absent() {
+    // `xs[..mid]` and `xs[mid..]` -- the one-sided range form exclusive
+    // to list slicing (DESIGN.md's `AdderTree` example), distinct from
+    // the pre-existing two-sided `BinOp::Range` bit-slice.
+    assert_eq!(stmt_sexpr("x := xs[..mid]"), "(:= x (index xs (..  mid)))");
+    assert_eq!(stmt_sexpr("x := xs[mid..]"), "(:= x (index xs (.. mid )))");
+}
+
+#[test]
+fn a_two_sided_range_still_parses_as_the_ordinary_bit_slice_binop() {
+    // Guards against the one-sided `..mid`/`mid..` parser additions
+    // accidentally shadowing the pre-existing two-sided `x[hi..lo]` bit-
+    // slice, which stays a plain `Binary { Range, .. }`, not the new
+    // one-sided `Range { lo: Option, hi: Option }` node.
+    assert_eq!(stmt_sexpr("x := y[7..0]"), "(:= x (index y (.. 7 0)))");
+}
+
+#[test]
+fn a_trailing_range_at_end_of_input_does_not_consume_past_the_statement() {
+    // The infix `mid..` lookahead must not eat tokens that begin the
+    // NEXT statement -- proved by a second statement following it.
+    let src = "rule t {\n x := xs[mid..]\n y := 1\n}\n";
+    let ast = parse_ok(src);
+    let trace::ast::Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 2, "expected two statements: {body:?}");
+}

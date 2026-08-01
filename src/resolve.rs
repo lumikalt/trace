@@ -606,6 +606,19 @@ impl<'a> Resolver<'a> {
                 }
             }
             Expr::Spawn(inner) => self.resolve_expr(inner, in_type),
+            Expr::ListLit(items) => {
+                for item in items {
+                    self.resolve_expr(item, in_type);
+                }
+            }
+            Expr::Range { lo, hi } => {
+                if let Some(lo) = lo {
+                    self.resolve_expr(lo, in_type);
+                }
+                if let Some(hi) = hi {
+                    self.resolve_expr(hi, in_type);
+                }
+            }
         }
     }
 }

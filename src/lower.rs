@@ -1190,6 +1190,8 @@ pub(crate) fn sub_exprs(ast: &Ast, id: ExprId) -> Vec<ExprId> {
             v.extend(args);
             v
         }
+        Expr::ListLit(items) => items,
+        Expr::Range { lo, hi } => [lo, hi].into_iter().flatten().collect(),
     }
 }
 

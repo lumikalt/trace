@@ -14,7 +14,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use trace::{effects, lexer, lower, parser, resolve, schedule, types};
+use trace::{effects, elaborate, lexer, lower, parser, resolve, schedule, types};
 
 fn tool_available(name: &str) -> bool {
     Command::new(name).arg("--version").output().is_ok()
@@ -29,11 +29,39 @@ fn generate_firrtl(tr_src: &str) -> String {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (_ty, type_errors) = types::check(&ast, &res);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (lowered, lower_errors) = lower::plan(&ast, &res, &fx, &ty);
+
+    let (elab_edits, elab_errors) = elaborate::plan(&ast, &res, &fx, tr_src);
+    assert!(elab_errors.is_empty(), "{elab_errors:?}");
+    let elaborated_src = elaborate::render(tr_src, &elab_edits);
+
+    let (tokens1, lex_errors1) = lexer::lex(&elaborated_src);
+    assert!(lex_errors1.is_empty(), "{lex_errors1:?}\n{elaborated_src}");
+    let (ast1, parse_errors1) = parser::parse(&elaborated_src, &tokens1);
+    assert!(
+        parse_errors1.is_empty(),
+        "{parse_errors1:?}\n{elaborated_src}"
+    );
+    let (res1, resolve_errors1) = resolve::resolve(&ast1);
+    assert!(
+        resolve_errors1.is_empty(),
+        "{resolve_errors1:?}\n{elaborated_src}"
+    );
+    let (fx1, effect_errors1) = effects::check(&ast1, &res1);
+    assert!(
+        effect_errors1.is_empty(),
+        "{effect_errors1:?}\n{elaborated_src}"
+    );
+    let (ty1, type_errors1) = types::check(&ast1, &res1);
+    assert!(
+        type_errors1.is_empty(),
+        "{type_errors1:?}\n{elaborated_src}"
+    );
+
+    let (lowered, lower_errors) = lower::plan(&ast1, &res1, &fx1, &ty1);
     assert!(lower_errors.is_empty(), "{lower_errors:?}");
-    let lowered_src = lower::render(&ast, tr_src, &lowered);
+    let lowered_src = lower::render(&ast1, &elaborated_src, &lowered);
 
     let (tokens2, lex_errors2) = lexer::lex(&lowered_src);
     assert!(lex_errors2.is_empty(), "{lex_errors2:?}\n{lowered_src}");
@@ -1207,5 +1235,33 @@ fn checksum_runs_through_real_ports() {
     assert!(
         output.contains("final: result=100"),
         "checksum result did not match expectations:\n{output}"
+    );
+}
+
+/// Proves DESIGN.md's own `<elaborates>` example (`AdderTree`, compile-
+/// time tree recursion over a `list` with one-sided slices) through real
+/// firtool and Icarus: `elaborate.rs`'s pre-pass unrolls `AdderTree([a,
+/// b, c, d])` into `((a + b) + (c + d))` entirely at compile time, and
+/// the resulting hardware both sums correctly and wraps modularly past
+/// `bits[32]` — see sim/adder_tree_tb.v.
+#[test]
+fn adder_tree_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/adder_tree.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/adder_tree_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
     );
 }

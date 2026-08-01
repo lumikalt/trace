@@ -1187,6 +1187,56 @@ instantiation, threaded down as an explicit hint. A builtin argument's width
 (needed by `prio`, for example) is resolved the same way, by following the
 argument back through parameter substitution to a concrete call site.
 
+## Elaboration lowering
+
+`<elaborates>` calls (DESIGN.md's `AdderTree`) do not go through the ordinary
+callee-inlining machinery above at all — they are reduced away entirely before
+it ever runs, by a separate pre-pass, `elaborate.rs`.
+
+The first design tried splicing freshly-synthesized `Expr` nodes straight into
+the `Ast` during FIRRTL emission, matching how ordinary callee inlining works.
+It does not work: `firrtl::Emitter`'s `Ast` reference is shared and read-only
+for a real reason — every synthesized node would need real type/width
+records, and `types.rs` only ever runs once, before emission, over the
+original tree. Emission-time synthesis has no way to backfill that.
+
+Instead, `elaborate.rs` mirrors `lower.rs`'s own sequences-lowering pattern:
+`plan` walks ordinary (non-`<elaborates>`) code for the outermost reachable
+`<elaborates>` call, interprets it to completion with a real interpreter over
+`Stmt`/`Expr` (sequential execution, real `if`/`return` control flow, real
+list slicing and `len()`), and reduces it to a string of real trace *source*
+syntax — not FIRRTL. `render` splices that text over the call expression's
+own span, the same text-splice-then-reparse round trip `lower::render` already
+uses. The caller re-runs the whole frontend (lex/parse/resolve/effects/types)
+on the spliced source, so every synthesized expression gets ordinary, real
+type checking for free, and a nested `<elaborates>` call found while
+interpreting (e.g. `AdderTree`'s own recursion) never becomes its own splice
+site — the interpreter recurses directly and folds the result into the same
+string, so only the outermost call reachable from ordinary code ever needs an
+edit.
+
+`wire[T]` has no representation in the interpreter: every list element is an
+ordinary `<combines>`-valued expression (never a fifo op, guard, or
+state-writing call — none of those can appear in an elaboration position at
+all), read exactly as many times as the source references it, so there is no
+aliasing/re-instantiation risk `wire` would need to guard against. A list's
+concrete length is real only inside the interpreter (`ElabValue::List`);
+`Ty::List` (`types.rs`) deliberately never tracks it, the same way a generic
+`bits[N]` callee body is checked once regardless of call-site width.
+
+`MAX_DEPTH` (64) is a hard compiler backstop against non-terminating
+recursion, an explicit error rather than a stack overflow or a hang. This
+does not contradict "termination of `elaborates` recursion is unchecked in
+v0" above — that is a language guarantee gap, not license for the compiler
+itself to hang on a malformed or genuinely non-terminating input.
+
+The real pipeline is now a three-stage text-splice-and-reparse chain:
+`--elaborate` (this pass) → `--lower` (sequences) → `--firrtl` (emission),
+matching `devenv.nix`'s `simulate` script. Elaboration runs first, since
+DESIGN.md's own ordering ("runs once, before synthesis") means a
+`<sequences>` rule's own tick-segmentation must never see an unreduced
+`<elaborates>` call.
+
 ## Tooling
 
 Editor support (`editors/vscode/`): TextMate-grammar syntax highlighting for
@@ -1258,6 +1308,10 @@ noted:
 - The `schedule` block: `urgency`, `mutually_exclusive` (checked simulation
   assertion), `conflict_free` (trusted, unchecked; rejected outright on a
   write/write conflict).
+- `elaborates`: compile-time tree recursion over a `list`, one-sided list
+  slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
+  pre-pass, not the ordinary callee-inlining machinery (`examples/
+  adder_tree.tr`, DESIGN.md's own `AdderTree`).
 
 Not yet implemented:
 
