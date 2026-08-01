@@ -63,6 +63,34 @@
   the rule (e.g. used only as a mem-read index). See DESIGN.md's
   "Locals" section, `examples/reassigned_local.tr` +
   `sim/reassigned_local_tb.v`.
+- Next up: two silent-miscompile-class gaps found auditing the recent
+  fifo/spawn fixes, not yet closed:
+  - `let v = value` for a value that needs to cross a `tick` compiles
+    clean but never actually writes the register backing it — later
+    reads silently see the reset value forever, not the computed one
+    (confirmed live: `let v = 8'd5` / `tick` / `out := v + 1` emits
+    `out` hardwired to `0 + 1`, never `5 + 1`). Root cause: the
+    splice-based lowering relies on `x := value` staying syntactically
+    valid once `x` becomes a register, which works by accident for
+    `:=` but not `let` (`let` always shadows into a fresh local, even
+    when a same-named register now exists). No example uses this
+    shape, so the safe fix is an explicit rejection matching the
+    existing v0-restriction pattern (nested tick, nested spawn), not
+    attempting full support in one pass. Also closes a related
+    duplicate-register "already defined" error from `let`-shadowing
+    the same name across two ticks, which needs the identical trigger.
+  - A memory written to more than once in one rule (even different
+    addresses, even split across an `if`/no-`if`) silently keeps only
+    the LAST write — the earlier one, and its guard condition, vanish
+    from the emitted FIRRTL with zero error. No `check_fifo_op_counts`
+    equivalent exists for mem writes. No example does this, so a
+    `check_mem_write_counts` mirroring the fifo one should be safe to
+    add.
+  - Lower priority, message quality only (both already hard-error, just
+    confusingly): `let x = m[addr]` fails with a generic "indexing form
+    not supported" instead of naming the real restriction; `let h =
+    spawn Foo(args)` gets lumped into the generic `race`-not-supported
+    error instead of saying spawn's result must be bound with `:=`.
 
 ## Language features with no synthesis path yet
 
