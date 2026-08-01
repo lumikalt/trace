@@ -27,7 +27,7 @@ impl<'a> Emitter<'a> {
         id: ExprId,
         hint: Option<u64>,
     ) -> Result<String, ()> {
-        if let Some(port) = self.read_ports.get(&id) {
+        if let Some((port, _)) = self.read_ports.get(&id) {
             let Expr::Bracket { callee, .. } = self.ast.expr(id) else {
                 unreachable!()
             };

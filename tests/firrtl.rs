@@ -2075,3 +2075,60 @@ module M {
     assert!(!fir.contains("not(fires_set_b)"));
     run_firtool(&fir, &[]);
 }
+
+#[test]
+fn mem_read_address_is_a_local_in_a_rule_that_isnt_last_in_urgency_order() {
+    // Reader ports are wired unconditionally in one pass, AFTER every
+    // rule's own `enter_rule`/compile pass has already happened (reads
+    // are free, driven regardless of which rule fires) -- so that pass
+    // used to run with `cx.locals` left over from whichever rule was
+    // entered LAST in the fires loop, not the rule the read site
+    // actually belongs to. `read_at_five`'s own local `x` is invisible
+    // by the time `incr` (declared lower-urgency, so entered later)
+    // finishes, and its address used to fail with "cannot find this
+    // local's binding" -- a real, previously latent bug, not a
+    // hypothetical.
+    let src = "\
+module M {
+    mem m : bits[16][256]
+    reg out : bits[16] = 0
+    reg counter : bits[8] = 0
+
+    rule read_at_five {
+        x := 5
+        out := m[x]
+    }
+
+    rule incr {
+        counter := counter + 1
+    }
+
+    schedule {
+        urgency read_at_five > incr
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    // Also proves the width-hint fix: a bare literal (`x := 5`) has no
+    // width of its own without the reader loop's new address-width hint.
+    assert!(fir.contains("connect m.r0.addr, UInt<8>(5)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn mem_read_address_is_a_local_bound_to_an_input() {
+    let src = "\
+module M {
+    mem m : bits[16][256]
+    input addr : bits[8]
+    reg out : bits[16] = 0
+    rule r {
+        x := addr
+        out := m[x]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect m.r0.addr, addr"));
+    run_firtool(&fir, &[]);
+}

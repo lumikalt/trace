@@ -322,8 +322,13 @@ struct Emitter<'a> {
     /// declaration site (see `compile_call`).
     module: ItemId,
     errors: Vec<EmitError>,
-    /// Each static mem-read expression -> its assigned reader port name.
-    read_ports: HashMap<ExprId, String>,
+    /// Each static mem-read expression -> its assigned reader port name,
+    /// plus the rule it was found in (needed to `enter_rule` the right
+    /// context before compiling its address expression — a read site's
+    /// address is compiled separately from, and after, the rule body
+    /// it lexically belongs to, since reads are wired unconditionally
+    /// across the whole module; see module.rs's reader-port loop).
+    read_ports: HashMap<ExprId, (String, ItemId)>,
     /// Output port name -> its internal backing register name. Reading
     /// an output inside a rule (`sum := sum + inc`) must see the
     /// register, not the port (a FIRRTL output port is drive-only from

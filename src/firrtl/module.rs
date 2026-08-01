@@ -239,7 +239,7 @@ pub(crate) fn emit_module(
     // known wherever it is later referenced).
     for rule in &rules {
         let body = rule_body(ast, *rule);
-        cx.collect_read_sites(&body);
+        cx.collect_read_sites(&body, *rule);
     }
 
     // Guards must all precede any state write, and not be nested.
@@ -324,16 +324,31 @@ pub(crate) fn emit_module(
         .collect();
 
     // Read ports: driven unconditionally (reads are free; latency 0).
+    // An address expression may reference the OWNING rule's own locals
+    // (`x := addr  out := m[x]`), so `enter_rule` must be re-entered
+    // for that specific rule before compiling it — this loop runs
+    // AFTER the fires loop above, whose own `enter_rule` calls leave
+    // `cx.locals` pointing at whichever rule was entered LAST, which is
+    // wrong for every other rule's own read sites (a real, previously
+    // latent bug: a local-addressed read in a non-last rule hit "cannot
+    // find this local's binding"). Also hint the address with the
+    // mem's own address width — a bare-literal address (`x := 5`) has
+    // no width of its own to fall back on otherwise.
     let mut mem_body = String::new();
-    for (site_expr, port) in cx.read_ports.clone() {
+    for (site_expr, (port, owning_rule)) in cx.read_ports.clone() {
         let Expr::Bracket { callee, args } = ast.expr(site_expr).clone() else {
             continue;
         };
-        let addr = cx.compile_expr(args[0]).unwrap_or_default();
         let mem_name = match ast.expr(callee) {
             Expr::Ident(n) => n.clone(),
             _ => continue,
         };
+        let addr_w = mems
+            .iter()
+            .find(|(n, _, _)| n == &mem_name)
+            .map(|(_, _, depth)| clog2(*depth).max(1));
+        cx.enter_rule(owning_rule);
+        let addr = cx.compile_expr_hinted(args[0], addr_w).unwrap_or_default();
         if let Some((readers, _)) = mem_ports.get_mut(&mem_name) {
             readers.push(port.clone());
         }
@@ -660,27 +675,27 @@ pub(crate) fn module_block(
 }
 
 impl<'a> Emitter<'a> {
-    pub(crate) fn collect_read_sites(&mut self, stmts: &[StmtId]) {
+    pub(crate) fn collect_read_sites(&mut self, stmts: &[StmtId], rule: ItemId) {
         for stmt in stmts {
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Assign { lhs, rhs } => {
-                    self.collect_read_sites_expr(rhs);
+                    self.collect_read_sites_expr(rhs, rule);
                     if let Expr::Bracket { args, .. } = self.ast.expr(lhs).clone() {
                         for a in args {
-                            self.collect_read_sites_expr(a);
+                            self.collect_read_sites_expr(a, rule);
                         }
                     }
                 }
-                Stmt::Expr(e) => self.collect_read_sites_expr(e),
+                Stmt::Expr(e) => self.collect_read_sites_expr(e, rule),
                 Stmt::If {
                     cond,
                     then_body,
                     else_body,
                 } => {
-                    self.collect_read_sites_expr(cond);
-                    self.collect_read_sites(&then_body);
+                    self.collect_read_sites_expr(cond, rule);
+                    self.collect_read_sites(&then_body, rule);
                     if let Some(e) = else_body {
-                        self.collect_read_sites(&e);
+                        self.collect_read_sites(&e, rule);
                     }
                 }
                 _ => {}
@@ -688,18 +703,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    pub(crate) fn collect_read_sites_expr(&mut self, id: ExprId) {
+    pub(crate) fn collect_read_sites_expr(&mut self, id: ExprId, rule: ItemId) {
         if let Expr::Bracket { callee, .. } = self.ast.expr(id).clone()
             && let Expr::Ident(_) = self.ast.expr(callee)
             && let Some(def) = self.res.expr_defs.get(&callee)
             && self.res.def(*def).kind == DefKind::Mem
         {
             let n = self.read_ports.len();
-            self.read_ports.insert(id, format!("r{n}"));
+            self.read_ports.insert(id, (format!("r{n}"), rule));
             return; // the address sub-expr is compiled, not walked further
         }
         for child in crate::lower::sub_exprs(self.ast, id) {
-            self.collect_read_sites_expr(child);
+            self.collect_read_sites_expr(child, rule);
         }
     }
 }

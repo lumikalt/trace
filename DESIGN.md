@@ -894,6 +894,26 @@ condition, is covered separately by `tests/firrtl.rs`'s
 assertion + real firtool, no separate sim needed — the enable machinery itself is
 already sim-proven by the if-only case above).
 
+**Bug fix, 2026-08-01: a mem read's address expression referencing a rule-local used to
+resolve against the WRONG rule's locals, or none at all.** Reader ports are wired
+unconditionally in one pass, separate from and AFTER every rule's own compile pass (a
+read is free, driven regardless of which rule fires — see "First milestone: SUBLEQ").
+That separate pass reused whatever `enter_rule` context the LAST rule processed in the
+fires loop had left behind, not the context of the rule the read site actually
+lexically belongs to — found while scoping the "reassigned locals" TODO item, not
+something that item was about, and confirmed as a real (not hypothetical) miscompile
+path by constructing the exact failing shape: a two-rule module where the rule owning
+the local-addressed read isn't the last one in urgency order fails with "cannot find
+this local's binding," and a single-rule module with a bare-literal local address
+(`x := 5  out := m[x]`) fails with "no concrete width" (the separate pass never hinted
+the address with the mem's own address width either). Fixed by having `collect_read_sites`
+record each read site's OWNING rule alongside its assigned port name, so the reader-port
+loop can `enter_rule` the correct rule before compiling each address, and hinting that
+compile with the mem's own address width. `tests/firrtl.rs`'s
+`mem_read_address_is_a_local_in_a_rule_that_isnt_last_in_urgency_order` and
+`mem_read_address_is_a_local_bound_to_an_input` pin both failing shapes as passing,
+verified against real firtool.
+
 ## Submodule instantiation
 
 **Achieved 2026-07-30.** Modules compose by name, not lexical nesting — a `module` is
