@@ -448,7 +448,41 @@ impl<'a> Checker<'a> {
             }
             Expr::Spawn(inner) => {
                 if !sig.sequences {
-                    self.error(span, "`spawn` requires `<sequences>`".to_string());
+                    self.error(span.clone(), "`spawn` requires `<sequences>`".to_string());
+                }
+                match self.ast.expr(inner).clone() {
+                    Expr::Call { callee, .. } => {
+                        if let Some(def) = self.res.expr_defs.get(&callee).copied() {
+                            let callee_def = self.res.def(def).clone();
+                            if callee_def.kind != DefKind::Fn {
+                                self.error(
+                                    span.clone(),
+                                    format!(
+                                        "`spawn` can only start a `<sequences>` fn, not `{}`",
+                                        callee_def.name
+                                    ),
+                                );
+                            } else if let Some(target) = self.def_items.get(&def).copied()
+                                && !self.sigs[&target].sequences
+                            {
+                                self.error(
+                                    span.clone(),
+                                    format!(
+                                        "`spawn`'s callee `{}` must itself be declared \
+                                         `<sequences>`",
+                                        callee_def.name
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        self.error(
+                            span.clone(),
+                            "`spawn` needs a direct function call, e.g. `spawn Foo(a, b)`"
+                                .to_string(),
+                        );
+                    }
                 }
                 self.check_expr(inner, item, sig, elab);
             }

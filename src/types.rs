@@ -39,6 +39,9 @@ pub enum Ty {
         len: u64,
     },
     Fifo(Box<Ty>),
+    /// A `spawn`'s result: `.result` yields the wrapped type, `.done`
+    /// (bits[1]) reports whether the spawned FSM has finished.
+    Handle(Box<Ty>),
     /// Elaboration-time integer (literals, `int` params).
     Int,
     Unit,
@@ -53,6 +56,7 @@ impl std::fmt::Display for Ty {
             Ty::Bits(Width::Unknown) => write!(f, "bits[?]"),
             Ty::Mem { elem, len } => write!(f, "{elem}[{len}]"),
             Ty::Fifo(elem) => write!(f, "fifo of {elem}"),
+            Ty::Handle(inner) => write!(f, "handle of {inner}"),
             Ty::Int => write!(f, "int"),
             Ty::Unit => write!(f, "unit"),
             Ty::Unknown => write!(f, "?"),
@@ -546,7 +550,17 @@ impl<'a> TypeChecker<'a> {
                         ),
                     }
                 } else {
+                    // Routes through the same read-side logic as any other
+                    // field access (rejects a bogus field/base the same
+                    // way `x.foo` would as an expression); a handle's
+                    // fields additionally aren't writable at all.
                     self.type_expr(lhs, locals);
+                    if matches!(self.types.expr_tys.get(&base), Some(Ty::Handle(_))) {
+                        self.error(
+                            self.expr_span(lhs),
+                            format!("cannot write `.{name}`: a handle's fields are read-only"),
+                        );
+                    }
                 }
             }
             _ => {
@@ -744,14 +758,35 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                 } else {
-                    self.type_expr(base, locals);
-                    // Fields on handles (spawn results) are untyped in v0.
-                    Ty::Unknown
+                    match self.type_expr(base, locals) {
+                        Ty::Handle(inner) => match name.as_str() {
+                            "result" => *inner,
+                            "done" => Ty::Bits(Width::Known(1)),
+                            _ => {
+                                self.error(
+                                    self.expr_span(id),
+                                    format!(
+                                        "a handle has no field `{name}`; only `.result` and \
+                                         `.done` are readable"
+                                    ),
+                                );
+                                Ty::Unknown
+                            }
+                        },
+                        Ty::Unknown => Ty::Unknown,
+                        other => {
+                            self.error(
+                                self.expr_span(id),
+                                format!("cannot access field `{name}` on {other}"),
+                            );
+                            Ty::Unknown
+                        }
+                    }
                 }
             }
             Expr::Spawn(inner) => {
-                self.type_expr(inner, locals);
-                Ty::Unknown
+                let ret = self.type_expr(inner, locals);
+                Ty::Handle(Box::new(ret))
             }
             Expr::Bracket { callee, args } => self.type_bracket(id, callee, &args, locals),
             Expr::Call { callee, args } => self.type_call(id, callee, &args, locals),

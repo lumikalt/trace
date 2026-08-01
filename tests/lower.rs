@@ -294,6 +294,174 @@ fn no_tick_no_lowering() {
     assert!(c.errors.is_empty());
 }
 
+const FETCH2: &str = "\
+module Fetch2 {
+    mem bank0 : bits[16][8]
+    mem bank1 : bits[16][8]
+    input pc : bits[16]
+    output ir : bits[32] = 0
+
+    ReadBank0(addr : bits[16]) : bits[16] <sequences> {
+        v := bank0[addr]
+        tick
+        return v
+    }
+
+    ReadBank1(addr : bits[16]) : bits[16] <sequences> {
+        v := bank1[addr]
+        tick
+        return v
+    }
+
+    rule fetch2 <sequences> {
+        h1 := spawn ReadBank0(pc)
+        h2 := spawn ReadBank1(pc + 1)
+        tick
+        sync(h1, h2)
+        ir := pack(h1.result, h2.result)
+    }
+}
+";
+
+#[test]
+fn spawn_sync_structural_shape() {
+    let c = run(FETCH2);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered.len(), 1);
+    let lr = &c.lowered[0];
+    assert_eq!(lr.segments.len(), 2, "one tick -> two segments");
+    assert_eq!(lr.spawns.len(), 2);
+    assert_eq!(lr.syncs.len(), 1);
+    assert!(
+        lr.captures.is_empty(),
+        "h1/h2 are handles, not ordinary captured locals: {:?}",
+        lr.captures
+    );
+
+    for spawn in &lr.spawns {
+        assert_eq!(spawn.segments.len(), 2, "ReadBank's own tick -> 2 segments");
+        assert_eq!(spawn.args.len(), 1);
+        assert_eq!(spawn.captures.len(), 1, "ReadBank's own `v` is captured");
+        assert_eq!(spawn.captures[0].name, "v");
+        assert_eq!(spawn.result_ty, Ty::Bits(Width::Known(16)));
+    }
+
+    let rendered = render(&c.ast, FETCH2, &c.lowered);
+    let rendered = assert_round_trips(&rendered);
+    assert!(rendered.contains("__cont_fetch2_h1 : bits[1] = 0"));
+    assert!(rendered.contains("__cont_fetch2_h2 : bits[1] = 0"));
+    assert!(rendered.contains("__arg_fetch2_h1_addr := pc"));
+    assert!(rendered.contains("__done_fetch2_h1 == 1"));
+    assert!(rendered.contains("__done_fetch2_h2 == 1"));
+    assert!(rendered.contains("pack(__result_fetch2_h1, __result_fetch2_h2)"));
+    assert!(
+        !rendered.contains("spawn"),
+        "no `spawn` keyword should survive lowering"
+    );
+    assert!(
+        !rendered.contains("sync("),
+        "no `sync` call should survive lowering"
+    );
+}
+
+#[test]
+fn spawn_nested_in_if_is_rejected() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        (1 == 1)?
+        if 1 == 1 {
+            h := spawn Slow(1)
+        }
+        tick
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("top level"));
+}
+
+#[test]
+fn sync_nested_in_if_is_rejected() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        h := spawn Slow(1)
+        tick
+        if 1 == 1 {
+            sync(h)
+        }
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("v0 restriction"));
+}
+
+#[test]
+fn race_is_still_rejected() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        h1 := spawn Slow(1)
+        h2 := spawn Slow(2)
+        tick
+        w := race(h1, h2)
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("`race`"));
+}
+
+// A wrong argument count is caught earlier, by types.rs's ordinary call
+// arity check on `spawn`'s inner call expression (same as any other
+// call) — `run()` here always sees type-checked input, so there's no
+// reachable case to test at this layer; `plan_spawn`'s own arity check
+// stays as defense-in-depth for `lower::plan`'s public API, which
+// doesn't statically force a caller to have checked types first.
+
+#[test]
+fn spawn_callee_early_return_is_rejected() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    if x == 0 {
+        return x
+    }
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        h := spawn Slow(1)
+        tick
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("early return"));
+}
+
 #[test]
 fn local_type_recorded_for_capture() {
     let src =

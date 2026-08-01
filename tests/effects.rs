@@ -229,6 +229,45 @@ fn guards_forbidden_at_elaboration_time() {
 }
 
 #[test]
+fn spawn_callee_must_itself_be_sequences() {
+    let src = "\
+Fast(x : bits[8]) : bits[8] <combines> {
+    return x
+}
+
+rule r <sequences> {
+    h := spawn Fast(1)
+    tick
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("must itself be declared"));
+
+    // A <sequences> callee is fine.
+    run_ok(
+        "Slow(x : bits[8]) : bits[8] <sequences> {\n tick\n return x\n}\n\n\
+         rule r <sequences> {\n h := spawn Slow(1)\n tick\n}\n",
+    );
+}
+
+#[test]
+fn spawn_needs_a_direct_call() {
+    let src = "\
+rule r <sequences> {
+    h := spawn 1
+    tick
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("direct function call"))
+    );
+}
+
+#[test]
 fn all_examples_pass_effect_check() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {

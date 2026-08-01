@@ -204,17 +204,17 @@ compiler reports the cost: how many segments, how many saved bits.
 
 These three constructs compose sequenced code. All three lower to rules and registers.
 
-**Design pass, 2026-08-01 — concretizing this section from prose into an actual
-lowering algorithm (three real forks, not derived from
-recollection) before any implementation started.** Recon (an Explore agent, plus
-advisor review of its findings) established that unlike every other gap closed this
-session, this one has NO small end-to-end-provable slice: a meaningful `spawn` needs
-its callee to be its own multi-cycle `<sequences>` computation with an independent
-continuation FSM, so the minimum that reaches real Verilog is spawn + sync + handle
-typing + generalizing the tick-lowering machinery all at once. The three forks below
-are now DECIDED; the algorithm that follows reflects them. Implementation has not
-started as of this writing — this section is the design-pass deliverable, written
-before touching `lower.rs`/`types.rs`/`effects.rs`.
+**`spawn` + `sync`, ACHIEVED 2026-08-01.** Concretized from prose into an actual
+lowering algorithm (three real forks, resolved via AskUserQuestion, not derived from
+recollection) and then implemented and proven end to end through real firtool +
+Icarus. Recon (an Explore agent, plus advisor review of its findings) established
+that unlike every other gap closed this session, this one has NO small
+end-to-end-provable slice: a meaningful `spawn` needs its callee to be its own
+multi-cycle `<sequences>` computation with an independent continuation FSM, so the
+minimum that reaches real Verilog is spawn + sync + handle typing + generalizing the
+tick-lowering machinery all at once. The three forks below were resolved first; the
+algorithm that follows reflects them and IS what `src/lower.rs` (`plan_spawn`,
+`SpawnPlan`) implements.
 
 **Fork 1 — cycle boundaries: explicit `tick`, `sync` is sugar for a guard.** The
 original sketch below had zero `tick`s, implying `sync` itself was some kind of
@@ -249,47 +249,105 @@ construct") holds exactly, no new scheduling concept needed.
 
 **The lowering algorithm, spawn.** `spawn Callee(args)` requires `Callee` to be a
 `<sequences>`-declared `fn` (the one genuinely new callable shape this introduces —
-every other synthesizable call today is combinational, inlined by `calls.rs`).
-Spawning is macro-expansion, not module instantiation, consistent with how this
-compiler already inlines every other call: at the spawn's call site, `Callee`'s own
-body (its own `tick`s) gets cut into segments by the SAME segmentation/capture
-algorithm `lower.rs` already runs per rule (`plan_rule`'s `Segment`/`CapturedLocal`
-machinery), but scoped to a FRESH continuation register unique to this spawn
-occurrence (named from the bound local, e.g. `__cont_h1`), with `Callee`'s parameters
-substituted from the call site's own arguments (the same substitution `calls.rs`
-already does for combinational calls, just carried across the spawned body's ticks
-instead of resolved in one step). Two new per-spawn registers, alongside the usual
-per-capture save registers: `__done_h1 : bits[1]` (starts / resets to 0 whenever the
-spawn is (re)triggered, set to 1 by the callee's own LAST segment — kept separate from
-the continuation counter specifically to avoid the "cont == 0" ambiguity between
-"never started" and "just wrapped after finishing") and `__result_h1 : <Callee's
-return type>` (written by the callee's last segment's `return` expression, the same
-"save register" pattern `CapturedLocal` already uses for a value crossing a tick, just
-for the return value specifically). `h1.result` reads `__result_h1`; `h1.done` (used
-internally by `sync`, see below) reads `__done_h1`.
+every other synthesizable call today is combinational, inlined by `calls.rs`) —
+`effects.rs`'s `Expr::Spawn` check now rejects anything else, closing the "today
+`spawn` accepts any expression" gap this section used to flag. Spawning is
+macro-expansion, not module instantiation, consistent with how this compiler already
+inlines every other call: at the spawn's call site, `Callee`'s own body (its own
+`tick`s) gets cut into segments by the SAME segmentation/capture algorithm `lower.rs`
+already runs per rule (`plan_rule`'s `Segment`/`CapturedLocal` machinery, factored out
+as `split_into_segments`/`compute_captures` and reused by the new `plan_spawn`), but
+scoped to a FRESH continuation register unique to this spawn occurrence, with
+`Callee`'s parameters substituted via dedicated `__arg_*` save registers written once
+at trigger time (not the same-step `self.locals` substitution `calls.rs` uses for a
+combinational call — that resolves in one compile pass, but a spawned body's
+references are read on LATER cycles, so the argument value has to be latched, exactly
+like a captured local crossing a tick). Every register a spawn occurrence needs is
+named `__{kind}_{rule}_{handle}[_{name}]` — prefixed by BOTH the enclosing rule and
+the handle, not just the handle, since two RULES could otherwise pick the same handle
+name and collide on the same register: `__cont_{rule}_{h}`, `__done_{rule}_{h}`,
+`__result_{rule}_{h}`, `__arg_{rule}_{h}_{param}` per parameter, `__save_{rule}_{h}_{local}`
+per callee-internal captured local (so two spawns of the *same* callee, e.g. Fetch2's
+two `ReadBank*` calls, never collide on a shared save-register name either). `h1.result`
+reads `__result_{rule}_h1`; `h1.done` (used internally by `sync`, see below) reads
+`__done_{rule}_h1`.
+
+**A spawn's continuation register resets to plain 0, same as every other continuation
+register in this emitter — a SENTINEL reset value was seriously considered and then
+found unnecessary.** While designing the lowering, before any code was written,
+tracing what a freshly-reset (never-triggered) spawn's FSM would do with a 0 reset
+raised a real-looking concern: `0` is also segment 0's own guard value, so the
+callee's first-segment rule looks like it could fire on cycle zero regardless of
+whether anything ever spawned it, or race the trigger itself the very cycle it's
+(re)triggered. A sentinel value (segment count, one past the last real index,
+entered only via `__done` going high and left only by the next trigger) was built
+and shipped as the fix. Advisor then pushed back on exactly that "kept anyway as the
+general-purpose fix" reasoning as an unverified claim, and a follow-up hand-simulated
+check (a gated variant: the trigger held behind an extra guard for several cycles
+post-reset, sentinel removed, `__cont_*` reset to plain 0) came back CORRECT — the
+spurious pre-trigger completion turns out to be structurally unobservable regardless
+of caller shape: `render_rule` always emits the trigger's own segment rules before a
+spawn's callee segments, so derived-stall priority always favors the trigger on any
+shared cycle; the trigger itself resets `done` to 0 whenever it fires, overwriting
+any spurious completion; and `sync` can never observe `done` before the trigger's own
+segment has run at least once, since it's gated behind the rule's own mandatory
+`tick`. The sentinel was removed as unneeded complexity per this project's own
+"don't validate scenarios that can't happen" standard — `examples/fetch2_gated.tr` +
+`sim/fetch2_gated_tb.v` keep the delayed-trigger case as a permanent regression
+proof, not just a one-off scratch check.
 
 **`spawn` must stay top-level in its enclosing segment** — the SAME restriction
-`tick` already has (no nesting in `if`/`while`) — which is what makes "spawn counts
-are static" (DESIGN.md's original constraint) fall out for free: no loop construct can
-ever contain a spawn, so there is no dynamic spawn count to reason about, and no new
-check is needed beyond the existing nested-tick/nested-construct scan `lower.rs`
-already runs.
+`tick` already has (no nesting in `if`/`while`, enforced by a new `find_nested_spawn`
+mirroring `find_nested_tick`) — which is what makes "spawn counts are static"
+(DESIGN.md's original constraint) fall out for free: no loop construct can ever
+contain a spawn, so there is no dynamic spawn count to reason about.
 
-**`sync(h1, h2)`** lowers, per fork 1, to `(h1.done == 1)? (h2.done == 1)?` — two
-ordinary guards inserted in place of the call, gating the segment they're written in
-exactly like any other guard. The segment containing `sync` therefore doesn't fire
-(and doesn't advance its OWN enclosing continuation) until both spawned FSMs have
-finished; this is the existing "blocked step" retry semantics, unchanged.
+**`sync(h1, h2, ...)`** lowers, per fork 1, to one `(h{i}.done == 1)?` guard per
+handle, inserted in place of the call, gating the segment it's written in exactly
+like any other guard — recognized only in the one legitimate bare-statement shape;
+anything else (nested in `if`/`while`, or embedded in a larger expression) is
+rejected by the same generic unsupported-construct scan `race` still hits. The
+segment containing `sync` therefore doesn't fire (and doesn't advance its OWN
+enclosing continuation) until every spawned FSM it names has finished; this is the
+existing "blocked step" retry semantics, unchanged.
+
+`examples/fetch2.tr` + `sim/fetch2_tb.v` prove this end to end — two independent bank
+reads spawned in parallel, joined by `sync`, packed into `ir`:
 
 ```
-Fetch2(pc : bits[16]) <sequences> {
-    h1 := spawn ReadBank(bank0, pc)
-    h2 := spawn ReadBank(bank1, pc + 1)
-    tick
-    sync(h1, h2)                        -- guards this segment; retries until both land
-    ir := pack(h1.result, h2.result)
+module Fetch2 {
+    mem bank0 : bits[16][8]
+    mem bank1 : bits[16][8]
+    input pc : bits[16]
+    output ir : bits[32] = 0
+
+    ReadBank0(addr : bits[16]) : bits[16] <sequences> {
+        v := bank0[addr]
+        tick
+        return v
+    }
+
+    ReadBank1(addr : bits[16]) : bits[16] <sequences> {
+        v := bank1[addr]
+        tick
+        return v
+    }
+
+    rule fetch2 <sequences> {
+        h1 := spawn ReadBank0(pc)
+        h2 := spawn ReadBank1(pc + 1)
+        tick
+        sync(h1, h2)                        -- guards this segment; retries until both land
+        ir := pack(h1.result, h2.result)
+    }
 }
 ```
+
+The testbench's own comment records how the arg-save-register design was confirmed to
+matter, not just assumed sound: `pc` changes one cycle after the trigger, and a
+hand-lowered variant with the `__arg_*` registers removed (segments reading `pc`
+directly) was run against this exact scenario and came back with the wrong `ir`
+before this file was trusted as a regression test.
 
 **`race(h1, h2)` is DEFERRED — fork 3's "ordinary scheduler" framing turned out to be
 wrong, caught by advisor review before implementation started.** The scheduler's
@@ -306,16 +364,12 @@ this document to prove one against — so `race` stays out of scope for the comi
 implementation pass. Revisit once spawn+sync are real and there's a concrete multi-spawn
 example to design the cancellation latch against.
 
-**Not yet implemented: this is the concretized design for `spawn` + `sync`, not shipped
-code.** `race` is explicitly excluded per above. The next step is `types.rs`'s
-`Ty::Handle` addition, `lower.rs`'s per-spawn segmentation (the largest single piece —
-it reuses `plan_rule`'s machinery but needs it callable at an arbitrary spawn site, not
-just once per rule, and needs the callee's own internal save/capture registers prefixed
-per spawn occurrence so two spawns of the same callee — e.g. Fetch2's two `ReadBank`
-spawns — don't collide on shared register names), and `effects.rs` gaining a real check
-that a `spawn`'s callee is actually `<sequences>`-declared (today `spawn` accepts any
-expression). Each piece needs its own real end-to-end proof through firtool + Icarus,
-per this document's usual bar — there is no smaller slice to prove first.
+`race` stays out of scope (see above — no cancellation-latch design exists yet, and
+there's now a concrete multi-spawn example, `fetch2.tr`, to design one against
+whenever that's picked up). Everything else this section describes — `Ty::Handle`,
+`spawn`'s effects.rs callee check, `lower.rs`'s per-spawn segmentation and `sync`
+guard-rewriting — is implemented and proven through real firtool + Icarus, not just
+plausible-looking FIRRTL text.
 
 ## `chooses`: specification, not synthesis
 
@@ -417,12 +471,10 @@ Named to match Bluespec's own vocabulary (this project's cited scheduling refere
 rather than invent new terms for the same two ideas bsc already has words for.
 **This wasn't the first naming tried.** The feature initially shipped as a single
 `conflict_free` directive meaning "never both fire" (the `mutually_exclusive` reading
-above) — the natural-sounding name for "no conflict happens." Lumi asked for the
-concurrent-safe case to be added as well, which surfaced the clash directly: Bluespec's
+above) — the natural-sounding name for "no conflict happens." Also addedconcurrent-safe case
+as well, which surfaced the clash directly: Bluespec's
 own `conflict_free` attribute conventionally means the OPPOSITE of what had just been
-built (safe-to-fire-concurrently, not never-both-fire) — confirmed with Lumi (who is
-Bluespec-fluent) before touching any code, since this was a naming/semantics call only
-they could make, not something to resolve from recollection alone. Realigned: the
+built (safe-to-fire-concurrently, not never-both-fire). Realigned: the
 just-shipped checked directive was renamed `mutually_exclusive`, and `conflict_free`
 was repurposed to mean the concurrent-safe, trusted case — matching bsc rather than
 leaving a plausible-but-backwards name in place next to a newly-added correct one.
@@ -849,8 +901,7 @@ aliasing.
 **This closes the general capability, not SUBLEQ's specific gap** — that gap is closed
 separately below.
 
-**SUBLEQ boot loading, ACHIEVED 2026-08-01** (Lumi's pick off TODO.md's remaining SUBLEQ
-gap, offered alongside "reassigned locals" and "spawn/sync/race synthesis"). `PortRam`'s
+**SUBLEQ boot loading, ACHIEVED 2026-08-01**. `PortRam`'s
 pattern works per-word, on demand, with no notion of "not yet loaded" — good enough for
 a RAM, not for booting a CPU from a cold `mem`, since `step`/`refill` start firing the
 instant `reset` clears, racing any port-driven load sequence. The actual open design
@@ -1363,9 +1414,7 @@ has an `= init` for a type to be inferred from.
 written by any rule) holds its `0xFF00` reset value forever — both observed directly,
 not inferred from "it compiled."
 
-**`/` and `%`, added 2026-07-31** (Lumi's pick off TODO.md's expression-surface sublist,
-recommended as the most mechanical remaining gap — no new design decision needed, unlike
-logical `!`'s bit-vs-whole-value ambiguity). Types.rs already typed both (the same
+**`/` and `%`, added 2026-07-31**. Types.rs already typed both (the same
 `max(w(a), w(b))` default rule `+`/`-`/bitwise share); the only gap was firrtl.rs's
 `compile_binop` rejecting them outright. Turned out NOT to share `mul`'s "sum, then trim
 the excess" shape, and I didn't trust memory of the FIRRTL spec text for this — confirmed
@@ -1398,11 +1447,11 @@ report the correct `q1=15 q2=0 r1=5 r2=13` (`a=200, b=13`: `200/13=15`, `13/200=
 `200%13=5`, `13%200=13`).
 
 **Logical `!`, added 2026-07-31, resolving the "bit-vs-whole-value ambiguity" flagged
-above as the reason it was left out of the div/rem pass.** Lumi raised the actual design
+above as the reason it was left out of the div/rem pass.** Raised the actual design
 question directly: does this language need `!` to mean something DIFFERENT from `~`
 (C-style "nonzero is true" truthiness for a wide value), or is it purely redundant with
-`~` given comparisons/guards already produce `bits[1]`? Checked before answering, not
-assumed: `check_cond` (types.rs, gating every `if`/`while` condition) already requires
+`~` given comparisons/guards already produce `bits[1]`? `check_cond` (types.rs, 
+gating every `if`/`while` condition) already requires
 EXACT `bits[1]` type equality — `"condition must be bits[1], got {other} (compare
 explicitly)"` — there is no implicit "nonzero is true" coercion anywhere in this
 language for a wider `!x` to usefully mean. So the ambiguity resolves itself: wherever
@@ -1438,8 +1487,8 @@ unrelated to `!` specifically — it would need its own investigation into wheth
 reachable/harmful in practice — noted here rather than silently ignored, not yet added to
 TODO.md since its actual impact isn't confirmed.
 
-**`bit` as sugar for `bits[1]`, added 2026-07-31, Lumi's request right after logical `!`
-landed.** A new lexer keyword (`src/lexer.rs`), not a `resolve.rs` `BUILTINS` identifier
+**`bit` as sugar for `bits[1]`, added 2026-07-31.**
+A new lexer keyword (`src/lexer.rs`), not a `resolve.rs` `BUILTINS` identifier
 like `bits` itself — a real keyword so it can never collide with a user-declared name the
 way an ordinary identifier could, matching how `reg`/`mem`/`fifo`/`input`/`output` are
 already reserved tokens. Desugars purely in the parser: `Parser::parse_expr`'s primary
@@ -1789,8 +1838,7 @@ through real ports so a wrong value on EITHER side would fail the testbench, not
 "firtool accepted it."
 
 **`prio`, the one synthesizable builtin, added 2026-07-31** (the calls TODO bullet's
-last remaining item — the user asked to go for both remaining sub-items, state-writing
-callees and builtin calls, together; this is the second, landed as its own commit on
+last remaining item; this is the second, landed as its own commit on
 its own recon per the state-writing-callees section's own guidance not to conflate two
 differently-shaped features). Every other builtin (`bits`, `wire`, `list`, `any`,
 `clog2`, `pack`, `trunc`, `len`, `sync`, `race`) is either a type-position construct
@@ -1808,9 +1856,7 @@ existing test only checked `prio`'s TYPE (`bits[N] -> bits[clog2(N)]`), never it
 actual returned value for a given input. That's a real gap in a repo whose stated
 practice is verifying claims by running code: there was no code to run.
 
-**Semantics, decided here, not invented in isolation** (confirmed with Lumi before
-writing any emission code, since this becomes permanent source-of-truth the moment
-it's implemented): `prio(reqs)` is a FIXED-priority encoder — the LOWEST set bit in
+**Semantics, decided here, not invented in isolation** `prio(reqs)` is a FIXED-priority encoder — the LOWEST set bit in
 `reqs` wins (bit 0 is highest priority), and `reqs == 0` returns `0`, a defined but
 not-meaningful value; gating on `reqs != 0` (when that matters) is the CALLER's job,
 the same way a `fails` precondition is established by the caller, not the failing
@@ -1879,16 +1925,13 @@ different kind of gap than `prio` (which had a real spec-level purpose, `arbiter
 refinement, to confirm an encoding against) or `trunc` (unambiguous by construction).
 `pack` (concatenation, well-defined) was flagged in this same pass as real but tied to
 a `<sequences>`/spawn body in its only DOCUMENTED use — see the next section for why
-that turned out not to block implementing it anyway. Scoped this way with Lumi via
-AskUserQuestion before writing any code, rather than assuming "close the whole TODO
-line" meant treating all four builtins as one uniform task.
+that turned out not to block implementing it anyway.
 
 `examples/call_trunc.tr` proves it through real firtool and Icarus simulation,
 deliberately feeding a value (`0xBEEF`) whose low and high bytes differ, so truncating
 to the wrong end would show up as a wrong answer (`0xEF`, not `0xBE`).
 
-**`pack`, the third synthesizable builtin, added 2026-07-31** (a follow-up pass, once
-Lumi asked to go for it specifically, after this section had left it flagged as "tied
+**`pack`, the third synthesizable builtin, added 2026-07-31** (a follow-up pass after this section had left it flagged as "tied
 to spawn" rather than implemented). Revisiting the reasoning above: `pack`'s only
 DOCUMENTED example (`Fetch2`'s `pack(h1.result, h2.result)`, above) lives inside a
 `<sequences>`/spawn body, which still has no synthesis path of its own — but
@@ -1907,8 +1950,7 @@ significant bits. Went with the FIRST argument as most significant, matching FIR
 own `cat(hi, lo)` primop directly (so `compile_pack` needs no reordering, just folding
 multiple arguments left-to-right: `cat(cat(a, b), c)` for three), and the same
 "leftmost is most significant" convention as Chisel's `Cat` and Verilog's `{a, b}`
-concatenation — strong enough external precedent that, unlike `prio`'s tie-breaking
-rule, this didn't need an AskUserQuestion round to confirm before implementing.
+concatenation.
 Verified empirically anyway, not just asserted: ran the compiled FIRRTL through real
 firtool and Icarus with `a = 0xAA`, `b = 0xBB` and confirmed `result = 0xAABB` (not
 `0xBBAA`) before writing it into this section as settled fact, and again with three
@@ -1921,8 +1963,7 @@ same distinguishable-halves technique `call_trunc.tr` uses (`a = 0xAA`, `b = 0xB
 checking the RESULT lands as `0xAABB` specifically, not just "some concatenation").
 
 **A callee may call another callee, added 2026-07-31** (the last bundled piece of the
-calls TODO line — user picked this over generalizing `concrete_width_of` or lifting the
-loop/guard/fifo-op restriction). Before this, a called function's own body was banned
+calls TODO line). Before this, a called function's own body was banned
 from containing ANY further call at all — a blanket rule that doubled as free recursion
 prevention ("a callee that cannot call anything can never call itself") but also blocked
 ordinary composition (`Outer` calling `Inner` for a value). Lifted to: a callee's own

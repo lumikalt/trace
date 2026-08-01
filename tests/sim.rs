@@ -990,6 +990,76 @@ fn reassigned_local_runs_through_real_ports() {
     );
 }
 
+/// Proves `spawn`/`sync` end to end: DESIGN.md's `Fetch2` example, two
+/// independent bank-read FSMs running in parallel off distinct
+/// `__cont_*` registers, triggered together and joined by `sync` before
+/// their results are packed. See sim/fetch2_tb.v's own comment for how
+/// this was confirmed to actually discriminate a missing trigger-time
+/// argument save, not just pass vacuously.
+#[test]
+fn fetch2_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fetch2.tr"))
+        .unwrap();
+    let fir = generate_firrtl(&src);
+    // `bank0`/`bank1` are never WRITTEN anywhere in this design (read-only
+    // banks, no loader rule like subleq_boot.tr's) -- same as
+    // checksum.tr, firtool's default optimizer treats that as license to
+    // constant-fold the whole read/pack/`ir` chain away despite the real
+    // output port, confirmed empirically.
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/fetch2_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: ir=aaaabbbb"),
+        "ir did not settle at the packed trigger-time bank reads:\n{output}"
+    );
+}
+
+/// Companion to `fetch2_runs_through_real_ports`: the trigger sits
+/// behind an extra guard (`go`), held low for several cycles after
+/// reset. See sim/fetch2_gated_tb.v's own comment for why this proves
+/// the spawn lowering's plain-0 continuation-register reset (as opposed
+/// to a sentinel/idle value, considered and then found unnecessary) is
+/// safe for a delayed trigger too, not just the immediate-trigger shape
+/// `fetch2.tr` exercises.
+#[test]
+fn fetch2_gated_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/fetch2_gated.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    // Same as fetch2.tr: bank0/bank1 are never written, so firtool's
+    // optimizer constant-folds the read/pack/`ir` chain away without
+    // this despite the real output port.
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/fetch2_gated_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: ir=aaaabbbb"),
+        "ir did not settle at the packed trigger-time bank reads:\n{output}"
+    );
+}
+
 /// Proves the `Checksum` motivating example (unrolled accumulation via
 /// a local reassigned four times in a row) through real firtool and
 /// Icarus, not just plausible-looking FIRRTL text. See

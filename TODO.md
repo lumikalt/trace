@@ -66,8 +66,13 @@
 
 ## Language features with no synthesis path yet
 
-- `spawn`/`sync`/`race`: parse and effect-check, but `lower.rs` and
-  `firrtl.rs` both explicitly reject them (v0 restriction, not silent).
+- `race`: parses and effect-checks, but `lower.rs` explicitly rejects it
+  (v0 restriction, not silent) — needs a loser-cancellation latch design
+  first (arbitrating a same-cycle write conflict, which the ordinary
+  scheduler already does, isn't the same as "first handle to complete
+  wins" across cycles). `spawn`/`sync` themselves are ACHIEVED (see
+  DESIGN.md's "`sync`, `race`, `spawn`" section,
+  `examples/fetch2.tr` + `sim/fetch2_tb.v`).
 - Combinational-only (stateless) modules: `output` is register-backed by
   design (see DESIGN.md's "Module ports"), so a pure function of inputs
   can't be expressed without a cycle of delay.

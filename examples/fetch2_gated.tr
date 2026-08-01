@@ -1,0 +1,34 @@
+-- Same design as fetch2.tr, but the spawn trigger sits behind an extra
+-- guard (`go`) instead of firing unconditionally the first live cycle.
+-- Proves the spawn lowering's plain-0 continuation-register reset is
+-- safe even when the trigger is delayed for several cycles after reset
+-- (not just the immediate-trigger shape fetch2.tr exercises) --
+-- see sim/fetch2_gated_tb.v and DESIGN.md's "sync, race, spawn" section.
+module Fetch2Gated {
+    mem bank0 : bits[16][8]
+    mem bank1 : bits[16][8]
+    input pc : bits[16]
+    input go : bits[1]
+    output ir : bits[32] = 0
+
+    ReadBank0(addr : bits[16]) : bits[16] <sequences> {
+        v := bank0[addr]
+        tick
+        return v
+    }
+
+    ReadBank1(addr : bits[16]) : bits[16] <sequences> {
+        v := bank1[addr]
+        tick
+        return v
+    }
+
+    rule fetch2 <sequences> {
+        (go == 1)?
+        h1 := spawn ReadBank0(pc)
+        h2 := spawn ReadBank1(pc + 1)
+        tick
+        sync(h1, h2)
+        ir := pack(h1.result, h2.result)
+    }
+}

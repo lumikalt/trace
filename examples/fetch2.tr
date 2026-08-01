@@ -1,0 +1,30 @@
+-- DESIGN.md's `spawn`/`sync` example: two independent bank reads run in
+-- parallel FSMs, joined by `sync` before their results are packed. Each
+-- `ReadBank*` is its own `<sequences>` fn, macro-expanded by the spawn
+-- lowering into a private continuation FSM per spawn occurrence.
+module Fetch2 {
+    mem bank0 : bits[16][8]
+    mem bank1 : bits[16][8]
+    input pc : bits[16]
+    output ir : bits[32] = 0
+
+    ReadBank0(addr : bits[16]) : bits[16] <sequences> {
+        v := bank0[addr]
+        tick
+        return v
+    }
+
+    ReadBank1(addr : bits[16]) : bits[16] <sequences> {
+        v := bank1[addr]
+        tick
+        return v
+    }
+
+    rule fetch2 <sequences> {
+        h1 := spawn ReadBank0(pc)
+        h2 := spawn ReadBank1(pc + 1)
+        tick
+        sync(h1, h2)
+        ir := pack(h1.result, h2.result)
+    }
+}

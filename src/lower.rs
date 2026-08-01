@@ -21,19 +21,49 @@
 //! read in its own assignment segment, is rejected rather than silently
 //! miscompiled.
 //!
+//! `spawn`/`sync` (2026-08-01, DESIGN.md's fork-resolved algorithm):
+//! `h := spawn Callee(args)` at a rule's top level starts an independent
+//! FSM, macro-expanded from `Callee`'s own `<sequences>` body using this
+//! same segment/capture machinery, scoped to fresh per-occurrence
+//! registers (`__cont_{rule}_{h}`, `__done_{rule}_{h}`,
+//! `__result_{rule}_{h}`, one `__arg_{rule}_{h}_{param}` per parameter,
+//! one `__save_{rule}_{h}_{local}` per callee-internal captured local —
+//! every name prefixed by both the enclosing rule and the handle to keep
+//! two spawns of the same callee, or the same handle name in two rules,
+//! from colliding). A callee's own segment-0 rule COULD in principle fire
+//! from a zeroed reset before ever being triggered, or race the trigger
+//! itself the cycle it's (re)triggered — checked by hand-simulating a
+//! gated-trigger variant before this shipped, and both turn out to be
+//! structurally unobservable: `render_rule` always emits the trigger's
+//! own segment rules before a spawn's callee segments (so derived-stall
+//! priority always favors the trigger on any shared cycle), the trigger
+//! itself resets `done` to 0 whenever it fires, and `sync` can never
+//! observe `done` before the trigger's own segment has run at least once
+//! — so the continuation register resets to a plain 0, same as every
+//! other continuation register in this emitter, no sentinel value
+//! needed. `sync(h1, h2, ...)`
+//! lowers to one `(__done_h{i} == 1)?` guard per handle, inserted in
+//! place of the call — reusing "guard fails, segment retries next cycle"
+//! unchanged, no new segmentation trigger. `h.result`/`h.done` anywhere
+//! in the enclosing rule rewrite to `__result_*`/`__done_*` reads.
+//! `race` stays unimplemented (DESIGN.md: needs a loser-cancellation
+//! latch not yet designed).
+//!
 //! v0 scope, each an explicit error rather than a silent skip:
 //! - `tick` must be at the top level of the rule body, not nested in
 //!   `if`/`while` (a conditional cycle boundary is real scheduler work,
-//!   not yet designed).
-//! - `spawn`/`sync`/`race` are not handled by this pass.
+//!   not yet designed). `spawn` has the identical restriction.
+//! - `race` is not handled by this pass.
 //! - a captured local's type must be a concrete `bits[w]`.
+//! - a spawn callee's `return` must be the last statement of its last
+//!   segment; no early return.
 
-use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Stmt, StmtId};
+use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::effects::Effects;
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
 use crate::types::{Ty, Types, Width};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -51,6 +81,43 @@ pub struct CapturedLocal {
     pub read_segments: Vec<usize>,
 }
 
+/// One `spawn`'s callee parameter: a save register written once, at
+/// trigger time, from the caller's own argument expression.
+#[derive(Debug, Clone)]
+pub struct SpawnArg {
+    pub reg_name: String,
+    pub ty: Ty,
+    pub caller_expr: ExprId,
+}
+
+/// One `h := spawn Callee(args)` occurrence, fully planned: the callee's
+/// own body cut into segments exactly like a top-level rule, renamed
+/// into this occurrence's own private registers.
+#[derive(Debug, Clone)]
+pub struct SpawnPlan {
+    pub handle_def: DefId,
+    pub handle_name: String,
+    pub trigger_stmt: StmtId,
+    pub cont_name: String,
+    pub cont_width: u64,
+    pub done_name: String,
+    pub result_name: String,
+    pub result_ty: Ty,
+    pub args: Vec<SpawnArg>,
+    pub segments: Vec<Segment>,
+    pub captures: Vec<CapturedLocal>,
+    /// Every reference (inside `segments`) to a param or a captured local
+    /// rewrites to this register name instead of its original text.
+    pub renames: HashMap<DefId, String>,
+    /// Pre-computed `(span, replacement)` edits for every renamed
+    /// reference anywhere in the callee's body (all segments, including
+    /// the final `return`'s own value expression) — render time only
+    /// splices, it never needs `Resolution` again.
+    pub rename_edits: Vec<(Span, String)>,
+    pub return_expr: ExprId,
+    pub base_rule_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoweredRule {
     pub rule: ItemId,
@@ -59,6 +126,12 @@ pub struct LoweredRule {
     pub cont_width: u64,
     pub segments: Vec<Segment>,
     pub captures: Vec<CapturedLocal>,
+    pub spawns: Vec<SpawnPlan>,
+    /// `sync(...)` call statements, each naming the handles it joins.
+    pub syncs: Vec<(StmtId, Vec<DefId>)>,
+    /// Every `h.result`/`h.done` reference anywhere in this rule's own
+    /// segments, rewritten to the owning spawn's register name.
+    pub handle_field_rewrites: Vec<(Span, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +157,7 @@ pub fn plan(
     fx: &Effects,
     types: &Types,
 ) -> (Vec<LoweredRule>, Vec<LowerError>) {
+    let def_items: HashMap<DefId, ItemId> = res.item_defs.iter().map(|(i, d)| (*d, *i)).collect();
     let mut out = Vec::new();
     let mut errors = Vec::new();
     let mut stack: Vec<ItemId> = ast.roots.clone();
@@ -97,7 +171,7 @@ pub fn plan(
                 if !body.iter().any(|s| matches!(ast.stmt(*s), Stmt::Tick)) {
                     continue; // nothing to cut; leave as an ordinary rule
                 }
-                match plan_rule(ast, res, types, id, &name.text, &body) {
+                match plan_rule(ast, res, types, &def_items, id, &name.text, &body) {
                     Ok(lowered) => out.push(lowered),
                     Err(errs) => errors.extend(errs),
                 }
@@ -112,32 +186,148 @@ fn plan_rule(
     ast: &Ast,
     res: &Resolution,
     types: &Types,
+    def_items: &HashMap<DefId, ItemId>,
     rule: ItemId,
     rule_name: &str,
     body: &[StmtId],
 ) -> Result<LoweredRule, Vec<LowerError>> {
-    let mut errors = Vec::new();
-
+    // Each of these three checks scans the whole body; run them in order
+    // and stop at the first hit rather than accumulating, since a nested
+    // spawn (say) would otherwise ALSO get re-flagged by the generic
+    // unsupported-construct scan below, as two reports of one problem.
     if let Some(span) = find_nested_tick(ast, body) {
-        errors.push(LowerError {
+        return Err(vec![LowerError {
             span,
             message: "`tick` must be at the top level of a sequences rule, not nested in \
                       if/while (v0 restriction)"
                 .to_string(),
-        });
+        }]);
     }
-    if let Some(span) = find_unsupported_construct(ast, res, body) {
-        errors.push(LowerError {
+    if let Some(span) = find_nested_spawn(ast, body) {
+        return Err(vec![LowerError {
             span,
-            message: "sequences lowering does not yet support spawn/sync/race (v0 restriction)"
+            message: "`spawn` must be at the top level of a sequences rule, not nested in \
+                      if/while (v0 restriction, same as `tick`)"
                 .to_string(),
-        });
+        }]);
     }
+    if let Some(span) = find_unsupported_construct(ast, res, body, true) {
+        return Err(vec![LowerError {
+            span,
+            message: "sequences lowering does not yet support `race` (v0 restriction); \
+                      `spawn`/`sync` need `spawn`'s result bound directly to a fresh local \
+                      (`h := spawn Callee(args)`) and `sync(...)` written as its own \
+                      statement"
+                .to_string(),
+        }]);
+    }
+
+    let mut errors = Vec::new();
+
+    // Split at top-level ticks.
+    let segments = split_into_segments(ast, body);
+
+    // Spawn-trigger and sync-call statements, found at the top level of
+    // each segment (never nested — `find_nested_spawn` above already
+    // confirmed no spawn hides in if/while, and a nested sync would have
+    // been caught by `find_unsupported_construct` above since only a
+    // bare top-level shape is recognized).
+    let mut handle_defs: HashSet<DefId> = HashSet::new();
+    let mut spawn_sites: Vec<(StmtId, DefId, String, ExprId)> = Vec::new();
+    let mut syncs: Vec<(StmtId, Vec<DefId>)> = Vec::new();
+    for seg in &segments {
+        for stmt in &seg.stmts {
+            if let Some((handle_def, handle_name, call)) = spawn_trigger_shape(ast, res, *stmt) {
+                handle_defs.insert(handle_def);
+                spawn_sites.push((*stmt, handle_def, handle_name, call));
+            } else if let Some(handles) = sync_call_shape(ast, res, *stmt) {
+                syncs.push((*stmt, handles));
+            }
+        }
+    }
+
+    let mut spawns = Vec::new();
+    for (trigger_stmt, handle_def, handle_name, call) in spawn_sites {
+        match plan_spawn(
+            ast,
+            res,
+            types,
+            def_items,
+            rule_name,
+            &handle_name,
+            handle_def,
+            trigger_stmt,
+            call,
+        ) {
+            Ok(plan) => spawns.push(plan),
+            Err(errs) => errors.extend(errs),
+        }
+    }
+
+    let captures = match compute_captures(ast, res, types, &segments, &handle_defs) {
+        Ok(c) => c,
+        Err(errs) => {
+            errors.extend(errs);
+            Vec::new()
+        }
+    };
+
     if !errors.is_empty() {
         return Err(errors);
     }
 
-    // Split at top-level ticks.
+    let handle_names: HashMap<DefId, (String, String)> = spawns
+        .iter()
+        .map(|s| (s.handle_def, (s.result_name.clone(), s.done_name.clone())))
+        .collect();
+    let handle_field_rewrites = collect_handle_field_rewrites(ast, res, body, &handle_names);
+
+    let cont_width = clog2(segments.len() as u64).max(1);
+    Ok(LoweredRule {
+        rule,
+        rule_name: rule_name.to_string(),
+        cont_name: format!("__cont_{rule_name}"),
+        cont_width,
+        segments,
+        captures,
+        spawns,
+        syncs,
+        handle_field_rewrites,
+    })
+}
+
+/// Every `Return` statement reachable from `stmt`, including itself and
+/// any nested inside if/while — used to catch an early return hiding
+/// inside a conditional, which a purely top-level scan would miss.
+fn find_returns(ast: &Ast, stmt: StmtId) -> Vec<StmtId> {
+    let mut out = Vec::new();
+    match ast.stmt(stmt) {
+        Stmt::Return(_) => out.push(stmt),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for s in then_body {
+                out.extend(find_returns(ast, *s));
+            }
+            if let Some(else_body) = else_body {
+                for s in else_body {
+                    out.extend(find_returns(ast, *s));
+                }
+            }
+        }
+        Stmt::While { body, .. } => {
+            for s in body {
+                out.extend(find_returns(ast, *s));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn split_into_segments(ast: &Ast, body: &[StmtId]) -> Vec<Segment> {
     let mut segments: Vec<Segment> = vec![Segment {
         index: 0,
         stmts: Vec::new(),
@@ -153,11 +343,301 @@ fn plan_rule(
             segments.last_mut().unwrap().stmts.push(*stmt);
         }
     }
+    segments
+}
 
-    // Per-local def/use segments, across the whole rule.
-    let mut assigns: std::collections::BTreeMap<DefId, BTreeSet<usize>> = Default::default();
-    let mut reads: std::collections::BTreeMap<DefId, BTreeSet<usize>> = Default::default();
-    for seg in &segments {
+/// Recognizes `h := spawn Callee(args)`: a top-level assignment to a
+/// fresh ident whose RHS is directly a `spawn` of a call. Returns the
+/// handle's def, name, and the inner call expression.
+fn spawn_trigger_shape(
+    ast: &Ast,
+    res: &Resolution,
+    stmt: StmtId,
+) -> Option<(DefId, String, ExprId)> {
+    let Stmt::Assign { lhs, rhs } = ast.stmt(stmt) else {
+        return None;
+    };
+    let Expr::Ident(_) = ast.expr(*lhs) else {
+        return None;
+    };
+    let Expr::Spawn(inner) = ast.expr(*rhs) else {
+        return None;
+    };
+    let def = *res.expr_defs.get(lhs)?;
+    if res.def(def).kind != DefKind::Local {
+        return None;
+    }
+    Some((def, res.def(def).name.clone(), *inner))
+}
+
+/// Recognizes `sync(h1, h2, ...)` written as its own bare statement.
+fn sync_call_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefId>> {
+    let Stmt::Expr(e) = ast.stmt(stmt) else {
+        return None;
+    };
+    let Expr::Call { callee, args } = ast.expr(*e) else {
+        return None;
+    };
+    let def = res.expr_defs.get(callee)?;
+    let d = res.def(*def);
+    if d.kind != DefKind::Builtin || d.name != "sync" {
+        return None;
+    }
+    let mut handles = Vec::new();
+    for arg in args {
+        let Expr::Ident(_) = ast.expr(*arg) else {
+            return None;
+        };
+        handles.push(*res.expr_defs.get(arg)?);
+    }
+    Some(handles)
+}
+
+/// Plan one `spawn` occurrence: cut the callee's own `<sequences>` body
+/// into segments (same algorithm as a rule), rename its params and
+/// captured locals into this occurrence's private registers.
+#[allow(clippy::too_many_arguments)]
+fn plan_spawn(
+    ast: &Ast,
+    res: &Resolution,
+    types: &Types,
+    def_items: &HashMap<DefId, ItemId>,
+    rule_name: &str,
+    handle_name: &str,
+    handle_def: DefId,
+    trigger_stmt: StmtId,
+    call: ExprId,
+) -> Result<SpawnPlan, Vec<LowerError>> {
+    let span = ast.expr_spans[call.0 as usize].clone();
+    let Expr::Call {
+        callee,
+        args: call_args,
+    } = ast.expr(call).clone()
+    else {
+        return Err(vec![LowerError {
+            span,
+            message: "`spawn` needs a direct function call, e.g. `spawn Foo(a, b)`".to_string(),
+        }]);
+    };
+    let Some(callee_def) = res.expr_defs.get(&callee).copied() else {
+        return Err(vec![LowerError {
+            span,
+            message: "spawn callee did not resolve".to_string(),
+        }]);
+    };
+    let Some(&callee_item) = def_items.get(&callee_def) else {
+        return Err(vec![LowerError {
+            span,
+            message: "spawn callee is not a function".to_string(),
+        }]);
+    };
+    let Item::Fn {
+        params,
+        body: callee_body,
+        ..
+    } = ast.item(callee_item).clone()
+    else {
+        return Err(vec![LowerError {
+            span,
+            message: "spawn callee is not a function".to_string(),
+        }]);
+    };
+
+    if let Some(s) = find_nested_tick(ast, &callee_body) {
+        return Err(vec![LowerError {
+            span: s,
+            message: "`tick` must be at the top level of a spawned fn's body, not nested in \
+                      if/while (v0 restriction)"
+                .to_string(),
+        }]);
+    }
+    if let Some(s) = find_nested_spawn(ast, &callee_body) {
+        return Err(vec![LowerError {
+            span: s,
+            message: "a spawned fn cannot itself `spawn` (v0 restriction: no nested \
+                      parallelism)"
+                .to_string(),
+        }]);
+    }
+    if let Some(s) = find_unsupported_construct(ast, res, &callee_body, true) {
+        return Err(vec![LowerError {
+            span: s,
+            message: "sequences lowering does not yet support `race`, or a nested \
+                      `spawn`/`sync`, inside a spawned fn's body (v0 restriction)"
+                .to_string(),
+        }]);
+    }
+
+    let mut errors = Vec::new();
+    let segments = split_into_segments(ast, &callee_body);
+    let nsegs = segments.len() as u64;
+
+    // `return` must be the last statement of the last segment; no early
+    // return anywhere else, including nested inside if/while.
+    let mut return_expr = None;
+    for (i, seg) in segments.iter().enumerate() {
+        for (j, stmt) in seg.stmts.iter().enumerate() {
+            let is_last_stmt_of_last_segment = i + 1 == segments.len() && j + 1 == seg.stmts.len();
+            for nested in find_returns(ast, *stmt) {
+                let is_last = is_last_stmt_of_last_segment && nested == *stmt;
+                if !is_last {
+                    errors.push(LowerError {
+                        span: ast.stmt_spans[nested.0 as usize].clone(),
+                        message: "a spawned fn's `return` must be the last statement of its \
+                                  last segment (v0 restriction: no early return)"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                let Stmt::Return(value) = ast.stmt(nested) else {
+                    unreachable!()
+                };
+                match value {
+                    Some(v) => return_expr = Some(*v),
+                    None => errors.push(LowerError {
+                        span: ast.stmt_spans[nested.0 as usize].clone(),
+                        message: "a spawned fn must `return` a value; `.result` needs \
+                                  something to read"
+                            .to_string(),
+                    }),
+                }
+            }
+        }
+    }
+    let Some(return_expr) = return_expr else {
+        if errors.is_empty() {
+            errors.push(LowerError {
+                span,
+                message: "a spawned fn's last segment must end with `return <value>`".to_string(),
+            });
+        }
+        return Err(errors);
+    };
+    // The `return` statement itself isn't ordinary rule-body syntax;
+    // `render_spawn_segments` recognizes it by position (last statement
+    // of the last segment, already validated above) and emits a
+    // `result := ...` write in its place instead of splicing it verbatim.
+
+    let param_defs: Vec<(DefId, &Param)> = params
+        .iter()
+        .filter_map(|p| {
+            res.defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == p.name.span)
+                .map(|(i, _)| (DefId(i as u32), p))
+        })
+        .collect();
+    let param_def_set: HashSet<DefId> = param_defs.iter().map(|(d, _)| *d).collect();
+
+    if call_args.len() != param_defs.len() {
+        errors.push(LowerError {
+            span,
+            message: format!(
+                "spawn callee expects {} argument(s), got {}",
+                param_defs.len(),
+                call_args.len()
+            ),
+        });
+        return Err(errors);
+    }
+
+    let mut renames: HashMap<DefId, String> = HashMap::new();
+    let mut args = Vec::new();
+    for ((def, param), arg_expr) in param_defs.iter().zip(call_args.iter()) {
+        let reg_name = format!("__arg_{rule_name}_{handle_name}_{}", param.name.text);
+        let ty = types.local_tys.get(def).cloned().unwrap_or(Ty::Unknown);
+        renames.insert(*def, reg_name.clone());
+        args.push(SpawnArg {
+            reg_name,
+            ty,
+            caller_expr: *arg_expr,
+        });
+    }
+
+    let captures = match compute_captures(ast, res, types, &segments, &param_def_set) {
+        Ok(c) => c,
+        Err(errs) => {
+            errors.extend(errs);
+            Vec::new()
+        }
+    };
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    for cap in &captures {
+        renames.insert(
+            cap.def,
+            format!("__save_{rule_name}_{handle_name}_{}", cap.name),
+        );
+    }
+
+    let result_ty = types
+        .expr_tys
+        .get(&return_expr)
+        .cloned()
+        .unwrap_or(Ty::Unknown);
+    if !matches!(result_ty, Ty::Bits(Width::Known(_))) {
+        errors.push(LowerError {
+            span: ast.expr_spans[return_expr.0 as usize].clone(),
+            message: format!(
+                "spawn's return value has type {result_ty}, not a concrete `bits[w]`; \
+                 sequences lowering needs a known width to declare `.result`'s register"
+            ),
+        });
+        return Err(errors);
+    }
+
+    let rename_edits = collect_renames(ast, res, &callee_body, &renames);
+
+    // No sentinel/idle reset value: unlike a first glance suggests, a
+    // plain 0 reset (matching every other continuation register in this
+    // emitter) is sound here too, checked by hand-simulating a gated-
+    // trigger variant before settling on this. A spurious pre-trigger
+    // completion (segment-0 guard reading true before ever being
+    // spawned) is structurally unobservable — `render_rule` always
+    // emits the trigger's own segment rules before a spawn's callee
+    // segments, so derived-stall priority always favors the trigger on
+    // any shared cycle; the trigger itself resets `done` to 0 whenever
+    // it fires, overwriting any spurious completion; and `sync` can
+    // never observe `done` before the trigger's own segment has fired
+    // at least once, since it's gated behind the rule's own mandatory
+    // `tick`.
+    let cont_width = clog2(nsegs).max(1);
+    Ok(SpawnPlan {
+        handle_def,
+        handle_name: handle_name.to_string(),
+        trigger_stmt,
+        cont_name: format!("__cont_{rule_name}_{handle_name}"),
+        cont_width,
+        done_name: format!("__done_{rule_name}_{handle_name}"),
+        result_name: format!("__result_{rule_name}_{handle_name}"),
+        result_ty,
+        args,
+        segments,
+        captures,
+        renames,
+        rename_edits,
+        return_expr,
+        base_rule_name: rule_name.to_string(),
+    })
+}
+
+/// Shared by a rule's own body and a spawn callee's body: per-local
+/// def/use segments, single-assignment + read-only-later validation,
+/// concrete-width requirement. `exclude` skips defs handled by a
+/// different mechanism (spawn handles at rule level, params at callee
+/// level).
+fn compute_captures(
+    ast: &Ast,
+    res: &Resolution,
+    types: &Types,
+    segments: &[Segment],
+    exclude: &HashSet<DefId>,
+) -> Result<Vec<CapturedLocal>, Vec<LowerError>> {
+    let mut assigns: BTreeMap<DefId, BTreeSet<usize>> = Default::default();
+    let mut reads: BTreeMap<DefId, BTreeSet<usize>> = Default::default();
+    for seg in segments {
         scan_stmts(
             ast,
             res,
@@ -167,7 +647,10 @@ fn plan_rule(
             &mut reads,
         );
     }
+    assigns.retain(|d, _| !exclude.contains(d));
+    reads.retain(|d, _| !exclude.contains(d));
 
+    let mut errors = Vec::new();
     let mut captures = Vec::new();
     for (def, assign_segs) in &assigns {
         let read_segs = reads.get(def).cloned().unwrap_or_default();
@@ -221,23 +704,72 @@ fn plan_rule(
         });
     }
 
-    if !errors.is_empty() {
-        return Err(errors);
+    if errors.is_empty() {
+        Ok(captures)
+    } else {
+        Err(errors)
     }
-
-    let cont_width = clog2(segments.len() as u64).max(1);
-    Ok(LoweredRule {
-        rule,
-        rule_name: rule_name.to_string(),
-        cont_name: format!("__cont_{rule_name}"),
-        cont_width,
-        segments,
-        captures,
-    })
 }
 
-/// Called on the rule's top-level body: top-level ticks are fine, only
-/// descends into if/while to reject ticks hiding inside them.
+/// Every `h.result`/`h.done` reference anywhere in `stmts` (recursing
+/// through if/else), rewritten to the owning spawn's register name.
+fn collect_handle_field_rewrites(
+    ast: &Ast,
+    res: &Resolution,
+    stmts: &[StmtId],
+    handles: &HashMap<DefId, (String, String)>,
+) -> Vec<(Span, String)> {
+    let mut edits = Vec::new();
+    for stmt in stmts {
+        for e in stmt_exprs(ast, *stmt) {
+            collect_handle_fields_expr(ast, res, e, handles, &mut edits);
+        }
+        match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                edits.extend(collect_handle_field_rewrites(ast, res, then_body, handles));
+                if let Some(else_body) = else_body {
+                    edits.extend(collect_handle_field_rewrites(ast, res, else_body, handles));
+                }
+            }
+            Stmt::While { body, .. } => {
+                edits.extend(collect_handle_field_rewrites(ast, res, body, handles));
+            }
+            _ => {}
+        }
+    }
+    edits
+}
+
+fn collect_handle_fields_expr(
+    ast: &Ast,
+    res: &Resolution,
+    id: ExprId,
+    handles: &HashMap<DefId, (String, String)>,
+    edits: &mut Vec<(Span, String)>,
+) {
+    if let Expr::Field { base, name } = ast.expr(id).clone()
+        && let Some(def) = res.expr_defs.get(&base)
+        && let Some((result_name, done_name)) = handles.get(def)
+    {
+        let replacement = match name.as_str() {
+            "result" => result_name.clone(),
+            "done" => done_name.clone(),
+            _ => return,
+        };
+        edits.push((ast.expr_spans[id.0 as usize].clone(), replacement));
+        return;
+    }
+    for child in sub_exprs(ast, id) {
+        collect_handle_fields_expr(ast, res, child, handles, edits);
+    }
+}
+
+/// Called on a body's top level: top-level ticks are fine, only descends
+/// into if/while to reject ticks hiding inside them.
 fn find_nested_tick(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
     for stmt in stmts {
         match ast.stmt(*stmt) {
@@ -297,25 +829,140 @@ fn find_tick_anywhere(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
     None
 }
 
-fn find_unsupported_construct(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<Span> {
+/// Same shape as `find_nested_tick`, for `spawn`: legal at a body's top
+/// level, never inside if/while.
+fn find_nested_spawn(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
     for stmt in stmts {
-        let exprs = stmt_exprs(ast, *stmt);
-        for e in exprs {
-            if let Some(span) = find_unsupported_in_expr(ast, res, e) {
+        match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_spawn_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_spawn_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
+            Stmt::While { body, .. } => {
+                if let Some(span) = find_spawn_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_spawn_anywhere(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
+    for stmt in stmts {
+        for e in stmt_exprs(ast, *stmt) {
+            if let Some(span) = find_spawn_in_expr(ast, e) {
                 return Some(span);
             }
         }
+        match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_spawn_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_spawn_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
+            Stmt::While { body, .. } => {
+                if let Some(span) = find_spawn_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_spawn_in_expr(ast: &Ast, id: ExprId) -> Option<Span> {
+    if let Expr::Spawn(_) = ast.expr(id) {
+        return Some(ast.expr_spans[id.0 as usize].clone());
+    }
+    for child in sub_exprs(ast, id) {
+        if let Some(span) = find_spawn_in_expr(ast, child) {
+            return Some(span);
+        }
+    }
+    None
+}
+
+/// Scans for anything this pass still can't handle: `race` always, plus
+/// `spawn`/`sync` used in any shape other than the two legitimate ones
+/// (`h := spawn Callee(args)`, `sync(...)` as its own statement) — those
+/// two are recognized and skipped by the caller before reaching here.
+fn find_unsupported_construct(
+    ast: &Ast,
+    res: &Resolution,
+    stmts: &[StmtId],
+    top_level: bool,
+) -> Option<Span> {
+    for stmt in stmts {
+        let is_spawn_trigger = top_level && spawn_trigger_shape(ast, res, *stmt).is_some();
+        let is_sync_call = top_level && sync_call_shape(ast, res, *stmt).is_some();
+
+        if is_spawn_trigger {
+            let Stmt::Assign { rhs, .. } = ast.stmt(*stmt) else {
+                unreachable!()
+            };
+            let Expr::Spawn(inner) = ast.expr(*rhs) else {
+                unreachable!()
+            };
+            for child in sub_exprs(ast, *inner) {
+                if let Some(span) = find_unsupported_in_expr(ast, res, child) {
+                    return Some(span);
+                }
+            }
+        } else if is_sync_call {
+            let Stmt::Expr(e) = ast.stmt(*stmt) else {
+                unreachable!()
+            };
+            let Expr::Call { args, .. } = ast.expr(*e) else {
+                unreachable!()
+            };
+            for arg in args {
+                if let Some(span) = find_unsupported_in_expr(ast, res, *arg) {
+                    return Some(span);
+                }
+            }
+        } else {
+            for e in stmt_exprs(ast, *stmt) {
+                if let Some(span) = find_unsupported_in_expr(ast, res, e) {
+                    return Some(span);
+                }
+            }
+        }
+
         let nested = match ast.stmt(*stmt) {
             Stmt::If {
                 then_body,
                 else_body,
                 ..
-            } => find_unsupported_construct(ast, res, then_body).or_else(|| {
+            } => find_unsupported_construct(ast, res, then_body, false).or_else(|| {
                 else_body
                     .as_deref()
-                    .and_then(|b| find_unsupported_construct(ast, res, b))
+                    .and_then(|b| find_unsupported_construct(ast, res, b, false))
             }),
-            Stmt::While { body, .. } => find_unsupported_construct(ast, res, body),
+            Stmt::While { body, .. } => find_unsupported_construct(ast, res, body, false),
             _ => None,
         };
         if nested.is_some() {
@@ -381,8 +1028,8 @@ fn scan_stmts(
     res: &Resolution,
     stmts: &[StmtId],
     segment: usize,
-    assigns: &mut std::collections::BTreeMap<DefId, BTreeSet<usize>>,
-    reads: &mut std::collections::BTreeMap<DefId, BTreeSet<usize>>,
+    assigns: &mut BTreeMap<DefId, BTreeSet<usize>>,
+    reads: &mut BTreeMap<DefId, BTreeSet<usize>>,
 ) {
     for stmt in stmts {
         match ast.stmt(*stmt).clone() {
@@ -441,7 +1088,7 @@ fn scan_expr(
     res: &Resolution,
     id: ExprId,
     segment: usize,
-    reads: &mut std::collections::BTreeMap<DefId, BTreeSet<usize>>,
+    reads: &mut BTreeMap<DefId, BTreeSet<usize>>,
 ) {
     if let Expr::Ident(_) = ast.expr(id)
         && let Some(def) = res.expr_defs.get(&id)
@@ -452,6 +1099,78 @@ fn scan_expr(
     for child in sub_exprs(ast, id) {
         scan_expr(ast, res, child, segment, reads);
     }
+}
+
+/// Collects `(span, replacement)` edits for every `Expr::Ident` in
+/// `stmts` whose resolved def is a key in `renames`.
+fn collect_renames(
+    ast: &Ast,
+    res: &Resolution,
+    stmts: &[StmtId],
+    renames: &HashMap<DefId, String>,
+) -> Vec<(Span, String)> {
+    let mut edits = Vec::new();
+    for stmt in stmts {
+        for e in stmt_exprs(ast, *stmt) {
+            collect_renames_expr(ast, res, e, renames, &mut edits);
+        }
+        match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                edits.extend(collect_renames(ast, res, then_body, renames));
+                if let Some(else_body) = else_body {
+                    edits.extend(collect_renames(ast, res, else_body, renames));
+                }
+            }
+            Stmt::While { body, .. } => {
+                edits.extend(collect_renames(ast, res, body, renames));
+            }
+            _ => {}
+        }
+    }
+    edits
+}
+
+fn collect_renames_expr(
+    ast: &Ast,
+    res: &Resolution,
+    id: ExprId,
+    renames: &HashMap<DefId, String>,
+    edits: &mut Vec<(Span, String)>,
+) {
+    if let Expr::Ident(_) = ast.expr(id)
+        && let Some(def) = res.expr_defs.get(&id)
+        && let Some(new_name) = renames.get(def)
+    {
+        edits.push((ast.expr_spans[id.0 as usize].clone(), new_name.clone()));
+        return;
+    }
+    for child in sub_exprs(ast, id) {
+        collect_renames_expr(ast, res, child, renames, edits);
+    }
+}
+
+/// Applies every edit inside `base` (sorted, non-overlapping by
+/// construction — each comes from a distinct `ExprId`'s own span) to
+/// `src[base]`, verbatim outside those spans.
+fn splice(src: &str, base: &Span, edits: &[(Span, String)]) -> String {
+    let mut relevant: Vec<&(Span, String)> = edits
+        .iter()
+        .filter(|(s, _)| s.start >= base.start && s.end <= base.end)
+        .collect();
+    relevant.sort_by_key(|(s, _)| s.start);
+    let mut out = String::new();
+    let mut pos = base.start;
+    for (span, text) in relevant {
+        out.push_str(&src[pos..span.start]);
+        out.push_str(text);
+        pos = span.end;
+    }
+    out.push_str(&src[pos..base.end]);
+    out
 }
 
 /// Render every planned lowering as a text splice over `src`: each
@@ -570,18 +1289,38 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
     for cap in &lr.captures {
         out.push_str(&format!("reg {} : {} = 0\n", cap.name, cap.ty));
     }
+    for spawn in &lr.spawns {
+        render_spawn_regs(&mut out, spawn);
+    }
     out.push_str(&format!(
         "reg {} : bits[{}] = 0\n\n",
         lr.cont_name, lr.cont_width
     ));
+
+    let spawn_by_trigger: HashMap<StmtId, &SpawnPlan> =
+        lr.spawns.iter().map(|s| (s.trigger_stmt, s)).collect();
+    let sync_by_stmt: HashMap<StmtId, &Vec<DefId>> =
+        lr.syncs.iter().map(|(s, h)| (*s, h)).collect();
+    let spawn_by_handle: HashMap<DefId, &SpawnPlan> =
+        lr.spawns.iter().map(|s| (s.handle_def, s)).collect();
 
     let nsegs = lr.segments.len() as u64;
     for seg in &lr.segments {
         out.push_str(&format!("rule {}_s{} {{\n", lr.rule_name, seg.index));
         out.push_str(&format!("    ({} == {})?\n", lr.cont_name, seg.index));
         for stmt in &seg.stmts {
-            let span = ast.stmt_spans[stmt.0 as usize].clone();
-            out.push_str(&src[span]);
+            if let Some(spawn) = spawn_by_trigger.get(stmt) {
+                render_spawn_trigger(&mut out, src, ast, spawn, &lr.handle_field_rewrites);
+            } else if let Some(handles) = sync_by_stmt.get(stmt) {
+                for h in handles.iter() {
+                    if let Some(plan) = spawn_by_handle.get(h) {
+                        out.push_str(&format!("    ({} == 1)?\n", plan.done_name));
+                    }
+                }
+            } else {
+                let span = ast.stmt_spans[stmt.0 as usize].clone();
+                out.push_str(&splice(src, &span, &lr.handle_field_rewrites));
+            }
         }
         let next = if seg.index + 1 < nsegs {
             seg.index + 1
@@ -591,5 +1330,79 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
         out.push_str(&format!("    {} := {next}\n", lr.cont_name));
         out.push_str("}\n\n");
     }
+
+    for spawn in &lr.spawns {
+        render_spawn_segments(&mut out, src, ast, spawn);
+    }
     out
+}
+
+fn render_spawn_regs(out: &mut String, spawn: &SpawnPlan) {
+    for arg in &spawn.args {
+        out.push_str(&format!("reg {} : {} = 0\n", arg.reg_name, arg.ty));
+    }
+    for cap in &spawn.captures {
+        let name = spawn
+            .renames
+            .get(&cap.def)
+            .cloned()
+            .unwrap_or_else(|| cap.name.clone());
+        out.push_str(&format!("reg {name} : {} = 0\n", cap.ty));
+    }
+    out.push_str(&format!("reg {} : bits[1] = 0\n", spawn.done_name));
+    out.push_str(&format!(
+        "reg {} : {} = 0\n",
+        spawn.result_name, spawn.result_ty
+    ));
+    out.push_str(&format!(
+        "reg {} : bits[{}] = 0\n",
+        spawn.cont_name, spawn.cont_width
+    ));
+}
+
+fn render_spawn_trigger(
+    out: &mut String,
+    src: &str,
+    ast: &Ast,
+    spawn: &SpawnPlan,
+    outer_rewrites: &[(Span, String)],
+) {
+    for arg in &spawn.args {
+        let span = ast.expr_spans[arg.caller_expr.0 as usize].clone();
+        out.push_str(&format!(
+            "    {} := {}\n",
+            arg.reg_name,
+            splice(src, &span, outer_rewrites)
+        ));
+    }
+    out.push_str(&format!("    {} := 0\n", spawn.done_name));
+    out.push_str(&format!("    {} := 0\n", spawn.cont_name));
+}
+
+fn render_spawn_segments(out: &mut String, src: &str, ast: &Ast, spawn: &SpawnPlan) {
+    let nsegs = spawn.segments.len() as u64;
+    for seg in &spawn.segments {
+        out.push_str(&format!(
+            "rule {}_{}_s{} {{\n",
+            spawn.base_rule_name, spawn.handle_name, seg.index
+        ));
+        out.push_str(&format!("    ({} == {})?\n", spawn.cont_name, seg.index));
+        let is_last = seg.index + 1 == nsegs;
+        for stmt in &seg.stmts {
+            if is_last && matches!(ast.stmt(*stmt), Stmt::Return(_)) {
+                let rspan = ast.expr_spans[spawn.return_expr.0 as usize].clone();
+                let rendered = splice(src, &rspan, &spawn.rename_edits);
+                out.push_str(&format!("    {} := {}\n", spawn.result_name, rendered));
+            } else {
+                let span = ast.stmt_spans[stmt.0 as usize].clone();
+                out.push_str(&splice(src, &span, &spawn.rename_edits));
+            }
+        }
+        let next = if is_last { 0 } else { seg.index + 1 };
+        out.push_str(&format!("    {} := {next}\n", spawn.cont_name));
+        if is_last {
+            out.push_str(&format!("    {} := 1\n", spawn.done_name));
+        }
+        out.push_str("}\n\n");
+    }
 }

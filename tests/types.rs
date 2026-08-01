@@ -430,6 +430,70 @@ fn instance_ports_check_direction_and_width() {
 }
 
 #[test]
+fn spawn_types_a_handle_whose_result_and_done_fields_are_readable() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    output out : bits[8] = 0
+
+    rule r <sequences> {
+        h := spawn Slow(1)
+        tick
+        (h.done == 1)?
+        out := h.result
+    }
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn handle_field_write_is_rejected() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        h := spawn Slow(1)
+        tick
+        h.result := 1
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(errors.iter().any(|e| e.message.contains("read-only")));
+}
+
+#[test]
+fn handle_has_no_field_besides_result_and_done() {
+    let src = "\
+Slow(x : bits[8]) : bits[8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    output out : bits[8] = 0
+
+    rule r <sequences> {
+        h := spawn Slow(1)
+        tick
+        out := h.nope
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(errors.iter().any(|e| e.message.contains("no field")));
+}
+
+#[test]
 fn all_examples_type_check() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {
