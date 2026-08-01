@@ -239,18 +239,27 @@ fn fifo_bridge_emits_depth_one_buffers() {
 }
 
 #[test]
-fn fifo_enq_and_deq_same_cycle_is_an_error() {
+fn fifo_enq_and_deq_same_cycle_is_a_passthrough() {
+    // Enqueueing AND dequeueing the SAME fifo in one rule is a
+    // pass-through, not an error: `x := f.Deq[]` reads the fifo's
+    // current (pre-edge) data, `f.Enq[x + 1]` writes a NEW value for
+    // next cycle -- the combined guard is just `valid` (there must be
+    // something to dequeue), not the always-false AND of each op's own
+    // individual guard.
     let src = "\
 module M {
     fifo f : bits[8]
     rule r {
         x := f.Deq[]
-        f.Enq[x]
+        f.Enq[x + 1]
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(err.iter().any(|e| e.message.contains("same cycle")));
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = __fifo_f_valid"));
+    assert!(fir.contains("connect __fifo_f_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect __fifo_f_data, tail(add(__fifo_f_data, UInt<8>(1)), 1)"));
+    run_firtool(&fir, &[]);
 }
 
 #[test]

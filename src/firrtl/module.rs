@@ -249,7 +249,6 @@ pub(crate) fn emit_module(
     // `inst_port_value_in_stmts`/`mem_write_in_stmts`).
     for rule in &rules {
         cx.check_guard_placement(*rule);
-        cx.check_fifo_same_cycle(*rule);
         cx.check_no_reassigned_locals(*rule);
         cx.check_writing_call_positions(*rule);
     }
@@ -422,32 +421,51 @@ pub(crate) fn emit_module(
     // per cycle — every fifo op reads+writes it (effects.rs), so every
     // touching rule conflicts with every other, exactly like mem
     // writers above; same priority-mux pattern, though only one
-    // `when` can ever actually be live per fifo.
+    // `when` can ever actually be live per fifo. A rule may enqueue AND
+    // dequeue the SAME fifo (a pass-through — see fifo.rs's module doc
+    // comment): its connects are identical to an enqueue-only rule's
+    // (`valid` stays 1, `data` updates to the new value) regardless of
+    // whether it also dequeues, since `Deq[]`'s own value already reads
+    // the pre-edge `data` before this connect takes effect — the same
+    // "reads see the old value, connects land for next cycle" register
+    // semantics used everywhere else in this emitter.
     let mut fifo_body = String::new();
     for (fifo_name, width) in &fifos {
-        let mut touching: Vec<(ItemId, bool, Option<ExprId>)> = Vec::new();
+        let mut touching: Vec<(ItemId, Option<ExprId>, bool)> = Vec::new();
         for rule in &rules {
             let body = rule_body(ast, *rule);
-            if let Some((is_enq, value)) = body.iter().find_map(|s| match cx.fifo_op_stmt(*s) {
-                Some((name, is_enq, value)) if &name == fifo_name => Some((is_enq, value)),
-                _ => None,
-            }) {
-                touching.push((*rule, is_enq, value));
+            let mut enq_value: Option<ExprId> = None;
+            let mut saw_deq = false;
+            for s in &body {
+                let Some((name, is_enq, value)) = cx.fifo_op_stmt(*s) else {
+                    continue;
+                };
+                if &name != fifo_name {
+                    continue;
+                }
+                if is_enq {
+                    enq_value = value;
+                } else {
+                    saw_deq = true;
+                }
+            }
+            if enq_value.is_some() || saw_deq {
+                touching.push((*rule, enq_value, saw_deq));
             }
         }
         if touching.is_empty() {
             continue;
         }
-        touching.sort_by_key(|(r, _, _)| std::cmp::Reverse(order.iter().position(|x| x == r)));
+        touching.sort_by_key(|(r, ..)| std::cmp::Reverse(order.iter().position(|x| x == r)));
         let valid = fifo_valid_name(fifo_name);
         let data = fifo_data_name(fifo_name);
-        for (rule, is_enq, value) in touching {
+        for (rule, enq_value, _saw_deq) in touching {
             cx.enter_rule(rule);
             let f = &fires_name[&rule];
             let _ = writeln!(fifo_body, "    when {f} :");
-            if is_enq {
+            if let Some(value_expr) = enq_value {
                 let value = cx
-                    .compile_expr_hinted(value.expect("Enq[] always carries a value"), Some(*width))
+                    .compile_expr_hinted(value_expr, Some(*width))
                     .unwrap_or_default();
                 let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(1)");
                 let _ = writeln!(fifo_body, "      connect {data}, {value}");

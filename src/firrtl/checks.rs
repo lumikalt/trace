@@ -1,14 +1,16 @@
 //! Pre-compilation validation, run once per rule before any expression is
-//! compiled: guard/fifo-op placement (`check_guard_placement`,
-//! `check_fifo_same_cycle`), no reassigned locals
-//! (`check_no_reassigned_locals`), and a state-writing call only in an
-//! allowed position (`check_writing_call_positions`). Each violation is
-//! an explicit `Emitter::error`, never a silent skip — see mod.rs's
-//! module doc comment. A memory write MAY nest in `if`/`else` (threaded
-//! through a `mux` by `writes.rs`'s `mem_write_in_stmts`, same as a
-//! register or instance-port write) — there is no separate preflight
-//! check for it here, matching how a register write's own nesting isn't
-//! preflight-checked either.
+//! compiled: guard/fifo-op placement (`check_guard_placement`), no
+//! reassigned locals (`check_no_reassigned_locals`), and a state-writing
+//! call only in an allowed position (`check_writing_call_positions`).
+//! Each violation is an explicit `Emitter::error`, never a silent skip —
+//! see mod.rs's module doc comment. A memory write MAY nest in
+//! `if`/`else` (threaded through a `mux` by `writes.rs`'s
+//! `mem_write_in_stmts`, same as a register or instance-port write) —
+//! there is no separate preflight check for it here, matching how a
+//! register write's own nesting isn't preflight-checked either. A rule
+//! enqueueing AND dequeueing the SAME fifo is likewise no longer a
+//! preflight rejection (see fifo.rs's module doc comment for the
+//! pass-through semantics `compile_guard`, not a check here, computes).
 
 use super::Emitter;
 use super::calls::*;

@@ -1,0 +1,32 @@
+-- A rule may `Enq` AND `Deq` the SAME fifo -- a "pass-through": `step`
+-- dequeues the fifo's current value, increments it, and enqueues the
+-- result back into the same slot, every cycle the fifo holds a value.
+-- The combined guard is just `valid == 1` (there must be something to
+-- dequeue) -- not the always-false AND of Deq's own guard (`valid`) and
+-- Enq's own guard (`not(valid)`), which would forbid this outright. See
+-- DESIGN.md's "Fifo synthesis" section and sim/fifo_passthrough_tb.v,
+-- which observes `last_out` incrementing every cycle once seeded,
+-- proving the old value is read (not the just-written new one) and the
+-- new value correctly lands for the NEXT cycle's Deq.
+module FifoPassthrough {
+    fifo f : bits[8]
+
+    input seed : bits[1]
+    input seed_value : bits[8]
+    output last_out : bits[8] = 0
+
+    rule load {
+        (seed == 1)?
+        f.Enq[seed_value]
+    }
+
+    rule step {
+        x := f.Deq[]
+        f.Enq[x + 1]
+        last_out := x
+    }
+
+    schedule {
+        urgency load > step
+    }
+}

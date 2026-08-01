@@ -1,13 +1,24 @@
 //! Fifo-specific naming/detection: a depth-1 fifo is one data register
 //! plus one valid bit (`fifo_valid_name`/`fifo_data_name`), `Enq`/`Deq`
 //! recognition (`is_fifo_op`, `Emitter::fifo_op`/`fifo_op_stmt`), and the
-//! guard condition each op contributes (`fifo_guard_cond`). See the
-//! module doc comment (mod.rs) for the depth-1 restriction this all
-//! assumes.
+//! guard condition each op contributes (`fifo_guard_cond`,
+//! `rule_fifo_guard_cond`). See the module doc comment (mod.rs) for the
+//! depth-1 restriction this all assumes.
+//!
+//! A rule MAY both `Enq` and `Deq` the SAME fifo — a "pass-through":
+//! this cycle's `Deq` returns the fifo's current (pre-edge) data, same
+//! as any other read of a register, while the `Enq`'s value becomes the
+//! new data for the NEXT cycle; `valid` stays 1 throughout rather than
+//! toggling 0 then back to 1. The combined precondition is just
+//! `valid == 1` (there must be something to dequeue) — NOT the AND of
+//! each op's own individual guard (`valid` for `Deq`, `not(valid)` for
+//! `Enq`), which would always be false. `rule_fifo_guard_cond` computes
+//! this per-fifo, folding an Enq+Deq pair of the same fifo into a
+//! single term; `compile_guard` (writes.rs) uses it instead of a
+//! per-statement `fifo_guard_cond` call for exactly this reason.
 
 use super::Emitter;
-use super::writes::*;
-use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
+use crate::ast::{Ast, Expr, ExprId, Stmt, StmtId};
 use crate::resolve::{DefKind, Resolution};
 
 pub(crate) fn fifo_valid_name(fifo: &str) -> String {
@@ -26,6 +37,19 @@ pub(crate) fn fifo_guard_cond(fifo: &str, is_enq: bool) -> String {
         format!("not({valid})")
     } else {
         valid
+    }
+}
+
+/// The guard term ONE fifo contributes to its rule, given whether the
+/// rule enqueues it, dequeues it, or (the pass-through case) both:
+/// `valid` alone when both are present — see this module's own doc
+/// comment for why that's the correct combined precondition, not
+/// `fifo_guard_cond`'s individual `valid`/`not(valid)` AND'ed together.
+pub(crate) fn rule_fifo_guard_cond(fifo: &str, saw_enq: bool, saw_deq: bool) -> String {
+    if saw_enq && saw_deq {
+        fifo_valid_name(fifo)
+    } else {
+        fifo_guard_cond(fifo, saw_enq)
     }
 }
 
@@ -94,35 +118,5 @@ impl<'a> Emitter<'a> {
             _ => return None,
         };
         self.fifo_op(expr)
-    }
-
-    /// A depth-1 fifo cannot both `Enq` and `Deq` in the same cycle:
-    /// that would require its valid bit to be both 1 (for `Deq`) and 0
-    /// (for `Enq`) at once, an always-false guard. Reject it explicitly
-    /// rather than silently synthesizing permanently dead hardware.
-    pub(crate) fn check_fifo_same_cycle(&mut self, rule: ItemId) {
-        let body = rule_body(self.ast, rule);
-        let mut enqueued = std::collections::HashSet::new();
-        let mut dequeued = std::collections::HashSet::new();
-        for stmt in &body {
-            let Some((fifo, is_enq, _)) = self.fifo_op_stmt(*stmt) else {
-                continue;
-            };
-            if is_enq {
-                enqueued.insert(fifo);
-            } else {
-                dequeued.insert(fifo);
-            }
-        }
-        for fifo in enqueued.intersection(&dequeued) {
-            self.error(
-                self.ast.item_spans[rule.0 as usize].clone(),
-                format!(
-                    "this rule both enqueues and dequeues `{fifo}` in the same cycle; \
-                     not supported for a depth-1 fifo (v0 restriction): split into two \
-                     rules"
-                ),
-            );
-        }
     }
 }

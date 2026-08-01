@@ -151,7 +151,24 @@ impl<'a> Emitter<'a> {
 
     pub(crate) fn compile_guard(&mut self, rule: ItemId) -> String {
         let body = rule_body(self.ast, rule);
+        // Pre-scan which fifos this rule enqueues/dequeues (top-level
+        // only, matching `fifo_op_stmt`'s own scope) so a same-fifo
+        // Enq+Deq pair contributes ONE combined guard term below, not
+        // the AND of each op's own individual (mutually exclusive)
+        // guard — see fifo.rs's module doc comment.
+        let mut fifo_ops: std::collections::HashMap<String, (bool, bool)> = Default::default();
+        for stmt in &body {
+            if let Some((fifo, is_enq, _)) = self.fifo_op_stmt(*stmt) {
+                let entry = fifo_ops.entry(fifo).or_insert((false, false));
+                if is_enq {
+                    entry.0 = true;
+                } else {
+                    entry.1 = true;
+                }
+            }
+        }
         let mut conds = Vec::new();
+        let mut fifo_conds_emitted: std::collections::HashSet<String> = Default::default();
         for stmt in &body {
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Expr(e) => {
@@ -160,13 +177,19 @@ impl<'a> Emitter<'a> {
                             self.compile_expr(*inner)
                                 .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
                         );
-                    } else if let Some((fifo, is_enq, _)) = self.fifo_op(e) {
-                        conds.push(fifo_guard_cond(&fifo, is_enq));
+                    } else if let Some((fifo, ..)) = self.fifo_op(e)
+                        && fifo_conds_emitted.insert(fifo.clone())
+                    {
+                        let (saw_enq, saw_deq) = fifo_ops[&fifo];
+                        conds.push(rule_fifo_guard_cond(&fifo, saw_enq, saw_deq));
                     }
                 }
                 Stmt::Assign { rhs, .. } => {
-                    if let Some((fifo, is_enq, _)) = self.fifo_op(rhs) {
-                        conds.push(fifo_guard_cond(&fifo, is_enq));
+                    if let Some((fifo, ..)) = self.fifo_op(rhs)
+                        && fifo_conds_emitted.insert(fifo.clone())
+                    {
+                        let (saw_enq, saw_deq) = fifo_ops[&fifo];
+                        conds.push(rule_fifo_guard_cond(&fifo, saw_enq, saw_deq));
                     }
                 }
                 _ => {}

@@ -616,16 +616,14 @@ module FifoBridge {
 
 v0 fifos are **depth-1 buffers**: one data register plus one valid bit. `Deq[]`
 succeeds only while valid; `Enq[x]` succeeds only while *not* valid (there is no room
-for a second element). Both failure conditions fold into the rule's guard exactly like
-an explicit `?` — the compiler ANDs them into the same `fires` signal that already
-carries every other guard, so "derive ready/valid handshaking from failure" (this
-document's opening claim) now covers fifos, not just guards. One consequence stated
-honestly, not hidden: a rule cannot both `Enq` and `Deq` the *same* fifo in one cycle —
-that would require its valid bit to be 1 (for `Deq`) and 0 (for `Enq`) at once, an
-always-false guard, so the compiler rejects it outright rather than silently
-synthesizing permanently dead hardware. `Enq`/`Deq` calls must stay at a rule's top
-level, same restriction as an explicit guard, and for the same reason (a guard nested
-in `if`/`while` isn't threaded through the `fires` computation yet).
+for a second element) — UNLESS the same rule both `Enq`s and `Deq`s the same fifo, a
+pass-through case with its own combined guard; see "Fifo pass-through" below. Both
+failure conditions fold into the rule's guard exactly like an explicit `?` — the
+compiler ANDs them into the same `fires` signal that already carries every other guard,
+so "derive ready/valid handshaking from failure" (this document's opening claim) now
+covers fifos, not just guards. `Enq`/`Deq` calls must stay at a rule's top level, same
+restriction as an explicit guard, and for the same reason (a guard nested in `if`/`while`
+isn't threaded through the `fires` computation yet).
 
 Compiling `x := input.Deq[]` then `output.Enq[x]` surfaced a real, previously-latent
 gap: `x` is a local, and this is the first example where a local's value is *used*
@@ -649,6 +647,69 @@ later (the forward path), and a rule that would overflow `output` correctly stal
 has no module ports — fifos are an internal-only construct, there is no fifo-port
 concept — so, like SUBLEQ, the testbench reaches in with hierarchical paths
 (`dut.__fifo_input_valid`, `dut.__fifo_input_data`, ...) rather than real ports.
+
+**Fifo pass-through, added 2026-08-01.** A rule enqueueing AND dequeueing the SAME fifo
+used to be a hard error, for the reason above: `Deq`'s own guard needs `valid == 1`,
+`Enq`'s own guard needs `valid == 0`, and ANDing them together is always false. But that
+reasoning only holds for two INDEPENDENT ops competing over the same slot — when the
+SAME rule does both, it's really a pass-through: this cycle's `Deq` pops the old value,
+this cycle's `Enq` pushes a new one into the slot it just vacated, `valid` stays 1
+throughout rather than toggling 0 then back to 1:
+
+```
+module FifoPassthrough {
+    fifo f : bits[8]
+
+    input seed : bits[1]
+    input seed_value : bits[8]
+    output last_out : bits[8] = 0
+
+    rule load {
+        (seed == 1)?
+        f.Enq[seed_value]
+    }
+
+    rule step {
+        x := f.Deq[]
+        f.Enq[x + 1]
+        last_out := x
+    }
+
+    schedule {
+        urgency load > step
+    }
+}
+```
+
+The combined precondition is just `valid == 1` (there must be something to dequeue) — the
+`Enq`'s own individual `not(valid)` guard is dropped entirely for this specific pairing,
+not weakened or reworked. `compile_guard` (writes.rs) pre-scans a rule's fifo ops by name
+before generating guard terms, so an Enq+Deq pair of the SAME fifo folds into one `valid`
+term instead of two separately-ANDed ones (`rule_fifo_guard_cond`, fifo.rs) — everything
+else about guard generation (explicit `?`, other fifos, ANDing multiple distinct
+conditions together) is unchanged. Emission needed no new logic beyond widening what
+"touches this fifo" already collects per rule: `Enq`'s own connects (`valid <= 1`, `data
+<= <new value>`) are correct regardless of whether the SAME rule also dequeues, since
+`Deq`'s value expression already just reads the (pre-edge) data register directly — the
+identical "a read sees the old value, a connect lands for next cycle" register semantics
+used everywhere else in this emitter, needing no special-casing for the fifo case.
+The old blanket rejection (`fifo.rs`'s `check_fifo_same_cycle`) is gone outright, not
+narrowed — but it only ever guarded the Enq+Deq pairing specifically, which is now legal.
+It never caught, and still doesn't catch, multiple `Enq`s (or multiple `Deq`s) of the SAME
+fifo within one rule: nonsensical for a depth-1 fifo, and the emission loop silently keeps
+only the LAST `Enq`'s value (a "keep the first" `find_map` was replaced with a full
+per-rule-per-fifo scan that lets later ops overwrite earlier ones) — unguarded on purpose,
+same as other genuinely-invalid-input shapes this emitter doesn't defend against. A fifo op
+nested anywhere other than a rule's top level is separately caught by the existing guard-
+placement check, for an unrelated reason (fifo ops, like guards, aren't threaded through
+`if`/`while` yet).
+
+`examples/fifo_passthrough.tr` + `sim/fifo_passthrough_tb.v` prove it through real
+firtool + Icarus simulation: `load` seeds the (empty) fifo with 10, then `step` fires
+every following cycle, observed through `last_out` incrementing 10, 11, 12, 13, 14 across
+five CONSECUTIVE cycles with no gaps or repeats — proving the pass-through sustains
+indefinitely (not just a one-shot special case) and that each cycle's dequeued value is
+genuinely the previous cycle's enqueued one, not stale or re-read data.
 
 ## Port-based memory access
 
