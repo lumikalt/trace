@@ -293,7 +293,11 @@ impl<'a> Parser<'a> {
         let name = self.expect_ident("declaration name")?;
         let infers_ty = matches!(keyword, TokenKind::Reg | TokenKind::Output);
         let ty = if self.eat(TokenKind::Colon) {
-            Some(self.parse_expr(TYPE_MIN_BP)?)
+            if keyword == TokenKind::Fifo && self.at(TokenKind::LBracket) {
+                Some(self.parse_fifo_depth_ty()?)
+            } else {
+                Some(self.parse_expr(TYPE_MIN_BP)?)
+            }
         } else {
             if !infers_ty {
                 self.expect(TokenKind::Colon, "`:` before type").ok()?;
@@ -346,6 +350,32 @@ impl<'a> Parser<'a> {
         };
         self.expect_terminator();
         Some(self.ast.push_item(item, lo..self.prev_end))
+    }
+
+    /// `[depth]elem_ty` — a fifo's depth, written before its element
+    /// type (Lumi's pick over mem's postfix `elem[len]` spelling — a
+    /// fifo's depth reads more naturally up front). A bare leading `[`
+    /// already means a `list[T]` literal in primary expression position,
+    /// so this can't be handled by the general Pratt parser; it's only
+    /// reachable here, from a `fifo` declaration's own type position.
+    /// Parses to the exact same `Bracket { callee: elem_ty, args: [depth] }`
+    /// shape a postfix `elem_ty[depth]` would produce, so types.rs's
+    /// existing elem/len extraction (written for `mem`) is reused as-is
+    /// rather than adding a second copy of that logic.
+    fn parse_fifo_depth_ty(&mut self) -> Option<ExprId> {
+        let lo = self.cur_span().start;
+        self.bump(); // `[`
+        let depth = self.parse_expr(0)?;
+        self.expect(TokenKind::RBracket, "`]` after fifo depth")
+            .ok()?;
+        let elem = self.parse_expr(TYPE_MIN_BP)?;
+        Some(self.ast.push_expr(
+            Expr::Bracket {
+                callee: elem,
+                args: vec![depth],
+            },
+            lo..self.prev_end,
+        ))
     }
 
     /// Synthesizes the `bits[width]` type expression by hand — the AST

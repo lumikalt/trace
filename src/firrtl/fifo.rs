@@ -1,26 +1,40 @@
 //! Fifo-specific naming/detection: a depth-1 fifo is one data register
-//! plus one valid bit (`fifo_valid_name`/`fifo_data_name`), `Enq`/`Deq`
-//! recognition (`is_fifo_op`, `Emitter::fifo_op`/`fifo_op_stmt`), and the
-//! guard condition each op contributes (`fifo_guard_cond`,
-//! `rule_fifo_guard_cond`). See the module doc comment (mod.rs) for the
-//! depth-1 restriction this all assumes.
+//! plus one valid bit (`fifo_valid_name`/`fifo_data_name`); a depth-N
+//! (N>1) fifo is N data-slot registers plus `head`/`count` pointer
+//! registers (`fifo_slot_name`/`fifo_head_name`/`fifo_count_name`) —
+//! see module.rs's `Item::Fifo` arm and state-transition emission for
+//! the storage/update logic itself, hand-verified against a real
+//! firtool+Icarus simulation of a depth-3 circuit before being ported
+//! here (non-power-of-2 depth, to stress head/tail wraparound). `Enq`/
+//! `Deq` recognition (`is_fifo_op`, `Emitter::fifo_op`/`fifo_op_stmt`)
+//! and the guard condition each op contributes (`fifo_guard_cond`,
+//! `rule_fifo_guard_cond`) are depth-generic; both fork internally on
+//! `depth == 1` to keep that (by far the most common) case's emitted
+//! FIRRTL byte-identical to before depth support existed.
 //!
 //! A rule MAY both `Enq` and `Deq` the SAME fifo — a "pass-through":
 //! this cycle's `Deq` returns the fifo's current (pre-edge) data, same
 //! as any other read of a register, while the `Enq`'s value becomes the
-//! new data for the NEXT cycle; `valid` stays 1 throughout rather than
-//! toggling 0 then back to 1. The combined precondition is just
-//! `valid == 1` (there must be something to dequeue) — NOT the AND of
-//! each op's own individual guard (`valid` for `Deq`, `not(valid)` for
-//! `Enq`), which would always be false. `rule_fifo_guard_cond` computes
-//! this per-fifo, folding an Enq+Deq pair of the same fifo into a
-//! single term; `compile_guard` (writes.rs) uses it instead of a
-//! per-statement `fifo_guard_cond` call for exactly this reason.
+//! new data for the NEXT cycle. At depth 1, `valid` stays 1 throughout
+//! rather than toggling 0 then back to 1; at depth N, `count` stays
+//! unchanged (the Enq's +1 and the Deq's -1 net to zero — verified by
+//! hand-tracing the depth-3 circuit above, which first caught a real
+//! bug where composing those two updates from the SAME pre-edge `count`
+//! independently silently dropped the Enq's credit instead of netting
+//! it). Either way the combined precondition is just "there is
+//! something to dequeue" (`valid`, or `count > 0`) — NOT the AND of
+//! each op's own individual guard (which would always be false, since
+//! Deq needs non-empty and Enq needs non-full and a depth-1 fifo can't
+//! be both at once). `rule_fifo_guard_cond` computes this per-fifo,
+//! folding an Enq+Deq pair of the same fifo into a single term;
+//! `compile_guard` (writes.rs) uses it instead of a per-statement
+//! `fifo_guard_cond` call for exactly this reason.
 
 use super::Emitter;
 use super::writes::rule_body;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Stmt, StmtId};
 use crate::resolve::{DefKind, Resolution};
+use crate::types::Ty;
 
 pub(crate) fn fifo_valid_name(fifo: &str) -> String {
     format!("__fifo_{fifo}_valid")
@@ -30,27 +44,77 @@ pub(crate) fn fifo_data_name(fifo: &str) -> String {
     format!("__fifo_{fifo}_data")
 }
 
-/// `Deq[]` succeeds iff the fifo is valid; `Enq[x]` succeeds iff it is
-/// not (depth-1: there is no room for a second element).
-pub(crate) fn fifo_guard_cond(fifo: &str, is_enq: bool) -> String {
-    let valid = fifo_valid_name(fifo);
-    if is_enq {
-        format!("not({valid})")
+pub(crate) fn fifo_head_name(fifo: &str) -> String {
+    format!("__fifo_{fifo}_head")
+}
+
+pub(crate) fn fifo_count_name(fifo: &str) -> String {
+    format!("__fifo_{fifo}_count")
+}
+
+pub(crate) fn fifo_slot_name(fifo: &str, i: u64) -> String {
+    format!("__fifo_{fifo}_slot{i}")
+}
+
+/// The combinational expression a `Deq[]` read compiles to: the single
+/// data register at depth 1, or (at depth N) a mux chain over the N
+/// slot registers selected by `head` — reading the CURRENT (pre-edge)
+/// register contents, same as any other register read, so a combined
+/// Enq+Deq on the same fifo naturally reads the old value while the
+/// Enq's own connect (module.rs) lands the new one for next cycle.
+pub(crate) fn fifo_deq_read_expr(fifo: &str, depth: u64) -> String {
+    if depth == 1 {
+        return fifo_data_name(fifo);
+    }
+    let head = fifo_head_name(fifo);
+    let head_w = super::writes::clog2(depth).max(1);
+    let mut expr = fifo_slot_name(fifo, depth - 1);
+    for i in (0..depth - 1).rev() {
+        let slot = fifo_slot_name(fifo, i);
+        expr = format!("mux(eq({head}, UInt<{head_w}>({i})), {slot}, {expr})");
+    }
+    expr
+}
+
+/// `Deq[]` succeeds iff the fifo is non-empty; `Enq[x]` succeeds iff it
+/// is non-full. At depth 1 this is exactly the old single-valid-bit
+/// check (`not(valid)`/`valid`); at depth N it's a `count` comparison.
+pub(crate) fn fifo_guard_cond(fifo: &str, is_enq: bool, depth: u64) -> String {
+    if depth == 1 {
+        let valid = fifo_valid_name(fifo);
+        if is_enq {
+            format!("not({valid})")
+        } else {
+            valid
+        }
     } else {
-        valid
+        let count = fifo_count_name(fifo);
+        if is_enq {
+            format!("lt({count}, UInt<{cw}>({depth}))", cw = count_width(depth))
+        } else {
+            format!("gt({count}, UInt<{cw}>(0))", cw = count_width(depth))
+        }
     }
 }
 
+/// `count`'s own width: it ranges `0..=depth` (`depth + 1` distinct
+/// values), NOT `0..depth` — sized for `depth` alone would be one bit
+/// too narrow to ever represent a full buffer.
+pub(crate) fn count_width(depth: u64) -> u64 {
+    super::writes::clog2(depth + 1).max(1)
+}
+
 /// The guard term ONE fifo contributes to its rule, given whether the
-/// rule enqueues it, dequeues it, or (the pass-through case) both:
-/// `valid` alone when both are present — see this module's own doc
-/// comment for why that's the correct combined precondition, not
-/// `fifo_guard_cond`'s individual `valid`/`not(valid)` AND'ed together.
-pub(crate) fn rule_fifo_guard_cond(fifo: &str, saw_enq: bool, saw_deq: bool) -> String {
+/// rule enqueues it, dequeues it, or (the pass-through case) both: just
+/// "non-empty" (`valid`, or `count > 0`) when both are present — see
+/// this module's own doc comment for why that's the correct combined
+/// precondition, not `fifo_guard_cond`'s individual per-op guards
+/// AND'ed together.
+pub(crate) fn rule_fifo_guard_cond(fifo: &str, saw_enq: bool, saw_deq: bool, depth: u64) -> String {
     if saw_enq && saw_deq {
-        fifo_valid_name(fifo)
+        fifo_guard_cond(fifo, false, depth)
     } else {
-        fifo_guard_cond(fifo, saw_enq)
+        fifo_guard_cond(fifo, saw_enq, depth)
     }
 }
 
@@ -88,23 +152,27 @@ pub(crate) fn contains_fifo_op(ast: &Ast, res: &Resolution, stmt: StmtId) -> boo
 }
 
 impl<'a> Emitter<'a> {
-    /// `expr` is `<fifo>.Enq[x]` or `<fifo>.Deq[]` -> the fifo's name,
-    /// whether it is `Enq`, and (for `Enq`) the value argument.
-    pub(crate) fn fifo_op(&self, expr: ExprId) -> Option<(String, bool, Option<ExprId>)> {
+    /// `expr` is `<fifo>.Enq[x]` or `<fifo>.Deq[]` -> the fifo's name and
+    /// depth, whether it is `Enq`, and (for `Enq`) the value argument.
+    pub(crate) fn fifo_op(&self, expr: ExprId) -> Option<(String, u64, bool, Option<ExprId>)> {
         let Expr::Bracket { callee, args } = self.ast.expr(expr) else {
             return None;
         };
         let Expr::Field { base, name } = self.ast.expr(*callee) else {
             return None;
         };
-        let def = self.res.expr_defs.get(base)?;
-        if self.res.def(*def).kind != DefKind::Fifo {
+        let def = *self.res.expr_defs.get(base)?;
+        if self.res.def(def).kind != DefKind::Fifo {
             return None;
         }
-        let fifo = self.res.def(*def).name.clone();
+        let fifo = self.res.def(def).name.clone();
+        let depth = match self.state_width(def) {
+            Some(Ty::Fifo { depth, .. }) => depth,
+            _ => 1,
+        };
         match name.as_str() {
-            "Deq" => Some((fifo, false, None)),
-            "Enq" => Some((fifo, true, args.first().copied())),
+            "Deq" => Some((fifo, depth, false, None)),
+            "Enq" => Some((fifo, depth, true, args.first().copied())),
             _ => None,
         }
     }
@@ -114,7 +182,7 @@ impl<'a> Emitter<'a> {
     /// statement) plus `let x = f.Deq[]`, an equally legal binding form
     /// (see DESIGN.md's "Locals") that must resolve to the identical fifo
     /// op its `:=` counterpart would.
-    pub(crate) fn fifo_op_stmt(&self, stmt: StmtId) -> Option<(String, bool, Option<ExprId>)> {
+    pub(crate) fn fifo_op_stmt(&self, stmt: StmtId) -> Option<(String, u64, bool, Option<ExprId>)> {
         let expr = match self.ast.stmt(stmt) {
             Stmt::Expr(e) => *e,
             Stmt::Assign { rhs, .. } => *rhs,
@@ -146,10 +214,11 @@ impl<'a> Emitter<'a> {
         let body = rule_body(self.ast, rule);
         let mut out = Vec::new();
         for stmt in &body {
-            if let Some((fifo, is_enq, value)) = self.fifo_op_stmt(*stmt) {
+            if let Some((fifo, depth, is_enq, value)) = self.fifo_op_stmt(*stmt) {
                 out.push(RuleFifoOp {
                     stmt: *stmt,
                     fifo,
+                    depth,
                     is_enq,
                     value,
                     callee_ctx: None,
@@ -192,10 +261,11 @@ impl<'a> Emitter<'a> {
                 continue;
             };
             for cstmt in &callee_body {
-                if let Some((fifo, is_enq, value)) = self.fifo_op_stmt(*cstmt) {
+                if let Some((fifo, depth, is_enq, value)) = self.fifo_op_stmt(*cstmt) {
                     out.push(RuleFifoOp {
                         stmt: *stmt,
                         fifo,
+                        depth,
                         is_enq,
                         value,
                         callee_ctx: Some((fn_item, args.clone())),
@@ -245,6 +315,7 @@ impl<'a> Emitter<'a> {
 pub(crate) struct RuleFifoOp {
     pub(crate) stmt: StmtId,
     pub(crate) fifo: String,
+    pub(crate) depth: u64,
     pub(crate) is_enq: bool,
     pub(crate) value: Option<ExprId>,
     pub(crate) callee_ctx: Option<(ItemId, Vec<ExprId>)>,

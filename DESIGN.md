@@ -448,7 +448,8 @@ module Accumulator {
 ```trace
 reg   name : ty (= init)?     -- one register
 mem   name : ty                -- a memory: ty is elem[depth], e.g. bits[16][256]
-fifo  name : ty                -- a depth-1 fifo
+fifo  name : ty                -- a fifo; ty is an element type (depth 1) or
+                                --   [depth]elem_ty (e.g. [4]bits[8])
 inst  name : Module            -- a child module instance
 ```
 
@@ -477,11 +478,17 @@ sit at a rule's top level. A rule that both `Enq`s and `Deq`s the same fifo is a
 pass-through: this cycle's `Deq` reads the old value, this cycle's `Enq` writes
 the new one, and the combined guard is just "the fifo currently holds a value" —
 the `Enq` side's own guard is dropped for this specific pairing. Enqueuing, or
-dequeuing, the same fifo more than once in one rule is a compile-time error: a
-depth-1 buffer holds one word, so a second `Enq` would silently discard the
-first candidate value, and a second `Deq` would silently re-read the same
-value rather than advance to a new one. Use a `reg` instead if a rule needs to
-hold more than one candidate value in a cycle.
+dequeuing, the same fifo more than once in one rule is a compile-time error,
+regardless of depth: a second `Enq` would silently discard the first candidate
+value (one `Enq[x]` fills one slot, not one slot per statement), and a second
+`Deq` would silently re-read the same value rather than advance to a new one.
+Use a `reg` instead if a rule needs to hold more than one candidate value in a
+cycle.
+
+A fifo's depth defaults to 1; `[depth]elem_ty` (e.g. `fifo f : [4]bits[8]`)
+declares a deeper one — depth-first, the preferred spelling, though a
+memory's postfix `elem_ty[depth]` (`bits[8][4]`) also works for a fifo:
+both parse to the same underlying elem/depth pair.
 
 An instance's ports are read and written through `.`: `adder.a := x` writes a
 child's input port; `result := adder.sum` reads a child's output port. Writing an
@@ -999,7 +1006,7 @@ exactly one to actually complete, by spawn declaration order) rather than
 
 ## FIFO synthesis emission
 
-v0 fifos are depth-1 buffers: one data register plus one valid bit. `Deq[]`
+A depth-1 fifo (the default) is one data register plus one valid bit. `Deq[]`
 succeeds only while valid; `Enq[x]` succeeds only while not valid, unless the
 same rule both `Enq`s and `Deq`s the fifo (the pass-through case, below). Both
 failure conditions combine, by AND, into the rule's own guard signal — the same
@@ -1009,6 +1016,25 @@ A rule that both enqueues and dequeues the same fifo combines the two guards
 into one: `valid == 1` alone, since this cycle's `Deq` frees the slot this
 cycle's `Enq` refills. The `Enq` side's own `not(valid)` guard is dropped for
 this specific pairing, not weakened.
+
+A depth-N (`[N]elem_ty`, N>1) fifo is N data-slot registers plus `head`/`count`
+pointer registers — a circular buffer; `tail` (the next write position) is
+derived, `head + count` wrapped back into `[0, N)`, not stored. `Deq[]`
+succeeds while `count > 0`; `Enq[x]` succeeds while `count < N`; the combined
+pass-through guard, same reasoning as depth-1, is just `count > 0`. `Deq[]`
+reads the slot at `head` (a plain register read, so it sees the pre-edge value
+even on a pass-through cycle); `Enq[x]` writes the slot at `tail`. On a
+pass-through, `count` is left unconnected rather than computed as
+"+1, then -1" from the same pre-edge value — composing those two updates
+that way was tried, hand-traced, and found to silently drop the `Enq`'s credit
+(a real bug caught before it reached the emitter — see fifo.rs's module doc
+comment); leaving `count` unconnected holds it at its current value, correctly
+netting to "unchanged" without the composition bug. This whole shape (data
+slots, `head`/`count`, wraparound, the pass-through's `count` non-update) was
+hand-verified against a real firtool+Icarus simulation of a depth-3 circuit —
+chosen non-power-of-2 specifically to stress the wraparound arithmetic — before
+being ported into the emitter (`examples/fifo_depth.tr`,
+`sim/fifo_depth_tb.v`).
 
 ```trace
 module FifoPassthrough {

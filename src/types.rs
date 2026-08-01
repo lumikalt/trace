@@ -38,7 +38,10 @@ pub enum Ty {
         elem: Box<Ty>,
         len: u64,
     },
-    Fifo(Box<Ty>),
+    Fifo {
+        elem: Box<Ty>,
+        depth: u64,
+    },
     /// A `spawn`'s result: `.result` yields the wrapped type, `.done`
     /// (bits[1]) reports whether the spawned FSM has finished.
     Handle(Box<Ty>),
@@ -63,7 +66,7 @@ impl std::fmt::Display for Ty {
             Ty::Bits(Width::Known(w)) => write!(f, "bits[{w}]"),
             Ty::Bits(Width::Unknown) => write!(f, "bits[?]"),
             Ty::Mem { elem, len } => write!(f, "{elem}[{len}]"),
-            Ty::Fifo(elem) => write!(f, "fifo of {elem}"),
+            Ty::Fifo { elem, depth } => write!(f, "fifo[{depth}] of {elem}"),
             Ty::Handle(inner) => write!(f, "handle of {inner}"),
             Ty::Int => write!(f, "int"),
             Ty::List(elem) => write!(f, "list[{elem}]"),
@@ -191,8 +194,14 @@ impl<'a> TypeChecker<'a> {
                     self.state_tys.insert(def, ty);
                 }
                 Item::Fifo { ty, .. } => {
-                    let elem = self.eval_ty(ty, &HashMap::new());
-                    self.state_tys.insert(def, Ty::Fifo(Box::new(elem)));
+                    let (elem, depth) = self.eval_fifo_ty(ty, &HashMap::new());
+                    self.state_tys.insert(
+                        def,
+                        Ty::Fifo {
+                            elem: Box::new(elem),
+                            depth,
+                        },
+                    );
                 }
                 Item::Input { ty, .. } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
@@ -270,6 +279,34 @@ impl<'a> TypeChecker<'a> {
             .iter()
             .find(|(n, _, _)| n == name)
             .map(|(_, k, t)| (*k, t.clone()))
+    }
+
+    /// A fifo's type is either a bare element type (`bits[8]`, depth 1)
+    /// or `[depth]elem_ty` (parser.rs's `parse_fifo_depth_ty`), which
+    /// parses to the exact same `Bracket { callee: elem_ty, args: [depth] }`
+    /// shape a mem's postfix `elem_ty[depth]` would produce. Extracts
+    /// elem/depth directly from that shape rather than routing through
+    /// `eval_ty`'s generic Bracket fallthrough, which would wrap the
+    /// result in `Ty::Mem` instead of the flat `(elem, depth)` a fifo
+    /// needs.
+    fn eval_fifo_ty(&mut self, id: ExprId, env: &HashMap<DefId, u64>) -> (Ty, u64) {
+        if let Expr::Bracket { callee, args } = self.ast.expr(id).clone()
+            && !self.is_builtin(callee, "bits")
+            && !self.is_builtin(callee, "list")
+        {
+            let elem = self.eval_ty(callee, env);
+            return match args.first().and_then(|a| self.const_eval(*a, env)) {
+                Some(depth) => (elem, depth),
+                None => {
+                    self.error(
+                        self.expr_span(id),
+                        "fifo depth must be an elaboration-time constant".to_string(),
+                    );
+                    (elem, 1)
+                }
+            };
+        }
+        (self.eval_ty(id, env), 1)
     }
 
     /// Evaluate a type expression. `env` carries solved implicit params.
@@ -902,9 +939,15 @@ impl<'a> TypeChecker<'a> {
         // Fifo op: `f.Deq[]` / `f.Enq[x]`.
         if let Expr::Field { base, name } = self.ast.expr(callee).clone()
             && let Some(def) = self.res.expr_defs.get(&base).copied()
-            && let Some(Ty::Fifo(elem)) = self.state_tys.get(&def).cloned()
+            && let Some(Ty::Fifo { elem, depth }) = self.state_tys.get(&def).cloned()
         {
-            self.types.expr_tys.insert(callee, Ty::Fifo(elem.clone()));
+            self.types.expr_tys.insert(
+                callee,
+                Ty::Fifo {
+                    elem: elem.clone(),
+                    depth,
+                },
+            );
             return match name.as_str() {
                 "Deq" => {
                     if !args.is_empty() {

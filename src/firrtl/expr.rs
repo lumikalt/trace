@@ -36,10 +36,10 @@ impl<'a> Emitter<'a> {
             };
             return Ok(format!("{mem_name}.{port}.data"));
         }
-        if let Some((fifo, is_enq, _)) = self.fifo_op(id)
+        if let Some((fifo, depth, is_enq, _)) = self.fifo_op(id)
             && !is_enq
         {
-            return Ok(fifo_data_name(&fifo));
+            return Ok(fifo_deq_read_expr(&fifo, depth));
         }
         // `inst.port` reading a child's output port: a plain combinational
         // reference, always valid (the child drives it unconditionally),

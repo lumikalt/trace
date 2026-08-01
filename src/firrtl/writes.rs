@@ -297,7 +297,7 @@ impl<'a> Emitter<'a> {
                 .filter(|o| fifo_conds_emitted.insert(o.fifo.clone()))
                 .map(|o| {
                     let (saw_enq, saw_deq) = fifo_ops[&o.fifo];
-                    rule_fifo_guard_cond(&o.fifo, saw_enq, saw_deq)
+                    rule_fifo_guard_cond(&o.fifo, saw_enq, saw_deq, o.depth)
                 })
                 .collect();
             match self.ast.stmt(*stmt).clone() {

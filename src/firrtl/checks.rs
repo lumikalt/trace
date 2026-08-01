@@ -148,15 +148,19 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// At most one `Enq` and at most one `Deq` per fifo per rule — a
-    /// second `Enq[x]` on the same fifo silently discards the first
-    /// candidate value (the buffer holds one word, so only the last
-    /// write lands), and a second `Deq[]` does not dequeue a second
-    /// value (there is nothing left to advance to); both are almost
-    /// certainly a mistake, not the one-`Enq`-plus-one-`Deq`
-    /// pass-through this emitter does support (fifo.rs's module doc
-    /// comment). Enqueuing one fifo and dequeuing a DIFFERENT one is
-    /// unaffected — this counts occurrences per fifo, not per rule.
+    /// At most one `Enq` and at most one `Deq` per fifo per rule,
+    /// regardless of the fifo's depth — a second `Enq[x]` on the same
+    /// fifo silently discards the first candidate value (only the last
+    /// write lands, at any depth: one `Enq[x]` fills one slot, not one
+    /// slot per statement), and a second `Deq[]` does not dequeue a
+    /// second value (both would read the same pre-edge data, not
+    /// distinct entries). Both are almost certainly a mistake, not the
+    /// one-`Enq`-plus-one-`Deq` pass-through this emitter does support
+    /// (fifo.rs's module doc comment) — multi-slot fills/drains in one
+    /// rule are a deliberately separate, unimplemented feature, not
+    /// something a depth>1 fifo gets for free. Enqueuing one fifo and
+    /// dequeuing a DIFFERENT one is unaffected — this counts occurrences
+    /// per fifo, not per rule.
     pub(crate) fn check_fifo_op_counts(&mut self, rule: ItemId) {
         let ops = self.rule_fifo_ops(rule);
         let mut enqs: HashMap<String, Vec<StmtId>> = HashMap::new();

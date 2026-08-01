@@ -76,13 +76,15 @@
 //!   above). No other field access, `/`/`%`, dynamic-amount shifts,
 //!   computed bit-select bounds, or logical `!` yet.
 //!
-//! Fifos are depth-1 buffers: one data register plus one valid bit.
-//! `Deq[]` succeeds iff valid; `Enq[x]` succeeds iff not valid — the
+//! Fifos default to depth 1 (one data register plus one valid bit);
+//! `[depth]elem_ty` declares a deeper one (N data-slot registers plus
+//! `head`/`count` pointers — see fifo.rs's module doc comment).
+//! `Deq[]` succeeds iff non-empty; `Enq[x]` succeeds iff non-full — the
 //! two failure conditions fold into the rule's guard exactly like an
-//! explicit `?`. A rule may not both `Enq` and `Deq` the same fifo:
-//! that would require valid=1 and valid=0 at once, an always-false
-//! guard, so it is rejected explicitly rather than silently synthesized
-//! as permanently dead hardware.
+//! explicit `?`. A rule MAY both `Enq` and `Deq` the same fifo in one
+//! cycle (a pass-through: `Deq` reads the pre-edge data, `Enq` writes
+//! the new data for next cycle, fill level unchanged) — fifo.rs's
+//! module doc comment covers the combined guard and update this needs.
 //!
 //! Memories get one reader port per static read site (not one shared
 //! port): the scheduler treats read-read as free, which is only sound

@@ -239,6 +239,97 @@ fn fifo_bridge_emits_depth_one_buffers() {
 }
 
 #[test]
+fn fifo_depth_n_emits_a_slot_array_plus_head_and_count() {
+    // Depth 4 deliberately, not 3: `head` ranges 0..4 (needs
+    // clog2(4) = 2 bits) but `count` ranges 0..=4, five distinct values
+    // (needs clog2(5) = 3 bits, one more than `head`) -- picking a
+    // depth where these two widths actually differ makes this test
+    // catch the specific off-by-one this shape is prone to (sizing
+    // `count` for `depth` instead of `depth + 1`, which can't represent
+    // a full buffer).
+    let src = "\
+module M {
+    fifo f : [4]bits[8]
+    rule r {
+        (want == 1)?
+        x := f.Deq[]
+        f.Enq[x + 1]
+    }
+    in want : bits[1]
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+
+    // Four data-slot registers, not one -- plus head/count pointers.
+    assert!(fir.contains("regreset __fifo_f_slot0 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_f_slot1 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_f_slot2 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_f_slot3 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_f_head : UInt<2>"));
+    assert!(fir.contains("regreset __fifo_f_count : UInt<3>"));
+    assert!(!fir.contains("__fifo_f_valid"));
+    assert!(!fir.contains("__fifo_f_data"));
+
+    // Combined Enq+Deq guard generalizes from depth-1's `valid` to
+    // `count > 0`.
+    assert!(
+        fir.contains("node fires_r = and(eq(want, UInt<1>(1)), gt(__fifo_f_count, UInt<3>(0)))")
+    );
+
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn fifo_depth_n_fifo_op_reached_via_a_callee_still_uses_the_slot_array() {
+    // `rule_fifo_ops` (fifo.rs) finds a fifo op reached through exactly
+    // one failing-callee call, not just a rule's own top-level
+    // statements -- confirms that path is depth-aware too, not just
+    // the direct-op path the other tests above exercise.
+    let src = "\
+module M {
+    fifo input : [3]bits[8]
+    fifo output : bits[8]
+    out last : bits[8] = 0
+
+    Bridge() : bits[8] <combines, fails> {
+        let x = input.Deq[]
+        output.Enq[x]
+        return x
+    }
+
+    rule transfer {
+        last := Bridge()
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset __fifo_input_slot0 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_input_slot1 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_input_slot2 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_input_head : UInt<2>"));
+    assert!(fir.contains("regreset __fifo_input_count : UInt<2>"));
+    assert!(!fir.contains("__fifo_input_valid"));
+    assert!(fir.contains(
+        "node fires_transfer = and(gt(__fifo_input_count, UInt<2>(0)), not(__fifo_output_valid))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn fifo_depth_zero_is_an_error() {
+    let src = "\
+module M {
+    fifo f : [0]bits[8]
+    rule r {
+        f.Enq[8'd1]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("at least 1")));
+}
+
+#[test]
 fn fifo_enq_and_deq_same_cycle_is_a_passthrough() {
     // Enqueueing AND dequeueing the SAME fifo in one rule is a
     // pass-through, not an error: `x := f.Deq[]` reads the fifo's

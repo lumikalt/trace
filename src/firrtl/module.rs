@@ -64,8 +64,8 @@ pub(crate) fn emit_module(
     // backing register (see the `Item::Output` arm below).
     let mut regs: Vec<(String, String, u64, u64)> = Vec::new();
     let mut mems = Vec::new();
-    // `(fifo_name, width)`, depth-1 buffers (see module doc comment).
-    let mut fifos: Vec<(String, u64)> = Vec::new();
+    // `(fifo_name, width, depth)`.
+    let mut fifos: Vec<(String, u64, u64)> = Vec::new();
     // `(port_name, width)`.
     let mut inputs: Vec<(String, u64)> = Vec::new();
     // `(port_name, internal_reg_name, width)`.
@@ -145,7 +145,7 @@ pub(crate) fn emit_module(
             }
             Item::Fifo { name, .. } => {
                 let def = res.item_defs[id];
-                let Some(Ty::Fifo(elem)) = cx.state_width(def) else {
+                let Some(Ty::Fifo { elem, depth }) = cx.state_width(def) else {
                     cx.error(
                         ast.item_spans[id.0 as usize].clone(),
                         format!("`{}` has no concrete fifo type", name.text),
@@ -159,18 +159,48 @@ pub(crate) fn emit_module(
                     );
                     continue;
                 };
-                // A depth-1 buffer: one data register, one valid bit,
-                // both internally named to avoid colliding with a user
-                // identifier (same `__`-prefix convention as `__out_x`
-                // and lower.rs's `__cont_x`).
-                regs.push((
-                    fifo_valid_name(&name.text),
-                    fifo_valid_name(&name.text),
-                    1,
-                    0,
-                ));
-                regs.push((fifo_data_name(&name.text), fifo_data_name(&name.text), w, 0));
-                fifos.push((name.text.clone(), w));
+                if depth == 0 {
+                    cx.error(
+                        ast.item_spans[id.0 as usize].clone(),
+                        format!("`{}` needs a depth of at least 1", name.text),
+                    );
+                    continue;
+                }
+                if depth == 1 {
+                    // A depth-1 buffer: one data register, one valid
+                    // bit, both internally named to avoid colliding
+                    // with a user identifier (same `__`-prefix
+                    // convention as `__out_x` and lower.rs's
+                    // `__cont_x`). Kept as its own case (rather than a
+                    // degenerate N=1 instance of the general one-slot-
+                    // array-plus-head-plus-count shape below) so the
+                    // by-far-most-common depth emits byte-identical
+                    // FIRRTL to before depth support existed.
+                    regs.push((
+                        fifo_valid_name(&name.text),
+                        fifo_valid_name(&name.text),
+                        1,
+                        0,
+                    ));
+                    regs.push((fifo_data_name(&name.text), fifo_data_name(&name.text), w, 0));
+                } else {
+                    // A depth-N circular buffer: N data-slot registers
+                    // plus `head`/`count` pointer registers (`tail` is
+                    // derived, `head + count` wrapped — not stored).
+                    // See fifo.rs's module doc comment: this shape was
+                    // hand-verified against a real firtool+Icarus
+                    // simulation (depth 3, chosen non-power-of-2 to
+                    // stress wraparound) before being ported here.
+                    for i in 0..depth {
+                        let slot = fifo_slot_name(&name.text, i);
+                        regs.push((slot.clone(), slot, w, 0));
+                    }
+                    let head = fifo_head_name(&name.text);
+                    regs.push((head.clone(), head, clog2(depth).max(1), 0));
+                    let count = fifo_count_name(&name.text);
+                    regs.push((count.clone(), count, count_width(depth), 0));
+                }
+                fifos.push((name.text.clone(), w, depth));
             }
             Item::Rule { name, body, .. } => {
                 let still_sequences = fx.sigs.get(id).is_some_and(|s| s.sequences)
@@ -436,18 +466,15 @@ pub(crate) fn emit_module(
         }
     }
 
-    // Fifos: depth-1 buffers. At most one rule can touch a given fifo
-    // per cycle — every fifo op reads+writes it (effects.rs), so every
-    // touching rule conflicts with every other, exactly like mem
-    // writers above; same priority-mux pattern, though only one
-    // `when` can ever actually be live per fifo. A rule may enqueue AND
-    // dequeue the SAME fifo (a pass-through — see fifo.rs's module doc
-    // comment): its connects are identical to an enqueue-only rule's
-    // (`valid` stays 1, `data` updates to the new value) regardless of
-    // whether it also dequeues, since `Deq[]`'s own value already reads
-    // the pre-edge `data` before this connect takes effect — the same
-    // "reads see the old value, connects land for next cycle" register
-    // semantics used everywhere else in this emitter.
+    // Fifos. At most one rule can touch a given fifo per cycle — every
+    // fifo op reads+writes it (effects.rs), so every touching rule
+    // conflicts with every other, exactly like mem writers above; same
+    // priority-mux pattern, though only one `when` can ever actually be
+    // live per fifo. A rule may enqueue AND dequeue the SAME fifo (a
+    // pass-through — see fifo.rs's module doc comment): `Deq[]`'s own
+    // value already reads the pre-edge state before these connects take
+    // effect, the same "reads see the old value, connects land for next
+    // cycle" register semantics used everywhere else in this emitter.
     // `(rule, Some(the Enq op — direct or via a callee), saw a dequeue)`.
     // `rule_fifo_ops` (fifo.rs) is the single enumerator every fifo-touch
     // question in this emitter routes through — it already finds an Enq/
@@ -458,7 +485,7 @@ pub(crate) fn emit_module(
     // across a direct op and a callee's own op.
     type FifoTouch = (ItemId, Option<RuleFifoOp>, bool);
     let mut fifo_body = String::new();
-    for (fifo_name, width) in &fifos {
+    for (fifo_name, width, depth) in &fifos {
         let mut touching: Vec<FifoTouch> = Vec::new();
         for rule in &rules {
             let mut enq: Option<RuleFifoOp> = None;
@@ -481,22 +508,33 @@ pub(crate) fn emit_module(
             continue;
         }
         touching.sort_by_key(|(r, ..)| std::cmp::Reverse(order.iter().position(|x| x == r)));
-        let valid = fifo_valid_name(fifo_name);
-        let data = fifo_data_name(fifo_name);
-        for (rule, enq, _saw_deq) in touching {
-            cx.enter_rule(rule);
-            let f = &fires_name[&rule];
-            let _ = writeln!(fifo_body, "    when {f} :");
-            if let Some(enq_op) = enq {
-                cx.set_pos(rule, enq_op.stmt);
-                let value = cx
-                    .compile_fifo_op_value(&enq_op, *width)
-                    .unwrap_or_default();
-                let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(1)");
-                let _ = writeln!(fifo_body, "      connect {data}, {value}");
-            } else {
-                let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(0)");
+        if *depth == 1 {
+            let valid = fifo_valid_name(fifo_name);
+            let data = fifo_data_name(fifo_name);
+            for (rule, enq, _saw_deq) in touching {
+                cx.enter_rule(rule);
+                let f = &fires_name[&rule];
+                let _ = writeln!(fifo_body, "    when {f} :");
+                if let Some(enq_op) = enq {
+                    cx.set_pos(rule, enq_op.stmt);
+                    let value = cx
+                        .compile_fifo_op_value(&enq_op, *width)
+                        .unwrap_or_default();
+                    let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(1)");
+                    let _ = writeln!(fifo_body, "      connect {data}, {value}");
+                } else {
+                    let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(0)");
+                }
             }
+        } else {
+            cx.emit_fifo_depth_n(
+                &mut fifo_body,
+                fifo_name,
+                *width,
+                *depth,
+                &touching,
+                &fires_name,
+            );
         }
     }
 
@@ -686,6 +724,91 @@ pub(crate) fn module_block(
 }
 
 impl<'a> Emitter<'a> {
+    /// A depth-N (N>1) fifo's state-transition emission: N data-slot
+    /// registers plus `head`/`count` pointers. Design hand-verified
+    /// against a real firtool+Icarus simulation of a depth-3 circuit
+    /// (see fifo.rs's module doc comment) before being ported here —
+    /// caught a real bug in composing the Enq/Deq `count` update (a
+    /// combined Enq+Deq must net to unchanged, not lose the Enq's
+    /// credit by branching off the SAME pre-update `count` twice).
+    ///
+    /// `tail` (the next write position) is derived, not stored: `head +
+    /// count` wrapped back into `[0, depth)`. It's computed once here,
+    /// as plain top-level nodes shared by every touching rule's own
+    /// `when` block below, since it depends only on the `head`/`count`
+    /// registers' current (pre-edge) values, not on which rule fires.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fifo_depth_n(
+        &mut self,
+        out: &mut String,
+        fifo_name: &str,
+        width: u64,
+        depth: u64,
+        touching: &[(ItemId, Option<RuleFifoOp>, bool)],
+        fires_name: &HashMap<ItemId, String>,
+    ) {
+        let head = fifo_head_name(fifo_name);
+        let count = fifo_count_name(fifo_name);
+        let head_w = clog2(depth).max(1);
+        let count_w = count_width(depth);
+        let pos = format!("__fifo_{fifo_name}_pos");
+        let wpos = format!("__fifo_{fifo_name}_wpos");
+        let head_p1 = format!("__fifo_{fifo_name}_head_p1");
+        let _ = writeln!(out, "    node {pos} = add({head}, {count})");
+        let _ = writeln!(
+            out,
+            "    node {wpos} = mux(geq({pos}, UInt<{count_w}>({depth})), \
+             sub({pos}, UInt<{count_w}>({depth})), {pos})"
+        );
+        let _ = writeln!(
+            out,
+            "    node {head_p1} = mux(eq({head}, UInt<{head_w}>({})), UInt<{head_w}>(0), \
+             tail(add({head}, UInt<{head_w}>(1)), 1))",
+            depth - 1
+        );
+        for (rule, enq, saw_deq) in touching {
+            self.enter_rule(*rule);
+            let f = &fires_name[rule];
+            let _ = writeln!(out, "    when {f} :");
+            if let Some(enq_op) = enq {
+                self.set_pos(*rule, enq_op.stmt);
+                let value = self
+                    .compile_fifo_op_value(enq_op, width)
+                    .unwrap_or_default();
+                if !saw_deq {
+                    let _ = writeln!(
+                        out,
+                        "      connect {count}, tail(add({count}, UInt<{count_w}>(1)), 1)"
+                    );
+                }
+                // Combined Enq+Deq: `count` is unchanged (the Enq's +1
+                // above is skipped and the Deq's -1 below is skipped
+                // too — they'd net to zero anyway, but composing them
+                // by branching off the SAME pre-update `count` twice
+                // is exactly the bug the hand-verified circuit caught;
+                // omitting both connects sidesteps it entirely and
+                // holds the register's current value).
+                for i in 0..depth {
+                    let slot = fifo_slot_name(fifo_name, i);
+                    let _ = writeln!(
+                        out,
+                        "      connect {slot}, mux(eq({wpos}, UInt<{count_w}>({i})), {value}, \
+                         {slot})"
+                    );
+                }
+            }
+            if *saw_deq {
+                let _ = writeln!(out, "      connect {head}, {head_p1}");
+                if enq.is_none() {
+                    let _ = writeln!(
+                        out,
+                        "      connect {count}, tail(sub({count}, UInt<{count_w}>(1)), 1)"
+                    );
+                }
+            }
+        }
+    }
+
     pub(crate) fn collect_read_sites(&mut self, stmts: &[StmtId], rule: ItemId) {
         for stmt in stmts {
             match self.ast.stmt(*stmt).clone() {

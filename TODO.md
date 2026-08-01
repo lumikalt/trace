@@ -83,12 +83,6 @@
   `examples/div_rem.tr`, `examples/sized_literal.tr`,
   `examples/infer_reg_ty.tr`, `examples/dynamic_bit_select.tr` for
   coverage.
-- Fifos are depth-1 only (one data reg + one valid bit); no depth syntax
-  exists. A rule may `Enq`+`Deq` the SAME fifo now (a pass-through —
-  `Deq` reads the old value, `Enq` writes the new one, `valid` stays 1;
-  guard is `valid == 1`, not the always-false AND of each op's own
-  individual guard). See DESIGN.md's "FIFO synthesis emission" section,
-  `examples/fifo_passthrough.tr` + `sim/fifo_passthrough_tb.v`.
 - A local reassigned at a rule's top level now resolves each reference
   at its own textual position (still rejected inside `if`/`else` — no
   example needs that, and it's a materially different, larger change).
