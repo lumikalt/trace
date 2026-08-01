@@ -413,6 +413,24 @@ impl<'a> Checker<'a> {
             }
             Stmt::Let { init, .. } => self.check_expr(init, item, sig, elab),
             Stmt::Return(e) => {
+                // A `rule` has no return value to give back to anything —
+                // `return` only makes sense inside a `fn`/`spec`/`impl`
+                // body (all `Item::Fn`). Left unchecked, this used to
+                // parse and even emit "successfully": nothing downstream
+                // (guard placement, read-site collection, write-in-stmts)
+                // has a case for `Stmt::Return` at a rule's top level, so
+                // the whole statement — and anything it does, like a fifo
+                // `Deq`/guard — silently vanished with zero error.
+                if !matches!(self.ast.item(item), Item::Fn { .. }) {
+                    self.error(
+                        span,
+                        "`return` is only valid inside a function body; a `rule` has no \
+                         return value (this used to compile and silently drop the whole \
+                         statement — if this was meant to gate the rule, write it as an \
+                         ordinary guard or fifo operation instead)"
+                            .to_string(),
+                    );
+                }
                 if let Some(e) = e {
                     self.check_expr(e, item, sig, elab);
                 }

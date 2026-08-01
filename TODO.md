@@ -75,6 +75,19 @@
   fifo-op bug); `let h = spawn Foo(args)` now names the real restriction
   (bind with `:=`, since `.result`/`.done` are read on a later cycle)
   instead of being blamed on `race`.
+- Audited every `_ => {}` wildcard match over `Stmt`/`Expr`/`Item`/etc.
+  across `src/` (30 sites) for more Assign-vs-Let-shaped silent gaps.
+  29 are legitimately safe (most route the semantically-important part
+  through `lower.rs`'s `sub_exprs`/`stmt_exprs`, which are fully
+  exhaustive with no wildcard at all; the rest are narrowly scoped to a
+  write shape — mem/reg/port writes — that can only ever be
+  `Stmt::Assign`, never `Stmt::Let`, so excluding `Let` there isn't a
+  gap). One real, new, silent bug turned up: `return <expr>` at a
+  rule's top level (not a `fn`) used to compile clean and silently drop
+  the entire statement — nothing downstream had a case for
+  `Stmt::Return` outside a callee body. Now a compile-time error in
+  `effects.rs`'s `check_stmt` (a `rule` has no return value). See
+  DESIGN.md's "Calling a function from a rule" section.
 
 ## Language features with no synthesis path yet
 

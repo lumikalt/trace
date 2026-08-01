@@ -46,6 +46,26 @@ fn tick_requires_sequences() {
 }
 
 #[test]
+fn return_is_rejected_inside_a_rule() {
+    // A `rule` has no return value -- found while auditing `_ => {}`
+    // wildcard matches for the Assign-vs-Let bug class: nothing
+    // downstream had a case for `Stmt::Return` at a rule's top level, so
+    // `return f.Deq[]` used to compile clean and silently drop the whole
+    // statement (the fifo op, and anything else it wrapped) with zero
+    // emitted logic and zero error.
+    let (_, _, errors) = run("fifo f : bits[8]\nrule r {\n return f.Deq[]\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("`return` is only valid inside a function body")
+    );
+
+    // Still legal inside a real fn/spawn-callee body.
+    run_ok("F(x : bits[8]) : bits[8] <combines> {\n return x\n}\n");
+}
+
+#[test]
 fn while_needs_sequences_or_elaborates() {
     // DESIGN.md's E012 example.
     let (_, _, errors) = run(

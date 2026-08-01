@@ -446,6 +446,9 @@ Inside a `sequences` body, only a `:=`-bound local can cross a `tick`; see
 ## Calling a function from a rule
 
 A rule may call a user `fn`/`impl` (not `spec` — those stay verification-only).
+`return` belongs to a callee's body, not a rule's: a rule has no return value,
+so `return <expr>` at a rule's top level is a compile-time error rather than
+something to write here.
 
 ```
 Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
