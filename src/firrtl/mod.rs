@@ -91,7 +91,7 @@
 //! writer conflicts with every reader of the same array in v0), so
 //! `read-under-write` is never exercised — it is set to `undefined`.
 
-use crate::ast::{Ast, Expr, ExprId, Item, ItemId};
+use crate::ast::{Ast, Expr, ExprId, Item, ItemId, StmtId};
 use crate::effects::Effects;
 use crate::lexer::Span;
 use crate::resolve::{DefId, Resolution};
@@ -323,26 +323,50 @@ struct Emitter<'a> {
     module: ItemId,
     errors: Vec<EmitError>,
     /// Each static mem-read expression -> its assigned reader port name,
-    /// plus the rule it was found in (needed to `enter_rule` the right
-    /// context before compiling its address expression — a read site's
-    /// address is compiled separately from, and after, the rule body
-    /// it lexically belongs to, since reads are wired unconditionally
+    /// plus the rule and enclosing (possibly if/else-nested) statement
+    /// it was found in — needed to `enter_rule`/`set_pos` the right
+    /// context before compiling its address expression, since a read
+    /// site's address is compiled separately from, and after, the rule
+    /// body it lexically belongs to (reads are wired unconditionally
     /// across the whole module; see module.rs's reader-port loop).
-    read_ports: HashMap<ExprId, (String, ItemId)>,
+    read_ports: HashMap<ExprId, (String, ItemId, StmtId)>,
     /// Output port name -> its internal backing register name. Reading
     /// an output inside a rule (`sum := sum + inc`) must see the
     /// register, not the port (a FIRRTL output port is drive-only from
     /// inside its own module in the shape this emitter produces).
     output_regs: HashMap<String, String>,
-    /// The rule currently being compiled: each local's binding
-    /// expression. Locals have no FIRRTL declaration of their own —
-    /// they are wires — so a reference to one inlines (recursively
-    /// compiles) its binding instead of emitting an undeclared
-    /// identifier. Refreshed by `enter_rule` before compiling any part
-    /// of a rule; only that rule's top-level bindings are visible,
-    /// matching source scoping (a local from inside `if`/`while` cannot
-    /// be referenced outside it).
+    /// A CALLEE body's own params/`let`s (see `calls.rs`/`callee_reg_write`/
+    /// `callee_port_write`): single binding per `DefId`, save/restored
+    /// around a call for reentrancy safety. Unrelated to a RULE's own
+    /// top-level locals — see `locals_snapshots` below for those. A
+    /// `DefId` never appears in both maps, so `compile_expr`'s Ident
+    /// case checks `locals_snapshots` first and falls back to this one.
     locals: HashMap<DefId, ExprId>,
+    /// A rule's own top-level local bindings, each ALREADY COMPILED to
+    /// FIRRTL text and snapshotted per top-level statement position:
+    /// `locals_snapshots[i]` is every local's value as established by
+    /// statements STRICTLY BEFORE `rule_body(rule)[i]` — i.e. what that
+    /// statement (or anything nested inside it, e.g. an if/else branch)
+    /// should see. Rebuilt fresh per rule by `enter_rule`, which walks
+    /// the body in program order and compiles each local's own RHS
+    /// EAGERLY (not lazily, unlike `locals` above) the moment it's
+    /// bound, using whatever was already established so far — the only
+    /// way a REASSIGNED local resolves correctly: a lazy, ExprId-keyed
+    /// single binding (the old design) can't distinguish "read before
+    /// the second assignment" from "read after" once compilation is
+    /// deferred past `enter_rule`'s own pass. `current_pos` (below)
+    /// selects which snapshot is active; `set_pos` computes it from
+    /// whichever statement is currently being compiled. See DESIGN.md's
+    /// "Reassigned locals" section for the full design story.
+    locals_snapshots: Vec<HashMap<DefId, String>>,
+    /// Index into `locals_snapshots` currently in effect — set by
+    /// `set_pos` before compiling any expression that might reference a
+    /// rule-local, consulted by `compile_expr`'s Ident case. Stays fixed
+    /// across a nested call's own param/body compilation (calls never
+    /// touch this field), which is exactly what makes a call argument
+    /// referencing a rule-local resolve correctly: the call's own
+    /// compile happens "at" whatever position the caller set.
+    current_pos: usize,
 }
 
 impl<'a> Emitter<'a> {

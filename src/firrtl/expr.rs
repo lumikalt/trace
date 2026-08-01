@@ -27,7 +27,7 @@ impl<'a> Emitter<'a> {
         id: ExprId,
         hint: Option<u64>,
     ) -> Result<String, ()> {
-        if let Some((port, _)) = self.read_ports.get(&id) {
+        if let Some((port, ..)) = self.read_ports.get(&id) {
             let Expr::Bracket { callee, .. } = self.ast.expr(id) else {
                 unreachable!()
             };
@@ -57,7 +57,15 @@ impl<'a> Emitter<'a> {
                 match def.map(|d| self.res.def(d).clone()) {
                     Some(d) if d.kind == DefKind::Output => Ok(self.output_regs[&d.name].clone()),
                     Some(d) if matches!(d.kind, DefKind::Local | DefKind::Param) => {
-                        match self.locals.get(&def.unwrap()) {
+                        let def = def.unwrap();
+                        if let Some(text) = self
+                            .locals_snapshots
+                            .get(self.current_pos)
+                            .and_then(|m| m.get(&def))
+                        {
+                            return Ok(text.clone());
+                        }
+                        match self.locals.get(&def) {
                             Some(bound) => self.compile_expr_hinted(*bound, hint),
                             None => {
                                 self.error(

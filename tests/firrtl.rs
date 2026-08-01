@@ -299,10 +299,12 @@ module M {
 }
 
 #[test]
-fn reassigned_local_is_an_error_not_a_silent_miscompile() {
-    // A local read between two assignments must not silently inline
-    // the *later* binding: `y` should see `r`, not `r + 1`. Rather than
-    // risk that, reassigning a local in an emitted rule is rejected.
+fn reassigned_local_read_between_two_bindings_sees_the_first() {
+    // `y` must resolve against `x`'s FIRST binding (`r`), not the later
+    // one (`r + 1`) that hasn't happened yet from `y`'s own position --
+    // proving `enter_rule`'s eager, position-ordered compilation, not
+    // the old lazy last-assignment-wins map this used to reject
+    // outright to avoid miscompiling.
     let src = "\
 module M {
     fifo f : bits[8]
@@ -312,6 +314,85 @@ module M {
         y := x
         x := r + 1
         f.Enq[y]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __fifo_f_data, r"));
+    assert!(!fir.contains("add(r"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn reassigned_local_write_between_two_bindings_sees_old_then_new() {
+    // The discriminating case: an OBSERVABLE write sits BETWEEN two
+    // reassignments of the same local. `before` must see `x`'s value as
+    // of ITS OWN position (== `a`), `after` must see the LATER
+    // reassignment (== `b`) -- a naive last-assignment-wins pass (what
+    // simply deleting the old rejection, with no position tracking,
+    // would give) fails this by making `before` ALSO read `b`.
+    let src = "\
+module M {
+    input a : bits[8]
+    input b : bits[8]
+    reg before : bits[8] = 0
+    reg after : bits[8] = 0
+    rule r {
+        x := a
+        before := x
+        x := b
+        after := x
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect before, a"));
+    assert!(fir.contains("connect after, b"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn reassigned_local_chain_resolves_each_reference_at_its_own_position() {
+    // `y := z + 10` must use `z`'s FIRST binding; the later `out := y + z`
+    // must use `z`'s SECOND binding for the bare `z` reference while `y`
+    // itself still carries the value computed from the FIRST one --
+    // proving transitively-chained locals resolve correctly, not just a
+    // single reassigned name referenced directly.
+    let src = "\
+module M {
+    mem m : bits[16][4]
+    output result : bits[16] = 0
+    rule r {
+        z := m[0]
+        y := z + m[1]
+        z := m[2]
+        result := y + z
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_result, tail(add(tail(add(m.r0.data, m.r1.data), 1), m.r2.data), 1)"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn reassigned_local_with_no_concrete_width_still_errors() {
+    // A local used ONLY as a mem-read address never gets a concrete
+    // `bits[w]` type from the checker (see `type_expr_inner`'s `Ty::Mem`
+    // arm) -- eager compilation has no width to resolve it with at bind
+    // time, so THIS narrow shape still rejects reassignment explicitly,
+    // same spirit as the old blanket check but scoped to just this case.
+    let src = "\
+module M {
+    mem m : bits[16][256]
+    reg out : bits[16] = 0
+    rule r {
+        x := 5
+        out := m[x]
+        x := 6
+        out := m[x]
     }
 }
 ";

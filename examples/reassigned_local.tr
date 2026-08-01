@@ -1,0 +1,22 @@
+-- A local reassigned within one rule now resolves each reference at
+-- ITS OWN textual position, not the local's final binding: `first_val`
+-- reads `x` as of its first assignment (`a`), `second_val` reads `x`
+-- as of its second, later one (`b`) -- proving `enter_rule`'s eager,
+-- position-ordered compilation actually threads through real
+-- hardware, not just emitted FIRRTL text. See DESIGN.md's "Reassigned
+-- locals" section and sim/reassigned_local_tb.v, which drives several
+-- distinct (a, b) pairs across consecutive cycles and checks both
+-- outputs never alias each other or lag a cycle behind.
+module ReassignedLocal {
+    input a : bits[8]
+    input b : bits[8]
+    output first_val : bits[8] = 0
+    output second_val : bits[8] = 0
+
+    rule r {
+        x := a
+        first_val := x
+        x := b
+        second_val := x
+    }
+}

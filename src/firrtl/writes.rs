@@ -26,6 +26,7 @@ use super::fifo::*;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Stmt, StmtId};
 use crate::resolve::{DefId, DefKind, Resolution};
 use crate::types::{Ty, Width};
+use std::collections::HashMap;
 
 pub(crate) fn clog2(v: u64) -> u64 {
     if v <= 1 {
@@ -46,6 +47,28 @@ pub(crate) fn rule_body(ast: &Ast, id: ItemId) -> Vec<StmtId> {
     match ast.item(id) {
         Item::Rule { body, .. } => body.clone(),
         _ => Vec::new(),
+    }
+}
+
+/// Is `target` `s` itself, or nested inside `s`'s if/else branches? Used
+/// by `set_pos` to find which top-level statement a (possibly nested)
+/// statement logically belongs to for local-snapshot purposes.
+pub(crate) fn stmt_contains(ast: &Ast, s: StmtId, target: StmtId) -> bool {
+    if s == target {
+        return true;
+    }
+    match ast.stmt(s) {
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            then_body.iter().any(|c| stmt_contains(ast, *c, target))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|c| stmt_contains(ast, *c, target)))
+        }
+        _ => false,
     }
 }
 
@@ -119,34 +142,126 @@ pub(crate) fn is_ident_named_inst(ast: &Ast, res: &Resolution, id: ExprId, name:
 }
 
 impl<'a> Emitter<'a> {
-    /// This rule's local bindings, refreshed before compiling any part
-    /// of it. See the `locals` field doc comment.
+    /// Rebuilds `locals_snapshots` for `rule`, one entry per top-level
+    /// statement position plus a final trailing entry for "after
+    /// everything" (the `set_pos` fallback). Walks the body in program
+    /// order, EAGERLY compiling each local's own RHS to FIRRTL text the
+    /// moment it's bound — using whichever bindings were already
+    /// established by statements strictly before it, so a REASSIGNED
+    /// local's later binding can never retroactively change what an
+    /// earlier read already resolved to. `local_hint` (below) supplies
+    /// the width: a bare-literal RHS (`x := 5`) has no concrete width
+    /// of its own to fall back on (`types.rs` never gives a literal
+    /// EXPRESSION node one — see that method's own doc comment), so
+    /// without this, eager compilation of a bare-literal local would
+    /// fail exactly where the OLD lazy design's use-site hint used to
+    /// paper over it.
+    ///
+    /// A local whose type never resolves to a concrete `bits[w]` at all
+    /// (`local_hint` returns `None`) — e.g. one used ONLY as a mem-read
+    /// address, whose own width the type checker never needs to pin
+    /// down (see `type_expr_inner`'s `Ty::Mem` arm: it type-checks the
+    /// index argument for its own sake but never widens the LOCAL's
+    /// type from it) — can't be eagerly resolved at bind time; the only
+    /// width that's ever come from is the READ site. Such a local falls
+    /// back to the OLD lazy `locals` map (an uncompiled `ExprId`,
+    /// recompiled with the read site's own hint — see `expr.rs`'s Ident
+    /// case), same as before this feature existed. That preserves the
+    /// single-assignment case exactly, but is unsound for reassignment
+    /// (the old single-binding-per-DefId problem, unaddressed here) —
+    /// so THIS specific sub-case still rejects reassignment explicitly,
+    /// narrower than the old blanket `check_no_reassigned_locals` ever
+    /// was.
+    ///
+    /// Also clears `locals` (the separate callee-param/let map — see
+    /// its own field doc comment) before repopulating it with any
+    /// unresolvable-width locals found this pass.
     pub(crate) fn enter_rule(&mut self, rule: ItemId) {
         self.locals.clear();
+        self.locals_snapshots.clear();
+        self.current_pos = 0;
         let body = rule_body(self.ast, rule);
-        for stmt in &body {
-            match self.ast.stmt(*stmt).clone() {
-                Stmt::Assign { lhs, rhs } => {
-                    if let Some(def) = self.res.expr_defs.get(&lhs).copied()
-                        && self.res.def(def).kind == DefKind::Local
-                    {
-                        self.locals.insert(def, rhs);
-                    }
+        let mut current: HashMap<DefId, String> = HashMap::new();
+        let mut seen: std::collections::HashSet<DefId> = Default::default();
+        for (i, stmt) in body.iter().enumerate() {
+            self.locals_snapshots.push(current.clone());
+            self.current_pos = i;
+            let bind = match self.ast.stmt(*stmt).clone() {
+                Stmt::Assign { lhs, rhs } => self
+                    .res
+                    .expr_defs
+                    .get(&lhs)
+                    .copied()
+                    .filter(|def| self.res.def(*def).kind == DefKind::Local)
+                    .map(|def| (def, rhs)),
+                Stmt::Let { name, init } => self
+                    .res
+                    .defs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, d)| d.span == name.span)
+                    .map(|(i, _)| (DefId(i as u32), init)),
+                _ => None,
+            };
+            let Some((def, rhs)) = bind else { continue };
+            match self.local_hint(def) {
+                Some(hint) => {
+                    let compiled = self
+                        .compile_expr_hinted(rhs, Some(hint))
+                        .unwrap_or_default();
+                    current.insert(def, compiled);
                 }
-                Stmt::Let { name, init } => {
-                    if let Some((i, _)) = self
-                        .res
-                        .defs
-                        .iter()
-                        .enumerate()
-                        .find(|(_, d)| d.span == name.span)
-                    {
-                        self.locals.insert(DefId(i as u32), init);
+                None => {
+                    if !seen.insert(def) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            format!(
+                                "`{}` is reassigned, but its width is never pinned to a \
+                                 concrete `bits[w]` anywhere in this rule (e.g. it's only \
+                                 ever used as a mem-read index) — FIRRTL emission cannot \
+                                 yet support reassigning a local in that shape",
+                                self.res.def(def).name
+                            ),
+                        );
                     }
+                    self.locals.insert(def, rhs);
                 }
-                _ => {}
             }
         }
+        self.locals_snapshots.push(current);
+        self.current_pos = self.locals_snapshots.len() - 1;
+    }
+
+    /// The width hint to use when EAGERLY compiling a local's own RHS —
+    /// its stable, post-fixpoint width (`types.rs`'s `local_tys`, built
+    /// by re-typing the body to a fixed point so a rebound local's
+    /// width already reflects the max across ALL its bindings). Safe to
+    /// pass unconditionally: for anything OTHER than a bare literal
+    /// (e.g. a mem read, already concretely widthed), `compile_expr`'s
+    /// hint is only ever consulted by a leaf `Expr::Int`, so it's
+    /// simply ignored.
+    fn local_hint(&self, def: DefId) -> Option<u64> {
+        match self.types.local_tys.get(&def) {
+            Some(Ty::Bits(Width::Known(w))) => Some(*w),
+            _ => None,
+        }
+    }
+
+    /// Points `current_pos` at whichever `locals_snapshots` entry is
+    /// correct for compiling `stmt` (which may be nested inside an
+    /// if/else — the search looks for the enclosing TOP-LEVEL statement
+    /// that IS or CONTAINS it, since a rule-local's own binding is only
+    /// ever established at top level; anything inside a branch sees
+    /// exactly what the branch's own enclosing statement saw). Falls
+    /// back to the trailing "after everything" snapshot if `stmt` can't
+    /// be found (defensive; every real call site's `stmt` does belong
+    /// to `rule`).
+    pub(crate) fn set_pos(&mut self, rule: ItemId, stmt: StmtId) {
+        let body = rule_body(self.ast, rule);
+        self.current_pos = body
+            .iter()
+            .position(|s| stmt_contains(self.ast, *s, stmt))
+            .unwrap_or_else(|| self.locals_snapshots.len().saturating_sub(1));
     }
 
     pub(crate) fn compile_guard(&mut self, rule: ItemId) -> String {
@@ -170,6 +285,7 @@ impl<'a> Emitter<'a> {
         let mut conds = Vec::new();
         let mut fifo_conds_emitted: std::collections::HashSet<String> = Default::default();
         for stmt in &body {
+            self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Expr(e) => {
                     if let Expr::Guard(inner) = self.ast.expr(e) {
@@ -218,12 +334,14 @@ impl<'a> Emitter<'a> {
     pub(crate) fn mem_write_in_stmts(
         &mut self,
         stmts: &[StmtId],
+        rule: ItemId,
         mem_name: &str,
         elem_width: u64,
         addr_width: u64,
     ) -> Option<(String, String, String)> {
         let mut current: Option<(String, String, String)> = None;
         for stmt in stmts {
+            self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Assign { lhs, rhs }
                     if is_mem_write_to(self.ast, self.res, *stmt, mem_name) =>
@@ -243,10 +361,10 @@ impl<'a> Emitter<'a> {
                     else_body,
                 } => {
                     let then_val =
-                        self.mem_write_in_stmts(&then_body, mem_name, elem_width, addr_width);
-                    let else_val = else_body
-                        .as_ref()
-                        .and_then(|b| self.mem_write_in_stmts(b, mem_name, elem_width, addr_width));
+                        self.mem_write_in_stmts(&then_body, rule, mem_name, elem_width, addr_width);
+                    let else_val = else_body.as_ref().and_then(|b| {
+                        self.mem_write_in_stmts(b, rule, mem_name, elem_width, addr_width)
+                    });
                     if then_val.is_some() || else_val.is_some() {
                         let hold = current.clone().unwrap_or_else(|| {
                             (
@@ -257,6 +375,11 @@ impl<'a> Emitter<'a> {
                         });
                         let (te, ta, td) = then_val.unwrap_or_else(|| hold.clone());
                         let (ee, ea, ed) = else_val.unwrap_or(hold);
+                        // Branch recursion above moved `current_pos` to
+                        // whatever its own last statement was — restore
+                        // it to THIS (enclosing) statement before
+                        // compiling the if's own condition.
+                        self.set_pos(rule, *stmt);
                         let cond_str = self
                             .compile_expr(cond)
                             .unwrap_or_else(|_| "UInt<1>(0)".to_string());
@@ -291,11 +414,13 @@ impl<'a> Emitter<'a> {
     pub(crate) fn reg_value_in_stmts(
         &mut self,
         stmts: &[StmtId],
+        rule: ItemId,
         reg_name: &str,
         width: u64,
     ) -> Option<String> {
         let mut current: Option<String> = None;
         for stmt in stmts {
+            self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Assign { lhs, rhs } => {
                     if is_ident_named(self.ast, self.res, lhs, reg_name) {
@@ -317,14 +442,15 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let then_val = self.reg_value_in_stmts(&then_body, reg_name, width);
+                    let then_val = self.reg_value_in_stmts(&then_body, rule, reg_name, width);
                     let else_val = else_body
                         .as_ref()
-                        .and_then(|b| self.reg_value_in_stmts(b, reg_name, width));
+                        .and_then(|b| self.reg_value_in_stmts(b, rule, reg_name, width));
                     if then_val.is_some() || else_val.is_some() {
                         let hold = current.clone().unwrap_or_else(|| reg_name.to_string());
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
+                        self.set_pos(rule, *stmt);
                         let cond_str = self
                             .compile_expr(cond)
                             .unwrap_or_else(|_| "UInt<1>(0)".to_string());
@@ -509,12 +635,14 @@ impl<'a> Emitter<'a> {
     pub(crate) fn inst_port_value_in_stmts(
         &mut self,
         stmts: &[StmtId],
+        rule: ItemId,
         inst_name: &str,
         port_name: &str,
         width: u64,
     ) -> Option<String> {
         let mut current: Option<String> = None;
         for stmt in stmts {
+            self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Assign { lhs, rhs } => {
                     if let Expr::Field { base, name } = self.ast.expr(lhs).clone()
@@ -540,10 +668,10 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let then_val =
-                        self.inst_port_value_in_stmts(&then_body, inst_name, port_name, width);
+                    let then_val = self
+                        .inst_port_value_in_stmts(&then_body, rule, inst_name, port_name, width);
                     let else_val = else_body.as_ref().and_then(|b| {
-                        self.inst_port_value_in_stmts(b, inst_name, port_name, width)
+                        self.inst_port_value_in_stmts(b, rule, inst_name, port_name, width)
                     });
                     if then_val.is_some() || else_val.is_some() {
                         let hold = current
@@ -551,6 +679,7 @@ impl<'a> Emitter<'a> {
                             .unwrap_or_else(|| format!("UInt<{width}>(0)"));
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
+                        self.set_pos(rule, *stmt);
                         let cond_str = self
                             .compile_expr(cond)
                             .unwrap_or_else(|_| "UInt<1>(0)".to_string());

@@ -54,6 +54,8 @@ pub(crate) fn emit_module(
         read_ports: HashMap::new(),
         output_regs: HashMap::new(),
         locals: HashMap::new(),
+        locals_snapshots: Vec::new(),
+        current_pos: 0,
     };
 
     // `(match_name, emit_name, width, init)`. For a plain `reg`, both
@@ -249,7 +251,6 @@ pub(crate) fn emit_module(
     // `inst_port_value_in_stmts`/`mem_write_in_stmts`).
     for rule in &rules {
         cx.check_guard_placement(*rule);
-        cx.check_no_reassigned_locals(*rule);
         cx.check_writing_call_positions(*rule);
     }
     if !cx.errors.is_empty() {
@@ -335,7 +336,7 @@ pub(crate) fn emit_module(
     // mem's own address width — a bare-literal address (`x := 5`) has
     // no width of its own to fall back on otherwise.
     let mut mem_body = String::new();
-    for (site_expr, (port, owning_rule)) in cx.read_ports.clone() {
+    for (site_expr, (port, owning_rule, owning_stmt)) in cx.read_ports.clone() {
         let Expr::Bracket { callee, args } = ast.expr(site_expr).clone() else {
             continue;
         };
@@ -348,6 +349,7 @@ pub(crate) fn emit_module(
             .find(|(n, _, _)| n == &mem_name)
             .map(|(_, _, depth)| clog2(*depth).max(1));
         cx.enter_rule(owning_rule);
+        cx.set_pos(owning_rule, owning_stmt);
         let addr = cx.compile_expr_hinted(args[0], addr_w).unwrap_or_default();
         if let Some((readers, _)) = mem_ports.get_mut(&mem_name) {
             readers.push(port.clone());
@@ -384,7 +386,7 @@ pub(crate) fn emit_module(
                 cx.enter_rule(rule);
                 let body = rule_body(ast, rule);
                 let (wrote, addr, data) = cx
-                    .mem_write_in_stmts(&body, mem_name, *elem_width, addr_w)
+                    .mem_write_in_stmts(&body, rule, mem_name, *elem_width, addr_w)
                     .unwrap_or_else(|| {
                         (
                             "UInt<1>(0)".to_string(),
@@ -444,12 +446,14 @@ pub(crate) fn emit_module(
     // the pre-edge `data` before this connect takes effect — the same
     // "reads see the old value, connects land for next cycle" register
     // semantics used everywhere else in this emitter.
+    // `(rule, Some((enqueue statement, enqueued value)), saw a dequeue)`.
+    type FifoTouch = (ItemId, Option<(StmtId, ExprId)>, bool);
     let mut fifo_body = String::new();
     for (fifo_name, width) in &fifos {
-        let mut touching: Vec<(ItemId, Option<ExprId>, bool)> = Vec::new();
+        let mut touching: Vec<FifoTouch> = Vec::new();
         for rule in &rules {
             let body = rule_body(ast, *rule);
-            let mut enq_value: Option<ExprId> = None;
+            let mut enq: Option<(StmtId, ExprId)> = None;
             let mut saw_deq = false;
             for s in &body {
                 let Some((name, is_enq, value)) = cx.fifo_op_stmt(*s) else {
@@ -459,13 +463,13 @@ pub(crate) fn emit_module(
                     continue;
                 }
                 if is_enq {
-                    enq_value = value;
+                    enq = value.map(|v| (*s, v));
                 } else {
                     saw_deq = true;
                 }
             }
-            if enq_value.is_some() || saw_deq {
-                touching.push((*rule, enq_value, saw_deq));
+            if enq.is_some() || saw_deq {
+                touching.push((*rule, enq, saw_deq));
             }
         }
         if touching.is_empty() {
@@ -474,11 +478,12 @@ pub(crate) fn emit_module(
         touching.sort_by_key(|(r, ..)| std::cmp::Reverse(order.iter().position(|x| x == r)));
         let valid = fifo_valid_name(fifo_name);
         let data = fifo_data_name(fifo_name);
-        for (rule, enq_value, _saw_deq) in touching {
+        for (rule, enq, _saw_deq) in touching {
             cx.enter_rule(rule);
             let f = &fires_name[&rule];
             let _ = writeln!(fifo_body, "    when {f} :");
-            if let Some(value_expr) = enq_value {
+            if let Some((enq_stmt, value_expr)) = enq {
+                cx.set_pos(rule, enq_stmt);
                 let value = cx
                     .compile_expr_hinted(value_expr, Some(*width))
                     .unwrap_or_default();
@@ -502,7 +507,7 @@ pub(crate) fn emit_module(
         for rule in &rules {
             cx.enter_rule(*rule);
             let body = rule_body(ast, *rule);
-            if let Some(v) = cx.reg_value_in_stmts(&body, match_name, *width) {
+            if let Some(v) = cx.reg_value_in_stmts(&body, *rule, match_name, *width) {
                 values.push((*rule, v));
             }
         }
@@ -560,7 +565,8 @@ pub(crate) fn emit_module(
             for rule in &rules {
                 cx.enter_rule(*rule);
                 let body = rule_body(ast, *rule);
-                if let Some(v) = cx.inst_port_value_in_stmts(&body, inst_name, port_name, w) {
+                if let Some(v) = cx.inst_port_value_in_stmts(&body, *rule, inst_name, port_name, w)
+                {
                     values.push((*rule, v));
                 }
             }
@@ -679,20 +685,20 @@ impl<'a> Emitter<'a> {
         for stmt in stmts {
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Assign { lhs, rhs } => {
-                    self.collect_read_sites_expr(rhs, rule);
+                    self.collect_read_sites_expr(rhs, rule, *stmt);
                     if let Expr::Bracket { args, .. } = self.ast.expr(lhs).clone() {
                         for a in args {
-                            self.collect_read_sites_expr(a, rule);
+                            self.collect_read_sites_expr(a, rule, *stmt);
                         }
                     }
                 }
-                Stmt::Expr(e) => self.collect_read_sites_expr(e, rule),
+                Stmt::Expr(e) => self.collect_read_sites_expr(e, rule, *stmt),
                 Stmt::If {
                     cond,
                     then_body,
                     else_body,
                 } => {
-                    self.collect_read_sites_expr(cond, rule);
+                    self.collect_read_sites_expr(cond, rule, *stmt);
                     self.collect_read_sites(&then_body, rule);
                     if let Some(e) = else_body {
                         self.collect_read_sites(&e, rule);
@@ -703,18 +709,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    pub(crate) fn collect_read_sites_expr(&mut self, id: ExprId, rule: ItemId) {
+    pub(crate) fn collect_read_sites_expr(&mut self, id: ExprId, rule: ItemId, stmt: StmtId) {
         if let Expr::Bracket { callee, .. } = self.ast.expr(id).clone()
             && let Expr::Ident(_) = self.ast.expr(callee)
             && let Some(def) = self.res.expr_defs.get(&callee)
             && self.res.def(*def).kind == DefKind::Mem
         {
             let n = self.read_ports.len();
-            self.read_ports.insert(id, (format!("r{n}"), rule));
+            self.read_ports.insert(id, (format!("r{n}"), rule, stmt));
             return; // the address sub-expr is compiled, not walked further
         }
         for child in crate::lower::sub_exprs(self.ast, id) {
-            self.collect_read_sites_expr(child, rule);
+            self.collect_read_sites_expr(child, rule, stmt);
         }
     }
 }

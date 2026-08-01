@@ -1,23 +1,26 @@
 //! Pre-compilation validation, run once per rule before any expression is
-//! compiled: guard/fifo-op placement (`check_guard_placement`), no
-//! reassigned locals (`check_no_reassigned_locals`), and a state-writing
-//! call only in an allowed position (`check_writing_call_positions`).
-//! Each violation is an explicit `Emitter::error`, never a silent skip —
-//! see mod.rs's module doc comment. A memory write MAY nest in
-//! `if`/`else` (threaded through a `mux` by `writes.rs`'s
-//! `mem_write_in_stmts`, same as a register or instance-port write) —
-//! there is no separate preflight check for it here, matching how a
-//! register write's own nesting isn't preflight-checked either. A rule
-//! enqueueing AND dequeueing the SAME fifo is likewise no longer a
-//! preflight rejection (see fifo.rs's module doc comment for the
-//! pass-through semantics `compile_guard`, not a check here, computes).
+//! compiled: guard/fifo-op placement (`check_guard_placement`) and a
+//! state-writing call only in an allowed position
+//! (`check_writing_call_positions`). Each violation is an explicit
+//! `Emitter::error`, never a silent skip — see mod.rs's module doc
+//! comment. A memory write MAY nest in `if`/`else` (threaded through a
+//! `mux` by `writes.rs`'s `mem_write_in_stmts`, same as a register or
+//! instance-port write) — there is no separate preflight check for it
+//! here, matching how a register write's own nesting isn't preflight-
+//! checked either. A rule enqueueing AND dequeueing the SAME fifo is
+//! likewise no longer a preflight rejection (see fifo.rs's module doc
+//! comment for the pass-through semantics `compile_guard`, not a check
+//! here, computes). A local reassigned at a rule's top level is no
+//! longer a preflight rejection either — `enter_rule`/`set_pos`
+//! (writes.rs) resolve each reference against a position-correct
+//! snapshot instead (see DESIGN.md's "Reassigned locals" section).
 
 use super::Emitter;
 use super::calls::*;
 use super::fifo::*;
 use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
-use crate::resolve::{DefId, DefKind, Resolution};
+use crate::resolve::{DefKind, Resolution};
 
 pub(crate) fn is_mem_write_to(ast: &Ast, res: &Resolution, stmt: StmtId, mem_name: &str) -> bool {
     let Stmt::Assign { lhs, .. } = ast.stmt(stmt) else {
@@ -86,40 +89,6 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 _ => {}
-            }
-        }
-    }
-
-    /// A local reassigned within one emitted rule is not supported: a
-    /// later reference to it would need to know *which* assignment it
-    /// follows (locals are inlined by binding, not by program order —
-    /// see `enter_rule`), and picking the wrong one silently compiles a
-    /// different value than the source reads. Reject it outright rather
-    /// than risk that.
-    pub(crate) fn check_no_reassigned_locals(&mut self, rule: ItemId) {
-        let body = rule_body(self.ast, rule);
-        let mut seen: std::collections::HashSet<DefId> = Default::default();
-        for stmt in &body {
-            let Stmt::Assign { lhs, .. } = self.ast.stmt(*stmt) else {
-                continue;
-            };
-            let Some(def) = self.res.expr_defs.get(lhs).copied() else {
-                continue;
-            };
-            if self.res.def(def).kind != DefKind::Local {
-                continue;
-            }
-            if !seen.insert(def) {
-                self.error(
-                    self.ast.stmt_spans[stmt.0 as usize].clone(),
-                    format!(
-                        "`{}` is reassigned in this rule; FIRRTL emission does not yet \
-                         support reassigning a local (v0 restriction: locals are \
-                         inlined at their single binding site, not read in program \
-                         order)",
-                        self.res.def(def).name
-                    ),
-                );
             }
         }
     }

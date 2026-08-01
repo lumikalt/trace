@@ -1,0 +1,24 @@
+-- The actual motivating use case for reassigned locals: unrolled
+-- accumulation, one memory word per statement (no loop -- a rule body
+-- has no loop construct at all, see DESIGN.md's "Reassigned locals"
+-- section). `s` is reassigned four times in a row; each reassignment's
+-- own RHS must see the PRIOR accumulated value, not the final one --
+-- exactly the shape a naive last-assignment-wins compile would get
+-- wrong. Also proves the width-hint subtlety documented there: `s`'s
+-- FIRST binding is a bare literal (`0`) that only ever becomes
+-- concretely `bits[16]` because of the LATER `m[i]`-widened
+-- reassignments -- eager compilation must use that widened width, not
+-- the literal's own (nonexistent) natural one.
+module Checksum {
+    mem m : bits[16][4]
+    output result : bits[16] = 0
+
+    rule sum {
+        s := 0
+        s := s + m[0]
+        s := s + m[1]
+        s := s + m[2]
+        s := s + m[3]
+        result := s
+    }
+}

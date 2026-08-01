@@ -956,3 +956,64 @@ fn subleq_boot_runs_through_real_ports() {
         "mem[11] should hold 8 - 3 == 5:\n{output}"
     );
 }
+
+/// Proves reassigned-local resolution through real hardware, not just
+/// emitted FIRRTL text. sim/reassigned_local_tb.v's own doc comment
+/// records that a deliberately broken variant (`x` bound only once, to
+/// `b`) was re-run against this exact testbench and failed as
+/// predicted (`first_val` reading `b` instead of `a`), confirming this
+/// test genuinely discriminates position-correct resolution from a
+/// naive last-assignment-wins compile.
+#[test]
+fn reassigned_local_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/reassigned_local.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/reassigned_local_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: first_val=255 second_val=128"),
+        "reassigned-local results did not match expectations:\n{output}"
+    );
+}
+
+/// Proves the `Checksum` motivating example (unrolled accumulation via
+/// a local reassigned four times in a row) through real firtool and
+/// Icarus, not just plausible-looking FIRRTL text. See
+/// sim/checksum_tb.v's own comment for why this needs `--disable-opt`
+/// despite having a real output port.
+#[test]
+fn checksum_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/checksum.tr"))
+        .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/checksum_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: result=100"),
+        "checksum result did not match expectations:\n{output}"
+    );
+}

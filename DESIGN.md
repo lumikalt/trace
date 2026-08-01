@@ -634,11 +634,11 @@ undeclared identifier. The emitter now tracks each rule's local bindings and res
 local reference by recursively compiling whatever it was bound to (`x` compiles to
 `input`'s data register directly, `__fifo_input_data`), the same way a Verilog reader
 would mentally substitute a `let` before reading the hardware it describes. One sharp
-edge this inlining creates: a local reassigned within one rule has only one binding in
-the emitter's table, so a read between the two assignments would silently inline the
-*wrong* (later) one — a genuine miscompile, and one no current example happened to
-exercise. Reassigning a local inside an emitted rule is therefore an explicit v0 error,
-not a silent trap.
+edge this inlining originally created: a local reassigned within one rule had only one
+binding in the emitter's table, so a read between the two assignments would silently
+inline the *wrong* (later) one — a genuine miscompile, and one no current example
+happened to exercise. Reassigning a local inside an emitted rule was therefore an
+explicit v0 error, not a silent trap — until "Reassigned locals" below closed it.
 
 `sim/fifo_bridge_tb.v` proves both halves of the claim through real simulation, not
 just a passing compile: a value placed in `input` reaches `output` unchanged one cycle
@@ -913,6 +913,99 @@ compile with the mem's own address width. `tests/firrtl.rs`'s
 `mem_read_address_is_a_local_in_a_rule_that_isnt_last_in_urgency_order` and
 `mem_read_address_is_a_local_bound_to_an_input` pin both failing shapes as passing,
 verified against real firtool.
+
+## Reassigned locals
+
+**Achieved 2026-08-01.** A local reassigned at a rule's top level (`x := a  ...  x := b`)
+now resolves each reference against whatever binding was active AT THAT READ'S OWN
+TEXTUAL POSITION, not the local's final one — closing the gap the previous section left
+as an explicit v0 error. Picked directly off TODO.md, alongside two other candidates
+(spawn/sync/race synthesis, a much larger feature) offered via AskUserQuestion.
+
+**Why the old design couldn't just drop its rejection.** `Emitter::locals:
+HashMap<DefId, ExprId>` mapped each local to ONE binding, built by a single up-front
+`enter_rule` pass over the whole rule body, then read LAZILY (recompiled on demand)
+wherever referenced. Simply deleting the rejection would have kept this: since a
+`HashMap` insert overwrites, the SECOND assignment's `ExprId` would end up as the map's
+only entry for that `DefId` regardless of where a read occurs — and because compilation
+is deferred past `enter_rule`, a read positioned BETWEEN the two assignments would
+lazily recompile using the map's FINAL state, not the state as of the read's own
+position. Hand-verified with a chained example (`z := 1; y := z + 10; z := 2; x := y +
+z`) before writing any code: naive last-wins would compute `x == 12` (both `y` and the
+bare `z` resolving `z` to its SECOND binding), not the correct `13`. Nor can a fix mint
+new "renamed" AST nodes for an SSA-style transform — `firrtl.rs` only ever borrows
+`&Ast`, an arena it can't append to.
+
+**The fix is eager, not lazy.** `enter_rule` now walks a rule's top-level body in
+program order and, for each local's assignment, COMPILES its RHS to FIRRTL text
+IMMEDIATELY — using whatever bindings earlier statements already established — then
+snapshots the running `DefId -> String` map after every statement
+(`Emitter::locals_snapshots: Vec<HashMap<DefId, String>>`, one entry per top-level
+position). A new `Emitter::current_pos: usize` selects which snapshot is active;
+`compile_expr`'s Ident case for a `Local`/`Param` reference consults
+`locals_snapshots[current_pos]` before falling back to the OLD `locals` map (unchanged,
+still serving callee params/`let`s — see below). Because a later reassignment's own
+compile only ever touches `current`'s LIVE state going forward, never rewrites an
+earlier snapshot already taken, an earlier read can never see a later value.
+
+Every existing write-threading walker (`reg_value_in_stmts`, `mem_write_in_stmts`,
+`inst_port_value_in_stmts`, `compile_guard`, the fifo-enqueue-value and mem-read-address
+call sites) now calls a new `Emitter::set_pos(rule, stmt)` before compiling anything tied
+to a specific statement — `set_pos` finds which top-level statement IS or CONTAINS
+`stmt` (recursing through `if`/`else`, since a nested write's own position is its
+ENCLOSING top-level statement's — locals stay top-level-only, unchanged from before) and
+points `current_pos` at it. A subtlety caught while writing this, not by testing: after
+`reg_value_in_stmts`/`mem_write_in_stmts`/`inst_port_value_in_stmts` recurse into an
+if/else's branches (which call `set_pos` themselves for their OWN nested statements,
+leaving `current_pos` wherever the branch's last statement put it), the enclosing `if`'s
+OWN condition must `set_pos` AGAIN before compiling — otherwise the condition would
+resolve locals as of the wrong (branch-internal) position.
+
+**The width hint problem.** Eager compilation must decide a literal's width AT BIND
+TIME, before any consumer's own hint is available — the old lazy design got away
+without this because a bare literal (`x := 5`) was only ever compiled once ITS reader
+was reached, using the READER's hint. `types.rs`'s existing `local_tys: HashMap<DefId,
+Ty>` (built by `check_body`'s "re-type to a fixed point, width grows to max" loop —
+already public, needed no changes) supplies exactly the right width: a rebound local's
+tracked type already reflects the WIDEST binding across the whole rule, confirmed by
+reading `check_body`/`type_write`/`widen` rather than assumed. `examples/checksum.tr`
+(unrolled accumulation, no loop construct exists for a rule body — `s := 0; s := s +
+m[0]; s := s + m[1]; s := s + m[2]; s := s + m[3]`, the actual motivating shape this
+whole feature exists for) confirmed this in practice: the FIRST binding (`s := 0`, a
+bare literal) correctly compiles at the FIXPOINT-WIDENED width (16, from the later
+`m[i]`-widened rebindings), not its own narrow natural width. `sim/checksum_tb.v` proves
+it through real firtool + Icarus (`mem[0..3] = 10,20,30,40`, `result == 100`) —
+needing `--disable-opt` despite a real output port, since firtool's default optimizer
+apparently constant-folds `result` to 0 for a `mem` that's never WRITTEN anywhere in the
+design, confirmed empirically after first getting a suspiciously-constant result.
+
+**One narrow width case still can't be eagerly resolved, and still rejects
+reassignment.** A local used ONLY as a mem-read address never gets a concrete `bits[w]`
+type from the checker at all (`type_expr_inner`'s `Ty::Mem` arm type-checks the index
+argument for its own sake but never widens the LOCAL's own tracked type from it) — its
+only-ever width has come from the READ site, exactly the case eager compilation can't
+serve. Such a local falls back to the OLD lazy `locals` map (an uncompiled `ExprId`,
+recompiled with the read site's own hint) — correct for a SINGLE assignment (this is
+exactly the shape the previous section's bug fix covers), but still unsound if
+reassigned, so `enter_rule` explicitly rejects reassignment for JUST this shape — a
+narrower restriction than the old blanket rejection, not a full regression back to it.
+
+**Real end-to-end proof, not just "the FIRRTL text looks right":** `examples/
+reassigned_local.tr` (`x := a  first_val := x  x := b  second_val := x`, real
+`input`/`output` ports) + `sim/reassigned_local_tb.v` drive four distinct `(a, b)` pairs
+across consecutive cycles, checking `first_val == a` and `second_val == b` every cycle.
+The discriminator was hand-verified, not assumed: a straight-through single-pair test
+would pass EVEN under the old "just delete the rejection" bug, since nothing about a
+single read-then-reassign-then-read forces the wrong value to surface differently from
+the right one in a way FIRRTL text alone reveals — the real risk is a chained,
+multi-hop reference (`y` built from `z`'s first binding, referenced again after `z`'s
+second) or an intervening OBSERVABLE write, both covered by `tests/firrtl.rs`'s
+`reassigned_local_chain_resolves_each_reference_at_its_own_position` and
+`reassigned_local_write_between_two_bindings_sees_old_then_new`. The sim testbench
+itself was ALSO re-run against a deliberately broken variant (`x` bound only once, to
+`b`) and failed exactly as predicted (`first_val` reading `b` instead of `a`) before
+being trusted as a real regression test — the same "run the negative case for real"
+discipline as every other feature in this document.
 
 ## Submodule instantiation
 

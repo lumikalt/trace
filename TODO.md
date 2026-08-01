@@ -55,8 +55,14 @@
   guard is `valid == 1`, not the always-false AND of each op's own
   individual guard). See DESIGN.md's "Fifo synthesis" section,
   `examples/fifo_passthrough.tr` + `sim/fifo_passthrough_tb.v`.
-- A local reassigned within one emitted rule is rejected (inlining picks
-  the wrong binding otherwise — see DESIGN.md's "sharp edge" note).
+- A local reassigned at a rule's top level now resolves each reference
+  at its own textual position (still rejected inside `if`/`else` — no
+  example needs that, and it's a materially different, larger change).
+  One narrow remaining case still rejects reassignment explicitly: a
+  local whose width never resolves to a concrete `bits[w]` anywhere in
+  the rule (e.g. used only as a mem-read index). See DESIGN.md's
+  "Reassigned locals" section, `examples/reassigned_local.tr` +
+  `sim/reassigned_local_tb.v`.
 
 ## Language features with no synthesis path yet
 
