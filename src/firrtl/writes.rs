@@ -561,6 +561,99 @@ impl<'a> Emitter<'a> {
         current
     }
 
+    /// Walks a struct literal `expr` by `path`, one nested field at a
+    /// time (`["inner", "a"]` finds `a`'s own value inside `inner`'s own
+    /// nested literal), returning the leaf field's value sub-expression.
+    /// `pub(crate)`: also used by `expr.rs`'s `compile_struct_field_read`
+    /// (a struct-typed local's field read walks the same literal shape a
+    /// struct-typed reg/output's WRITE does here).
+    pub(crate) fn find_struct_lit_field(&self, expr: ExprId, path: &[String]) -> Option<ExprId> {
+        let Expr::StructLit { fields, .. } = self.ast.expr(expr) else {
+            return None;
+        };
+        let (head, rest) = path.split_first()?;
+        let value = fields.iter().find(|(f, _)| f == head)?.1;
+        if rest.is_empty() {
+            Some(value)
+        } else {
+            self.find_struct_lit_field(value, rest)
+        }
+    }
+
+    /// A struct-typed reg/output's PER-FIELD write-threading — the same
+    /// if/else-mux pattern `reg_value_in_stmts` uses, but keyed on
+    /// (struct-local name, field PATH) instead of a flat register name:
+    /// the user writes the WHOLE struct value (`p := Pair{...}`), so
+    /// this finds THAT assignment and pulls out just `field_path`'s own
+    /// sub-expression (walking into a nested struct literal one segment
+    /// at a time via `find_struct_lit_field`), compiling it in the leaf
+    /// field's place. No callee-indirection case (`call_writes_reg`'s
+    /// sibling) — v0 excludes struct-typed fn params/returns entirely,
+    /// so a struct value can only ever reach a reg/output via a direct
+    /// assignment here, never through a callee's own write.
+    pub(crate) fn struct_field_value_in_stmts(
+        &mut self,
+        stmts: &[StmtId],
+        rule: ItemId,
+        struct_name: &str,
+        field_path: &[String],
+        width: u64,
+    ) -> Option<String> {
+        let mut current: Option<String> = None;
+        for stmt in stmts {
+            self.set_pos(rule, *stmt);
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Assign { lhs, rhs } => {
+                    if is_ident_named(self.ast, self.res, lhs, struct_name)
+                        && let Some(value) = self.find_struct_lit_field(rhs, field_path)
+                    {
+                        current = Some(
+                            self.compile_expr_hinted(value, Some(width))
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_val = self.struct_field_value_in_stmts(
+                        &then_body,
+                        rule,
+                        struct_name,
+                        field_path,
+                        width,
+                    );
+                    let else_val = else_body.as_ref().and_then(|b| {
+                        self.struct_field_value_in_stmts(b, rule, struct_name, field_path, width)
+                    });
+                    if then_val.is_some() || else_val.is_some() {
+                        let flat = format!("{struct_name}_{}", field_path.join("_"));
+                        let hold = current.clone().unwrap_or(flat);
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        self.set_pos(rule, *stmt);
+                        let cond_str = self
+                            .compile_expr(cond)
+                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
+                Stmt::While { .. } => {
+                    self.error(
+                        self.ast.stmt_spans[stmt.0 as usize].clone(),
+                        "a loop in an emitted rule body is not supported (sequences \
+                         lowering should have removed it before emission)"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        current
+    }
+
     /// If `expr` is a call to a function whose (already call-graph-
     /// merged) signature writes `reg_name`, finds the value it writes by
     /// running the same validation `compile_call` does (so a write

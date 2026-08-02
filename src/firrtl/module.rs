@@ -63,6 +63,20 @@ pub(crate) fn emit_module(
     // name (what rule bodies write) and `emit_name` is its internal
     // backing register (see the `Item::Output` arm below).
     let mut regs: Vec<(String, String, u64, u64)> = Vec::new();
+    // A struct-typed reg/output expands into N entries in `regs` above
+    // (one flat register per leaf field, `match_name` keyed) — this map
+    // records, for exactly those entries, which struct-local name and
+    // field PATH (nested-struct-aware — `["inner", "a"]`, not just
+    // `"a"`) they came from, so the write-threading loop below
+    // (Registers section) can route through `struct_field_value_in_stmts`
+    // instead of the ordinary `reg_value_in_stmts` (which looks for a
+    // `match_name := ...` statement that a struct field write, `p :=
+    // Pair{...}`, never produces). Keyed by `match_name` (the same
+    // string used as `regs`' first tuple element) rather than adding a
+    // 5th tuple field, so `module_block`'s own signature — which only
+    // ever needs name/width/init, never the write source — doesn't need
+    // to change.
+    let mut struct_reg_source: HashMap<String, (String, Vec<String>)> = HashMap::new();
     let mut mems = Vec::new();
     // `(fifo_name, width, depth)`.
     let mut fifos: Vec<(String, u64, u64)> = Vec::new();
@@ -77,53 +91,136 @@ pub(crate) fn emit_module(
         match ast.item(*id) {
             Item::Reg { name, .. } => {
                 let def = res.item_defs[id];
-                let Some(Ty::Bits(Width::Known(w))) = cx.state_width(def) else {
-                    cx.error(
-                        ast.item_spans[id.0 as usize].clone(),
-                        format!("`{}` has no concrete bit width", name.text),
-                    );
-                    continue;
-                };
-                let init = match ast.item(*id) {
-                    Item::Reg { init: Some(e), .. } => cx.const_eval(*e).unwrap_or(0),
-                    _ => 0,
-                };
-                regs.push((name.text.clone(), name.text.clone(), w, init));
+                match cx.state_width(def) {
+                    Some(Ty::Bits(Width::Known(w))) => {
+                        let init = match ast.item(*id) {
+                            Item::Reg { init: Some(e), .. } => cx.const_eval(*e).unwrap_or(0),
+                            _ => 0,
+                        };
+                        regs.push((name.text.clone(), name.text.clone(), w, init));
+                    }
+                    // A struct-typed reg expands to N flat registers, one
+                    // per field, named `{reg}_{field}` — no real FIRRTL
+                    // bundle type ever appears in the emitted text (see
+                    // `Emitter::struct_field_widths`'s own doc comment
+                    // for why: firtool flattens a bundle to exactly this
+                    // shape regardless, confirmed by hand-lowering one
+                    // through real firtool before this was written).
+                    // `match_name` doubles as `emit_name` here, same as a
+                    // plain scalar reg — a struct-typed reg is never
+                    // itself port-facing, so there's no separate
+                    // internal-vs-external name split the way `Output`
+                    // needs.
+                    Some(Ty::Struct {
+                        def: struct_def, ..
+                    }) => {
+                        let Some(fields) = cx.struct_field_widths(struct_def) else {
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!("`{}` has a field with no concrete bit width", name.text),
+                            );
+                            continue;
+                        };
+                        let init = match ast.item(*id) {
+                            Item::Reg { init: Some(e), .. } => Some(*e),
+                            _ => None,
+                        };
+                        for (path, w) in fields {
+                            let flat = format!("{}_{}", name.text, path.join("_"));
+                            let fv = init
+                                .and_then(|e| cx.struct_lit_field_const(e, &path))
+                                .unwrap_or(0);
+                            struct_reg_source.insert(flat.clone(), (name.text.clone(), path));
+                            regs.push((flat.clone(), flat, w, fv));
+                        }
+                    }
+                    _ => {
+                        cx.error(
+                            ast.item_spans[id.0 as usize].clone(),
+                            format!("`{}` has no concrete bit width", name.text),
+                        );
+                    }
+                }
             }
             Item::Input { name, .. } => {
                 let def = res.item_defs[id];
-                let Some(Ty::Bits(Width::Known(w))) = cx.state_width(def) else {
-                    cx.error(
-                        ast.item_spans[id.0 as usize].clone(),
-                        format!("`{}` has no concrete bit width", name.text),
-                    );
-                    continue;
-                };
-                inputs.push((name.text.clone(), w));
+                match cx.state_width(def) {
+                    Some(Ty::Bits(Width::Known(w))) => inputs.push((name.text.clone(), w)),
+                    Some(Ty::Struct {
+                        def: struct_def, ..
+                    }) => {
+                        let Some(fields) = cx.struct_field_widths(struct_def) else {
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!("`{}` has a field with no concrete bit width", name.text),
+                            );
+                            continue;
+                        };
+                        for (path, w) in fields {
+                            inputs.push((format!("{}_{}", name.text, path.join("_")), w));
+                        }
+                    }
+                    _ => {
+                        cx.error(
+                            ast.item_spans[id.0 as usize].clone(),
+                            format!("`{}` has no concrete bit width", name.text),
+                        );
+                    }
+                }
             }
             Item::Output { name, .. } => {
                 let def = res.item_defs[id];
-                let Some(Ty::Bits(Width::Known(w))) = cx.state_width(def) else {
-                    cx.error(
-                        ast.item_spans[id.0 as usize].clone(),
-                        format!("`{}` has no concrete bit width", name.text),
-                    );
-                    continue;
-                };
-                let init = match ast.item(*id) {
-                    Item::Output { init: Some(e), .. } => cx.const_eval(*e).unwrap_or(0),
-                    _ => 0,
-                };
-                // A rule-visible output is register-backed: driving it
-                // combinationally would expose a rule's speculative,
-                // pre-commit value, which breaks the "writes are
-                // speculative until the clock edge" invariant the whole
-                // scheduler is built on. So `output x` is really an
-                // ordinary register (`__out_x`) wired out to a port.
-                let internal = format!("__out_{}", name.text);
-                regs.push((name.text.clone(), internal.clone(), w, init));
-                outputs.push((name.text.clone(), internal.clone(), w));
-                cx.output_regs.insert(name.text.clone(), internal);
+                match cx.state_width(def) {
+                    Some(Ty::Bits(Width::Known(w))) => {
+                        let init = match ast.item(*id) {
+                            Item::Output { init: Some(e), .. } => cx.const_eval(*e).unwrap_or(0),
+                            _ => 0,
+                        };
+                        // A rule-visible output is register-backed: driving
+                        // it combinationally would expose a rule's
+                        // speculative, pre-commit value, which breaks the
+                        // "writes are speculative until the clock edge"
+                        // invariant the whole scheduler is built on. So
+                        // `output x` is really an ordinary register
+                        // (`__out_x`) wired out to a port.
+                        let internal = format!("__out_{}", name.text);
+                        regs.push((name.text.clone(), internal.clone(), w, init));
+                        outputs.push((name.text.clone(), internal.clone(), w));
+                        cx.output_regs.insert(name.text.clone(), internal);
+                    }
+                    Some(Ty::Struct {
+                        def: struct_def, ..
+                    }) => {
+                        let Some(fields) = cx.struct_field_widths(struct_def) else {
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!("`{}` has a field with no concrete bit width", name.text),
+                            );
+                            continue;
+                        };
+                        let init = match ast.item(*id) {
+                            Item::Output { init: Some(e), .. } => Some(*e),
+                            _ => None,
+                        };
+                        for (path, w) in fields {
+                            let fv = init
+                                .and_then(|e| cx.struct_lit_field_const(e, &path))
+                                .unwrap_or(0);
+                            let suffix = path.join("_");
+                            let port = format!("{}_{suffix}", name.text);
+                            let internal = format!("__out_{}_{suffix}", name.text);
+                            struct_reg_source.insert(port.clone(), (name.text.clone(), path));
+                            regs.push((port.clone(), internal.clone(), w, fv));
+                            outputs.push((port, internal, w));
+                        }
+                    }
+                    _ => {
+                        cx.error(
+                            ast.item_spans[id.0 as usize].clone(),
+                            format!("`{}` has no concrete bit width", name.text),
+                        );
+                    }
+                }
             }
             Item::Mem { name, .. } => {
                 let def = res.item_defs[id];
@@ -232,6 +329,32 @@ pub(crate) fn emit_module(
                     // a module).
                     continue;
                 };
+                // Instance-port wiring below drives every input port and
+                // reads every output port by its bare (unflattened) name —
+                // a struct-typed port on the target module is instead
+                // flattened to N `{name}_{field}` ports in its own emitted
+                // module block, so wiring it here by the bare name would
+                // either reference a nonexistent FIRRTL port or (worse)
+                // silently default-wire 1 bit via `port_bit_width`'s
+                // `unwrap_or(1)`. Rejected explicitly for v0 rather than
+                // left to surface as either.
+                if let Some(&target_def) = res.expr_defs.get(module_expr)
+                    && let Some(ports) = types.module_ports.get(&target_def)
+                {
+                    for (pname, _, ty) in ports {
+                        if matches!(ty, Ty::Struct { .. }) {
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!(
+                                    "instance `{}` has a struct-typed port `{pname}` \
+                                     -- struct-typed ports on an instantiated \
+                                     submodule aren't supported yet (v0 restriction)",
+                                    name.text
+                                ),
+                            );
+                        }
+                    }
+                }
                 instances.push((
                     name.text.clone(),
                     module_name(ast, target_item).to_string(),
@@ -243,7 +366,8 @@ pub(crate) fn emit_module(
             // scoped to this module (see resolve.rs) that `inst` can
             // target. It gets its own separate FIRRTL module block,
             // discovered and emitted independently (see `all_modules`).
-            Item::Fn { .. } | Item::Schedule { .. } | Item::Module { .. } => {}
+            Item::Fn { .. } | Item::Schedule { .. } | Item::Module { .. } | Item::Struct { .. } => {
+            }
         }
     }
 
@@ -569,7 +693,19 @@ pub(crate) fn emit_module(
         for rule in &rules {
             cx.enter_rule(*rule);
             let body = rule_body(ast, *rule);
-            if let Some(v) = cx.reg_value_in_stmts(&body, *rule, match_name, *width) {
+            // A struct-typed reg/output's flat field entry has no
+            // `match_name := ...` statement to find directly (the user
+            // writes the WHOLE struct, `p := Pair{...}`) — route through
+            // `struct_field_value_in_stmts` instead, which looks for that
+            // whole-value assignment and pulls out just this field's own
+            // sub-expression.
+            let found = match struct_reg_source.get(match_name) {
+                Some((struct_name, field_path)) => {
+                    cx.struct_field_value_in_stmts(&body, *rule, struct_name, field_path, *width)
+                }
+                None => cx.reg_value_in_stmts(&body, *rule, match_name, *width),
+            };
+            if let Some(v) = found {
                 values.push((*rule, v));
             }
         }

@@ -62,8 +62,6 @@
   stays unimplemented (v0 restriction: use recursion, `AdderTree` style).
   See `examples/adder_tree.tr` + `sim/adder_tree_tb.v`.
 - Expression surface still excludes:
-  - Field access other than `instance.port` (which is reads only; writes
-    only as a whole statement's LHS).
   - A fully dynamic slice (`x[hi..lo]` with a non-const `hi`/`lo`) —
     its result width would be dynamically sized, which this language
     can't express, so it's a compile-time type error by design, not a
@@ -213,15 +211,44 @@ Speculative, bigger, not committed to:
 
 - **Option type** (`?T`, `option{...}` construction, `?.` safe access,
   nested `??T`) — Verse's general mechanism for a value that may be
-  absent. Could generalize the valid-bit-plus-payload pattern fifos
-  already use into a first-class type, but "absence" has no free
-  representation in hardware (every wire has SOME bit pattern) the way
-  it does in a language with a heap — would need a real design decision
-  (a struct-shaped `{valid: bit, data: T}` under the hood, most likely)
-  before this is worth prototyping, not just a syntax port.
-  `?.`/nested-option unwrapping would also need TODO's existing "field
-  access beyond `instance.port`" gap (see "Expression surface" above)
-  closed first, since both are about accessing into a value's shape.
+  absent. General `struct` types are now ACHIEVED, including nesting
+  (see DESIGN.md's "Structs"/"Struct emission" sections,
+  `examples/struct_pair.tr`, `examples/struct_nested.tr`) — the
+  groundwork this bullet originally called for (a struct-shaped
+  `{valid: bit, data: T}` under the hood, with `T` itself possibly
+  another struct) is fully in place, chained field access included.
+  What's still open is `?T` itself as sugar over that shape: the
+  `option{...}`/`?.` surface syntax, "absence" still needing a
+  concrete bit pattern (no free representation the way a heap gives
+  a language), and safe-navigation semantics over a struct-typed value
+  (`?.`'s short-circuit-on-empty behavior has no existing analogue to
+  reuse — ordinary `.field` access requires the local to be bound
+  directly to a struct literal, no aliasing, which `?.` chaining would
+  need to relax). The real open design question, raised and deferred
+  when this groundwork landed: does reading a `?T` value fold a fail
+  condition into the rule's guard (Verse-aligned, reusing the `fails`
+  machinery `f.Deq[]` already has), or does it stay wrapped, requiring
+  explicit `.valid`/`.data`? Needs a decision, not just an
+  implementation pass.
+- **Struct destructuring** (`let Pair{valid, data} = p`, or a `let
+  {valid, data} = p` field-shorthand form — binding several named
+  locals from one struct value in a single statement, instead of one
+  `p.field` projection per local). Natural ergonomic companion to
+  general structs, now that those have landed; not needed for `?T`/
+  read-only field access itself.
+- **Struct update syntax** (Rust's `Pair{ valid: 1, ..old }` — build a
+  new struct value from an existing one, overriding just the named
+  fields and copying every other field from `old`). Another ergonomic
+  companion to general structs: today every field must be spelled out
+  explicitly in every literal, even when only one field of a large
+  (possibly nested) struct actually changes. Emission-wise this looks
+  straightforward on top of the flattening `struct_field_widths`/
+  `find_struct_lit_field` already do (a missing field falls back to
+  `..old`'s own flat register/field instead of erroring "missing
+  field"), but the parser/type-checker side needs its own design pass:
+  where `..old` may appear in the field list (trailing only, like
+  Rust?), and how it composes with a nested struct field that's itself
+  only partially overridden.
 - **Fallible bindings scoped to a single `if`** (Verse's
   `if (X := Expr, Y > 0):`, where `X` only exists in the `then` branch
   and a failure skips straight past it) — uncertain fit. trace's guard

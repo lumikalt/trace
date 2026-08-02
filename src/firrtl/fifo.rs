@@ -192,6 +192,12 @@ pub(crate) fn collect_fifo_ops(ast: &Ast, res: &Resolution, id: ExprId, out: &mu
                 collect_fifo_ops(ast, res, *alt, out);
             }
         }
+        Expr::StructLit { name, fields } => {
+            collect_fifo_ops(ast, res, *name, out);
+            for (_, value) in fields {
+                collect_fifo_ops(ast, res, *value, out);
+            }
+        }
     }
 }
 

@@ -1,0 +1,28 @@
+-- General struct types: a `struct` declares an ordered, named field
+-- list; `Name{ field: value, ... }` constructs one (exhaustive — every
+-- field must be given exactly once); `.field` reads it back. Whole-
+-- value read/write only in v0 (no per-field write), the same
+-- restriction `spawn`'s `.result`/`.done` handle already has. No real
+-- FIRRTL bundle type is ever emitted — `p` below compiles to two flat
+-- registers, `p_valid`/`p_data`, confirmed to match what firtool's own
+-- bundle-lowering produces by hand-lowering a real bundle through it
+-- first (see DESIGN.md's "Structs" section).
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module StructPair {
+    fifo input : bits[8]
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    out result : Pair = Pair{ valid: 0, data: 0 }
+
+    rule fill {
+        let d = input.Deq[]
+        p := Pair{ valid: 1, data: d }
+    }
+
+    rule pass {
+        result := Pair{ valid: p.valid, data: p.data }
+    }
+}

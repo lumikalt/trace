@@ -260,6 +260,15 @@ fn inst_target_must_be_a_module() {
 }
 
 #[test]
+fn struct_literal_naming_a_non_struct_is_an_error() {
+    let (_, _, errors) = run(
+        "module NotAStruct {\n}\nmodule M {\n reg r : bits[8] = 0\n \
+         rule x {\n r := NotAStruct{ a: 1 }\n }\n}\n",
+    );
+    assert!(errors.iter().any(|e| e.message.contains("not a struct")));
+}
+
+#[test]
 fn inst_cannot_be_assigned_directly() {
     let (_, _, errors) = run("module Child {\n in a : bits[8]\n}\n\
          module Top {\n inst c : Child\n rule w {\n c := c\n}\n}\n");

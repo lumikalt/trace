@@ -163,6 +163,19 @@ pub enum Expr {
     /// the last may be an infallible default" as a direct index, not a
     /// left-spine walk. Always at least 2 elements.
     Or(Vec<ExprId>),
+    /// `Name { field: expr, ... }` — a struct literal. `name` is the
+    /// already-parsed `Ident` naming the struct type, resolved normally
+    /// (like a `Call`'s own callee) rather than stored as a bare
+    /// `String`, so resolve.rs's existing ident-resolution machinery
+    /// finds the struct's `DefKind::Struct` def for free. Recognized in
+    /// the parser's postfix loop only when `{` is immediately followed
+    /// by `ident :` (not `:=`) — no statement shape starts that way, so
+    /// this never misfires on an ordinary `if cond { ... }` block whose
+    /// condition happens to be a bare identifier.
+    StructLit {
+        name: ExprId,
+        fields: Vec<(String, ExprId)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +298,14 @@ pub enum Item {
     Schedule {
         directives: Vec<ScheduleDirective>,
     },
+    /// `struct Name { field : ty, ... }` — a declarable record type. v0:
+    /// every field must be a plain `bits[N]` (no nested structs); reused
+    /// `Param` for the field list since the shape (`name : ty`) is
+    /// identical to a function parameter's.
+    Struct {
+        name: Name,
+        fields: Vec<Param>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -376,6 +397,14 @@ impl Ast {
                 for alt in alts {
                     out.push(' ');
                     out.push_str(&self.expr_sexpr(*alt));
+                }
+                out.push(')');
+                out
+            }
+            Expr::StructLit { name, fields } => {
+                let mut out = format!("(struct {}", self.expr_sexpr(*name));
+                for (fname, fexpr) in fields {
+                    out.push_str(&format!(" ({fname} {})", self.expr_sexpr(*fexpr)));
                 }
                 out.push(')');
                 out
@@ -479,6 +508,17 @@ impl Ast {
                 out.push('\n');
                 for stmt in body {
                     self.dump_stmt(*stmt, depth + 1, out);
+                }
+            }
+            Item::Struct { name, fields } => {
+                out.push_str(&format!("{pad}struct {name}\n"));
+                let inner = "  ".repeat(depth + 1);
+                for field in fields {
+                    out.push_str(&format!(
+                        "{inner}{} : {}\n",
+                        field.name,
+                        self.expr_sexpr(field.ty)
+                    ));
                 }
             }
             Item::Schedule { directives } => {

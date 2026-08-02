@@ -667,6 +667,175 @@ fn an_empty_list_literal_is_an_error() {
 }
 
 #[test]
+fn struct_field_read_round_trips() {
+    run_ok(
+        "struct Pair {\n\
+             valid : bit\n\
+             data : bits[8]\n\
+         }\n\
+         module M {\n\
+             reg p : Pair = Pair{ valid: 0, data: 0 }\n\
+             out ok : bit = 0\n\
+             rule r {\n\
+                 p := Pair{ valid: 1, data: 8'd42 }\n\
+                 ok := p.valid\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn struct_field_write_is_rejected() {
+    let src = "struct Pair {\n\
+                   valid : bit\n\
+                   data : bits[8]\n\
+               }\n\
+               module M {\n\
+                   reg p : Pair = Pair{ valid: 0, data: 0 }\n\
+                   rule r {\n\
+                       p.valid := 1\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("read-only") && e.message.contains(".valid")),
+        "expected a read-only-field error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_literal_missing_field_is_an_error() {
+    let src = "struct Pair {\n\
+                   valid : bit\n\
+                   data : bits[8]\n\
+               }\n\
+               module M {\n\
+                   reg p : Pair = Pair{ valid: 0 }\n\
+                   rule r {\n\
+                       p?\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("missing field") && e.message.contains("data")),
+        "expected a missing-field error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_literal_extra_field_is_an_error() {
+    let src = "struct Pair {\n\
+                   valid : bit\n\
+                   data : bits[8]\n\
+               }\n\
+               module M {\n\
+                   reg p : Pair = Pair{ valid: 0, data: 0, extra: 1 }\n\
+                   rule r {\n\
+                       p?\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("has no field") && e.message.contains("extra")),
+        "expected an unknown-field error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_literal_duplicate_field_is_an_error() {
+    let src = "struct Pair {\n\
+                   valid : bit\n\
+                   data : bits[8]\n\
+               }\n\
+               module M {\n\
+                   reg p : Pair = Pair{ valid: 0, valid: 1, data: 0 }\n\
+                   rule r {\n\
+                       p?\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors.iter().any(|e| e.message.contains("more than once")),
+        "expected a duplicate-field error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn nested_struct_field_type_checks_and_reads_by_chained_field() {
+    run_ok(
+        "struct Inner {\n\
+             a : bit\n\
+             b : bits[8]\n\
+         }\n\
+         struct Outer {\n\
+             inner : Inner\n\
+             x : bit\n\
+         }\n\
+         module M {\n\
+             reg o : Outer = Outer{ inner: Inner{ a: 1, b: 8'd5 }, x: 0 }\n\
+             out ok : bit = 0\n\
+             rule r {\n\
+                 ok := o.inner.a\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn self_referential_struct_is_rejected() {
+    // Cycle detection runs over every declared struct regardless of
+    // whether anything actually uses it -- no reg/rule needed to
+    // trigger it.
+    let src = "struct A {\n\
+                   b : B\n\
+               }\n\
+               struct B {\n\
+                   a : A\n\
+               }\n\
+               module M {\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("recursively defined")),
+        "expected a self-referential-struct rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_to_struct_copy_is_rejected() {
+    // `p := q` between two struct-typed regs isn't lowerable by
+    // `struct_field_value_in_stmts` (it only decomposes a literal RHS
+    // into per-field values) -- rejected here at the type-check level
+    // instead of silently freezing `p` at its reset value in FIRRTL.
+    let src = "struct Pair {\n\
+                   valid : bit\n\
+                   data : bits[8]\n\
+               }\n\
+               module M {\n\
+                   reg p : Pair = Pair{ valid: 0, data: 0 }\n\
+                   reg q : Pair = Pair{ valid: 0, data: 0 }\n\
+                   rule r {\n\
+                       p := q\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("must be a struct literal")),
+        "expected a struct-copy rejection, got: {errors:?}"
+    );
+}
+
+#[test]
 fn all_examples_type_check() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {

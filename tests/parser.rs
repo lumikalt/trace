@@ -547,3 +547,58 @@ fn a_trailing_range_at_end_of_input_does_not_consume_past_the_statement() {
     };
     assert_eq!(body.len(), 2, "expected two statements: {body:?}");
 }
+
+#[test]
+fn if_with_a_bare_ident_condition_still_parses_its_body_as_a_block_not_a_struct_literal() {
+    // `at_struct_lit_open` disambiguates `Name{ field: value }` (a
+    // struct literal) from `if cond { x := 1 }` (a block body) by
+    // requiring `ident :` -- not `ident :=` -- right after the `{`. A
+    // bare-ident condition followed by an assignment statement is
+    // exactly the case that could collide: `cond { x := 1 }` has `{`
+    // immediately followed by an ident, same as a struct literal's
+    // opening shape.
+    let src = "rule t {\n if cond {\n x := 1\n }\n}\n";
+    let ast = parse_ok(src);
+    let trace::ast::Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 1, "expected one statement: {body:?}");
+    let trace::ast::Stmt::If { then_body, .. } = ast.stmt(body[0]) else {
+        panic!("expected an if statement, got: {:?}", ast.stmt(body[0]));
+    };
+    assert_eq!(
+        then_body.len(),
+        1,
+        "expected one statement in the then-body"
+    );
+    assert!(matches!(
+        ast.stmt(then_body[0]),
+        trace::ast::Stmt::Assign { .. }
+    ));
+}
+
+#[test]
+fn while_with_a_bare_ident_condition_still_parses_its_body_as_a_block_not_a_struct_literal() {
+    // `while`'s condition is parsed by the exact same `parse_expr(0)`
+    // call `if`'s condition is (see `parse_stmt`), so it shares the
+    // same struct-literal-vs-block-body collision risk -- pinned
+    // separately since the two aren't literally the same code path
+    // (`parse_if` vs. the `While` arm), just the same expression parse.
+    let src = "rule t {\n while cond {\n x := 1\n }\n}\n";
+    let ast = parse_ok(src);
+    let trace::ast::Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 1, "expected one statement: {body:?}");
+    let trace::ast::Stmt::While {
+        body: while_body, ..
+    } = ast.stmt(body[0])
+    else {
+        panic!("expected a while statement, got: {:?}", ast.stmt(body[0]));
+    };
+    assert_eq!(while_body.len(), 1, "expected one statement in the body");
+    assert!(matches!(
+        ast.stmt(while_body[0]),
+        trace::ast::Stmt::Assign { .. }
+    ));
+}

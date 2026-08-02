@@ -98,7 +98,7 @@ use crate::effects::Effects;
 use crate::lexer::Span;
 use crate::resolve::{DefId, Resolution};
 use crate::schedule::Schedule;
-use crate::types::{Ty, Types};
+use crate::types::{Ty, Types, Width};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -392,6 +392,43 @@ impl<'a> Emitter<'a> {
         self.types.state_tys.get(&def).cloned()
     }
 
+    /// A struct's declared fields, each with its own concrete width —
+    /// `None` if any field's width isn't concrete (mirrors `state_width`'s
+    /// own "no concrete bit width" contract, generalized to N fields).
+    /// module.rs's Reg/Input/Output collection uses this to expand ONE
+    /// struct-typed declaration into N flat registers/ports, one per
+    /// field — the architecture confirmed by hand-lowering a real bundle
+    /// through firtool before this was written: firtool flattens a
+    /// bundle-typed reg/port to exactly this shape regardless, so trace's
+    /// own emitted FIRRTL skips real bundle syntax entirely and emits the
+    /// flat shape directly.
+    /// A struct's flat field list: `(path, width)` per leaf `bits[N]`
+    /// field — `path` is the field-name chain from the struct's own top
+    /// level down to that leaf (`["inner", "a"]`, not just `"a"`) —
+    /// recurses through any `Ty::Struct` field, so an arbitrarily nested
+    /// struct flattens to the same shape a single-level one already did.
+    /// Callers join `path` with `_` for the flat register/port name
+    /// (`struct_lit_field_const` below takes the same `path` shape
+    /// unjoined, to walk back into a nested struct literal). `check_
+    /// struct_cycles` (types.rs) guarantees this recursion terminates.
+    pub(crate) fn struct_field_widths(&self, struct_def: DefId) -> Option<Vec<(Vec<String>, u64)>> {
+        let fields = self.types.struct_fields.get(&struct_def)?;
+        let mut out = Vec::with_capacity(fields.len());
+        for (name, ty) in fields {
+            match ty {
+                Ty::Bits(Width::Known(w)) => out.push((vec![name.clone()], *w)),
+                Ty::Struct { def, .. } => {
+                    for (mut sub_path, w) in self.struct_field_widths(*def)? {
+                        sub_path.insert(0, name.clone());
+                        out.push((sub_path, w));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
     pub(crate) fn state_mem_ty(&self, def: DefId) -> Option<Ty> {
         self.types.state_tys.get(&def).cloned()
     }
@@ -401,6 +438,26 @@ impl<'a> Emitter<'a> {
             Expr::Int(v) => Some(*v),
             Expr::SizedInt { value, .. } => Some(*value),
             _ => None,
+        }
+    }
+
+    /// A struct-typed reg/output's init (`= Pair{valid: 0, data: 0}`),
+    /// one flat field at a time — `init` must literally be a struct
+    /// literal (types.rs already required this: a struct-typed reg/
+    /// output's declared type only unifies against a `StructLit`'s own
+    /// inferred type). `path` walks into nested struct literals one
+    /// segment at a time (`["inner", "a"]` for a nested field), same
+    /// join convention `struct_field_widths` uses for the flat name.
+    pub(crate) fn struct_lit_field_const(&self, init: ExprId, path: &[String]) -> Option<u64> {
+        let Expr::StructLit { fields, .. } = self.ast.expr(init) else {
+            return None;
+        };
+        let (head, rest) = path.split_first()?;
+        let value = fields.iter().find(|(f, _)| f == head)?.1;
+        if rest.is_empty() {
+            self.const_eval(value)
+        } else {
+            self.struct_lit_field_const(value, rest)
         }
     }
 }

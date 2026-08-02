@@ -46,6 +46,8 @@ pub enum TokenKind {
     Refines,
     #[token("schedule")]
     Schedule,
+    #[token("struct")]
+    Struct,
     #[token("tick")]
     Tick,
     #[token("sync")]

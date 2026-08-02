@@ -31,8 +31,8 @@
       "match": "\\b(0x[0-9A-Fa-f][0-9A-Fa-f_]*|0b[01][01_]*|[0-9][0-9_]*)\\b"
     },
     "declarations-with-name": {
-      "comment": "module/rule NAME — highlighted as a unit so the declared name reads as a type/function, not a plain identifier.",
-      "match": "\\b(module|rule)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "comment": "module/rule/struct NAME — highlighted as a unit so the declared name reads as a type/function, not a plain identifier.",
+      "match": "\\b(module|rule|struct)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": { "name": "keyword.declaration.trace" },
         "2": { "name": "entity.name.function.trace" }
@@ -56,7 +56,7 @@
         },
         {
           "name": "keyword.declaration.trace",
-          "match": "\\b(module|rule|reg|mem|fifo|in|out|inst|spec|impl|refines|schedule|let|bit)\\b"
+          "match": "\\b(module|rule|struct|reg|mem|fifo|in|out|inst|spec|impl|refines|schedule|let|bit)\\b"
         },
         {
           "comment": "uN (u8, u32, ...) is sugar for bits[N] — see src/parser.rs's u_width, same treatment as `bit` above.",

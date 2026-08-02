@@ -1383,3 +1383,72 @@ fn or_fifos_runs_through_real_ports() {
         "simulation did not report PASSED:\n{output}"
     );
 }
+
+/// Proves general structs end to end: `examples/struct_pair.tr`'s
+/// struct-typed reg `p` and struct-typed output `result` both flatten
+/// to per-field registers/ports, a struct literal write (`p :=
+/// Pair{...}`) updates both fields together in one cycle, and reading
+/// two fields off the same struct-typed reg into a fresh literal
+/// (`result := Pair{valid: p.valid, data: p.data}`) round-trips both
+/// values. See sim/struct_pair_tb.v.
+#[test]
+fn struct_pair_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/struct_pair.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/struct_pair_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: p_valid=1 p_data=2a result_valid=1 result_data=2a"),
+        "p/result did not settle at valid=1 data=0x2a:\n{output}"
+    );
+}
+
+/// Proves NESTED structs end to end: `examples/struct_nested.tr`'s
+/// `Frame { header: Header, data: bits[8] }` flattens all the way down
+/// to per-leaf-field registers/ports (`f_header_valid`, `f_header_seq`,
+/// `f_data`), a nested struct literal write updates every leaf field
+/// together in one cycle, and a chained field read (`f.header.valid`)
+/// resolves through both levels into a freshly-built nested literal.
+/// See sim/struct_nested_tb.v.
+#[test]
+fn struct_nested_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/struct_nested.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/struct_nested_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains(
+            "final: f_header_valid=1 f_header_seq=0 f_data=2a result_header_valid=1 \
+             result_header_seq=0 result_data=2a"
+        ),
+        "f/result did not settle correctly:\n{output}"
+    );
+}

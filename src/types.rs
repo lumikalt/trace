@@ -56,6 +56,14 @@ pub enum Ty {
     /// `Expr::ListLit` directly, never through this type.
     List(Box<Ty>),
     Unit,
+    /// A `struct Name { ... }` value. `name` is carried alongside `def`
+    /// purely for `Display` (error messages read `Pair`, not a raw
+    /// `DefId`) — `def` is what equality/lookup actually key off of;
+    /// `struct_fields` (`Types`) holds the declared field list itself.
+    Struct {
+        def: DefId,
+        name: String,
+    },
     /// Recovery type: unifies with anything, silences cascades.
     Unknown,
 }
@@ -71,6 +79,7 @@ impl std::fmt::Display for Ty {
             Ty::Int => write!(f, "int"),
             Ty::List(elem) => write!(f, "list[{elem}]"),
             Ty::Unit => write!(f, "unit"),
+            Ty::Struct { name, .. } => write!(f, "struct {name}"),
             Ty::Unknown => write!(f, "?"),
         }
     }
@@ -92,6 +101,9 @@ pub struct Types {
     /// side table rather than a `Ty` variant: an instance isn't a scalar
     /// value, only its ports are.
     pub instance_module: HashMap<DefId, DefId>,
+    /// A `struct` def -> its declared, ordered field list. Keyed by the
+    /// struct's own `DefId`, mirroring `module_ports`.
+    pub struct_fields: HashMap<DefId, Vec<(String, Ty)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +126,12 @@ pub fn check(ast: &Ast, res: &Resolution) -> (Types, Vec<TypeError>) {
         errors: Vec::new(),
         emit: false,
     };
+    // `collect_structs` first: `collect_state` now type-checks a struct-
+    // typed reg/output's own init expression (missing/extra/mistyped
+    // fields), which needs `struct_fields` already populated to validate
+    // against — found the hard way when it wasn't (missing/extra-field
+    // inits silently passed instead of erroring).
+    checker.collect_structs();
     checker.collect_state();
     checker.collect_module_ports();
     checker.check_all();
@@ -171,12 +189,27 @@ impl<'a> TypeChecker<'a> {
                 Item::Module { items, .. } => stack.extend(items),
                 Item::Reg { ty, init, .. } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
-                    if !matches!(ty, Ty::Bits(_) | Ty::Unknown) {
+                    if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
                         let span = self.ast.item_spans[id.0 as usize].clone();
-                        self.error(span, format!("a reg holds bits, not {ty}"));
+                        self.error(span, format!("a reg holds bits or a struct, not {ty}"));
                     }
                     if let Some(init) = init {
-                        self.check_literal_fits(init, &ty);
+                        // A struct-typed init is a real expression tree
+                        // (missing/extra/mistyped fields, not just a
+                        // width-fit check) — `check_literal_fits` alone
+                        // (which only ever looks at `Ty::Bits` targets)
+                        // would silently skip all of that, since nothing
+                        // else in `collect_state` ever runs `type_expr`
+                        // over a reg/output's own init. `Ty::Bits` inits
+                        // are untouched (still just `check_literal_fits`,
+                        // matching every existing example/test).
+                        if matches!(ty, Ty::Struct { .. }) {
+                            let mut locals = HashMap::new();
+                            let init_ty = self.type_expr(init, &mut locals);
+                            self.check_assignable(&init_ty, &ty, self.expr_span(init), "reg init");
+                        } else {
+                            self.check_literal_fits(init, &ty);
+                        }
                     }
                     self.state_tys.insert(def, ty);
                 }
@@ -205,20 +238,31 @@ impl<'a> TypeChecker<'a> {
                 }
                 Item::Input { ty, .. } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
-                    if !matches!(ty, Ty::Bits(_) | Ty::Unknown) {
+                    if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
                         let span = self.ast.item_spans[id.0 as usize].clone();
-                        self.error(span, format!("an input holds bits, not {ty}"));
+                        self.error(span, format!("an input holds bits or a struct, not {ty}"));
                     }
                     self.state_tys.insert(def, ty);
                 }
                 Item::Output { ty, init, .. } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
-                    if !matches!(ty, Ty::Bits(_) | Ty::Unknown) {
+                    if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
                         let span = self.ast.item_spans[id.0 as usize].clone();
-                        self.error(span, format!("an output holds bits, not {ty}"));
+                        self.error(span, format!("an output holds bits or a struct, not {ty}"));
                     }
                     if let Some(init) = init {
-                        self.check_literal_fits(init, &ty);
+                        if matches!(ty, Ty::Struct { .. }) {
+                            let mut locals = HashMap::new();
+                            let init_ty = self.type_expr(init, &mut locals);
+                            self.check_assignable(
+                                &init_ty,
+                                &ty,
+                                self.expr_span(init),
+                                "output init",
+                            );
+                        } else {
+                            self.check_literal_fits(init, &ty);
+                        }
                     }
                     self.state_tys.insert(def, ty);
                 }
@@ -227,6 +271,104 @@ impl<'a> TypeChecker<'a> {
         }
         self.emit = false;
         self.types.state_tys = self.state_tys.clone();
+    }
+
+    /// Every `struct`'s declared, ordered field list — v0: each field
+    /// must itself be a plain `bits[N]` (no nested structs; `eval_ty`
+    /// would happily resolve a field naming ANOTHER struct, since it
+    /// doesn't distinguish "a struct's own field type" from any other
+    /// type position, so that has to be rejected explicitly here rather
+    /// than falling out of the type system on its own).
+    fn collect_structs(&mut self) {
+        // Runs before `collect_state` sets this (needed there now too —
+        // a struct-typed reg/output init is type-checked against
+        // `struct_fields`, so this must populate it first) — without its
+        // own `emit = true`, every error below is silently discarded
+        // (`Emitter::error`'s own gate), found the hard way when a
+        // nested-struct field passed with zero diagnostic at all.
+        self.emit = true;
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            if let Item::Module { items, .. } = self.ast.item(id) {
+                stack.extend(items.iter().copied());
+            }
+            let Item::Struct { fields, .. } = self.ast.item(id).clone() else {
+                continue;
+            };
+            let Some(&struct_def) = self.res.item_defs.get(&id) else {
+                continue;
+            };
+            let mut field_tys = Vec::new();
+            for field in &fields {
+                let ty = self.eval_ty(field.ty, &HashMap::new());
+                // A struct field may be `bits[N]` or another struct
+                // (flattened recursively at emission time, see
+                // `firrtl::struct_field_widths`) — anything else
+                // (fifo/mem/list/handle) has no flat register shape.
+                if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
+                    self.error(
+                        self.ast.expr_spans[field.ty.0 as usize].clone(),
+                        format!("a struct field holds bits or a struct, not {ty}"),
+                    );
+                }
+                field_tys.push((field.name.text.clone(), ty));
+            }
+            self.types.struct_fields.insert(struct_def, field_tys);
+        }
+        self.check_struct_cycles();
+        self.emit = false;
+    }
+
+    /// A struct field's declared type may itself be a struct — reject
+    /// only the case that would make flattening (recursive by
+    /// construction, `firrtl::struct_field_widths`) never terminate: a
+    /// struct that directly or transitively contains itself. Runs once
+    /// `struct_fields` is fully populated (order-independent: a field's
+    /// `Ty::Struct` only needs the referenced struct's `DefId`, not its
+    /// own field list, so `collect_structs`'s single top-level walk
+    /// above doesn't need to visit structs in dependency order).
+    fn check_struct_cycles(&mut self) {
+        let defs: Vec<DefId> = self.types.struct_fields.keys().copied().collect();
+        for start in defs {
+            let mut visited = std::collections::HashSet::new();
+            if self.struct_reaches(start, start, &mut visited) {
+                let span = self
+                    .def_items
+                    .get(&start)
+                    .map(|item| self.ast.item_spans[item.0 as usize].clone())
+                    .unwrap_or(0..0);
+                self.error(
+                    span,
+                    format!(
+                        "struct `{}` is recursively defined (directly or indirectly \
+                         contains itself)",
+                        self.res.def(start).name
+                    ),
+                );
+            }
+        }
+    }
+
+    fn struct_reaches(
+        &self,
+        from: DefId,
+        target: DefId,
+        visited: &mut std::collections::HashSet<DefId>,
+    ) -> bool {
+        if !visited.insert(from) {
+            return false;
+        }
+        let Some(fields) = self.types.struct_fields.get(&from) else {
+            return false;
+        };
+        for (_, ty) in fields {
+            if let Ty::Struct { def, .. } = ty
+                && (*def == target || self.struct_reaches(*def, target, visited))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Every module's port list (its direct `in`/`out` children) and
@@ -350,14 +492,20 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             // Tolerate builtin type constructors we do not model yet
-            // (wire); reject unknown identifiers as types.
-            Expr::Ident(_) => {
-                let def = self.res.expr_defs.get(&id);
-                if def.is_some_and(|d| self.res.def(*d).kind == DefKind::Builtin) {
-                    Ty::Unknown
-                } else {
-                    self.error(self.expr_span(id), "expected a type here".to_string());
-                    Ty::Unknown
+            // (wire); recognize a struct name; reject unknown identifiers
+            // as types.
+            Expr::Ident(name) => {
+                let def = self.res.expr_defs.get(&id).copied();
+                match def.map(|d| self.res.def(d).kind) {
+                    Some(DefKind::Builtin) => Ty::Unknown,
+                    Some(DefKind::Struct) => Ty::Struct {
+                        def: def.unwrap(),
+                        name,
+                    },
+                    _ => {
+                        self.error(self.expr_span(id), "expected a type here".to_string());
+                        Ty::Unknown
+                    }
                 }
             }
             Expr::Call { .. } => Ty::Unknown,
@@ -563,6 +711,18 @@ impl<'a> TypeChecker<'a> {
                 if let Some(state) = self.state_tys.get(&def).cloned() {
                     self.check_assignable(&rhs_ty, &state, self.expr_span(rhs), "state write");
                     self.check_literal_fits(rhs, &state);
+                    if matches!(state, Ty::Struct { .. })
+                        && !matches!(self.ast.expr(rhs), Expr::StructLit { .. })
+                    {
+                        self.error(
+                            self.expr_span(rhs),
+                            "a struct-typed write's right-hand side must be a struct \
+                             literal (v0 restriction) -- copying one struct value into \
+                             another isn't supported yet; construct a fresh literal \
+                             instead"
+                                .to_string(),
+                        );
+                    }
                 } else if self.res.def(def).kind == DefKind::Local {
                     let merged = match locals.get(&def) {
                         Some(old) => self.widen(old.clone(), rhs_ty, lhs),
@@ -619,14 +779,31 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     // Routes through the same read-side logic as any other
                     // field access (rejects a bogus field/base the same
-                    // way `x.foo` would as an expression); a handle's
-                    // fields additionally aren't writable at all.
+                    // way `x.foo` would as an expression); a handle's or
+                    // struct's fields additionally aren't writable at all
+                    // (v0 restriction for structs: whole-value assignment
+                    // only, `p := Pair{...}` — mirrors `Ty::Handle`'s own
+                    // existing read-only restriction, same reasoning: no
+                    // answer yet for what a partial-field write does to
+                    // the OTHER fields of an if/else-nested assignment).
                     self.type_expr(lhs, locals);
-                    if matches!(self.types.expr_tys.get(&base), Some(Ty::Handle(_))) {
-                        self.error(
-                            self.expr_span(lhs),
-                            format!("cannot write `.{name}`: a handle's fields are read-only"),
-                        );
+                    match self.types.expr_tys.get(&base) {
+                        Some(Ty::Handle(_)) => {
+                            self.error(
+                                self.expr_span(lhs),
+                                format!("cannot write `.{name}`: a handle's fields are read-only"),
+                            );
+                        }
+                        Some(Ty::Struct { .. }) => {
+                            self.error(
+                                self.expr_span(lhs),
+                                format!(
+                                    "cannot write `.{name}`: a struct's fields are read-only \
+                                     (v0 restriction) — assign the whole value instead"
+                                ),
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -840,6 +1017,22 @@ impl<'a> TypeChecker<'a> {
                                 Ty::Unknown
                             }
                         },
+                        Ty::Struct { def, name: sname } => {
+                            let fields = self.types.struct_fields.get(&def).cloned();
+                            match fields
+                                .as_ref()
+                                .and_then(|fs| fs.iter().find(|(fname, _)| fname == &name))
+                            {
+                                Some((_, fty)) => fty.clone(),
+                                None => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        format!("struct `{sname}` has no field `{name}`"),
+                                    );
+                                    Ty::Unknown
+                                }
+                            }
+                        }
                         Ty::Unknown => Ty::Unknown,
                         other => {
                             self.error(
@@ -910,6 +1103,80 @@ impl<'a> TypeChecker<'a> {
                     self.check_assignable(&t, &elem, self.expr_span(alt), "`or` alternative");
                 }
                 elem
+            }
+            // `Name { field: expr, ... }` — v0 requires an EXHAUSTIVE,
+            // one-shot field list (matching Rust's own struct-literal
+            // rule): no defaults exist yet for a missing field, and a
+            // duplicate is almost certainly a typo, not a deliberate
+            // "last one wins" overwrite. A bad struct NAME (unresolved,
+            // or resolved to something that isn't `DefKind::Struct`) is
+            // already reported by resolve.rs — this stays defensive
+            // (`Ty::Unknown`, no second error) rather than re-checking
+            // the same thing.
+            Expr::StructLit { name, fields } => {
+                let Some(&struct_def) = self.res.expr_defs.get(&name) else {
+                    for (_, value) in &fields {
+                        self.type_expr(*value, locals);
+                    }
+                    return Ty::Unknown;
+                };
+                let struct_name = match self.ast.expr(name) {
+                    Expr::Ident(n) => n.clone(),
+                    _ => String::new(),
+                };
+                let Some(declared) = self.types.struct_fields.get(&struct_def).cloned() else {
+                    for (_, value) in &fields {
+                        self.type_expr(*value, locals);
+                    }
+                    return Ty::Unknown;
+                };
+                let mut seen: HashMap<String, ExprId> = HashMap::new();
+                for (fname, value) in &fields {
+                    let vty = self.type_expr(*value, locals);
+                    if seen.contains_key(fname) {
+                        self.error(
+                            self.expr_span(*value),
+                            format!("field `{fname}` is given more than once"),
+                        );
+                        continue;
+                    }
+                    seen.insert(fname.clone(), *value);
+                    match declared.iter().find(|(dname, _)| dname == fname) {
+                        Some((_, dty)) => {
+                            self.check_assignable(
+                                &vty,
+                                dty,
+                                self.expr_span(*value),
+                                "struct field",
+                            );
+                            self.check_literal_fits(*value, dty);
+                        }
+                        None => {
+                            self.error(
+                                self.expr_span(*value),
+                                format!("struct `{struct_name}` has no field `{fname}`"),
+                            );
+                        }
+                    }
+                }
+                let missing: Vec<&str> = declared
+                    .iter()
+                    .map(|(dname, _)| dname.as_str())
+                    .filter(|dname| !seen.contains_key(*dname))
+                    .collect();
+                if !missing.is_empty() {
+                    self.error(
+                        self.expr_span(id),
+                        format!(
+                            "struct `{struct_name}` literal is missing field(s): {}",
+                            missing.join(", ")
+                        ),
+                    );
+                }
+                Ty::Struct {
+                    def: struct_def,
+                    name: struct_name,
+                }
             }
         }
     }

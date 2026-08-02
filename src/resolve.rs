@@ -26,6 +26,12 @@ pub struct DefId(pub u32);
 pub enum DefKind {
     Builtin,
     Module,
+    /// A `struct Name { field : ty, ... }` declaration — a type, not
+    /// state; its own fields are never separately `declare`d (they're
+    /// plain structural data on the `Item::Struct`, resolved contextually
+    /// by types.rs, matching how a module's port names or a fifo's
+    /// element type aren't standalone resolvable idents either).
+    Struct,
     Reg,
     Mem,
     Fifo,
@@ -65,6 +71,7 @@ impl DefKind {
         match self {
             DefKind::Builtin => "a builtin",
             DefKind::Module => "a module",
+            DefKind::Struct => "a struct",
             DefKind::Reg => "a register",
             DefKind::Mem => "a memory",
             DefKind::Fifo => "a fifo",
@@ -357,6 +364,7 @@ impl<'a> Resolver<'a> {
                 };
                 (name.clone(), def_kind)
             }
+            Item::Struct { name, .. } => (name.clone(), DefKind::Struct),
             Item::Schedule { .. } => return,
         };
         let def = self.declare(&name, kind);
@@ -383,6 +391,17 @@ impl<'a> Resolver<'a> {
             }
             Item::Mem { ty, .. } | Item::Fifo { ty, .. } | Item::Input { ty, .. } => {
                 self.resolve_expr(*ty, false);
+            }
+            // Field names are structural, not scoped idents (matching a
+            // module's port names or a fifo's element type) — only each
+            // field's own TYPE expression resolves against scope. No
+            // implicit-param binding (`in_type: false`): a struct
+            // declaration has no call site to infer a generic width
+            // from, unlike a fn's params.
+            Item::Struct { fields, .. } => {
+                for field in fields.clone() {
+                    self.resolve_expr(field.ty, false);
+                }
             }
             Item::Output { ty, init, .. } => {
                 self.resolve_expr(*ty, false);
@@ -692,6 +711,24 @@ impl<'a> Resolver<'a> {
             Expr::Or(alts) => {
                 for alt in alts {
                     self.resolve_expr(alt, in_type);
+                }
+            }
+            Expr::StructLit { name, fields } => {
+                self.resolve_expr(name, in_type);
+                if let Some(def) = self.res.expr_defs.get(&name).copied()
+                    && self.res.def(def).kind != DefKind::Struct
+                {
+                    self.error(
+                        self.ast.expr_spans[name.0 as usize].clone(),
+                        format!(
+                            "`{}` is {}, not a struct",
+                            self.res.def(def).name,
+                            self.res.def(def).kind.describe()
+                        ),
+                    );
+                }
+                for (_, value) in fields {
+                    self.resolve_expr(value, in_type);
                 }
             }
         }

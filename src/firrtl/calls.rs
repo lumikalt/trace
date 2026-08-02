@@ -165,6 +165,12 @@ pub(crate) fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
                 collect_calls(ast, *alt, out);
             }
         }
+        Expr::StructLit { name, fields } => {
+            collect_calls(ast, *name, out);
+            for (_, value) in fields {
+                collect_calls(ast, *value, out);
+            }
+        }
     }
 }
 

@@ -616,6 +616,77 @@ rule step {
 }
 ```
 
+## Structs
+
+```trace
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+```
+
+A `struct` declares an ordered, named field list. `Name{ field: value, ... }`
+constructs one — every declared field must be given exactly once, in any
+order; a missing field, an unknown field, or a field given twice are all
+compile-time errors. `.field` reads a field back:
+
+```trace
+module M {
+    fifo input : bits[8]
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+
+    rule fill {
+        let d = input.Deq[]
+        p := Pair{ valid: 1, data: d }
+    }
+}
+```
+
+A `reg`, `in`, or `out` may be struct-typed; a plain local may too, as long as
+it's bound directly to a struct literal (`let p = Pair{...}`) — reading a
+field off a local that's merely an alias for another struct-typed value
+(`let q = p; q.field`) isn't resolved in v0.
+
+A struct field may itself be another struct — nested arbitrarily deep, not
+just one level:
+
+```trace
+struct Header {
+    valid : bit
+    seq : bits[4]
+}
+
+struct Frame {
+    header : Header
+    data : bits[8]
+}
+```
+
+A chained field read (`f.header.valid`) walks each level in turn; a nested
+struct literal (`Frame{ header: Header{ valid: 1, seq: 0 }, data: d }`)
+constructs the whole tree at once, still exhaustive at every level. A struct
+that directly or transitively contains itself (`struct A { b : B }` /
+`struct B { a : A }`) is a compile-time error — an infinitely-sized type,
+caught before it ever reaches flattening (see "Struct emission" under Part
+2), not a stack overflow.
+
+v0 restrictions, all enforced as clean compile-time errors rather than left to
+miscompile: a field's type must be `bits[N]` or another struct (no `list`, no
+fifo/mem); a struct has no per-field write — `p.field := x` is rejected,
+assign the whole value instead (`p := Pair{...}`, same restriction a `spawn`
+handle's `.result`/`.done` fields already have); a struct-typed write's
+right-hand side must itself be a struct literal, not another struct-typed
+value (`p := q` between two struct-typed regs is rejected, not silently
+compiled to a frozen register); a struct-typed fn/rule param or return type
+isn't supported yet; a struct-typed port on an *instantiated* submodule is
+rejected (its target module flattens the port to N real ports internally,
+see "Struct emission" under Part 2 — wiring it from outside by its bare name has no
+way to reach those).
+
+Struct destructuring (binding several locals from one struct value in a
+single statement) is a natural follow-on but not yet implemented — see
+TODO.md.
+
 ## Locals
 
 A local (`x := value`, or `let x = value`) may be reassigned within one rule. A
@@ -1270,6 +1341,62 @@ parent's own output built from a child's output is a second register hop behind
 that. Latency compounds once per hop through the hierarchy — a real,
 honestly-modeled consequence of composition.
 
+## Struct emission
+
+FIRRTL does support a real bundle type (`{ field : ty, ... }`), confirmed by
+hand-lowering one through firtool directly (`regreset`, `mux`, and
+struct-typed ports all accept it) — but the emitted text here never uses it.
+The same hand-lowering probe also confirmed that firtool's own lowering to
+Verilog *flattens* a bundle-typed port or register to exactly `{name}_
+{field}`, one signal per field. Since that's the shape trace needs
+regardless (a struct-typed reg/output/input's fields are read/written
+individually, never as one opaque wire), emission skips the bundle detour
+entirely: a struct-typed `reg name : S` becomes N plain registers, one per
+LEAF field, named `name_field`; a struct-typed `out`/`in` follows the same
+`{port}_{field}` naming an `Output`'s existing internal-backing-register
+split already uses. `Types::struct_fields` (an ordered `(name, Ty)` list per
+struct `DefId`) drives the expansion; every leaf field's type must resolve
+to a concrete `bits[N]` or emission errors, mirroring the "no concrete bit
+width" check an ordinary scalar reg already has.
+
+A struct field may itself be another struct — `struct_field_widths`
+recurses through any `Ty::Struct` field, joining names with `_` at every
+level it descends (`Frame.header.valid` flattens to `f_header_valid`, not
+just `f_valid`), so an arbitrarily nested struct produces exactly the same
+flat shape a single-level one already did, just carried further. A struct
+that directly or transitively contains itself would make that recursion
+never terminate — caught up front instead, by `check_struct_cycles`
+(types.rs) walking the struct-to-struct field graph once `struct_fields` is
+fully populated and erroring on any cycle, so `struct_field_widths` itself
+never needs to guard against one.
+
+A struct-typed reg/output has no single `name := ...` statement to find the
+way a scalar reg's write-threading walk (`reg_value_in_stmts`) looks for —
+the user writes the *whole* struct (`p := Pair{...}`), one literal covering
+every field at once. `struct_field_value_in_stmts` mirrors that walk's
+if/else mux-threading structure but, on finding a matching whole-value
+assignment, pulls out just one LEAF field's own sub-expression per call —
+one call per flat register, walking a field PATH (`["header", "valid"]`,
+not just `"valid"`) into any nesting depth of struct literal via
+`find_struct_lit_field`, shared with the read side (`expr.rs`'s
+`compile_struct_field_read`, which peels a chased `.field.field` chain back
+down to its root value and the same path before dispatching). A struct-typed
+write whose right-hand side isn't literally a struct literal (`p := q`
+between two struct-typed regs) is rejected at type-check time rather than
+silently compiling to nothing here: the field-path walk can only decompose
+a literal, so a non-literal RHS would otherwise leave the register frozen
+at its reset value with no error at all.
+
+A struct-typed port on an *instantiated* submodule is rejected outright
+(v0): the target module's own emission flattens its port to N real FIRRTL
+ports, but the instance-wiring code only ever has the port's bare,
+unflattened name to wire by (`module_ports`' entry is still one `(name,
+kind, Ty::Struct)` triple) — driving `inst.p` against a module that actually
+declares `p_valid`/`p_data` would either reference a nonexistent port or
+silently default-wire a single bit (`port_bit_width`'s `unwrap_or(1)`
+fallback, built for scalar ports and never meant to see a struct). Caught
+explicitly at instance-collection time instead of surfacing as either.
+
 ## Calling a function: inlining
 
 FIRRTL has no function-call concept, so a callee is inlined at its call site:
@@ -1487,6 +1614,11 @@ noted:
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/
 adder_tree.tr`, DESIGN.md's own `AdderTree`).
+- General `struct` types: declaration, exhaustive-field-checked
+  construction, whole-value read/write, arbitrary nesting (a struct field
+  may itself be a struct, cycle-rejected), flattened to N plain
+  registers/ports per LEAF field with no real FIRRTL bundle ever emitted
+  (`examples/struct_pair.tr`, `examples/struct_nested.tr`).
 
 Not yet implemented:
 

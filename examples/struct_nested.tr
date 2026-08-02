@@ -1,0 +1,37 @@
+-- Nested structs: a struct field may itself be another struct
+-- (`Frame.header : Header`), no longer a v0 restriction. Flattening
+-- recurses through every level, joining field names with `_` at each
+-- step (`f_header_valid`, `f_header_seq`, `f_data`) — the same flat-
+-- register shape a single-level struct already used, just carried one
+-- level deeper. A chained field read (`f.header.valid`) resolves by
+-- walking the same chain back down to its flat register. See
+-- DESIGN.md's "Structs"/"Struct emission" sections.
+struct Header {
+    valid : bit
+    seq : bits[4]
+}
+
+struct Frame {
+    header : Header
+    data : bits[8]
+}
+
+module StructNested {
+    fifo input : bits[8]
+    reg seq : bits[4] = 0
+    reg f : Frame = Frame{ header: Header{ valid: 0, seq: 0 }, data: 0 }
+    out result : Frame = Frame{ header: Header{ valid: 0, seq: 0 }, data: 0 }
+
+    rule fill {
+        let d = input.Deq[]
+        f := Frame{ header: Header{ valid: 1, seq: seq }, data: d }
+        seq := seq + 1
+    }
+
+    rule pass {
+        result := Frame{
+            header: Header{ valid: f.header.valid, seq: f.header.seq },
+            data: f.data
+        }
+    }
+}

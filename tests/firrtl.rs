@@ -3738,3 +3738,345 @@ module M {
     ));
     run_firtool(&fir, &[]);
 }
+
+/// A struct-typed reg/output never emits a real FIRRTL bundle: it
+/// flattens to N plain registers/ports, one per field, named
+/// `{name}_{field}` -- confirmed to match what firtool's own bundle
+/// lowering produces (hand-lowered through real firtool before this was
+/// written; see DESIGN.md's "Structs" section).
+#[test]
+fn struct_reg_and_output_flatten_to_per_field_registers() {
+    let fir = emit_from_source(&read_example("struct_pair.tr")).expect("emission should succeed");
+    assert!(fir.contains("regreset p_valid : UInt<1>"));
+    assert!(fir.contains("regreset p_data : UInt<8>"));
+    assert!(fir.contains("output result_valid : UInt<1>"));
+    assert!(fir.contains("output result_data : UInt<8>"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-typed port on an INSTANTIATED submodule is rejected (v0
+/// restriction): the target module's own port flattens to N real FIRRTL
+/// ports (`p_valid`/`p_data`), but the instance-wiring code here only
+/// ever knows the port's bare, unflattened name -- wiring it by that
+/// name would either reference a port that doesn't exist or (silently,
+/// worse) default-wire a single bit. Caught explicitly instead.
+#[test]
+fn struct_typed_instance_port_is_rejected() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module Child {
+    out p : Pair = Pair{ valid: 0, data: 0 }
+    rule fill {
+        p := Pair{ valid: 1, data: 5 }
+    }
+}
+
+module Parent {
+    inst c : Child
+    out v : bit = 0
+    rule read {
+        v := c.p.valid
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter().any(|e| e.message.contains("struct-typed port")),
+        "expected a struct-typed-port rejection, got: {err:?}"
+    );
+}
+
+/// A struct-typed reg write nested in `if`/`else` mux-threads per FIELD,
+/// same as an ordinary scalar reg -- and, with no `else`, holds the
+/// FLAT field register (`p_valid`, not the un-flattened `p`) on the
+/// branch that doesn't write. This is the exact coverage gap this
+/// session already caught once for mem writes (if/else-both-branches);
+/// `struct_field_value_in_stmts` builds its hold name from `{struct}_
+/// {field}` (see its own doc comment), which this pins.
+#[test]
+fn struct_reg_write_nested_in_if_else_mux_threads_per_field() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    in go : bit
+
+    rule r {
+        if go = 1 {
+            p := Pair{ valid: 1, data: 8'd7 }
+        } else {
+            p := Pair{ valid: 0, data: 8'd9 }
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect p_valid, mux(eq(go, UInt<1>(1)), UInt<1>(1), UInt<1>(0))"));
+    assert!(fir.contains("connect p_data, mux(eq(go, UInt<1>(1)), UInt<8>(7), UInt<8>(9))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn struct_reg_write_nested_in_if_with_no_else_holds_the_flat_field_name() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    in go : bit
+
+    rule r {
+        if go = 1 {
+            p := Pair{ valid: 1, data: 8'd7 }
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect p_valid, mux(eq(go, UInt<1>(1)), UInt<1>(1), p_valid)"));
+    assert!(fir.contains("connect p_data, mux(eq(go, UInt<1>(1)), UInt<8>(7), p_data)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-typed `in` port flattens the same way a struct-typed `reg`/
+/// `out` does -- `compile_struct_field_read`'s `Reg | Input` branch
+/// (shared with `reg`) is otherwise unexercised by anything else in the
+/// tree (`struct_pair.tr`'s `input` is a fifo, not a port).
+#[test]
+fn struct_typed_input_port_flattens_and_reads_by_field() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    in q : Pair
+    out ok : bit = 0
+
+    rule r {
+        ok := q.valid
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("input q_valid : UInt<1>"));
+    assert!(fir.contains("input q_data : UInt<8>"));
+    assert!(fir.contains("connect __out_ok, q_valid"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-typed local bound directly to a struct literal resolves its
+/// field reads through the lazy `locals` map (not `locals_snapshots`,
+/// since a struct-typed local's width is never a concrete `bits[N]`).
+#[test]
+fn struct_typed_local_bound_to_a_literal_resolves_field_reads() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    out out_v : bits[8] = 0
+
+    rule r {
+        let q = Pair{ valid: 1, data: 8'd7 }
+        out_v := q.data
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_out_v, UInt<8>(7)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-typed local that's merely an ALIAS for another struct-typed
+/// value (not bound directly to a literal) doesn't resolve field reads
+/// in v0 -- DESIGN.md's "Structs" section documents this restriction;
+/// this pins it as an actual compile error, not a silent miscompile.
+#[test]
+fn struct_typed_local_aliasing_another_local_is_rejected() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    out out_v : bits[8] = 0
+
+    rule r {
+        let q = Pair{ valid: 1, data: 8'd7 }
+        let p = q
+        out_v := p.data
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter().any(|e| e.message.contains("struct literal")),
+        "expected an aliasing-rejection error, got: {err:?}"
+    );
+}
+
+/// A NESTED struct (a struct field that's itself another struct)
+/// flattens all the way down: `Types::struct_field_widths` recurses
+/// through the inner struct, joining names with `_` at every level, so
+/// `f_header_valid`/`f_header_seq`/`f_data` -- not a real FIRRTL bundle
+/// at any level -- same as `struct_reg_and_output_flatten_to_per_field_
+/// registers` above, just carried one level deeper.
+#[test]
+fn nested_struct_flattens_all_the_way_down() {
+    let fir = emit_from_source(&read_example("struct_nested.tr")).expect("emission should succeed");
+    assert!(fir.contains("regreset f_header_valid : UInt<1>"));
+    assert!(fir.contains("regreset f_header_seq : UInt<4>"));
+    assert!(fir.contains("regreset f_data : UInt<8>"));
+    assert!(fir.contains("output result_header_valid : UInt<1>"));
+    assert!(fir.contains("output result_header_seq : UInt<4>"));
+    assert!(fir.contains("output result_data : UInt<8>"));
+    run_firtool(&fir, &[]);
+}
+
+/// A NESTED struct-typed `in` port flattens the same way a nested reg/
+/// out does -- `module.rs`'s `Item::Input` arm and `compile_struct_
+/// field_read`'s `Reg | Input` branch build the flat name from opposite
+/// ends (declaration vs. a chained `.field.field` read) and must agree.
+#[test]
+fn nested_struct_typed_input_port_flattens_and_reads_by_chained_field() {
+    let src = "\
+struct Header {
+    valid : bit
+    seq : bits[4]
+}
+
+struct Frame {
+    header : Header
+    data : bits[8]
+}
+
+module M {
+    in q : Frame
+    out ok : bits[4] = 0
+
+    rule r {
+        ok := q.header.seq
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("input q_header_valid : UInt<1>"));
+    assert!(fir.contains("input q_header_seq : UInt<4>"));
+    assert!(fir.contains("input q_data : UInt<8>"));
+    assert!(fir.contains("connect __out_ok, q_header_seq"));
+    run_firtool(&fir, &[]);
+}
+
+/// A nested struct-typed reg write nested in `if`/`else` mux-threads
+/// per LEAF field, holding the flat leaf name (not the un-flattened
+/// `f` or the one-level `f_header`) on the branch that doesn't write --
+/// the same coverage this session already pinned for a single-level
+/// struct, one level deeper.
+#[test]
+fn nested_struct_write_in_if_with_no_else_holds_the_flat_leaf_name() {
+    let src = "\
+struct Header {
+    valid : bit
+    seq : bits[4]
+}
+
+struct Frame {
+    header : Header
+    data : bits[8]
+}
+
+module M {
+    reg f : Frame = Frame{ header: Header{ valid: 0, seq: 0 }, data: 0 }
+    in go : bit
+
+    rule r {
+        if go = 1 {
+            f := Frame{ header: Header{ valid: 1, seq: 4'd3 }, data: 8'd7 }
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(
+        fir.contains("connect f_header_valid, mux(eq(go, UInt<1>(1)), UInt<1>(1), f_header_valid)")
+    );
+    assert!(
+        fir.contains("connect f_header_seq, mux(eq(go, UInt<1>(1)), UInt<4>(3), f_header_seq)")
+    );
+    assert!(fir.contains("connect f_data, mux(eq(go, UInt<1>(1)), UInt<8>(7), f_data)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct literal is allowed to span multiple lines, its opening `{`
+/// immediately followed by a newline before the first field --
+/// `at_struct_lit_open`'s 2-token lookahead must skip past that newline
+/// before checking `ident :` vs `ident :=`, or a multi-line literal
+/// (the natural way to write a nested one readably) silently fails to
+/// parse as a struct literal at all.
+#[test]
+fn a_multiline_struct_literal_still_parses_as_one() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    in go : bit
+
+    rule r {
+        if go = 1 {
+            p := Pair{
+                valid: 1,
+                data: 8'd7
+            }
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect p_valid, mux(eq(go, UInt<1>(1)), UInt<1>(1), p_valid)"));
+    assert!(fir.contains("connect p_data, mux(eq(go, UInt<1>(1)), UInt<8>(7), p_data)"));
+    run_firtool(&fir, &[]);
+}
+
+/// The multi-line fix above must NOT reopen the collision it was
+/// checked against when this session's struct feature first landed:
+/// `if cond { x := 1 }`, with the assignment on its own line, must
+/// still parse as an ordinary if/block, not get misread as a struct
+/// literal now that the lookahead skips newlines.
+#[test]
+fn if_with_a_bare_ident_condition_and_a_newline_before_its_body_still_parses_as_a_block() {
+    let src = "\
+module M {
+    reg x : bits[8] = 0
+    in cond : bit
+
+    rule r {
+        if cond {
+            x := 1
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect x, mux(cond, UInt<8>(1), x)"));
+    run_firtool(&fir, &[]);
+}

@@ -444,6 +444,11 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            Expr::StructLit { fields, .. } => {
+                for (_, value) in fields {
+                    self.infer_expr(*value, sig);
+                }
+            }
         }
     }
 
@@ -676,6 +681,11 @@ impl<'a> Checker<'a> {
             Expr::Or(alts) => {
                 for alt in alts {
                     self.check_expr(alt, item, sig, elab);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, value) in fields {
+                    self.check_expr(value, item, sig, elab);
                 }
             }
             Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}

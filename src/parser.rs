@@ -212,6 +212,7 @@ impl<'a> Parser<'a> {
         use TokenKind::*;
         match self.peek() {
             Some(Module) => self.parse_module(),
+            Some(Struct) => self.parse_struct(),
             Some(Reg) => self.parse_state_decl(Reg),
             Some(Mem) => self.parse_state_decl(Mem),
             Some(Fifo) => self.parse_state_decl(Fifo),
@@ -231,7 +232,8 @@ impl<'a> Parser<'a> {
             Some(Schedule) => self.parse_schedule(),
             _ => {
                 self.error_here(
-                    "expected an item (module, reg, mem, fifo, in, out, rule, schedule, or a function)"
+                    "expected an item (module, struct, reg, mem, fifo, in, out, rule, \
+                     schedule, or a function)"
                         .to_string(),
                 );
                 self.sync();
@@ -272,6 +274,45 @@ impl<'a> Parser<'a> {
         Some(
             self.ast
                 .push_item(Item::Module { name, items }, lo..self.prev_end),
+        )
+    }
+
+    /// `struct Name { field : ty \n ... }` — newline-terminated field
+    /// list, same brace-block shape `parse_module` uses (not comma-
+    /// separated like `parse_fn`'s parameter list, since a field list
+    /// reads more naturally one per line matching every other multi-
+    /// line body in this language).
+    fn parse_struct(&mut self) -> Option<ItemId> {
+        let lo = self.cur_span().start;
+        self.bump(); // struct
+        let name = self.expect_ident("struct name")?;
+        self.expect(TokenKind::LBrace, "`{` after struct name")
+            .ok()?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            match self.peek() {
+                Some(TokenKind::RBrace) => {
+                    self.bump();
+                    break;
+                }
+                None => {
+                    self.error_here("unclosed struct body".to_string());
+                    break;
+                }
+                _ => {
+                    let fname = self.expect_ident("field name")?;
+                    self.expect(TokenKind::Colon, "`:` before field type")
+                        .ok()?;
+                    let ty = self.parse_expr(TYPE_MIN_BP)?;
+                    fields.push(Param { name: fname, ty });
+                    self.expect_terminator();
+                }
+            }
+        }
+        Some(
+            self.ast
+                .push_item(Item::Struct { name, fields }, lo..self.prev_end),
         )
     }
 
@@ -969,6 +1010,28 @@ impl<'a> Parser<'a> {
                         );
                         continue;
                     }
+                    // `Name { field: expr, ... }` — a struct literal.
+                    // Gated on BOTH `lhs` being a bare `Ident` (a struct
+                    // type name is never anything else) AND a lookahead
+                    // confirming the `{` is followed by `ident :` — not
+                    // `ident :=`, and not anything else. That second
+                    // condition is what keeps this from misfiring on
+                    // `if ready { x := 1 }`: no statement in this
+                    // language starts with `ident :`, so the lookahead
+                    // never collides with genuine block content, and a
+                    // bare-ident condition's `{` is correctly left for
+                    // `parse_block` to consume as the if/while body.
+                    LBrace
+                        if matches!(self.ast.expr(lhs), Expr::Ident(_))
+                            && self.at_struct_lit_open() =>
+                    {
+                        self.bump(); // `{`
+                        let fields = self.parse_struct_lit_fields()?;
+                        lhs = self
+                            .ast
+                            .push_expr(Expr::StructLit { name: lhs, fields }, lo..self.prev_end);
+                        continue;
+                    }
                     Question => {
                         self.bump();
                         lhs = self.ast.push_expr(Expr::Guard(lhs), lo..self.prev_end);
@@ -1080,6 +1143,54 @@ impl<'a> Parser<'a> {
         };
         self.expect(close, what).ok()?;
         Some(args)
+    }
+
+    /// Whether the CURRENT `{` (not yet consumed) opens a struct
+    /// literal: the very next two tokens must be `ident :` — specifically
+    /// `Colon`, not `ColonEq`. No statement in this language starts with
+    /// a bare `ident :`, so this never collides with genuine block
+    /// content (see the postfix `LBrace` arm's own comment for the
+    /// motivating `if ready { x := 1 }` case). An empty literal (`Pair{}`)
+    /// isn't recognized by this lookahead — a v0 non-goal, not a
+    /// deliberate rejection.
+    fn at_struct_lit_open(&self) -> bool {
+        // The opening `{` may be followed by a newline before the first
+        // field (a multi-line literal, `parse_struct_lit_fields`'s own
+        // convention) — skip those before checking shape, same as
+        // `if cond {\n x := 1\n }` must still NOT be mistaken for one
+        // (the `:` vs `:=` check below is what actually discriminates
+        // that case, unaffected by skipping newlines first).
+        let mut i = self.pos + 1;
+        while matches!(self.tokens.get(i).map(|t| t.kind), Some(TokenKind::Newline)) {
+            i += 1;
+        }
+        matches!(self.tokens.get(i).map(|t| t.kind), Some(TokenKind::Ident))
+            && matches!(
+                self.tokens.get(i + 1).map(|t| t.kind),
+                Some(TokenKind::Colon)
+            )
+    }
+
+    /// The `{ field: expr, ... }` tail of a struct literal, with the
+    /// opening `{` already consumed — same comma-separated-with-
+    /// newlines convention `parse_args` uses.
+    fn parse_struct_lit_fields(&mut self) -> Option<Vec<(String, ExprId)>> {
+        let mut fields = Vec::new();
+        self.skip_newlines();
+        while !self.at(TokenKind::RBrace) {
+            let fname = self.expect_ident("field name")?;
+            self.expect(TokenKind::Colon, "`:` before field value")
+                .ok()?;
+            let value = self.parse_expr(0)?;
+            fields.push((fname.text, value));
+            self.skip_newlines();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            self.skip_newlines();
+        }
+        self.expect(TokenKind::RBrace, "`}`").ok()?;
+        Some(fields)
     }
 }
 

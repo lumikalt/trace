@@ -51,6 +51,24 @@ impl<'a> Emitter<'a> {
             let inst_name = self.res.def(*def).name.clone();
             return Ok(format!("{inst_name}.{name}"));
         }
+        // `p.field` where `p` is struct-typed: a reg/output/input's field
+        // compiles to its own flat register/port (`{base}_{field}`,
+        // confirmed via real firtool to match how a native FIRRTL bundle
+        // flattens on its own — module.rs's Reg/Input/Output collection
+        // already named the backing storage this same way). A struct-
+        // typed LOCAL's field substitutes directly from its bound struct
+        // literal instead: it never reaches `locals_snapshots`'s pre-
+        // compiled-text path (`local_hint`, writes.rs, returns `None` for
+        // any non-`bits[N]` local type, keeping it in the lazy
+        // `self.locals` `ExprId` map, exactly what per-field extraction
+        // needs).
+        if let Expr::Field { base, name } = self.ast.expr(id).clone()
+            && matches!(self.types.expr_tys.get(&base), Some(Ty::Struct { .. }))
+        {
+            let (root, mut path) = self.struct_field_path(base);
+            path.push(name);
+            return self.compile_struct_field_read(root, &path, hint);
+        }
         match self.ast.expr(id).clone() {
             Expr::Ident(_) => {
                 let def = self.res.expr_defs.get(&id).copied();
@@ -209,6 +227,99 @@ impl<'a> Emitter<'a> {
             out = format!("mux({select}, {value}, {out})");
         }
         Ok(out)
+    }
+
+    /// Peels a chain of struct-typed `.field` accesses down to its root
+    /// expression, collecting the field-name chain in root-to-leaf order
+    /// (`p.inner.a`'s `base` — `p.inner` — peels to `(p, ["inner"])`;
+    /// the caller pushes the outer access's own field name, `"a"`, on
+    /// top). Only walks through a base that is ITSELF a struct-typed
+    /// `Field` access; a plain struct-typed root value (an `Ident`)
+    /// stops the walk, becoming `root` with an empty path so far.
+    fn struct_field_path(&self, id: ExprId) -> (ExprId, Vec<String>) {
+        if let Expr::Field { base, name } = self.ast.expr(id).clone()
+            && matches!(self.types.expr_tys.get(&base), Some(Ty::Struct { .. }))
+        {
+            let (root, mut path) = self.struct_field_path(base);
+            path.push(name);
+            (root, path)
+        } else {
+            (id, Vec::new())
+        }
+    }
+
+    /// `p.a.b. ...`'s value: `root` is the struct-typed value the WHOLE
+    /// chain starts from (already confirmed struct-typed by the
+    /// caller), `path` the field-name chain from `root`'s own top level
+    /// down to the leaf field actually being read (`["inner", "a"]` for
+    /// `p.inner.a`). Three cases, matching the plain-`Ident` dispatch's
+    /// own split (`Ident` arm, above) one level deeper:
+    /// - `Output`: its field's backing register (`__out_{name}_{path
+    ///   joined with _}`, module.rs's own naming).
+    /// - `Reg`/`Input`: its field's flat register/port (`{name}_{path
+    ///   joined with _}`).
+    /// - `Local`/`Param`: substitute the local's bound struct literal
+    ///   and walk `path` into it (`find_struct_lit_field`, shared with
+    ///   `writes.rs`'s per-field write-threading, since both need the
+    ///   same nested-literal walk), then compile just the leaf field's
+    ///   own sub-expression — a real, if narrow, v0 restriction: only a
+    ///   local bound DIRECTLY to a struct literal resolves (no aliasing
+    ///   chain, e.g. `let q = p`), a deliberate scope line, not an
+    ///   oversight.
+    fn compile_struct_field_read(
+        &mut self,
+        root: ExprId,
+        path: &[String],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let def = self.res.expr_defs.get(&root).copied();
+        let suffix = path.join("_");
+        match def.map(|d| self.res.def(d).clone()) {
+            Some(d) if d.kind == DefKind::Output => Ok(format!("__out_{}_{suffix}", d.name)),
+            Some(d) if matches!(d.kind, DefKind::Reg | DefKind::Input) => {
+                Ok(format!("{}_{suffix}", d.name))
+            }
+            Some(d) if matches!(d.kind, DefKind::Local | DefKind::Param) => {
+                let def = def.unwrap();
+                let Some(bound) = self.locals.get(&def).copied() else {
+                    self.error(
+                        self.ast.expr_spans[root.0 as usize].clone(),
+                        "cannot find this local's binding in the rule currently being \
+                         compiled (v0 restriction: a local is only resolved within its \
+                         own rule/call)"
+                            .to_string(),
+                    );
+                    return Err(());
+                };
+                if !matches!(self.ast.expr(bound), Expr::StructLit { .. }) {
+                    self.error(
+                        self.ast.expr_spans[root.0 as usize].clone(),
+                        "cannot resolve this struct field (v0 restriction: a struct-typed \
+                         local must be bound directly to a struct literal, not aliased \
+                         from another local)"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                match self.find_struct_lit_field(bound, path) {
+                    Some(value) => self.compile_expr_hinted(value, hint),
+                    None => {
+                        self.error(
+                            self.ast.expr_spans[root.0 as usize].clone(),
+                            format!("this struct literal has no field `{}`", path.join(".")),
+                        );
+                        Err(())
+                    }
+                }
+            }
+            _ => {
+                self.error(
+                    self.ast.expr_spans[root.0 as usize].clone(),
+                    "unsupported struct reference in FIRRTL emission (v0 restriction)".to_string(),
+                );
+                Err(())
+            }
+        }
     }
 
     /// `x[i]` (single index), `x[hi..lo]` (slice), or `x[base +:
