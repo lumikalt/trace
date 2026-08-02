@@ -388,6 +388,168 @@
   the one place presence genuinely DOES add a layer to peel off (every
   other case in both functions deliberately does NOT, since bare-value
   coercion has no wrapper to peel).
+- **`let {field, field: bind, ...} = source` struct/`?T` destructuring
+  (Lumi's pick off the "what's next" list — closes the "Struct
+  destructuring" bullet that used to live under "Verse alignment"
+  below).** Bare-brace, not Rust's `let StructName{...} = source`:
+  deliberately NOT supporting a struct-name prefix, since the parser has
+  no type information to validate it against `source`'s actual type, and
+  advisor flagged an unchecked "looks like an assertion" name as exactly
+  the sharp edge this codebase avoids elsewhere (`list[Piar]`'s own
+  bare-identifier ambiguity was JUST documented as a reluctant one, not
+  a pattern to add to on purpose). Implemented as PURE parser sugar —
+  `parse_let_destructure` expands one destructuring statement into N
+  ordinary `Stmt::Let { name: bind, init: Expr::Field { base:
+  Expr::Ident(source), name: field } }` nodes at parse time, the same
+  "one source statement, several AST statements" `Vec<StmtId>` shape
+  `tick <expr>` already returns — no new AST node, and no other pass
+  (resolve/effects/types/firrtl) needed a single line changed, since
+  each projection is indistinguishable from a hand-written `let bind =
+  source.field`. Confirmed this "inherits every restriction for free"
+  claim empirically, not just by inspection: a typo'd field name
+  surfaces the exact same "struct `Pair` has no field `vlaid`" a
+  hand-written projection gives (span points at just the bad field
+  token, not the whole statement — each projection gets its own fresh
+  `Expr::Ident`/`Expr::Field` pair, never one shared base `ExprId`
+  reused across items, keeping the AST a tree the way every existing
+  walker assumes), and destructuring a LOCAL that itself aliases another
+  struct/Option value hits the pre-existing "not aliased from another
+  value" rejection with zero new code
+  (`let_destructure_of_an_aliased_option_local_is_rejected`,
+  tests/firrtl.rs).
+  `source` is restricted to a bare identifier — advisor's call, verified
+  before deciding rather than assumed: a call source would desugar to
+  one re-evaluation of the call PER destructured field (`Make().a`,
+  `Make().b`), silently duplicating whatever the callee's body does
+  instead of binding one shared result. Rather than auditing which call
+  shapes are actually safe to duplicate, the restriction is enforced
+  syntactically (a dedicated parser check, not the generic
+  `expect_terminator` message, so `let {a,b} = Make()` reports "must be
+  a plain reference... not a call/field access/other expression" instead
+  of a confusing "expected end of statement" pointing at `(`).
+  Field-shorthand alone (`let {valid, data} = p`) was the FIRST design —
+  advisor caught a real gap before implementation: `valid`/`data` are
+  the two field names every `?T` has, so destructuring TWO `?T` values
+  in one rule (`let {valid} = p` then `let {valid} = q`) would silently
+  shadow the first pair rather than error (`let_shadowing_is_allowed`,
+  tests/resolve.rs, confirms shadowing is legal, not a diagnostic) —
+  exactly the realistic use case this feature exists for. Added
+  `field: bind` renaming to close that gap before shipping, not as a
+  follow-up. No nested destructuring — single-level field projection
+  only, matching the scope Lumi actually asked for.
+  **Follow-up: exhaustive by default, `..` to opt out (Lumi's call,
+  after asking how to destructure a struct into FEWER locals than it
+  has fields — the answer, "just omit the field, no error," wasn't the
+  behavior wanted).** Naming only some fields with no trailing `..` is
+  now a compile-time error ("missing field(s): b — name them, or add
+  `..` to discard the rest"), mirroring `Expr::StructLit`'s own
+  missing-field check on the construction side. Unlike the rest of
+  destructuring, this piece can't stay pure sugar — validating
+  exhaustiveness needs `source`'s resolved type, which the parser
+  doesn't have. Rather than promoting destructuring to a real `Stmt`
+  variant (the struct-update playbook, and the more "architecturally
+  consistent" option per advisor), went with a lighter side channel: a
+  new `Ast.destructures: Vec<Destructure>` list the parser populates
+  alongside the existing N `Stmt::Let` nodes (unchanged), read only by
+  types.rs's new `check_destructures` at the very end of `check()`.
+  Justified precisely BECAUSE it's the opposite risk profile from
+  struct update's `base` field: forgetting to thread `base` into a
+  walker silently miscompiled hardware (a real bug this session hit,
+  `infer_expr` missing a read); forgetting to consult this side channel
+  anywhere but types.rs only means a missing diagnostic, never wrong
+  emission — no other pass needs to know a run of `Stmt::Let`s came
+  from a destructuring pattern, they're ordinary lets over `Expr::Field`
+  either way. `source`'s type is read back out of `expr_tys` using one
+  item's already-type-checked `Expr::Field.base` (`Destructure::
+  source_field_base`) rather than re-typing anything — skipped entirely
+  for a zero-item pattern (`let {..} = s` / `let {} = s`, no per-item
+  base to hang the lookup off, and "bind/discard nothing" can't miss a
+  field either way). Advisor flagged a double-error trap before
+  implementation, confirmed by the existing `let {vlaid, data} = p`
+  typo test: naive exhaustiveness-checking would ALSO report "missing
+  field(s): valid" alongside the typo, since `vlaid` doesn't count as
+  naming `valid`. Fixed by skipping the exhaustiveness error entirely
+  whenever any named field fails to resolve against the declared list —
+  that field's own `.field` projection already reports the typo, one
+  error not two (pinned:
+  `let_destructure_field_typo_reports_the_struct_has_no_such_field`,
+  tests/types.rs, now also asserts the missing-field error does NOT
+  fire). `?T`'s two synthetic field names were about to get a second
+  hand-written `["valid", "data"]` copy (the exhaustiveness side needs
+  the same list the `.field`-read arm already matches against) — pulled
+  both into one `OPTION_FIELDS` const instead so a future change to
+  `?T`'s shape has one site to update, not two.
+- **`Name{ field: value, ..., ..base }` struct update — closes the
+  "Struct update syntax" bullet that used to live under "Verse
+  alignment" below (Lumi's next pick off the same "what's next" list
+  destructuring came from).** `..base` fills every field this literal
+  doesn't name from `base`'s own same-named field, resolved via
+  `compile_struct_field_read` (expr.rs) — the SAME machinery an
+  ordinary `.field` read off a plain reference already uses, not new
+  emission logic of its own.
+  UNLIKE destructuring, this one is NOT pure parser sugar — it's a
+  real `base: Option<ExprId>` field on `Expr::StructLit` threaded
+  through typing (missing-field validation, base-type check) and
+  emission (the missing-field fallback itself). Confirmed empirically
+  before implementing (advisor-prompted, given this session's `optional`
+  history of getting the sugar-vs-real-node call wrong once already):
+  a new FIELD on an existing variant, unlike a new variant, is NOT
+  enumerated by the compiler — only sites that destructure `StructLit`
+  fully (`{ name, fields }`, no `..`) get forced to handle `base`; sites
+  using `{ fields, .. }` compile silently unaware of it. 6 of 10
+  `StructLit`-matching sites were compiler-forced (ast.rs, parser.rs,
+  resolve.rs, types.rs, lower.rs, firrtl/calls.rs, firrtl/fifo.rs); 4
+  were NOT and needed a manual grep-for-`..`-after-adding-the-field
+  pass: effects.rs's two walkers (`infer_expr`, `check_expr`),
+  firrtl/writes.rs's `compile_field_path_value`, firrtl/mod.rs's
+  `struct_lit_field_const`.
+  One of the four silent sites was a real correctness bug, not just a
+  missing feature: `infer_expr` (effects.rs) not walking `base` would
+  mean `q := Pair{ data: 5, ..p }` never recorded a READ of `p` in the
+  rule's effect signature — the scheduler wouldn't know the rule reads
+  `p` at all, and could legally schedule it concurrently with another
+  rule writing `p`, a real hazard invisible without checking the
+  schedule (no naturally-written "does `..old` copy the right fields"
+  test would catch it, since the VALUES would still be correct on
+  whichever cycle it happened to run). Fixed before shipping, verified
+  by isolating the read from any write to `p` in the same rule
+  (`struct_update_spread_registers_as_a_read_for_scheduling`,
+  tests/firrtl.rs) — confirms a second rule writing `p` gets scheduled
+  mutually exclusive with the `..p`-only rule, not just that `..p`'s
+  VALUES come out right.
+  `base` is restricted to a bare identifier — same reasoning and same
+  enforcement style as destructuring's `source` restriction (a
+  dedicated parser error, not the generic "expected `}`"): a call there
+  would need re-evaluating once per field `..base` supplies, silently
+  duplicating whatever the callee does. `..` may only be the LAST item
+  (Rust's own rule, parser-enforced) and never recurses into a nested
+  struct field that's itself only partially given — matches Rust's own
+  `..` semantics exactly (never a recursive merge), and sidesteps the
+  open design question the original TODO bullet raised about how it
+  "composes with a nested struct field that's itself only partially
+  overridden" by simply not composing with one at all.
+  Not supported in a reg/output INIT (a compile-time-constant position):
+  `base`'s own flat fields generally aren't known until runtime. Caught
+  the silent-miscompile shape here too before shipping — `struct_lit_
+  field_const`'s existing `fields.iter().find(...)?` returning `None`
+  for a `..base`-supplied field is routed by its caller (module.rs)
+  through `.unwrap_or(0)`, a silent zero reset with no error, the exact
+  same bug class `optional opt1`'s aliasing rejection closed for `?T`
+  earlier this session. Closed with a dedicated recursive walk
+  (`contains_struct_update`, types.rs, built on the now-`base`-aware
+  `lower::sub_exprs`) over the WHOLE init tree, not a top-level-only
+  check — `Outer{ inner: Inner{ ..old }, x: 1 }` nests a `..` one level
+  inside an explicitly-given field's own literal, still unreachable
+  from a const-eval and still caught.
+  Verified end to end through real firtool, not just `--firrtl` text:
+  `p := Pair{ data: 5, ..p }`'s untouched field emits a self-connect
+  (`connect p_valid, p_valid`), confirmed firtool accepts it cleanly —
+  a register reading its own pre-edge value combinationally, the same
+  transactional semantics `pc := pc + 3` already relies on.
+  `examples/struct_pair.tr` gained a `counter`/`bump` reg-and-rule pair
+  incrementing one field of its own current value every cycle while
+  carrying the other forward unchanged, simulated over several real
+  cycles (`sim/struct_pair_tb.v`) — not just checked once.
 - Audited every `_ => {}` wildcard match over `Stmt`/`Expr`/`Item`/etc.
   across `src/` (30 sites) for more Assign-vs-Let-shaped silent gaps.
   29 are legitimately safe (most route the semantically-important part
@@ -604,25 +766,6 @@ Speculative, bigger, not committed to:
     reuse (ordinary `.field` access requires the local bound directly
     to a literal, no aliasing) — unrelated to `optional`, would need
     its own design pass if ever wanted.
-- **Struct destructuring** (`let Pair{valid, data} = p`, or a `let
-  {valid, data} = p` field-shorthand form — binding several named
-  locals from one struct value in a single statement, instead of one
-  `p.field` projection per local). Natural ergonomic companion to
-  general structs, now that those have landed; not needed for `?T`/
-  read-only field access itself.
-- **Struct update syntax** (Rust's `Pair{ valid: 1, ..old }` — build a
-  new struct value from an existing one, overriding just the named
-  fields and copying every other field from `old`). Another ergonomic
-  companion to general structs: today every field must be spelled out
-  explicitly in every literal, even when only one field of a large
-  (possibly nested) struct actually changes. Emission-wise this looks
-  straightforward on top of the flattening `struct_field_widths`/
-  `compile_field_path_value` already do (a missing field falls back to
-  `..old`'s own flat register/field instead of erroring "missing
-  field"), but the parser/type-checker side needs its own design pass:
-  where `..old` may appear in the field list (trailing only, like
-  Rust?), and how it composes with a nested struct field that's itself
-  only partially overridden.
 - **Fallible bindings scoped to a single `if`** (Verse's
   `if (X := Expr, Y > 0):`, where `X` only exists in the `then` branch
   and a failure skips straight past it) — uncertain fit. trace's guard

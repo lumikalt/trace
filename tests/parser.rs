@@ -648,3 +648,119 @@ fn optional_is_a_real_prefix_node_distinct_from_its_wrapped_expression() {
         "(:= x (optional (optional false)))"
     );
 }
+
+fn let_sexpr(ast: &Ast, s: trace::ast::StmtId) -> String {
+    match ast.stmt(s) {
+        trace::ast::Stmt::Let { name, init } => {
+            format!("(let {} {})", name.text, ast.expr_sexpr(*init))
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+}
+
+#[test]
+fn let_destructure_desugars_to_one_field_projection_per_item() {
+    // `let {field, field: bind} = source` desugars to one ordinary
+    // `Stmt::Let` per item, each with its OWN fresh `Expr::Ident(source)`
+    // base (not one shared subexpression reused across every
+    // `Expr::Field` — the AST must stay a tree). No new `Stmt`/`Expr`
+    // variant for this — the ONE bit of extra bookkeeping is a side
+    // entry in `ast.destructures` (see the next test), consumed only by
+    // types.rs's exhaustiveness check, invisible to every other pass.
+    let ast = parse_ok("rule t {\n let {valid, data: d} = p\n}\n");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 2, "expected two statements: {body:?}");
+    assert_eq!(let_sexpr(&ast, body[0]), "(let valid (. p valid))");
+    assert_eq!(let_sexpr(&ast, body[1]), "(let d (. p data))");
+}
+
+#[test]
+fn let_destructure_records_named_fields_and_rest_flag() {
+    let ast = parse_ok("rule t {\n let {valid, data: d} = p\n}\n");
+    assert_eq!(
+        ast.destructures.len(),
+        1,
+        "expected one destructure group: {ast:?}"
+    );
+    let group = &ast.destructures[0];
+    assert_eq!(
+        group
+            .named_fields
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["valid", "data"]
+    );
+    assert!(!group.has_rest);
+
+    let ast = parse_ok("rule t {\n let {valid, ..} = p\n}\n");
+    assert_eq!(ast.destructures.len(), 1);
+    assert!(ast.destructures[0].has_rest);
+}
+
+#[test]
+fn let_destructure_rest_must_be_the_last_item() {
+    let src = "rule t {\n let {.., valid} = p\n}\n";
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (_ast, errors) = parser::parse(src, &tokens);
+    assert!(
+        errors.iter().any(|e| e.message.contains("last item")),
+        "expected a `..`-position rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn let_destructure_source_must_be_a_plain_reference() {
+    // A call source would desugar to one re-evaluation of the call per
+    // destructured field, silently duplicating whatever the callee does
+    // -- rejected syntactically rather than chasing which call shapes
+    // are actually safe to duplicate.
+    let src = "rule t {\n let {valid, data} = Make()\n}\n";
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (_ast, errors) = parser::parse(src, &tokens);
+    assert!(
+        errors.iter().any(|e| e.message.contains("plain reference")),
+        "expected a destructuring-source rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_update_parses_a_trailing_spread() {
+    assert_eq!(
+        stmt_sexpr("x := Pair{ data: 5, ..old }"),
+        "(:= x (struct Pair (data 5) (.. old)))"
+    );
+    // Spread-only (no explicit fields) is legal too -- equivalent to
+    // `old` itself, modulo the (unchecked) struct name.
+    assert_eq!(
+        stmt_sexpr("x := Pair{ ..old }"),
+        "(:= x (struct Pair (.. old)))"
+    );
+}
+
+#[test]
+fn struct_update_spread_must_be_last_and_a_plain_reference() {
+    let call_after = "rule t {\n x := Pair{ data: 5, ..Make() }\n}\n";
+    let (tokens, lex_errors) = lexer::lex(call_after);
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (_ast, errors) = parser::parse(call_after, &tokens);
+    assert!(
+        errors.iter().any(|e| e.message.contains("plain reference")),
+        "expected a spread-source rejection, got: {errors:?}"
+    );
+
+    // A field AFTER `..base` (not just a non-reference base) is
+    // rejected the same way -- `..` must be the LAST item.
+    let field_after = "rule t {\n x := Pair{ ..old, data: 5 }\n}\n";
+    let (tokens, lex_errors) = lexer::lex(field_after);
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (_ast, errors) = parser::parse(field_after, &tokens);
+    assert!(
+        errors.iter().any(|e| e.message.contains("LAST item")),
+        "expected a trailing-spread-position rejection, got: {errors:?}"
+    );
+}

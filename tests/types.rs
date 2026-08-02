@@ -744,6 +744,135 @@ fn struct_literal_missing_field_is_an_error() {
 }
 
 #[test]
+fn struct_update_fills_missing_fields_from_base() {
+    // `..old` supplies `valid`, left unnamed by this literal -- no
+    // "missing field" error, unlike `struct_literal_missing_field_is_
+    // an_error` above (same shape, no `..`).
+    run_ok(
+        "struct Pair {\n\
+             valid : [1]\n\
+             data : [8]\n\
+         }\n\
+         module M {\n\
+             reg old : Pair = Pair{ valid: 1, data: 0 }\n\
+             out result : [8] = 0\n\
+             rule r {\n\
+                 let p = Pair{ data: 5, ..old }\n\
+                 result := p.data\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn struct_update_base_must_match_the_struct_being_built() {
+    let src = "struct Pair {\n\
+                   valid : [1]\n\
+                   data : [8]\n\
+               }\n\
+               struct Other {\n\
+                   a : [1]\n\
+                   b : [8]\n\
+               }\n\
+               module M {\n\
+                   reg o : Other = Other{ a: 0, b: 0 }\n\
+                   rule r {\n\
+                       let p = Pair{ data: 5, ..o }\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("`..` base") && e.message.contains("struct Pair")),
+        "expected a base-type-mismatch rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_update_does_not_recurse_into_a_nested_partial_override() {
+    // `..old`'s fill only ever reaches fields THIS literal doesn't name
+    // -- `inner` IS named here (with its own, separately incomplete
+    // literal), so its missing field (`y`) is NOT filled from `old.
+    // inner.y`; it's an ordinary missing-field error on the NESTED
+    // literal, checked independently of the outer `..old` (matching
+    // Rust's own `..` semantics: never a recursive merge).
+    let src = "struct Inner {\n\
+                   x : [8]\n\
+                   y : [8]\n\
+               }\n\
+               struct Outer {\n\
+                   inner : Inner\n\
+                   z : [1]\n\
+               }\n\
+               module M {\n\
+                   reg old : Outer = Outer{ inner: Inner{ x: 0, y: 0 }, z: 0 }\n\
+                   rule r {\n\
+                       let o = Outer{ inner: Inner{ x: 9 }, ..old }\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("missing field") && e.message.contains("y")),
+        "expected the nested literal's own missing-field error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_update_is_rejected_in_a_reg_init() {
+    // `base` isn't a compile-time constant in general (a reg reference's
+    // flat fields aren't known until runtime), so `..` is rejected in a
+    // reg/output init outright rather than silently defaulting the
+    // fields it was meant to supply to 0 (`struct_lit_field_const`'s
+    // `fields.iter().find(...)?` would otherwise return `None`, routed
+    // by `module.rs` through `.unwrap_or(0)` with no error at all).
+    let src = "struct Pair {\n\
+                   valid : [1]\n\
+                   data : [8]\n\
+               }\n\
+               module M {\n\
+                   reg old : Pair = Pair{ valid: 1, data: 0 }\n\
+                   reg p : Pair = Pair{ data: 5, ..old }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("`..` isn't supported in a reg init")),
+        "expected a const-init `..` rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn struct_update_is_rejected_when_nested_inside_a_reg_init() {
+    // The rejection is a WALK, not a top-level-only check: `..` shows up
+    // one level deeper here (inside an explicitly-given field's own
+    // nested literal), still reachable from the reg's init and still
+    // not a compile-time constant.
+    let src = "struct Inner {\n\
+                   x : [8]\n\
+                   y : [8]\n\
+               }\n\
+               struct Outer {\n\
+                   inner : Inner\n\
+                   z : [1]\n\
+               }\n\
+               module M {\n\
+                   reg old_inner : Inner = Inner{ x: 1, y: 2 }\n\
+                   reg o : Outer = Outer{ inner: Inner{ x: 9, ..old_inner }, z: 0 }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("`..` isn't supported in a reg init")),
+        "expected a const-init `..` rejection, got: {errors:?}"
+    );
+}
+
+#[test]
 fn struct_literal_extra_field_is_an_error() {
     let src = "struct Pair {\n\
                    valid : [1]\n\
@@ -890,6 +1019,158 @@ fn nested_option_in_struct_field_type_checks() {
                  ok := fr.maybe.valid\n\
              }\n\
          }\n",
+    );
+}
+
+#[test]
+fn let_destructure_binds_struct_fields_by_name() {
+    // `let {valid, data: d} = p` desugars (parser.rs) into `let valid =
+    // p.valid` + `let d = p.data` -- ordinary field-projection locals.
+    // Naming every field of `p`'s type makes this exhaustive on its own
+    // (no `..` needed) -- see `check_destructures`, types.rs.
+    run_ok(
+        "struct Pair {\n\
+             valid : [1]\n\
+             data : [8]\n\
+         }\n\
+         module M {\n\
+             reg p : Pair = Pair{ valid: 1, data: 5 }\n\
+             out result : [8] = 0\n\
+             rule r {\n\
+                 let {valid, data: d} = p\n\
+                 result := d\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn let_destructure_binds_option_valid_and_data() {
+    run_ok(
+        "module M {\n\
+             reg opt : ?[8] = false\n\
+             out result : [8] = 0\n\
+             rule r {\n\
+                 let {valid, data} = opt\n\
+                 result := data\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn let_destructure_two_options_needs_renaming_to_avoid_shadowing() {
+    // `valid`/`data` are the two field names every `?T` has, so
+    // destructuring two of them in one rule is the actual motivating
+    // case for the rename form -- shorthand alone would silently shadow
+    // the first pair (`let_shadowing_is_allowed`, tests/resolve.rs),
+    // not error, so this pins the escape hatch actually works.
+    run_ok(
+        "module M {\n\
+             reg p : ?[8] = false\n\
+             reg q : ?[8] = false\n\
+             out result : [8] = 0\n\
+             rule r {\n\
+                 let {valid: p_valid, data: p_data} = p\n\
+                 let {valid: q_valid, data: q_data} = q\n\
+                 result := p_data\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn let_destructure_field_typo_reports_the_struct_has_no_such_field() {
+    // A typo'd field name surfaces through the SAME error an equivalent
+    // hand-written `let bind = source.field` would already give, because
+    // that's literally what this desugars to. Also pins the double-error
+    // trap `check_destructures` has to avoid: `vlaid` isn't a real field,
+    // so exhaustiveness-checking against Pair's declared fields would
+    // otherwise ALSO report "missing field(s): valid" alongside the typo
+    // -- self-caught while implementing the exhaustiveness check itself.
+    let src = "struct Pair {\n\
+                   valid : [1]\n\
+                   data : [8]\n\
+               }\n\
+               module M {\n\
+                   reg p : Pair = Pair{ valid: 1, data: 5 }\n\
+                   rule r {\n\
+                       let {vlaid, data} = p\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("has no field `vlaid`")),
+        "expected a field-typo rejection, got: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.message.contains("missing field")),
+        "typo'd field shouldn't ALSO trigger a missing-field error: {errors:?}"
+    );
+}
+
+#[test]
+fn let_destructure_non_exhaustive_without_rest_is_an_error() {
+    // `p` has two fields (`valid`, `data`); naming only one without a
+    // trailing `..` must error -- silently dropping `data` on the floor
+    // is exactly what `..` exists to make an explicit, opt-in choice.
+    let src = "struct Pair {\n\
+                   valid : [1]\n\
+                   data : [8]\n\
+               }\n\
+               module M {\n\
+                   reg p : Pair = Pair{ valid: 1, data: 5 }\n\
+                   rule r {\n\
+                       let {valid} = p\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("missing field(s): data")),
+        "expected a missing-field rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn let_destructure_with_rest_discards_remaining_fields() {
+    // Same non-exhaustive pattern as above, but with a trailing `..` --
+    // an explicit opt-in to discard `data`, so no error.
+    run_ok(
+        "struct Pair {\n\
+             valid : [1]\n\
+             data : [8]\n\
+         }\n\
+         module M {\n\
+             reg p : Pair = Pair{ valid: 1, data: 5 }\n\
+             out result : [1] = 0\n\
+             rule r {\n\
+                 let {valid, ..} = p\n\
+                 result := valid\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn let_destructure_option_non_exhaustive_without_rest_is_an_error() {
+    // Same rule applies to `?T`'s two synthetic fields (`valid`/`data`),
+    // not just user-declared structs.
+    let src = "module M {\n\
+                   reg opt : ?[8] = false\n\
+                   rule r {\n\
+                       let {valid} = opt\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("missing field(s): data")),
+        "expected a missing-field rejection, got: {errors:?}"
     );
 }
 

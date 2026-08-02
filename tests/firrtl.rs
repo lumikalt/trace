@@ -4544,6 +4544,125 @@ module M {
     );
 }
 
+/// `let {valid, data} = source` desugars (parser.rs) into one `let bind
+/// = source.field` per item -- no destructuring-specific rejection
+/// exists, so a destructuring `source` that aliases another struct/
+/// Option value hits this SAME pre-existing guard, for free.
+#[test]
+fn let_destructure_of_an_aliased_option_local_is_rejected() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    out ok : [1] = 0
+    rule r {
+        let o = opt
+        let {valid, data} = o
+        ok := valid
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("not aliased from another `?T` value")),
+        "expected an option-aliasing rejection, got: {err:?}"
+    );
+}
+
+/// End-to-end: `let {valid: p_valid, ...} = p` compiles to real,
+/// firtool-accepted FIRRTL reading straight off `p`'s own flat
+/// `p_valid`/`p_data` registers -- no intermediate wires, since the
+/// desugar's `p.field` projections are ordinary struct-field reads.
+#[test]
+fn let_destructure_compiles_to_a_direct_field_read() {
+    let src = "\
+struct Pair {
+    valid : [1]
+    data : [8]
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 1, data: 5 }
+    out result : [8] = 0
+    rule r {
+        let {valid, data: d} = p
+        result := d
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, p_data"), "{fir}");
+    run_firtool(&fir, &[]);
+}
+
+/// `p := Pair{ data: 5, ..p }` -- updating one field of a reg from its
+/// OWN current value. The untouched field's flat register connects to
+/// ITSELF (`connect p_valid, p_valid`) since `..p`'s fallback reads
+/// straight off `p`'s own flat fields -- confirmed firtool accepts that
+/// self-connect rather than erroring or warning on it (transactional
+/// semantics: a register reads its PRE-edge value combinationally, the
+/// same reasoning `pc := pc + 3` already relies on, so this is a
+/// same-cycle read of `p`'s old value, not a use-after-write).
+#[test]
+fn struct_update_of_a_regs_own_current_value_compiles_and_self_connects() {
+    let src = "\
+struct Pair {
+    valid : [1]
+    data : [8]
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 1, data: 0 }
+    rule go {
+        p := Pair{ data: 5, ..p }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect p_valid, p_valid"), "{fir}");
+    assert!(fir.contains("connect p_data, UInt<8>(5)"), "{fir}");
+    run_firtool(&fir, &[]);
+}
+
+/// The read `..base` contributes MUST reach the scheduler
+/// (`infer_expr`, effects.rs) -- isolated from the write side entirely:
+/// `copy_from_p` never writes `p` at all, only reads it through `..p`,
+/// so if that read weren't recorded, `write_p` (an unconditional write
+/// to `p`) would show no conflict and both would fire the same cycle,
+/// a real hazard invisible without checking the schedule. Self-caught
+/// before considering this feature done -- `effects.rs`'s two
+/// `Expr::StructLit` walkers don't destructure `base` by name (only
+/// `..`-wildcard it), so the compiler doesn't force this site the way
+/// adding a new `Expr` variant would.
+#[test]
+fn struct_update_spread_registers_as_a_read_for_scheduling() {
+    let src = "\
+struct Pair {
+    valid : [1]
+    data : [8]
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 1, data: 0 }
+    reg q : Pair = Pair{ valid: 0, data: 0 }
+
+    rule copy_from_p {
+        q := Pair{ data: 5, ..p }
+    }
+
+    rule write_p {
+        p := Pair{ valid: 1, data: 9 }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(
+        fir.contains("node fires_write_p = and(UInt<1>(1), not(fires_copy_from_p))"),
+        "expected write_p gated mutually exclusive with copy_from_p's read of p:\n{fir}"
+    );
+    run_firtool(&fir, &[]);
+}
+
 /// A struct-typed fn param resolves a REG-typed argument -- the
 /// actually-useful case, not just a literal -- by chasing through the
 /// param binding to the reg's own flat field registers

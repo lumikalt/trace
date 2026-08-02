@@ -6,8 +6,8 @@
 //! (or closing brace) and parsing continues, so one typo reports once.
 
 use crate::ast::{
-    Ast, BinOp, Effect, Expr, ExprId, FnKind, Item, ItemId, Name, Param, ScheduleDirective, Stmt,
-    StmtId, UnOp,
+    Ast, BinOp, Destructure, Effect, Expr, ExprId, FnKind, Item, ItemId, Name, Param,
+    ScheduleDirective, Stmt, StmtId, UnOp,
 };
 use crate::lexer::{Span, Token, TokenKind};
 
@@ -24,6 +24,10 @@ pub struct ParseError {
     pub span: Span,
     pub message: String,
 }
+
+/// `parse_struct_lit_fields`'s own return shape: the explicit `field:
+/// expr` list, plus a trailing `..base` if present.
+type StructLitFields = (Vec<(String, ExprId)>, Option<ExprId>);
 
 pub fn parse(src: &str, tokens: &[Token]) -> (Ast, Vec<ParseError>) {
     let mut parser = Parser {
@@ -107,6 +111,10 @@ impl<'a> Parser<'a> {
 
     fn peek(&self) -> Option<TokenKind> {
         self.tokens.get(self.pos).map(|t| t.kind)
+    }
+
+    fn peek_nth(&self, n: usize) -> Option<TokenKind> {
+        self.tokens.get(self.pos + n).map(|t| t.kind)
     }
 
     fn at(&self, kind: TokenKind) -> bool {
@@ -757,6 +765,20 @@ impl<'a> Parser<'a> {
                 self.expect_terminator();
                 Stmt::Tick
             }
+            // `let {field, field: bind, ...} = source` — struct/`?T`
+            // destructuring, sugar for one `let bind = source.field` per
+            // item (`parse_let_destructure`, below). Bare-brace, not
+            // `let StructName{...} = source` (Rust's own spelling): the
+            // parser has no type information to validate a struct name
+            // against `source`'s actual type, and text that READS like an
+            // assertion but isn't checked is exactly the kind of sharp
+            // edge this codebase avoids elsewhere (see `list[T]`'s own
+            // bare-identifier ambiguity, types.rs). `{` here can only
+            // mean this — `let` never has a block-shaped RHS otherwise.
+            Some(Let) if self.peek_nth(1) == Some(LBrace) => {
+                self.bump();
+                return self.parse_let_destructure(lo);
+            }
             Some(Let) => {
                 self.bump();
                 let name = self.expect_ident("binding name")?;
@@ -814,6 +836,135 @@ impl<'a> Parser<'a> {
         let id = self.ast.push_stmt(stmt, lo..self.prev_end);
         let mut out = vec![id];
         out.extend(extra_guard);
+        Some(out)
+    }
+
+    /// `let {field, field: bind, ...} = source` — one `let bind =
+    /// source.field` per item, in written order (dispatched here with
+    /// `{` not yet consumed). `source` is restricted to a bare
+    /// identifier (a reg/local/param reference), not a general
+    /// expression: a call there would desugar to one re-evaluation per
+    /// destructured field (`SomeCall().a`, `SomeCall().b`), silently
+    /// duplicating whatever the callee's body does instead of binding
+    /// one shared result — sidestepped by requiring the simple case
+    /// syntactically rather than chasing which call shapes are actually
+    /// safe to duplicate. Each synthetic `Stmt::Let` gets its OWN fresh
+    /// `Expr::Ident(source)` (never one shared base `ExprId` reused
+    /// across multiple `Expr::Field` parents), so the AST stays a tree —
+    /// every existing walker (`sub_exprs`, `collect_calls`, `collect_
+    /// fifo_ops`, `infer_expr`) assumes that shape; a shared
+    /// subexpression would make it a DAG instead. No nested
+    /// destructuring (`{maybe: {valid}}`) and no `..rest` — single-level
+    /// field projection only. The struct/`?T`'s actual field names are
+    /// validated for free by ordinary `.field` type-checking on each
+    /// projection, the same error a hand-written `let bind = source.
+    /// field` would already give for a typo — this desugar adds no
+    /// validation of its own.
+    fn parse_let_destructure(&mut self, lo: usize) -> Option<Vec<StmtId>> {
+        self.bump(); // `{`
+        self.skip_newlines();
+        let mut items: Vec<(Name, Name)> = Vec::new();
+        let mut has_rest = false;
+        while !self.at(TokenKind::RBrace) {
+            // `..`, same trailing-only rule struct update's `..base`
+            // has, minus a base identifier — this is a pattern
+            // discarding fields, not a value spreading them from
+            // somewhere, so there's nothing to name after it.
+            if self.eat(TokenKind::DotDot) {
+                has_rest = true;
+                self.skip_newlines();
+                if !self.at(TokenKind::RBrace) {
+                    self.error_here(
+                        "`..` must be the last item in a destructuring pattern -- no \
+                         field may follow it"
+                            .to_string(),
+                    );
+                    self.sync();
+                    return None;
+                }
+                break;
+            }
+            let field = self.expect_ident("field name")?;
+            let bind = if self.eat(TokenKind::Colon) {
+                self.expect_ident("binding name")?
+            } else {
+                field.clone()
+            };
+            items.push((field, bind));
+            self.skip_newlines();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            self.skip_newlines();
+        }
+        self.expect(TokenKind::RBrace, "`}` closing a destructuring pattern")
+            .ok()?;
+        self.expect(TokenKind::Eq, "`=` after a destructuring pattern")
+            .ok()?;
+        let source = self.expect_ident(
+            "a plain reference to destructure (a reg/local/param name, not a general expression)",
+        )?;
+        // A dedicated check, not a bare `expect_terminator()`: anything
+        // trailing the identifier (`(`, `.`, `[`, ...) means the source
+        // wasn't actually a bare reference, and `expect_terminator`'s own
+        // generic "expected end of statement" wouldn't say why that
+        // matters here.
+        match self.peek() {
+            Some(TokenKind::Newline) | Some(TokenKind::Semi) => {
+                self.bump();
+            }
+            Some(TokenKind::RBrace) | None => {}
+            _ => {
+                self.error_here(
+                    "a destructuring source must be a plain reference (a reg/local/param \
+                     name), not a call/field access/other expression; bind it with an \
+                     ordinary `let` first, then destructure that"
+                        .to_string(),
+                );
+                self.sync();
+                return None;
+            }
+        }
+        let mut out = Vec::with_capacity(items.len());
+        let mut source_field_base = None;
+        for (field, bind) in &items {
+            let base = self
+                .ast
+                .push_expr(Expr::Ident(source.text.clone()), source.span.clone());
+            source_field_base.get_or_insert(base);
+            let value = self.ast.push_expr(
+                Expr::Field {
+                    base,
+                    name: field.text.clone(),
+                },
+                field.span.clone(),
+            );
+            let span = field.span.start..bind.span.end;
+            out.push(self.ast.push_stmt(
+                Stmt::Let {
+                    name: bind.clone(),
+                    init: value,
+                },
+                span,
+            ));
+        }
+        // Exhaustiveness (every field of `source`'s type named, or `..`
+        // present) needs `source`'s resolved type, which the parser
+        // doesn't have — deferred to types.rs (`check_destructures`),
+        // which can read it back out of `expr_tys` once `source_field_
+        // base` above has been type-checked as an ordinary part of the
+        // body walk. Skipped for a zero-item pattern (`let {} = s` /
+        // `let {..} = s`): there's no per-item base left to hang the
+        // lookup off, and "bind/discard nothing" can't miss a field
+        // either way.
+        if let Some(source_field_base) = source_field_base {
+            self.ast.destructures.push(Destructure {
+                span: lo..self.prev_end,
+                source_field_base,
+                named_fields: items.into_iter().map(|(field, _)| field).collect(),
+                has_rest,
+            });
+        }
         Some(out)
     }
 
@@ -1095,10 +1246,15 @@ impl<'a> Parser<'a> {
                             && self.at_struct_lit_open() =>
                     {
                         self.bump(); // `{`
-                        let fields = self.parse_struct_lit_fields()?;
-                        lhs = self
-                            .ast
-                            .push_expr(Expr::StructLit { name: lhs, fields }, lo..self.prev_end);
+                        let (fields, base) = self.parse_struct_lit_fields()?;
+                        lhs = self.ast.push_expr(
+                            Expr::StructLit {
+                                name: lhs,
+                                fields,
+                                base,
+                            },
+                            lo..self.prev_end,
+                        );
                         continue;
                     }
                     Question => {
@@ -1216,12 +1372,13 @@ impl<'a> Parser<'a> {
 
     /// Whether the CURRENT `{` (not yet consumed) opens a struct
     /// literal: the very next two tokens must be `ident :` — specifically
-    /// `Colon`, not `ColonEq`. No statement in this language starts with
-    /// a bare `ident :`, so this never collides with genuine block
-    /// content (see the postfix `LBrace` arm's own comment for the
-    /// motivating `if ready { x := 1 }` case). An empty literal (`Pair{}`)
-    /// isn't recognized by this lookahead — a v0 non-goal, not a
-    /// deliberate rejection.
+    /// `Colon`, not `ColonEq` — or a leading `..` (a literal that's
+    /// nothing but a spread, `Pair{ ..old }`). No statement in this
+    /// language starts with a bare `ident :` or `..`, so neither collides
+    /// with genuine block content (see the postfix `LBrace` arm's own
+    /// comment for the motivating `if ready { x := 1 }` case). An empty
+    /// literal (`Pair{}`) isn't recognized by this lookahead — a v0
+    /// non-goal, not a deliberate rejection.
     fn at_struct_lit_open(&self) -> bool {
         // The opening `{` may be followed by a newline before the first
         // field (a multi-line literal, `parse_struct_lit_fields`'s own
@@ -1233,20 +1390,57 @@ impl<'a> Parser<'a> {
         while matches!(self.tokens.get(i).map(|t| t.kind), Some(TokenKind::Newline)) {
             i += 1;
         }
-        matches!(self.tokens.get(i).map(|t| t.kind), Some(TokenKind::Ident))
-            && matches!(
-                self.tokens.get(i + 1).map(|t| t.kind),
-                Some(TokenKind::Colon)
-            )
+        matches!(self.tokens.get(i).map(|t| t.kind), Some(TokenKind::DotDot))
+            || (matches!(self.tokens.get(i).map(|t| t.kind), Some(TokenKind::Ident))
+                && matches!(
+                    self.tokens.get(i + 1).map(|t| t.kind),
+                    Some(TokenKind::Colon)
+                ))
     }
 
-    /// The `{ field: expr, ... }` tail of a struct literal, with the
-    /// opening `{` already consumed — same comma-separated-with-
-    /// newlines convention `parse_args` uses.
-    fn parse_struct_lit_fields(&mut self) -> Option<Vec<(String, ExprId)>> {
+    /// The `{ field: expr, ..., ..base }` tail of a struct literal, with
+    /// the opening `{` already consumed — same comma-separated-with-
+    /// newlines convention `parse_args` uses, plus a trailing `..base`
+    /// (Rust's own spelling: `..` may only be the LAST item, no comma
+    /// after it). `base` is required to be a bare identifier — a general
+    /// expression would need re-evaluating once per field `..base`
+    /// supplies, silently duplicating a call the same way an
+    /// unrestricted destructuring source would (see `Expr::StructLit`'s
+    /// own doc comment, ast.rs) — enforced here with `expect_ident`
+    /// directly rather than parsing a full expression and rejecting its
+    /// shape after the fact.
+    fn parse_struct_lit_fields(&mut self) -> Option<StructLitFields> {
         let mut fields = Vec::new();
+        let mut base = None;
         self.skip_newlines();
         while !self.at(TokenKind::RBrace) {
+            if self.eat(TokenKind::DotDot) {
+                let name = self.expect_ident(
+                    "a plain reference to spread (a reg/local/param name, not a general \
+                     expression)",
+                )?;
+                self.skip_newlines();
+                // A dedicated check, not a bare `expect(RBrace, ...)`:
+                // anything trailing the identifier (`(`, `.`, `[`, a
+                // comma for a second field after `..base`, ...) means
+                // either `base` wasn't actually a bare reference, or
+                // `..base` wasn't the LAST item (Rust's own rule) —
+                // the generic "expected `}`" wouldn't say why either
+                // one matters here.
+                if !self.at(TokenKind::RBrace) {
+                    self.error_here(
+                        "`..base` must be a plain reference and the LAST item in a struct \
+                         literal -- no field/another `..` may follow it, and `base` can't \
+                         be a call/field access/other expression; bind it with an ordinary \
+                         `let` first, then spread that"
+                            .to_string(),
+                    );
+                    self.sync();
+                    return None;
+                }
+                base = Some(self.ast.push_expr(Expr::Ident(name.text), name.span));
+                break;
+            }
             let fname = self.expect_ident("field name")?;
             self.expect(TokenKind::Colon, "`:` before field value")
                 .ok()?;
@@ -1259,7 +1453,7 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
         }
         self.expect(TokenKind::RBrace, "`}`").ok()?;
-        Some(fields)
+        Some((fields, base))
     }
 }
 

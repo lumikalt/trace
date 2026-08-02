@@ -444,9 +444,19 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Expr::StructLit { fields, .. } => {
+            Expr::StructLit { fields, base, .. } => {
                 for (_, value) in fields {
                     self.infer_expr(*value, sig);
+                }
+                // `..base` reads every field `fields` doesn't name off
+                // `base` -- omitting this walk would silently drop
+                // `base` from `sig.reads`, so `p := Pair{ x: 1, ..p }`
+                // wouldn't register as reading `p` at all, and the
+                // scheduler could then let another rule write `p`
+                // concurrently: wrong hardware, not just a missing
+                // feature, and invisible without simulating.
+                if let Some(base) = base {
+                    self.infer_expr(*base, sig);
                 }
             }
             // Type-position only (`?T`); never appears in a rule/fn
@@ -689,9 +699,12 @@ impl<'a> Checker<'a> {
                     self.check_expr(alt, item, sig, elab);
                 }
             }
-            Expr::StructLit { fields, .. } => {
+            Expr::StructLit { fields, base, .. } => {
                 for (_, value) in fields {
                     self.check_expr(value, item, sig, elab);
+                }
+                if let Some(base) = base {
+                    self.check_expr(base, item, sig, elab);
                 }
             }
             Expr::Ident(_)

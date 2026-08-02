@@ -142,6 +142,12 @@ pub struct TypeError {
 /// stabilize; hitting the cap means widths grow without bound.
 const WIDEN_CAP: usize = 50;
 
+/// The two synthetic field names every `?T` value has — shared between
+/// the `.field`-read arm (`Ty::Option` case, below) and the
+/// destructuring exhaustiveness check (`declared_fields`), so a future
+/// change to `?T`'s shape only has one array to update.
+const OPTION_FIELDS: [&str; 2] = ["valid", "data"];
+
 pub fn check(ast: &Ast, res: &Resolution) -> (Types, Vec<TypeError>) {
     let mut checker = TypeChecker {
         ast,
@@ -161,6 +167,12 @@ pub fn check(ast: &Ast, res: &Resolution) -> (Types, Vec<TypeError>) {
     checker.collect_state();
     checker.collect_module_ports();
     checker.check_all();
+    // Runs last: needs every body's `expr_tys` already populated (see
+    // `Destructure::source_field_base`'s own doc comment, ast.rs), and
+    // runs exactly once (unlike a rule/fn body's own fixpoint re-typing,
+    // there's nothing here to re-stabilize), so there's no risk of the
+    // widening loop's usual double-emit problem.
+    checker.check_destructures();
     (checker.types, checker.errors)
 }
 
@@ -223,6 +235,16 @@ impl<'a> TypeChecker<'a> {
                         self.error(span, format!("a reg holds bits or a struct, not {ty}"));
                     }
                     if let Some(init) = init {
+                        if self.contains_struct_update(init) {
+                            self.error(
+                                self.expr_span(init),
+                                "`..` isn't supported in a reg init (v0 restriction): a \
+                                 reg's reset value must be fully explicit, not composed \
+                                 from an existing value's fields; give every field \
+                                 directly instead"
+                                    .to_string(),
+                            );
+                        }
                         // A struct- or Option-typed init is a real
                         // expression tree (missing/extra/mistyped
                         // fields, `false`/coerced-present, not just a
@@ -296,6 +318,16 @@ impl<'a> TypeChecker<'a> {
                         self.error(span, format!("an output holds bits or a struct, not {ty}"));
                     }
                     if let Some(init) = init {
+                        if self.contains_struct_update(init) {
+                            self.error(
+                                self.expr_span(init),
+                                "`..` isn't supported in an output init (v0 restriction): \
+                                 an output's reset value must be fully explicit, not \
+                                 composed from an existing value's fields; give every \
+                                 field directly instead"
+                                    .to_string(),
+                            );
+                        }
                         if matches!(ty, Ty::Struct { .. } | Ty::Option(_))
                             || matches!(self.ast.expr(init), Expr::Absent | Expr::Optional(_))
                         {
@@ -367,6 +399,73 @@ impl<'a> TypeChecker<'a> {
             self.types.struct_fields.insert(struct_def, field_tys);
         }
         self.check_struct_cycles();
+        self.emit = false;
+    }
+
+    /// The full field-name list a struct/`?T` type declares, for the
+    /// destructuring exhaustiveness check below -- `None` for anything
+    /// else (`Ty::Unknown` from an earlier type error, or a plain
+    /// `bits[N]`/other value, which the per-item `.field` projection
+    /// already rejects on its own; nothing more to say here).
+    fn declared_fields(&self, ty: &Ty) -> Option<Vec<String>> {
+        match ty {
+            Ty::Struct { def, .. } => self
+                .types
+                .struct_fields
+                .get(def)
+                .map(|fields| fields.iter().map(|(name, _)| name.clone()).collect()),
+            Ty::Option(_) => Some(OPTION_FIELDS.iter().map(|s| s.to_string()).collect()),
+            _ => None,
+        }
+    }
+
+    /// `let {a, c} = s` must either name every field `s`'s type
+    /// declares, or end in `..` to explicitly discard the rest (see
+    /// `Destructure`, ast.rs) -- mirrors `Expr::StructLit`'s own
+    /// missing-field check on the construction side, so both directions
+    /// are exhaustive-by-default the same way, `..`/`..base` the
+    /// matching opt-out on each. Runs once, at the very end of
+    /// `check()`, after every body's `expr_tys` is fully populated.
+    fn check_destructures(&mut self) {
+        self.emit = true;
+        let ast = self.ast;
+        for group in &ast.destructures {
+            let Some(source_ty) = self.types.expr_tys.get(&group.source_field_base).cloned() else {
+                continue;
+            };
+            let Some(declared) = self.declared_fields(&source_ty) else {
+                continue;
+            };
+            // A named field that isn't real already got its own "no
+            // field `x`" error from the per-item `.field` projection --
+            // don't also pile on a likely-spurious "missing field(s)"
+            // for what's probably just a typo (self-caught: `let
+            // {vlaid, data} = p` briefly reported both).
+            if !group
+                .named_fields
+                .iter()
+                .all(|f| declared.contains(&f.text))
+            {
+                continue;
+            }
+            if group.has_rest {
+                continue;
+            }
+            let missing: Vec<&str> = declared
+                .iter()
+                .filter(|d| !group.named_fields.iter().any(|f| &f.text == *d))
+                .map(|d| d.as_str())
+                .collect();
+            if !missing.is_empty() {
+                self.error(
+                    group.span.clone(),
+                    format!(
+                        "missing field(s): {} -- name them, or add `..` to discard the rest",
+                        missing.join(", ")
+                    ),
+                );
+            }
+        }
         self.emit = false;
     }
 
@@ -992,6 +1091,29 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Whether `id` reaches a `Pair{ ..base }`-shaped struct literal
+    /// anywhere in its own tree — used to reject `..` in a reg/output
+    /// INIT (a compile-TIME constant position, see `option_lit_field_
+    /// const`/`struct_lit_field_const`, firrtl/mod.rs), where `base`
+    /// would need to be a compile-time constant itself and generally
+    /// isn't (a reg reference's flat fields aren't known until runtime).
+    /// A walk, not a top-level-only check: `Outer{ inner: Inner{ ..old },
+    /// x: 1 }` nests a `..` inside an explicitly-given field's own
+    /// literal, still unreachable from a const-eval. Left unrejected,
+    /// `struct_lit_field_const`'s existing `fields.iter().find(...)?`
+    /// would return `None` for every field `..base` was meant to supply
+    /// — routed by its caller (`module.rs`) through `.unwrap_or(0)`, a
+    /// silent zero reset with no error at all, the exact same class of
+    /// bug `optional opt1`'s aliasing rejection closed for `?T`.
+    fn contains_struct_update(&self, id: ExprId) -> bool {
+        if let Expr::StructLit { base: Some(_), .. } = self.ast.expr(id) {
+            return true;
+        }
+        crate::lower::sub_exprs(self.ast, id)
+            .into_iter()
+            .any(|child| self.contains_struct_update(child))
+    }
+
     /// A constant written into `[w]` must fit in `w` bits.
     fn check_literal_fits(&mut self, value: ExprId, target: &Ty) {
         if let Ty::Bits(Width::Known(w)) = target
@@ -1270,10 +1392,8 @@ impl<'a> TypeChecker<'a> {
                         // fail (`opt?`'s job) — the non-failing
                         // alternative `if opt.valid { ...opt.data... }
                         // else { ... }` gives.
-                        Ty::Option(inner) => match name.as_str() {
-                            "valid" => Ty::Bits(Width::Known(1)),
-                            "data" => *inner,
-                            _ => {
+                        Ty::Option(inner) => {
+                            if !OPTION_FIELDS.contains(&name.as_str()) {
                                 self.error(
                                     self.expr_span(id),
                                     format!(
@@ -1282,8 +1402,12 @@ impl<'a> TypeChecker<'a> {
                                     ),
                                 );
                                 Ty::Unknown
+                            } else if name == "valid" {
+                                Ty::Bits(Width::Known(1))
+                            } else {
+                                *inner
                             }
-                        },
+                        }
                         Ty::Unknown => Ty::Unknown,
                         other => {
                             self.error(
@@ -1355,19 +1479,27 @@ impl<'a> TypeChecker<'a> {
                 }
                 elem
             }
-            // `Name { field: expr, ... }` — v0 requires an EXHAUSTIVE,
-            // one-shot field list (matching Rust's own struct-literal
-            // rule): no defaults exist yet for a missing field, and a
-            // duplicate is almost certainly a typo, not a deliberate
-            // "last one wins" overwrite. A bad struct NAME (unresolved,
-            // or resolved to something that isn't `DefKind::Struct`) is
+            // `Name { field: expr, ..., ..base }` — v0 requires either an
+            // EXHAUSTIVE, one-shot field list (matching Rust's own
+            // struct-literal rule: no defaults for a field this literal
+            // doesn't mention) or a trailing `..base` supplying every
+            // field this literal DOESN'T name — never both partially:
+            // `base` fills whatever's absent from THIS literal's own
+            // list, it does not recurse into a nested struct/Option
+            // field that's itself only partially given. A duplicate
+            // field is almost certainly a typo, not a deliberate "last
+            // one wins" overwrite. A bad struct NAME (unresolved, or
+            // resolved to something that isn't `DefKind::Struct`) is
             // already reported by resolve.rs — this stays defensive
             // (`Ty::Unknown`, no second error) rather than re-checking
             // the same thing.
-            Expr::StructLit { name, fields } => {
+            Expr::StructLit { name, fields, base } => {
                 let Some(&struct_def) = self.res.expr_defs.get(&name) else {
                     for (_, value) in &fields {
                         self.type_expr(*value, locals);
+                    }
+                    if let Some(base) = base {
+                        self.type_expr(base, locals);
                     }
                     return Ty::Unknown;
                 };
@@ -1378,6 +1510,9 @@ impl<'a> TypeChecker<'a> {
                 let Some(declared) = self.types.struct_fields.get(&struct_def).cloned() else {
                     for (_, value) in &fields {
                         self.type_expr(*value, locals);
+                    }
+                    if let Some(base) = base {
+                        self.type_expr(base, locals);
                     }
                     return Ty::Unknown;
                 };
@@ -1410,24 +1545,34 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                 }
-                let missing: Vec<&str> = declared
-                    .iter()
-                    .map(|(dname, _)| dname.as_str())
-                    .filter(|dname| !seen.contains_key(*dname))
-                    .collect();
-                if !missing.is_empty() {
-                    self.error(
-                        self.expr_span(id),
-                        format!(
-                            "struct `{struct_name}` literal is missing field(s): {}",
-                            missing.join(", ")
-                        ),
-                    );
-                }
-                Ty::Struct {
+                let result = Ty::Struct {
                     def: struct_def,
-                    name: struct_name,
+                    name: struct_name.clone(),
+                };
+                match base {
+                    Some(base) => {
+                        let base_ty = self.type_expr(base, locals);
+                        self.check_assignable(&base_ty, &result, self.expr_span(base), "`..` base");
+                    }
+                    None => {
+                        let missing: Vec<&str> = declared
+                            .iter()
+                            .map(|(dname, _)| dname.as_str())
+                            .filter(|dname| !seen.contains_key(*dname))
+                            .collect();
+                        if !missing.is_empty() {
+                            self.error(
+                                self.expr_span(id),
+                                format!(
+                                    "struct `{struct_name}` literal is missing field(s): {} \
+                                     -- give them explicitly, or add `..base`",
+                                    missing.join(", ")
+                                ),
+                            );
+                        }
+                    }
                 }
+                result
             }
             // `?T` has no meaning as a VALUE expression, only a type
             // (`eval_ty`'s own `Expr::OptionTy` arm handles it there) —

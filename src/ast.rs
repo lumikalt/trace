@@ -175,6 +175,20 @@ pub enum Expr {
     StructLit {
         name: ExprId,
         fields: Vec<(String, ExprId)>,
+        /// `..base` — trailing-only (Rust's own spelling), fills every
+        /// field NOT named in `fields` from `base`'s own same-named
+        /// field, one flat register read each (`compile_struct_field_
+        /// read`, expr.rs) — never a recursive merge into a nested
+        /// struct/Option field that's itself only partially given
+        /// (`Pair{ inner: Inner{ x: 1 }, ..old }` does NOT reach into
+        /// `inner`'s own missing fields, matching Rust's `..` exactly:
+        /// it only ever fills fields absent from THIS literal's own
+        /// list). `base` is restricted to a bare `Expr::Ident` — parser-
+        /// enforced (`parse_struct_lit_fields`), not just documented —
+        /// a general expression would need re-evaluating once per
+        /// missing field, silently duplicating a call the same way an
+        /// unrestricted `let {..} = source` destructuring source would.
+        base: Option<ExprId>,
     },
     /// `?T` in a type position — sugar for a compiler-synthesized struct
     /// `{ valid: bit, data: T }` (`Ty::Option`, types.rs). `inner` is
@@ -342,6 +356,38 @@ pub struct Ast {
     pub item_spans: Vec<Span>,
     /// Top-level items in source order.
     pub roots: Vec<ItemId>,
+    /// One entry per `let {...} = source` destructuring pattern parsed
+    /// (see `parser::parse_let_destructure`). Kept as a side list rather
+    /// than a real `Stmt`/`Expr` variant: unlike `Expr::Optional` or
+    /// struct update's `base`, no downstream pass (resolve/effects/
+    /// elaborate/lower/firrtl) needs to know a run of `Stmt::Let`s came
+    /// from a destructuring pattern — they're ordinary lets over
+    /// `Expr::Field` projections either way, and forgetting to consult
+    /// this list anywhere but types.rs only means a missing diagnostic,
+    /// never wrong hardware.
+    pub destructures: Vec<Destructure>,
+}
+
+/// Metadata for one `let {...} = source` destructuring pattern, consumed
+/// only by types.rs's exhaustiveness check (`TypeChecker::check_
+/// destructures`).
+#[derive(Debug, Clone)]
+pub struct Destructure {
+    /// The whole `let {...} = source` statement's span, for the
+    /// exhaustiveness error.
+    pub span: Span,
+    /// One item's synthesized `Expr::Field { base, .. }` base — already
+    /// type-checked as part of the ordinary per-statement walk (each
+    /// item's `Stmt::Let` types its own `init`, which recurses into
+    /// `base`), so types.rs can read `source`'s type back out of
+    /// `expr_tys` after the fact instead of re-typing it separately
+    /// (which would need its own, easy-to-get-wrong copy of whatever
+    /// `locals` snapshot was live at this exact point in the body).
+    pub source_field_base: ExprId,
+    /// Field names the pattern actually named (not their bind names).
+    pub named_fields: Vec<Name>,
+    /// Whether the pattern ended in a trailing `..`.
+    pub has_rest: bool,
 }
 
 impl Ast {
@@ -425,10 +471,13 @@ impl Ast {
                 out.push(')');
                 out
             }
-            Expr::StructLit { name, fields } => {
+            Expr::StructLit { name, fields, base } => {
                 let mut out = format!("(struct {}", self.expr_sexpr(*name));
                 for (fname, fexpr) in fields {
                     out.push_str(&format!(" ({fname} {})", self.expr_sexpr(*fexpr)));
+                }
+                if let Some(base) = base {
+                    out.push_str(&format!(" (.. {})", self.expr_sexpr(*base)));
                 }
                 out.push(')');
                 out

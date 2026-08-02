@@ -716,6 +716,32 @@ that directly or transitively contains itself (`struct A { b : B }` /
 caught before it ever reaches flattening (see "Struct emission" under Part
 2), not a stack overflow.
 
+`Name{ field: value, ..., ..base }` — struct update — fills every field this
+literal DOESN'T name from `base`'s own same-named field instead of erroring
+"missing field(s)":
+
+```trace
+p := Pair{ data: 5, ..p }   -- keep valid, change data
+```
+
+`base` reads directly off `base`'s own flat fields (`compile_struct_field_
+read`), so it's restricted to a bare reference (a reg/local/param name), not
+a general expression — a call there would need re-evaluating once per field
+`..base` supplies, silently duplicating whatever the callee's body does.
+`..` may only be the LAST item (Rust's own rule) and only ever fills fields
+THIS literal's own list doesn't name — it never recurses into a nested
+struct/Option field that's itself only partially given (`Pair{ inner:
+Inner{ x: 1 }, ..old }` does NOT reach into `inner`'s own missing fields;
+write your own nested `..` there if you want that). `base` must be the exact
+same struct type being constructed. Not supported in a reg/output INIT: v0
+requires a reg/output's reset value be a fully-explicit compile-time
+constant, and `base`'s own flat fields generally aren't known until runtime.
+
+Struct destructuring — `let {field, field: bind, ...} = source` binding
+several fields into fresh locals in one statement — is documented under
+"Locals" below; both it and struct update are pure sugar over the same
+`.field` projection machinery, not new capabilities of their own.
+
 v0 restrictions, all enforced as clean compile-time errors rather than left to
 miscompile: a field's type must be `[N]`, another struct, or `?T` (no
 `list`, no fifo/mem); a struct has no per-field write — `p.field := x` is rejected,
@@ -723,7 +749,9 @@ assign the whole value instead (`p := Pair{...}`, same restriction a `spawn`
 handle's `.result`/`.done` fields already have); a struct-typed write's
 right-hand side must itself be a struct literal, not another struct-typed
 value (`p := q` between two struct-typed regs is rejected, not silently
-compiled to a frozen register); a struct-typed fn/rule param IS supported —
+compiled to a frozen register — `p := Pair{ ..q }` is the supported way to
+copy every field from `q`, field by field, not a loophole around this
+restriction); a struct-typed fn/rule param IS supported —
 an argument may be a struct literal or a reg/another same-typed param,
 resolved by chasing through the alias to its flat fields (see "Calling a
 function from a rule" below) — and a struct-typed RETURN is too: a callee's
@@ -736,10 +764,6 @@ submodule is rejected
 (its target module flattens the port to N real ports internally, see
 "Struct emission" under Part 2 — wiring it from outside by its bare name has
 no way to reach those).
-
-Struct destructuring (binding several locals from one struct value in a
-single statement) is a natural follow-on but not yet implemented — see
-TODO.md.
 
 ## Option types
 
@@ -938,6 +962,60 @@ longer declare a local at all, the classic mistake this check used to catch
 fn has no lexical access to it at all (modules share no state with each
 other) — is now caught earlier and more precisely, as a plain "cannot find
 `log`" error at the `:=` itself, before this unread-local check ever runs.
+
+`let {field, field: bind, ...} = source` destructures several fields of a
+struct or `?T` value into fresh locals in one statement, instead of one
+`let bind = source.field` projection per field:
+
+```trace
+let {valid, data: d} = opt   -- sugar for:
+-- let valid = opt.valid
+-- let d = opt.data
+```
+
+Bare-brace, not Rust's `let StructName{...} = source` — the parser has no
+type information at this point to validate a struct name against
+`source`'s actual type, and unchecked text that reads like an assertion is
+exactly the kind of sharp edge this codebase avoids elsewhere. Mostly
+sugar: `parse_stmt` expands it into ordinary `Stmt::Let` nodes at parse
+time (the same "one source statement, several AST statements" shape
+`tick <expr>` already uses), so no other pass needs to know destructuring
+exists — each field's `.field` projection is type-checked, resolved, and
+emitted exactly as if hand-written, which means every existing
+restriction applies for free, with its existing error message: a typo'd
+field name is "struct `Pair` has no field `vlaid`", and destructuring a
+LOCAL that itself aliases another struct/Option value hits the same "not
+aliased from another value" rejection an equivalent hand-written
+projection would. `source` must be a bare reference (a reg/local/param
+name) — a call there would desugar to one re-evaluation of the call per
+destructured field (`Make().a`, `Make().b`), silently duplicating
+whatever the callee's body does instead of binding one shared result;
+bind it with an ordinary `let` first, then destructure that. No nested
+destructuring (`{maybe: {valid}}`) — single-level field projection only.
+`field: bind` renaming exists because `valid`/`data` are the two field
+names every `?T` has: destructuring two `?T` values in one rule needs it
+to avoid the second silently shadowing the first (`let` rebinding a name
+is legal, not an error — see above).
+
+Exhaustive by default, the same way struct construction is: every field
+of `source`'s type must be named, or the pattern must end in a trailing
+`..` to explicitly discard the rest (`let {valid, ..} = opt` skips
+`data`) — naming only some fields with no `..` is a compile-time error
+("missing field(s): data — name them, or add `..` to discard the rest"),
+`..`'s escape-hatch mirroring construction's own `..base` spread. Unlike
+the rest of destructuring, this one piece can't stay pure parser sugar —
+knowing whether a pattern is exhaustive needs `source`'s resolved type,
+which the parser doesn't have. The parser instead records each pattern's
+named fields and rest-flag in a side list on `Ast` (`Destructure`,
+ast.rs) — not a new `Stmt`/`Expr` variant, since unlike `Expr::Optional`
+or struct update's `base` field, no downstream pass (resolve/effects/
+elaborate/lower/firrtl) needs to know a run of `Stmt::Let`s came from a
+destructuring pattern at all; only types.rs reads the side list, once,
+at the very end of `check()`, by which point every body's field types
+are already known. A named field that doesn't actually exist on
+`source`'s type is left to its own "no field `x`" error rather than
+also reported missing — `let {vlaid, data} = p` on a two-field struct
+reports the typo once, not the typo AND a bogus "missing `valid`".
 
 ## Calling a function from a rule
 

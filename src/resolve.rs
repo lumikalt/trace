@@ -776,7 +776,7 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(alt, in_type);
                 }
             }
-            Expr::StructLit { name, fields } => {
+            Expr::StructLit { name, fields, base } => {
                 self.resolve_expr(name, in_type);
                 if let Some(def) = self.res.expr_defs.get(&name).copied()
                     && self.res.def(def).kind != DefKind::Struct
@@ -792,6 +792,9 @@ impl<'a> Resolver<'a> {
                 }
                 for (_, value) in fields {
                     self.resolve_expr(value, in_type);
+                }
+                if let Some(base) = base {
+                    self.resolve_expr(base, in_type);
                 }
             }
             // `?T`'s `T` is unconditionally a type position, regardless

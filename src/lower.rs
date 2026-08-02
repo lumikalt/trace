@@ -1207,9 +1207,10 @@ pub(crate) fn sub_exprs(ast: &Ast, id: ExprId) -> Vec<ExprId> {
         Expr::ListLit(items) => items,
         Expr::Range { lo, hi } => [lo, hi].into_iter().flatten().collect(),
         Expr::Or(alts) => alts,
-        Expr::StructLit { name, fields } => {
+        Expr::StructLit { name, fields, base } => {
             let mut v = vec![name];
             v.extend(fields.into_iter().map(|(_, value)| value));
+            v.extend(base);
             v
         }
     }

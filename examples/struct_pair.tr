@@ -23,6 +23,40 @@ module StructPair {
     }
 
     rule pass {
-        result := Pair{ valid: p.valid, data: p.data }
+        -- `let {field, ...} = p` destructures several fields into fresh
+        -- locals in one statement -- sugar for `let valid = p.valid`
+        -- + `let data = p.data`, expanded at parse time (see DESIGN.md's
+        -- "Locals" section). Exhaustive by default, mirroring struct
+        -- construction's own default: every field of `p`'s type must be
+        -- named here, or the pattern must end in `..` to explicitly
+        -- discard the rest (`let {valid, ..} = p` below skips `data`
+        -- on purpose) -- silently dropping a field with neither is a
+        -- compile error.
+        let {valid, data} = p
+        result := Pair{ valid: valid, data: data }
+    }
+
+    reg last_valid : [1] = 0
+
+    rule sample_valid {
+        -- `..` discards `data` on purpose -- if `p` ever grows a third
+        -- field, this line keeps compiling unchanged (no exhaustiveness
+        -- error to update), unlike `pass` above.
+        let {valid, ..} = p
+        last_valid := valid
+    }
+
+    -- Struct update (see DESIGN.md's "Structs" section): `Name{ field:
+    -- value, ..base }` fills every field this literal doesn't name from
+    -- `base`'s own same-named field -- `counter := counter` alone is
+    -- rejected (a plain struct-to-struct copy, v0 restriction), so this
+    -- is the supported way to change ONE field of an existing value
+    -- while carrying the rest forward unchanged. `..counter` reads
+    -- `counter`'s PRE-write value, same transactional semantics
+    -- `pc := pc + 3` already relies on.
+    reg counter : Pair = Pair{ valid: 1, data: 0 }
+
+    rule bump {
+        counter := Pair{ data: counter.data + 1, ..counter }
     }
 }

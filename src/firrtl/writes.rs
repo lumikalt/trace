@@ -682,11 +682,25 @@ impl<'a> Emitter<'a> {
         // fix put the chase-through here and broke it).
         match root_ty {
             Ty::Struct { def, .. } => {
-                let Expr::StructLit { fields, .. } = self.ast.expr(expr) else {
+                let Expr::StructLit { fields, base, .. } = self.ast.expr(expr) else {
                     return None;
                 };
                 let (head, rest) = path.split_first()?;
-                let value = fields.iter().find(|(f, _)| f == head)?.1;
+                let found = fields.iter().find(|(f, _)| f == head).map(|(_, v)| *v);
+                let base = *base;
+                let Some(value) = found else {
+                    // `..base` supplies whatever THIS literal doesn't
+                    // name -- read the WHOLE remaining path off `base`'s
+                    // own flat fields directly, in one shot
+                    // (`compile_struct_field_read` already resolves a
+                    // plain reference's field path to its flat register/
+                    // local name; `base` isn't a literal to keep
+                    // decomposing structurally the way `value` below is).
+                    let base = base?;
+                    return self
+                        .compile_struct_field_read(expr, base, path, Some(width))
+                        .ok();
+                };
                 if rest.is_empty() {
                     Some(
                         self.compile_expr_hinted(value, Some(width))
