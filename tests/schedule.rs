@@ -53,7 +53,7 @@ fn subleq_schedule() {
 fn declaration_order_breaks_ties() {
     let src = "\
 module M {
-    reg a : bits[8] = 0
+    reg a : [8] = 0
     rule first {
         a := a + 1
     }
@@ -76,9 +76,9 @@ module M {
 fn read_read_does_not_conflict() {
     let src = "\
 module M {
-    reg a : bits[8] = 0
-    reg x : bits[8] = 0
-    reg y : bits[8] = 0
+    reg a : [8] = 0
+    reg x : [8] = 0
+    reg y : [8] = 0
     rule p {
         x := a
     }
@@ -96,7 +96,7 @@ module M {
 fn mutually_exclusive_exempts() {
     let src = "\
 module M {
-    reg a : bits[8] = 0
+    reg a : [8] = 0
     rule p {
         a := a + 1
     }
@@ -126,8 +126,8 @@ fn conflict_free_exempts_a_readwrite_conflict() {
     // `a`, `q` reads it.
     let src = "\
 module M {
-    reg a : bits[8] = 0
-    reg b : bits[8] = 0
+    reg a : [8] = 0
+    reg b : [8] = 0
     rule p {
         a := a + 1
     }
@@ -157,7 +157,7 @@ fn conflict_free_rejects_a_writewrite_conflict() {
     // footgun left in the emitted hardware.
     let src = "\
 module M {
-    reg a : bits[8] = 0
+    reg a : [8] = 0
     rule p {
         a := a + 1
     }
@@ -182,7 +182,7 @@ module M {
 fn urgency_overrides_declaration_order() {
     let src = "\
 module M {
-    reg a : bits[8] = 0
+    reg a : [8] = 0
     rule p {
         a := a + 1
     }
@@ -206,7 +206,7 @@ module M {
 fn urgency_cycle_is_an_error() {
     let src = "\
 module M {
-    reg a : bits[8] = 0
+    reg a : [8] = 0
     rule p {
         a := a + 1
     }
@@ -230,9 +230,9 @@ fn fifo_contention_conflicts() {
     // read+write conservatively).
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg x : bits[8] = 0
-    reg y : bits[8] = 0
+    fifo f : [8]
+    reg x : [8] = 0
+    reg y : [8] = 0
     rule p {
         x := f.Deq[]
     }
@@ -262,9 +262,9 @@ fn fifo_contention_conflicts_through_a_let_binding_too() {
     // `let`-binding form exposed there.
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg x : bits[8] = 0
-    reg y : bits[8] = 0
+    fifo f : [8]
+    reg x : [8] = 0
+    reg y : [8] = 0
     rule p {
         let a = f.Deq[]
         x := a
@@ -307,17 +307,17 @@ fn different_instance_ports_do_not_conflict() {
     // disjointness proof is needed to tell them apart).
     let src = "\
 module Child {
-    in a : bits[8]
-    in b : bits[8]
-    out c : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    out c : [8] = 0
     rule pass {
         c := a
     }
 }
 module Top {
     inst x : Child
-    reg v : bits[8] = 0
-    reg w : bits[8] = 0
+    reg v : [8] = 0
+    reg w : [8] = 0
     rule write_a {
         x.a := v
     }
@@ -343,16 +343,16 @@ fn same_instance_port_conflicts() {
     // instance.
     let src = "\
 module Child {
-    in a : bits[8]
-    out c : bits[8] = 0
+    in a : [8]
+    out c : [8] = 0
     rule pass {
         c := a
     }
 }
 module Top {
     inst x : Child
-    reg v : bits[8] = 0
-    reg w : bits[8] = 0
+    reg v : [8] = 0
+    reg w : [8] = 0
     rule write_v {
         x.a := v
     }
@@ -381,16 +381,16 @@ module Top {
 fn writing_a_port_and_reading_a_different_port_do_not_conflict() {
     let src = "\
 module Child {
-    in a : bits[8]
-    out c : bits[8] = 0
+    in a : [8]
+    out c : [8] = 0
     rule pass {
         c := a
     }
 }
 module Top {
     inst x : Child
-    reg v : bits[8] = 0
-    reg out : bits[8] = 0
+    reg v : [8] = 0
+    reg out : [8] = 0
     rule write_a {
         x.a := v
     }
@@ -413,14 +413,14 @@ module Top {
 fn separate_modules_do_not_conflict() {
     let src = "\
 module A {
-    reg a : bits[8] = 0
+    reg a : [8] = 0
     rule p {
         a := a + 1
     }
 }
 
 module B {
-    reg a : bits[8] = 0
+    reg a : [8] = 0
     rule q {
         a := a + 1
     }

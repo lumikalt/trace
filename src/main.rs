@@ -182,29 +182,25 @@ mod tests {
 
     #[test]
     fn splits_a_trailing_use_hint() {
-        let (main, hint) = split_hint(
-            "state write would silently truncate bits[16] to bits[8]; use `trunc(value, 8)`",
-        );
-        assert_eq!(
-            main,
-            "state write would silently truncate bits[16] to bits[8]"
-        );
+        let (main, hint) =
+            split_hint("state write would silently truncate [16] to [8]; use `trunc(value, 8)`");
+        assert_eq!(main, "state write would silently truncate [16] to [8]");
         assert_eq!(hint, Some("use `trunc(value, 8)`"));
     }
 
     #[test]
     fn splits_the_logical_not_bits_1_hint() {
-        // Regression test: this message originally read "...got bits[8]
+        // Regression test: this message originally read "...got [8]
         // (use `~` for...)" — a parenthetical, not a `"; use "` clause —
         // so `split_hint` never found it and the full message repeated
         // in both the header and the underline label (Lumi caught this
         // by eye, same double-repeat `split_hint`'s own doc comment
         // exists specifically to avoid).
         let (main, hint) = split_hint(
-            "`not` needs a bits[1] operand, got bits[8]; use `~` for a bitwise complement \
+            "`not` needs a [1] operand, got [8]; use `~` for a bitwise complement \
              of a wider value, or compare explicitly",
         );
-        assert_eq!(main, "`not` needs a bits[1] operand, got bits[8]");
+        assert_eq!(main, "`not` needs a [1] operand, got [8]");
         assert_eq!(
             hint,
             Some("use `~` for a bitwise complement of a wider value, or compare explicitly")

@@ -8,12 +8,12 @@
 -- bundle-lowering produces by hand-lowering a real bundle through it
 -- first (see DESIGN.md's "Structs" section).
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module StructPair {
-    fifo input : bits[8]
+    fifo input : [8]
     reg p : Pair = Pair{ valid: 0, data: 0 }
     out result : Pair = Pair{ valid: 0, data: 0 }
 

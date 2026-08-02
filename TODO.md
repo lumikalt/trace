@@ -30,9 +30,11 @@
     error.
   - Of the builtins, only `prio`/`trunc`/`pack`/`logic` are
     synthesizable as calls; `clog2`/`len` are compile-time-only
-    (`Ty::Int`), and `bits`/`wire`/`list`/`any`/`sync`/`race` aren't
-    applicable to a plain combinational callee body at all.
-  - A generic callee parameter's own width (`bits[N]`) is only
+    (`Ty::Int`), and `wire`/`list`/`any`/`sync`/`race` aren't applicable
+    to a plain combinational callee body at all (the old explicit
+    `bits[N]` spelling no longer has surface syntax at all — see the
+    `[N]` entry below).
+  - A generic callee parameter's own width (`[N]`) is only
     resolvable for its own return value or by following it through
     `self.locals` back to a concrete call-site expression — used
     independently elsewhere in a generic callee body, this fails
@@ -84,7 +86,7 @@
   fn/impl body's locals are already read at least once.
 - `<elaborates>` recursion/unrolling (`src/elaborate.rs`) is ACHIEVED —
   DESIGN.md's own `AdderTree` example (compile-time tree recursion over a
-  `list[bits[N]]`, one-sided slices `xs[..mid]`/`xs[mid..]`). Separate
+  `list[[N]]`, one-sided slices `xs[..mid]`/`xs[mid..]`). Separate
   machinery from ordinary callee inlining above: a real interpreter over
   `Stmt`/`Expr` (sequential execution, real `if`/`return`, real list
   slicing/`len()`) runs as its own text-splice pre-pass — same
@@ -110,8 +112,8 @@
   AND dynamic-amount shifts (logical `<<`/`>>` and arithmetic
   sign-extending `>>>`), unary `-`/`~`/`not`, `/`/`%`, static AND dynamic
   bit-select/indexed part-select, Verilog-style sized literals (+
-  inferred `reg`/`out` types from one), `bit` sugar for `bits[1]`, `uN`
-  (`u8`, `u32`, ...) sugar for `bits[N]`.
+  inferred `reg`/`out` types from one), the `[N]` bit-vector type (`bit`/
+  `uN` sugar retired in favor of it — see below).
   See DESIGN.md's "Expression surface" section for the full history and
   width-rule derivations (several confirmed empirically against real
   firtool, not assumed from spec text); `examples/alu.tr`,
@@ -123,7 +125,7 @@
   at its own textual position (still rejected inside `if`/`else` — no
   example needs that, and it's a materially different, larger change).
   One narrow remaining case still rejects reassignment explicitly: a
-  local whose width never resolves to a concrete `bits[w]` anywhere in
+  local whose width never resolves to a concrete `[w]` anywhere in
   the rule (e.g. used only as a mem-read index). See DESIGN.md's
   "Locals" section, `examples/reassigned_local.tr` +
   `sim/reassigned_local_tb.v`.
@@ -212,6 +214,62 @@
   inlining, or a compile-time rejection of callee-local reassignment
   until that exists (a `:=` reassignment of an already-`let`-bound
   local, when the enclosing item isn't a `rule`).
+- **`bits[N]` respelled `[N]`; fifo depth respelled `{depth}elem_ty`
+  (Lumi's call, an explicit syntax simplification, not a bug fix).**
+  `bits`/`bit`/`uN` (`u8`, `u32`, ...) sugar all retired outright — no
+  dual-spelling transition period, matching this session's other
+  full-replacement migrations. `x := input.Deq[]` on the OLD explicit
+  `bits[8]` spelling is now a clean parser-level "no longer valid
+  syntax; use `[N]`" error (`parser.rs`'s `Some(Ident)` primary arm),
+  not a silent accept alongside the new spelling.
+  The real design question was disambiguating `[N]` from an EXISTING
+  bare-bracket primary meaning: `[a, b, c]`, a `list[T]` literal.
+  Resolved by CONTENT, not position: a bracket holding exactly one item
+  with no trailing comma is the `bits[N]` shorthand; empty or 2+
+  comma-separated items stays a list literal (`parse_expr`'s
+  `Some(LBracket)` arm). This is unambiguous and needs no separate
+  type-grammar production, no position tracking, and no special-casing
+  of `list`/`wire`'s own callee name, because a nested type position
+  (`list[[8]]`) reaches the identical primary rule through the ordinary
+  postfix-bracket-args path — confirmed via real firtool on
+  `AdderTree`'s own `list[[32]]` signature after respelling it. A
+  genuine one-element list VALUE isn't actually lost: a trailing comma
+  is the escape hatch (`[a,]`), the same role Rust's own one-element
+  tuple syntax gives a trailing comma — `tests/elaborate.rs`'s own
+  `AdderTree`-recursion-base-case tests use exactly this spelling
+  (`One([a,])`). Omitting the comma (`Foo([x])`) fails with a clear
+  type error (a `[N]` type where a value was expected), not a silent
+  miscompile — advisor caught an earlier draft of this bullet WRONGLY
+  claiming no spelling existed at all, before commit.
+  The AST shape is unchanged throughout (`Bracket { Ident("bits"),
+  [N] }`, exactly what a `bits[N]` literal always produced) — the
+  intent going in was "parser-and-text-only, zero changes downstream,"
+  and that held for resolve/effects/types/emission's own LOGIC. It did
+  NOT hold for every place that SYNTHESIZES source text to be
+  re-parsed: `Ty`'s own `Display` impl (`types.rs`) is reused by
+  `lower.rs`'s text-splice-and-reparse pipeline to print a captured
+  local's/spawn's save-register type back into generated `<sequences>`
+  segment text, and three more call sites in `lower.rs` hardcode
+  `"bits[{}]"` directly for continuation-register declarations — all
+  four had to move to `[{}]` or the respliced text would fail to
+  re-parse against the compiler's OWN new rule. Caught by real test
+  failures (`rmw_emits_and_compiles`, `subleq_emits_and_compiles`,
+  a fifo-op-after-tick test), not anticipated by the design pass — the
+  general lesson, worth remembering for any future AST-shape-preserving
+  syntax change: grep every hardcoded format string that emits the OLD
+  spelling, not just the AST/parser, since anything on a splice-reparse
+  path (`<sequences>`/`spawn`/`<elaborates>` lowering) will silently
+  regenerate stale surface syntax otherwise. Several hardcoded
+  `bits[...]`-in-error-message strings in `types.rs` (`does not fit
+  in`, `condition must be`, `` `not` needs a ``, `` `list` takes ``,
+  `a mem needs``) needed the same sweep, verified via `tests/types.rs`.
+  Fifo depth's leading-bracket prefix (`[depth]elem_ty`) moved to
+  curly braces (`{depth}elem_ty`) specifically to stay unambiguous from
+  the new `[N]` primary — `fifo f : [4][8]` would otherwise misparse
+  as a nested-list type, not depth-4-of-`[8]`. Verified end to end via
+  real firtool + Icarus sim on a representative spread (`fifo_depth`,
+  `adder_tree`, `subleq`, `race_value`, `option`, `call_fifo`,
+  `struct_pair`, `fetch2`), not just the unit-test suite.
 - Audited every `_ => {}` wildcard match over `Stmt`/`Expr`/`Item`/etc.
   across `src/` (30 sites) for more Assign-vs-Let-shaped silent gaps.
   29 are legitimately safe (most route the semantically-important part
@@ -236,7 +294,7 @@
   cutting across the whole type system, not a small addition).
   Deliberately deferred in favor of the narrower `>>>` (arithmetic,
   sign-extending shift) operator, added as a per-operator choice on
-  ordinary `bits[N]` rather than a new type. Revisit only if a real
+  ordinary `[N]` rather than a new type. Revisit only if a real
   design needs more than a shift — signed compare/add/mul, or
   sign-aware truncation/widening.
 
@@ -267,8 +325,8 @@ Worth building:
   accepted. `and` needed no dedicated syntax: sequential bare guards
   already conjoin for free, and `logic(...)` combined with bitwise `&`
   already covers it in expression position.
-- trace's `not` is confirmed to be a plain `bits[1]` boolean operator
-  (`types.rs`'s operand-must-already-be-`bits[1]` rule), not Verse's
+- trace's `not` is confirmed to be a plain `[1]` boolean operator
+  (`types.rs`'s operand-must-already-be-`[1]` rule), not Verse's
   "test success/failure without committing" operator — `17f21e9` was a
   respelling, not a semantics port, and that's fine as-is: the two
   positions where Verse's discharge semantics would matter (`not`
@@ -465,11 +523,11 @@ re-propose these from a fresh read of the same chapters:
   already reachable via a plain compile error, not a gap.
 - **Comparisons returning their left operand in a failure context**
   (Verse: `X > 0` yields `X` on success) — would blur trace's clean
-  condition/value type split (a condition is always `bits[1]`, a
+  condition/value type split (a condition is always `[1]`, a
   compared operand can be any width) for a cosmetic win only; not worth
   the type-system ambiguity. Concrete consequence, surfaced while
   building `or`: this is exactly why `a <> 0 or b` doesn't work today
-  (a comparison is a plain always-succeeding `bits[1]` value, with
+  (a comparison is a plain always-succeeding `[1]` value, with
   nothing for `or` to discharge — `or`'s alternatives all need real
   fallibility) — `if a <> 0 { a } else { b }` is the spelling instead.
   Revisit only if this specific pattern shows up for real, not

@@ -1,7 +1,7 @@
 module Top {
-    in x : bits[16]
-    out result : bits[16] = 0
-    out bit3 : bits[1] = 0
+    in x : [16]
+    out result : [16] = 0
+    out bit3 : [1] = 0
 
     rule compute {
         result := x + 8'd6

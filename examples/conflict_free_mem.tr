@@ -12,13 +12,13 @@
 -- elsewhere, rather than needing an extra non-writing cycle to "catch
 -- up" the way port_ram.tr's forced stall would.
 module ConflictFreeMem {
-    mem m : bits[16][256]
+    mem m : [16][256]
 
-    in write_addr : bits[8]
-    in write_data : bits[16]
-    in write_en : bits[1]
-    in read_addr : bits[8]
-    out read_data : bits[16] = 0
+    in write_addr : [8]
+    in write_data : [16]
+    in write_en : [1]
+    in read_addr : [8]
+    out read_data : [16] = 0
 
     rule write {
         (write_en = 1)?

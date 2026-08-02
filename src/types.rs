@@ -85,8 +85,8 @@ pub enum Ty {
 impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Ty::Bits(Width::Known(w)) => write!(f, "bits[{w}]"),
-            Ty::Bits(Width::Unknown) => write!(f, "bits[?]"),
+            Ty::Bits(Width::Known(w)) => write!(f, "[{w}]"),
+            Ty::Bits(Width::Unknown) => write!(f, "[?]"),
             Ty::Mem { elem, len } => write!(f, "{elem}[{len}]"),
             Ty::Fifo { elem, depth } => write!(f, "fifo[{depth}] of {elem}"),
             Ty::Handle(inner) => write!(f, "handle of {inner}"),
@@ -248,9 +248,7 @@ impl<'a> TypeChecker<'a> {
                         let span = self.ast.item_spans[id.0 as usize].clone();
                         self.error(
                             span,
-                            format!(
-                                "a mem needs an element type and a size (`bits[w][n]`), got {ty}"
-                            ),
+                            format!("a mem needs an element type and a size (`[w][n]`), got {ty}"),
                         );
                     }
                     self.state_tys.insert(def, ty);
@@ -510,7 +508,7 @@ impl<'a> TypeChecker<'a> {
                     if args.len() != 1 {
                         self.error(
                             self.expr_span(id),
-                            "`list` takes one element type, e.g. `list[bits[8]]`".to_string(),
+                            "`list` takes one element type, e.g. `list[[8]]`".to_string(),
                         );
                         return Ty::Unknown;
                     }
@@ -758,7 +756,7 @@ impl<'a> TypeChecker<'a> {
             Ty::Bits(Width::Known(1)) | Ty::Bits(Width::Unknown) | Ty::Unknown | Ty::Int => {}
             other => self.error(
                 self.expr_span(cond),
-                format!("condition must be bits[1], got {other} (compare explicitly)"),
+                format!("condition must be [1], got {other} (compare explicitly)"),
             ),
         }
     }
@@ -947,16 +945,13 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// A constant written into `bits[w]` must fit in `w` bits.
+    /// A constant written into `[w]` must fit in `w` bits.
     fn check_literal_fits(&mut self, value: ExprId, target: &Ty) {
         if let Ty::Bits(Width::Known(w)) = target
             && let Some(v) = self.const_eval(value, &HashMap::new())
             && bits_needed(v) > *w
         {
-            self.error(
-                self.expr_span(value),
-                format!("{v} does not fit in bits[{w}]"),
-            );
+            self.error(self.expr_span(value), format!("{v} does not fit in [{w}]"));
         }
     }
 
@@ -973,7 +968,7 @@ impl<'a> TypeChecker<'a> {
                     self.error(
                         span,
                         format!(
-                            "{what} would silently truncate bits[{v}] to bits[{t}]; \
+                            "{what} would silently truncate [{v}] to [{t}]; \
                              use `trunc(value, {t})`"
                         ),
                     );
@@ -1021,7 +1016,7 @@ impl<'a> TypeChecker<'a> {
                 if bits_needed(value) > width {
                     self.error(
                         self.expr_span(id),
-                        format!("{value} does not fit in bits[{width}]"),
+                        format!("{value} does not fit in [{width}]"),
                     );
                 }
                 Ty::Bits(Width::Known(width))
@@ -1092,7 +1087,7 @@ impl<'a> TypeChecker<'a> {
                     self.error(
                         self.expr_span(id),
                         format!(
-                            "`not` needs a bits[1] operand, got {t}; use `~` for a \
+                            "`not` needs a [1] operand, got {t}; use `~` for a \
                              bitwise complement of a wider value, or compare \
                              explicitly"
                         ),

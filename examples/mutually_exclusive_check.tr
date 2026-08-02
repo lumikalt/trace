@@ -13,10 +13,10 @@
 -- deliberately violated (the assertion DOES fire, confirming the check
 -- is real, not dead code that always passes).
 module MutuallyExclusiveCheck {
-    out a : bits[8] = 0
-    out b : bits[8] = 0
-    in we_a : bits[1]
-    in we_b : bits[1]
+    out a : [8] = 0
+    out b : [8] = 0
+    in we_a : [1]
+    in we_b : [1]
 
     rule set_a {
         (we_a = 1)?

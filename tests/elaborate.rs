@@ -23,17 +23,17 @@ fn run(src: &str) -> (Vec<(trace::lexer::Span, String)>, Vec<ElabError>) {
 
 #[test]
 fn adder_tree_reduces_to_a_left_associated_sum_at_each_call_site() {
-    let src = "AdderTree(xs: list[bits[32]]) : bits[32] <elaborates> {\n\
+    let src = "AdderTree(xs: list[[32]]) : [32] <elaborates> {\n\
                    if len(xs) = 1 { return xs[0] }\n\
                    let mid = len(xs) / 2\n\
                    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])\n\
                }\n\
                module M {\n\
-                   in a : bits[32]\n\
-                   in b : bits[32]\n\
-                   in c : bits[32]\n\
-                   in d : bits[32]\n\
-                   out total : bits[32] = 0\n\
+                   in a : [32]\n\
+                   in b : [32]\n\
+                   in c : [32]\n\
+                   in d : [32]\n\
+                   out total : [32] = 0\n\
                    rule go {\n\
                        total := AdderTree([a, b, c, d])\n\
                    }\n\
@@ -53,16 +53,16 @@ fn an_odd_length_list_exercises_the_asymmetric_split() {
     // The 4-element case (4->2->1) never exercises `let mid = len(xs) / 2`
     // truncating on an odd length -- 3 elements split [a] + [b, c], a
     // genuinely different shape than the power-of-two case.
-    let src = "AdderTree(xs: list[bits[32]]) : bits[32] <elaborates> {\n\
+    let src = "AdderTree(xs: list[[32]]) : [32] <elaborates> {\n\
                    if len(xs) = 1 { return xs[0] }\n\
                    let mid = len(xs) / 2\n\
                    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])\n\
                }\n\
                module M {\n\
-                   in a : bits[32]\n\
-                   in b : bits[32]\n\
-                   in c : bits[32]\n\
-                   out total : bits[32] = 0\n\
+                   in a : [32]\n\
+                   in b : [32]\n\
+                   in c : [32]\n\
+                   out total : [32] = 0\n\
                    rule go {\n\
                        total := AdderTree([a, b, c])\n\
                    }\n\
@@ -78,14 +78,18 @@ fn an_odd_length_list_exercises_the_asymmetric_split() {
 
 #[test]
 fn a_single_element_list_reduces_to_that_element_with_no_addition() {
-    let src = "One(xs: list[bits[8]]) : bits[8] <elaborates> {\n\
+    // A literal single-element list needs a trailing comma now — `[a]`
+    // alone is the `[N]` type shorthand instead (see parser.rs's
+    // `Some(LBracket)` primary arm) — the same escape hatch Rust's own
+    // one-element tuple syntax uses, for the identical reason.
+    let src = "One(xs: list[[8]]) : [8] <elaborates> {\n\
                    return xs[0]\n\
                }\n\
                module M {\n\
-                   in a : bits[8]\n\
-                   out total : bits[8] = 0\n\
+                   in a : [8]\n\
+                   out total : [8] = 0\n\
                    rule go {\n\
-                       total := One([a])\n\
+                       total := One([a,])\n\
                    }\n\
                }\n";
     let (edits, errors) = run(src);
@@ -99,14 +103,15 @@ fn a_single_element_list_reduces_to_that_element_with_no_addition() {
 
 #[test]
 fn an_out_of_bounds_list_slice_is_a_compile_error_not_a_panic() {
-    let src = "Bad(xs: list[bits[8]]) : bits[8] <elaborates> {\n\
+    // See the sibling test above for why this is `[a,]` rather than `[a]`.
+    let src = "Bad(xs: list[[8]]) : [8] <elaborates> {\n\
                    return xs[5]\n\
                }\n\
                module M {\n\
-                   in a : bits[8]\n\
-                   out total : bits[8] = 0\n\
+                   in a : [8]\n\
+                   out total : [8] = 0\n\
                    rule go {\n\
-                       total := Bad([a])\n\
+                       total := Bad([a,])\n\
                    }\n\
                }\n";
     let (_edits, errors) = run(src);
@@ -118,12 +123,12 @@ fn an_out_of_bounds_list_slice_is_a_compile_error_not_a_panic() {
 
 #[test]
 fn a_non_terminating_elaborates_function_hits_the_depth_cap_instead_of_hanging() {
-    let src = "Loopy(x: bits[8]) : bits[8] <elaborates> {\n\
+    let src = "Loopy(x: [8]) : [8] <elaborates> {\n\
                    return Loopy(x)\n\
                }\n\
                module M {\n\
-                   in a : bits[8]\n\
-                   out total : bits[8] = 0\n\
+                   in a : [8]\n\
+                   out total : [8] = 0\n\
                    rule go {\n\
                        total := Loopy(a)\n\
                    }\n\
@@ -143,13 +148,13 @@ fn an_elaborates_call_composes_with_an_unrelated_state_write_in_the_same_rule() 
     // write in an elaboration position outright, before `elaborate.rs`
     // ever runs. This just proves an elaborates call and an ordinary
     // state write can share a rule without interfering.
-    let src = "Id(x: bits[8]) : bits[8] <elaborates> {\n\
+    let src = "Id(x: [8]) : [8] <elaborates> {\n\
                    return x\n\
                }\n\
                module M {\n\
-                   reg r : bits[8] = 0\n\
-                   in a : bits[8]\n\
-                   out total : bits[8] = 0\n\
+                   reg r : [8] = 0\n\
+                   in a : [8]\n\
+                   out total : [8] = 0\n\
                    rule go {\n\
                        r := a\n\
                        total := Id(a)\n\

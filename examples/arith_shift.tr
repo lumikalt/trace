@@ -7,12 +7,12 @@
 -- sim/arith_shift_tb.v drives a value with its sign bit SET so the two
 -- operators' results genuinely differ, not just a shift amount of 0.
 module Top {
-    in x : bits[8]
-    in n : bits[3]
-    out shr_static : bits[8] = 0
-    out ashr_static : bits[8] = 0
-    out shr_dynamic : bits[8] = 0
-    out ashr_dynamic : bits[8] = 0
+    in x : [8]
+    in n : [3]
+    out shr_static : [8] = 0
+    out ashr_static : [8] = 0
+    out shr_dynamic : [8] = 0
+    out ashr_dynamic : [8] = 0
 
     rule compute {
         shr_static := x >> 3

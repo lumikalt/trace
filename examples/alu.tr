@@ -4,19 +4,19 @@
 -- bit-select/slice — see sim/alu_tb.v for the values chosen to catch a
 -- shl/shr mix-up or a truncated multiply.
 module Alu {
-    in a : bits[8]
-    in b : bits[8]
+    in a : [8]
+    in b : [8]
 
-    out prod : bits[16] = 0
-    out band : bits[8] = 0
-    out bor : bits[8] = 0
-    out bxor : bits[8] = 0
-    out shl3 : bits[8] = 0
-    out shr3 : bits[8] = 0
-    out nega : bits[8] = 0
-    out nota : bits[8] = 0
-    out lo4 : bits[4] = 0
-    out bit7 : bits[1] = 0
+    out prod : [16] = 0
+    out band : [8] = 0
+    out bor : [8] = 0
+    out bxor : [8] = 0
+    out shl3 : [8] = 0
+    out shr3 : [8] = 0
+    out nega : [8] = 0
+    out nota : [8] = 0
+    out lo4 : [4] = 0
+    out bit7 : [1] = 0
 
     rule compute {
         prod := a * b

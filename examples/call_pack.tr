@@ -1,7 +1,7 @@
 module Top {
-    in a : bits[8]
-    in b : bits[8]
-    out result : bits[16] = 0
+    in a : [8]
+    in b : [8]
+    out result : [16] = 0
 
     rule combine {
         result := pack(a, b)

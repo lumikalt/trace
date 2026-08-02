@@ -8,12 +8,12 @@
 -- see DESIGN.md's "Port-based memory access" section for why SUBLEQ
 -- itself is not retrofitted to use this.
 module PortRam {
-    mem m : bits[16][256]
+    mem m : [16][256]
 
-    in addr : bits[8]
-    in write_data : bits[16]
-    in write_en : bits[1]
-    out read_data : bits[16] = 0
+    in addr : [8]
+    in write_data : [16]
+    in write_en : [1]
+    out read_data : [16] = 0
 
     rule write {
         (write_en = 1)?

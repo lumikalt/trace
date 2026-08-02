@@ -1,7 +1,7 @@
 module Child {
-    in a : bits[8]
-    in b : bits[8]
-    out c : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    out c : [8] = 0
 
     rule pass {
         c := a + b
@@ -11,9 +11,9 @@ module Child {
 module Top {
     inst x : Child
 
-    in va : bits[8]
-    in vb : bits[8]
-    out result : bits[8] = 0
+    in va : [8]
+    in vb : [8]
+    out result : [8] = 0
 
     rule write_a {
         x.a := va

@@ -5,28 +5,28 @@
 -- (`UsePair(Pair{...})`) also works, decomposed the same way a
 -- struct-typed reg's own write already is. The struct/`?T`-typed
 -- RETURN side stays a v0 restriction (see DESIGN.md/TODO.md) -- both
--- callees here return a plain `bits[8]`.
+-- callees here return a plain `[8]`.
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
-UsePair(p : Pair) : bits[8] <combines> {
+UsePair(p : Pair) : [8] <combines> {
     return p.data
 }
 
-Consume(o : ?bits[8]) : bits[8] <combines, fails> {
+Consume(o : ?[8]) : [8] <combines, fails> {
     o?
     return o.data
 }
 
 module CallStructParam {
-    fifo input : bits[8]
+    fifo input : [8]
     reg pair : Pair = Pair{ valid: 0, data: 0 }
-    reg opt : ?bits[8] = false
-    in go : bit
-    out from_pair : bits[8] = 0
-    out from_opt : bits[8] = 0
+    reg opt : ?[8] = false
+    in go : [1]
+    out from_pair : [8] = 0
+    out from_opt : [8] = 0
 
     rule fill_pair {
         let d = input.Deq[]

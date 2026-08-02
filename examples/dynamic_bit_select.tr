@@ -9,11 +9,11 @@
 -- a dynamically-POSITIONED fixed-size one (`+:`/`-:`) or a dynamically-
 -- positioned single bit (`x[i]`). See sim/dynamic_bit_select_tb.v.
 module Top {
-    in x : bits[8]
-    in i : bits[3]
-    out bit_out : bits[1] = 0
-    out up : bits[4] = 0
-    out down : bits[4] = 0
+    in x : [8]
+    in i : [3]
+    out bit_out : [1] = 0
+    out up : [4] = 0
+    out down : [4] = 0
 
     rule compute {
         bit_out := x[i]

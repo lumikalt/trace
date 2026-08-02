@@ -25,13 +25,6 @@ pub enum TokenKind {
     Mem,
     #[token("fifo")]
     Fifo,
-    /// Pure syntax sugar for `bits[1]` — see `Parser::parse_expr`'s `Bit`
-    /// arm, which desugars it to the identical AST a literal `bits[1]`
-    /// would produce. A real keyword (not a `resolve.rs` `BUILTINS`
-    /// identifier like `bits` itself) so it can never collide with a
-    /// user-declared name the way an ordinary identifier could.
-    #[token("bit")]
-    Bit,
     #[token("in")]
     Input,
     #[token("out")]
@@ -75,14 +68,14 @@ pub enum TokenKind {
     /// Verse-spelled prefix logical negation, replacing the symbolic `!`
     /// this project used before aligning operator spelling with Verse
     /// (see DESIGN.md's "Expression surface"). Purely a spelling change —
-    /// same `UnOp::Not` semantics (requires a `bits[1]` operand, distinct
+    /// same `UnOp::Not` semantics (requires a `[1]` operand, distinct
     /// from bitwise `~`) as before.
     #[token("not")]
     Not,
     /// Verse spells an absent optional value `false` (tying into its
     /// logic-programming failure model) rather than a dedicated `none`
     /// keyword — trace follows that spelling. Deliberately NOT a general
-    /// `bits[1]` boolean literal (no `true` counterpart either): `?bit`
+    /// `[1]` boolean literal (no `true` counterpart either): `?[1]`
     /// would make `opt := false` ambiguous between "absent" and
     /// "present, holding 0" if `false` doubled as a plain zero. Only
     /// valid where a `?T` value is expected (`types.rs`'s `Ty::AbsentLit`

@@ -1,4 +1,4 @@
--- `?T` sugar for an optional value: `{valid: bit, data: T}` under the
+-- `?T` sugar for an optional value: `{valid: [1], data: T}` under the
 -- hood, reusing every bit of struct flattening/read/write machinery.
 -- Verse spells the absent case `false` (tying into its logic-
 -- programming failure model) rather than a dedicated `none` keyword —
@@ -10,11 +10,11 @@
 -- section. `.valid`/`.data` stay directly readable too, for a
 -- non-failing presence check via plain `if`/`else`.
 module Option {
-    fifo input : bits[8]
-    reg opt : ?bits[8] = false
-    out result : bits[8] = 0
-    out was_present : bit = 0
-    out relayed : ?bits[8] = false
+    fifo input : [8]
+    reg opt : ?[8] = false
+    out result : [8] = 0
+    out was_present : [1] = 0
+    out relayed : ?[8] = false
 
     rule fill {
         let d = input.Deq[]

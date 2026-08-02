@@ -7,18 +7,18 @@
 -- walking the same chain back down to its flat register. See
 -- DESIGN.md's "Structs"/"Struct emission" sections.
 struct Header {
-    valid : bit
-    seq : bits[4]
+    valid : [1]
+    seq : [4]
 }
 
 struct Frame {
     header : Header
-    data : bits[8]
+    data : [8]
 }
 
 module StructNested {
-    fifo input : bits[8]
-    reg seq : bits[4] = 0
+    fifo input : [8]
+    reg seq : [4] = 0
     reg f : Frame = Frame{ header: Header{ valid: 0, seq: 0 }, data: 0 }
     out result : Frame = Frame{ header: Header{ valid: 0, seq: 0 }, data: 0 }
 

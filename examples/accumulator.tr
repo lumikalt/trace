@@ -3,8 +3,8 @@
 -- the testbench observes through an ordinary port, not a hierarchical
 -- path — see sim/accumulator_tb.v.
 module Accumulator {
-    in inc : bits[8]
-    out sum : bits[8] = 0
+    in inc : [8]
+    out sum : [8] = 0
 
     rule accumulate {
         sum := sum + inc

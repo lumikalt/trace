@@ -1,11 +1,11 @@
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
 
 module Top {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
 
     rule compute {
         result := Classify(a)

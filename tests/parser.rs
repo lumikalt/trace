@@ -206,7 +206,7 @@ fn rule_with_effects() {
 
 #[test]
 fn function_with_signature() {
-    let ast = parse_ok("Parity(x : bits[8]) : bits[1] <combines> {\n return x[0] ^ x[1]\n}\n");
+    let ast = parse_ok("Parity(x : [8]) : [1] <combines> {\n return x[0] ^ x[1]\n}\n");
     let Item::Fn {
         name,
         kind,
@@ -232,11 +232,11 @@ fn spec_and_impl_refines() {
     // Multiline impl signature straight from DESIGN.md: newlines before
     // `refines` and before the body brace.
     let src = "\
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
+spec AnyGrant(reqs : [N]) : [clog2(N)] <combines, chooses> {
     return 0
 }
 
-impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines>
+impl RoundRobin(reqs : [N]) : [clog2(N)] <combines>
     refines AnyGrant
 {
     return 0
@@ -345,7 +345,7 @@ rule t
 
 #[test]
 fn reg_with_init_and_mem() {
-    let ast = parse_ok("module M {\n reg pc : bits[16] = 0\n mem m : bits[16][4096]\n}\n");
+    let ast = parse_ok("module M {\n reg pc : [16] = 0\n mem m : [16][4096]\n}\n");
     assert_eq!(
         ast.dump(),
         "\
@@ -367,7 +367,7 @@ module M
 #[test]
 fn reg_and_output_infer_type_from_a_sized_literal_init() {
     // Omitting `: ty` when initialized with a sized literal synthesizes
-    // the identical `bits[width]` an explicit annotation would parse to.
+    // the identical `[width]` an explicit annotation would parse to.
     let ast = parse_ok("module M {\n reg a = 8'd6\n out b = 16'hFF00\n}\n");
     assert_eq!(
         ast.dump(),
@@ -411,7 +411,7 @@ fn mem_fifo_in_inst_still_require_an_explicit_type() {
 #[test]
 fn input_output_ports() {
     let ast = parse_ok(
-        "module M {\n in inc : bits[8]\n out sum : bits[8] = 0\n\
+        "module M {\n in inc : [8]\n out sum : [8] = 0\n\
          rule r {\n sum := sum + inc\n}\n}\n",
     );
     assert_eq!(
@@ -474,32 +474,64 @@ fn one_error_not_a_cascade() {
 }
 
 #[test]
-fn bit_is_pure_sugar_for_bits_1() {
-    // `bit` desugars in the parser to the IDENTICAL AST a literal
-    // `bits[1]` produces (`Bracket { Ident("bits"), [Int(1)] }`) — proved
-    // here at the AST level so every downstream pass (resolve/effects/
-    // types/emission) can stay unaware `bit` was ever written, the same
-    // "needed no changes anywhere but parser.rs" property the sized-
-    // literal-inferred-`reg`-type feature already established.
-    assert_eq!(stmt_sexpr("x := bit"), stmt_sexpr("x := bits[1]"));
-    // Bracket-applied, `bit` behaves as a mem element type exactly like
-    // `bits[1]` would (`mem m : bit[16]` == `mem m : bits[1][16]`).
-    assert_eq!(stmt_sexpr("x := bit[16]"), stmt_sexpr("x := bits[1][16]"));
-}
-
-#[test]
-fn u_n_is_sugar_for_bits_n() {
-    // `u8`/`u16`/... desugar to the identical `Bracket { Ident("bits"),
-    // [N] }` shape a literal `bits[N]` would produce -- same treatment
-    // as `bit`, but matched on an already-lexed `Ident`'s own text
-    // (`u_width`, parser.rs) rather than a fixed keyword, since `N` is
-    // unbounded.
-    assert_eq!(stmt_sexpr("x := u8"), stmt_sexpr("x := bits[8]"));
-    assert_eq!(stmt_sexpr("x := u32"), stmt_sexpr("x := bits[32]"));
-    // Not sugar: no digits, or a non-digit suffix -- an ordinary ident.
+fn bit_and_u_n_are_now_ordinary_identifiers() {
+    // `bit`/`uN` sugar for `[1]`/`[N]` was retired in favor of
+    // the bare `[N]` type shorthand (see
+    // `bracket_disambiguates_list_literal_from_bits_ty`, below) — both
+    // are completely ordinary identifiers now, with zero parser-level
+    // special-casing; the CLI's `--lower`/`--firrtl` paths reject them
+    // downstream (`cannot find bit`/`cannot find u8`) exactly like any
+    // other unbound name, not here at parse time.
+    assert_eq!(stmt_sexpr("x := bit"), "(:= x bit)");
+    assert_eq!(stmt_sexpr("x := u8"), "(:= x u8)");
+    assert_eq!(stmt_sexpr("x := u32"), "(:= x u32)");
     assert_eq!(stmt_sexpr("x := u"), "(:= x u)");
     assert_eq!(stmt_sexpr("x := unused"), "(:= x unused)");
     assert_eq!(stmt_sexpr("x := u8x"), "(:= x u8x)");
+}
+
+#[test]
+fn bracket_disambiguates_list_literal_from_bits_ty() {
+    // A bare `[N]` — exactly one item, no trailing comma — is the
+    // `bits[N]` type shorthand: the identical `Bracket { Ident("bits"),
+    // [N] }` shape the now-retired literal `bits[N]` spelling used to
+    // produce, so every downstream pass (resolve/effects/types/emission)
+    // stays unaware the surface spelling ever changed.
+    assert_eq!(stmt_sexpr("x := [1]"), "(:= x (index bits 1))");
+    assert_eq!(stmt_sexpr("x := [8]"), "(:= x (index bits 8))");
+    // Bracket-applied, `[1]` behaves as a mem element type exactly like
+    // `bits[1]` used to (`mem m : [1][16]`).
+    assert_eq!(
+        stmt_sexpr("x := [1][16]"),
+        "(:= x (index (index bits 1) 16))"
+    );
+    // An arbitrary width EXPRESSION, not just a literal int, still works
+    // — the same generic-param/arithmetic width `[N]` always allowed.
+    assert_eq!(stmt_sexpr("x := [N]"), "(:= x (index bits N))");
+    assert_eq!(
+        stmt_sexpr("x := [clog2(N)]"),
+        "(:= x (index bits (call clog2 N)))"
+    );
+    // Empty, or 2+ comma-separated items, stays a list literal — told
+    // apart by content, not position.
+    assert_eq!(stmt_sexpr("x := []"), "(:= x (list))");
+    assert_eq!(stmt_sexpr("x := [a, b]"), "(:= x (list a b))");
+    assert_eq!(stmt_sexpr("x := [a, b, c]"), "(:= x (list a b c))");
+    // A trailing comma is the escape hatch for a genuine one-element list
+    // VALUE — the same role Rust's own one-element tuple syntax gives a
+    // trailing comma, and for an identical reason: `[a]` alone is already
+    // claimed (the `bits[N]` shorthand above).
+    assert_eq!(stmt_sexpr("x := [a,]"), "(:= x (list a))");
+}
+
+#[test]
+fn old_bits_n_spelling_is_a_clean_error() {
+    let src = "rule t {\nx := bits[8]\n}\n";
+    let (tokens, _) = lexer::lex(src);
+    let (_, errors) = parser::parse(src, &tokens);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("no longer valid syntax"));
+    assert!(errors[0].message.contains("use `[N]`"));
 }
 
 #[test]

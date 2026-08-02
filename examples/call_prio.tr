@@ -1,10 +1,10 @@
-RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines> {
+RoundRobin(reqs : [N]) : [clog2(N)] <combines> {
     return prio(reqs)
 }
 
 module Top {
-    in reqs : bits[4]
-    out grant : bits[2] = 0
+    in reqs : [4]
+    out grant : [2] = 0
 
     rule pick {
         grant := RoundRobin(reqs)

@@ -3,9 +3,9 @@
 -- (whole-array conflict rule; single-port memory). step and refill both
 -- touch m, so urgency picks the winner; they are NOT conflict_free.
 module Subleq {
-    reg pc : bits[16] = 0
-    reg ir : bits[16] = 0
-    mem m  : bits[16][4096]
+    reg pc : [16] = 0
+    reg ir : [16] = 0
+    mem m  : [16][4096]
 
     rule step <sequences> {
         let a = m[pc]

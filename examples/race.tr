@@ -2,14 +2,14 @@
 -- together; whichever finishes first wins, and the loser's own FSM is
 -- permanently blocked from ever completing (see "Race lowering").
 module Race {
-    in trigger : bits[1]
-    out result : bits[8] = 0
+    in trigger : [1]
+    out result : [8] = 0
 
-    Fast(x : bits[8]) : bits[8] <sequences> {
+    Fast(x : [8]) : [8] <sequences> {
         tick
         return x + 1
     }
-    Slow(x : bits[8]) : bits[8] <sequences> {
+    Slow(x : [8]) : [8] <sequences> {
         tick
         tick
         return x + 2

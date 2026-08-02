@@ -8,10 +8,10 @@
 -- distinct (a, b) pairs across consecutive cycles and checks both
 -- outputs never alias each other or lag a cycle behind.
 module ReassignedLocal {
-    in a : bits[8]
-    in b : bits[8]
-    out first_val : bits[8] = 0
-    out second_val : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    out first_val : [8] = 0
+    out second_val : [8] = 0
 
     rule r {
         let x = a

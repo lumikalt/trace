@@ -1,9 +1,9 @@
 module Top {
-    in a : bits[8]
-    out result : bits[8] = 0
-    out v_out : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
+    out v_out : [8] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         v_out := x
         return x + 1
     }

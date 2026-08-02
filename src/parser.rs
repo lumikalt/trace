@@ -70,9 +70,9 @@ const PREFIX_BP: u8 = 17;
 const POSTFIX_BP: u8 = 19;
 
 /// Minimum binding power for type positions (`: ty`). Excludes comparison
-/// and range operators so the `<` of a following effect list (`: bits[1]
+/// and range operators so the `<` of a following effect list (`: [1]
 /// <combines>`) is never eaten as less-than. Bracket application and
-/// arithmetic (`bits[N+1]`) still parse.
+/// arithmetic (`[N+1]`) still parse.
 const TYPE_MIN_BP: u8 = 5;
 
 fn binop_of(kind: TokenKind) -> BinOp {
@@ -334,7 +334,7 @@ impl<'a> Parser<'a> {
         let name = self.expect_ident("declaration name")?;
         let infers_ty = matches!(keyword, TokenKind::Reg | TokenKind::Output);
         let ty = if self.eat(TokenKind::Colon) {
-            if keyword == TokenKind::Fifo && self.at(TokenKind::LBracket) {
+            if keyword == TokenKind::Fifo && self.at(TokenKind::LBrace) {
                 Some(self.parse_fifo_depth_ty()?)
             } else {
                 Some(self.parse_expr(TYPE_MIN_BP)?)
@@ -393,21 +393,28 @@ impl<'a> Parser<'a> {
         Some(self.ast.push_item(item, lo..self.prev_end))
     }
 
-    /// `[depth]elem_ty` — a fifo's depth, written before its element
+    /// `{depth}elem_ty` — a fifo's depth, written before its element
     /// type (Lumi's pick over mem's postfix `elem[len]` spelling — a
-    /// fifo's depth reads more naturally up front). A bare leading `[`
-    /// already means a `list[T]` literal in primary expression position,
-    /// so this can't be handled by the general Pratt parser; it's only
-    /// reachable here, from a `fifo` declaration's own type position.
-    /// Parses to the exact same `Bracket { callee: elem_ty, args: [depth] }`
-    /// shape a postfix `elem_ty[depth]` would produce, so types.rs's
-    /// existing elem/len extraction (written for `mem`) is reused as-is
-    /// rather than adding a second copy of that logic.
+    /// fifo's depth reads more naturally up front). Curly braces, not
+    /// square brackets: a bare leading `[` in a fifo's own type position
+    /// is the ordinary `[N]`/list-literal primary (see `parse_expr`'s
+    /// `Some(LBracket)` arm) — `fifo f : {16}[8]` needs its OWN bracket
+    /// shape to stay unambiguous from that, distinct from `[16][8]`,
+    /// which would otherwise misparse as a nested-list type entirely. A
+    /// bare leading `{` is otherwise unused in a type position (a struct
+    /// literal always follows a type NAME, never opens one cold), so
+    /// this can't collide with anything the general Pratt parser already
+    /// handles; only reachable here, from a `fifo` declaration's own
+    /// type position. Parses to the exact same
+    /// `Bracket { callee: elem_ty, args: [depth] }` shape a postfix
+    /// `elem_ty[depth]` would produce, so types.rs's existing elem/len
+    /// extraction (written for `mem`) is reused as-is rather than adding
+    /// a second copy of that logic.
     fn parse_fifo_depth_ty(&mut self) -> Option<ExprId> {
         let lo = self.cur_span().start;
-        self.bump(); // `[`
+        self.bump(); // `{`
         let depth = self.parse_expr(0)?;
-        self.expect(TokenKind::RBracket, "`]` after fifo depth")
+        self.expect(TokenKind::RBrace, "`}` after fifo depth")
             .ok()?;
         let elem = self.parse_expr(TYPE_MIN_BP)?;
         Some(self.ast.push_expr(
@@ -419,22 +426,32 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Synthesizes the `bits[width]` type expression by hand — the AST
-    /// shape a literal `bits[width]` would itself parse to
-    /// (`Bracket { callee: Ident("bits"), args: [Int(width)] }`), so
-    /// nothing downstream (resolve/effects/types/emission) can tell the
-    /// difference. Shared by `infer_ty_from_sized_literal` (below) and
-    /// the `bit` keyword's desugar (`parse_expr`'s `Bit` arm) — both are
-    /// pure parser-level sugar for an already-explicit `bits[N]` spelling.
+    /// Synthesizes the `bits[width]` type expression from a literal width
+    /// known at parse time — used only by `infer_ty_from_sized_literal`
+    /// (below), inferring a `reg`/`out` declaration's type from its own
+    /// sized-literal initializer. Delegates to `synth_bits_ty_expr` for
+    /// the actual AST shape.
     fn synth_bits_ty(&mut self, width: u64, span: Span) -> ExprId {
         let width_expr = self.ast.push_expr(Expr::Int(width), span.clone());
+        self.synth_bits_ty_expr(width_expr, span)
+    }
+
+    /// Synthesizes the `bits[width]` type expression by hand, from an
+    /// already-parsed width expression — the AST shape a literal
+    /// `bits[width]` used to parse to directly
+    /// (`Bracket { callee: Ident("bits"), args: [width] }`), so nothing
+    /// downstream (resolve/effects/types/emission) can tell the
+    /// difference between this and the retired explicit spelling. Used by
+    /// `parse_expr`'s `[N]` primary arm (the ordinary case) and its
+    /// `bits[N]`-rejection recovery path (the retired-spelling case).
+    fn synth_bits_ty_expr(&mut self, width: ExprId, span: Span) -> ExprId {
         let bits_ident = self
             .ast
             .push_expr(Expr::Ident("bits".to_string()), span.clone());
         self.ast.push_expr(
             Expr::Bracket {
                 callee: bits_ident,
-                args: vec![width_expr],
+                args: vec![width],
             },
             span,
         )
@@ -452,7 +469,7 @@ impl<'a> Parser<'a> {
             self.errors.push(ParseError {
                 span: span.clone(),
                 message: "cannot infer a type here: the initializer must be a sized \
-                          literal like `8'd6`, or give an explicit `: bits[N]`"
+                          literal like `8'd6`, or give an explicit `: [N]`"
                     .to_string(),
             });
             return None;
@@ -855,18 +872,23 @@ impl<'a> Parser<'a> {
             Some(Ident) => {
                 let span = self.bump().unwrap().span;
                 let name = self.text(&span).to_string();
-                // `uN` (`u8`, `u32`, ...) is pure sugar for `bits[N]`,
-                // same desugaring `bit` gets below, and for the same
-                // reason: everything downstream sees the identical
-                // `Bracket { Ident("bits"), [N] }` shape a literal
-                // `bits[N]` would produce. Unlike `bit`, this isn't a
-                // fixed keyword (`N` is unbounded) so it can't live in
-                // the lexer's token set — matched here on the already-
-                // lexed identifier's own text instead. Like `bit`, it has
-                // no user-name fallback: `u8`/`u16`/... are reserved by
-                // this pattern, not available as ordinary identifiers.
-                if let Some(width) = u_width(&name) {
-                    self.synth_bits_ty(width, span)
+                // `bits[N]` (the old explicit spelling) is a clean,
+                // targeted rejection rather than a silent accept: `bits`
+                // is a reserved `resolve.rs` `BUILTINS` name with no
+                // meaning of its own anymore now that a bare `[N]` covers
+                // it (see this file's own `Some(LBracket)` primary arm,
+                // below) — so `Ident("bits")` immediately followed by `[`
+                // can only ever be someone reaching for the retired
+                // spelling, never a legitimate user reference. Recovers by
+                // still building the identical `Bracket { Ident("bits"),
+                // [N] }` shape the width-expr implies, so one stale
+                // `bits[N]` doesn't cascade into unrelated errors below it.
+                if name == "bits" && self.at(TokenKind::LBracket) {
+                    self.error_here("`bits[N]` is no longer valid syntax; use `[N]`".to_string());
+                    self.bump(); // `[`
+                    let width = self.parse_expr(0)?;
+                    self.expect(TokenKind::RBracket, "`]`").ok()?;
+                    self.synth_bits_ty_expr(width, lo..self.prev_end)
                 } else {
                     self.ast.push_expr(Expr::Ident(name), span)
                 }
@@ -884,21 +906,6 @@ impl<'a> Parser<'a> {
             Some(Underscore) => {
                 let span = self.bump().unwrap().span;
                 self.ast.push_expr(Expr::Wildcard, span)
-            }
-            // `bit` is pure sugar for `bits[1]`, desugared here rather
-            // than given its own `Ty`-like AST node — everything
-            // downstream (resolve/effects/types/emission) sees the exact
-            // same `Bracket { Ident("bits"), [1] }` shape a literal
-            // `bits[1]` would produce, so it needs no awareness `bit` was
-            // ever written. Unlike `reg`/`mem`/`fifo`/`in`/`out`
-            // (contextual keywords that fall back to `Expr::Ident` in
-            // expression position, for the case where a user's own item
-            // happens to be named that word), `bit` has no such fallback:
-            // it isn't a declaration-introducing keyword with a
-            // followed name to collide with, so it always desugars.
-            Some(Bit) => {
-                let span = self.bump().unwrap().span;
-                self.synth_bits_ty(1, span)
             }
             Some(Int) => {
                 let span = self.bump().unwrap().span;
@@ -942,15 +949,53 @@ impl<'a> Parser<'a> {
                 let inner = self.parse_expr(PREFIX_BP)?;
                 self.ast.push_expr(Expr::Spawn(inner), lo..self.prev_end)
             }
-            // `[a, b, c]` — a `list[T]` literal. A leading `[` is
-            // otherwise unused in primary position (postfix `x[...]` is
-            // handled separately, below, once `lhs` already exists), so
-            // this doesn't collide with bit-select/fifo-op/mem-index
-            // syntax.
+            // A leading `[` in primary position is one of two things,
+            // told apart by content rather than position: `[a, b, c]`
+            // (empty, or 2+ comma-separated items) is a `list[T]`
+            // literal; `[N]` (exactly one item, no trailing comma) is the
+            // `bits[N]` type shorthand instead — the same `Bracket {
+            // Ident("bits"), [N] }` shape a literal `bits[N]` used to
+            // produce (see `synth_bits_ty_expr`, below), reached here
+            // uniformly whether this bracket is a top-level type
+            // position or nested inside another bracket's own args
+            // (`list[[8]]`, `mem`'s postfix `elem_ty[len]`), since
+            // `parse_args` parses every argument through this same
+            // primary path. `AdderTree([a, b, c, d])`-style call
+            // arguments are unaffected (always 2+ elements in practice);
+            // a genuine one-element list literal has no spelling left —
+            // no real use of one exists anywhere in this codebase, and a
+            // future one would fail with a clear type error (a `bits[N]`
+            // type appearing where a value is expected), not a silent
+            // miscompile. Postfix `x[...]` (bit-select/fifo-op/mem-index)
+            // is unaffected, handled separately below once an `lhs`
+            // already exists.
             Some(LBracket) => {
                 self.bump();
-                let items = self.parse_args(RBracket)?;
-                self.ast.push_expr(Expr::ListLit(items), lo..self.prev_end)
+                self.skip_newlines();
+                if self.at(RBracket) {
+                    self.bump();
+                    self.ast.push_expr(Expr::ListLit(vec![]), lo..self.prev_end)
+                } else {
+                    let first = self.parse_expr(0)?;
+                    self.skip_newlines();
+                    if self.eat(Comma) {
+                        self.skip_newlines();
+                        let mut items = vec![first];
+                        while !self.at(RBracket) {
+                            items.push(self.parse_expr(0)?);
+                            self.skip_newlines();
+                            if !self.eat(Comma) {
+                                break;
+                            }
+                            self.skip_newlines();
+                        }
+                        self.expect(RBracket, "`]`").ok()?;
+                        self.ast.push_expr(Expr::ListLit(items), lo..self.prev_end)
+                    } else {
+                        self.expect(RBracket, "`]`").ok()?;
+                        self.synth_bits_ty_expr(first, lo..self.prev_end)
+                    }
+                }
             }
             // `..hi` — an open-start list slice bound (`xs[..mid]`).
             // Only meaningful as a bracket argument; `type_bracket`
@@ -1217,17 +1262,6 @@ fn parse_int(text: &str) -> Option<u64> {
     } else {
         text.parse().ok()
     }
-}
-
-/// `u` followed by one or more digits (`u8`, `u32`, ...) is sugar for
-/// `bits[N]`; anything else (`u`, `unused`, `u8x`) is an ordinary
-/// identifier.
-fn u_width(text: &str) -> Option<u64> {
-    let digits = text.strip_prefix('u')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
 }
 
 /// `<width>'<radix?><value>` — e.g. `8'd6`, `8'hFF`, `8'b1010`, `8'o17`,

@@ -7,26 +7,26 @@
 -- caller's rule guard, exactly the way a scalar-returning `<fails>`
 -- callee already does (`callee_fail_cond`).
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
-MakePair(d : bits[8]) : Pair <combines> {
+MakePair(d : [8]) : Pair <combines> {
     return Pair{ valid: 1, data: d }
 }
 
-Wrap(x : bits[8]) : ?bits[8] <combines, fails> {
+Wrap(x : [8]) : ?[8] <combines, fails> {
     (x <> 0)?
     return x
 }
 
 module CallStructReturn {
-    fifo pair_input : bits[8]
-    fifo opt_input : bits[8]
+    fifo pair_input : [8]
+    fifo opt_input : [8]
     reg pair : Pair = Pair{ valid: 0, data: 0 }
-    reg opt : ?bits[8] = false
-    out from_pair : bits[8] = 0
-    out from_opt : bits[8] = 0
+    reg opt : ?[8] = false
+    out from_pair : [8] = 0
+    out from_opt : [8] = 0
 
     rule fill_pair {
         let d = pair_input.Deq[]

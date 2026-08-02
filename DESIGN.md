@@ -24,8 +24,8 @@ handshaking from failure. The user never writes a `ready` signal.
 
 ```trace
 module FifoBridge {
-    fifo input  : bits[8]
-    fifo output : bits[8]
+    fifo input  : [8]
+    fifo output : [8]
 
     rule transfer {
         let x = input.Deq[]   -- fails when input is empty
@@ -57,8 +57,8 @@ in the sense that each already has its own established meaning as a bare
 statement (a call may or may not fail on its own terms; a fifo op's fail
 condition already folds in on its own; a `spawn`'s handle being unused is
 the point) — none of those need `?`, and writing one there wouldn't add
-anything. Anything else bare must be `bits[1]`, the same requirement an
-`if`/`while` condition already has; a bare non-`bits[1]` expression (its
+anything. Anything else bare must be `[1]`, the same requirement an
+`if`/`while` condition already has; a bare non-`[1]` expression (its
 value computed and discarded for no reason) is a compile-time error rather
 than silently doing nothing. Both `?` and its bare-statement sugar are only
 legal in a failure context (a rule, always; a `fn`/`impl`/`spec` only if it
@@ -99,7 +99,7 @@ A `combines` function cannot recurse, loop on circuit values, or suspend. It
 always lowers to a pure combinational expression.
 
 ```trace
-Parity(x : bits[8]) : bits[1] <combines> {
+Parity(x : [8]) : [1] <combines> {
     return x[0] ^ x[1] ^ x[2] ^ x[3] ^ x[4] ^ x[5] ^ x[6] ^ x[7]
 }
 ```
@@ -107,7 +107,7 @@ Parity(x : bits[8]) : bits[1] <combines> {
 The checker rejects circuit-value loops in `combines` code:
 
 ```trace
-Bad(x : bits[8]) : bits[8] <combines> {
+Bad(x : [8]) : [8] <combines> {
     while x <> 0 { x := x >> 1 }
     -- error[E012]: loop bound depends on a circuit value.
     -- Loops over circuit values need `<sequences>` (one iteration per cycle)
@@ -121,7 +121,7 @@ Bad(x : bits[8]) : bits[8] <combines> {
 and dynamic allocation are legal here and only here.
 
 ```trace
-AdderTree(xs : list[wire[bits[32]]]) : wire[bits[32]] <elaborates> {
+AdderTree(xs : list[wire[[32]]]) : wire[[32]] <elaborates> {
     if len(xs) = 1 { return xs[0] }        -- `if` on an elab value: unrolls
     let mid = len(xs) / 2
     return Add(AdderTree(xs[..mid]), AdderTree(xs[mid..]))   -- recursion: legal
@@ -159,7 +159,7 @@ merely calls a failing function and returns its result also fails, and also
 needs the declaration, not just the site with the `?`.
 
 ```trace
-Classify(x : bits[8]) : bits[2] <combines, fails> {
+Classify(x : [8]) : [2] <combines, fails> {
     (x <> 0)?                 -- fallible: aborts the calling rule's cycle
     return clog2(x)
 }
@@ -219,7 +219,7 @@ same first-match-wins convention `prio` already uses.
 `or`'s v0 restrictions, checked explicitly rather than silently mis-compiled:
 an alternative may only be `Deq[]` (an `Enq[x]` alternative is rejected by
 ordinary type-checking — it has no value of its own for `or` to select
-between, so its `unit` type can never match a fifo element's `bits[N]`); a
+between, so its `unit` type can never match a fifo element's `[N]`); a
 fifo used as an `or` alternative may not be touched anywhere else in the same
 rule (composing an alternative's conditional state transition with an
 unconditional touch of the same fifo elsewhere hasn't been verified); and an
@@ -251,7 +251,7 @@ no checkpoint hardware. Each cycle is still its own one-cycle transaction.
 The `tick` statement marks a cycle boundary.
 
 ```trace
-Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
+Rmw(addr : [8]) <sequences, reads {mem}, writes {mem}> {
     let v = mem[addr]
     tick
     mem[addr] := v + 1
@@ -295,18 +295,18 @@ finish, and permanently blocks every other named one from ever completing.
 
 ```trace
 module Fetch2 {
-    mem bank0 : bits[16][8]
-    mem bank1 : bits[16][8]
-    in pc : bits[16]
-    out ir : bits[32] = 0
+    mem bank0 : [16][8]
+    mem bank1 : [16][8]
+    in pc : [16]
+    out ir : [32] = 0
 
-    ReadBank0(addr : bits[16]) : bits[16] <sequences> {
+    ReadBank0(addr : [16]) : [16] <sequences> {
         let v = bank0[addr]
         tick
         return v
     }
 
-    ReadBank1(addr : bits[16]) : bits[16] <sequences> {
+    ReadBank1(addr : [16]) : [16] <sequences> {
         let v = bank1[addr]
         tick
         return v
@@ -324,7 +324,7 @@ module Fetch2 {
 `spawn Callee(args)` requires `Callee` to be a `<sequences>`-declared function.
 The expression's type is a handle, written internally as `Ty::Handle(T)` where
 `T` is `Callee`'s return type. `h.result` reads the spawned computation's return
-value; `h.done` reports whether it has finished, as `bits[1]`. Both fields are
+value; `h.done` reports whether it has finished, as `[1]`. Both fields are
 read-only.
 
 `spawn` must sit at the top level of its enclosing segment, the same restriction
@@ -344,14 +344,14 @@ larger expression — the idiomatic place is directly after `tick`
 
 ```trace
 module FirstWins {
-    in trigger : bits[1]
-    out result : bits[8] = 0
+    in trigger : [1]
+    out result : [8] = 0
 
-    Fast(x : bits[8]) : bits[8] <sequences> {
+    Fast(x : [8]) : [8] <sequences> {
         tick
         return x + 1
     }
-    Slow(x : bits[8]) : bits[8] <sequences> {
+    Slow(x : [8]) : [8] <sequences> {
         tick
         tick
         return x + 2
@@ -393,14 +393,14 @@ already the module's own output:
 
 ```trace
 module RaceValue {
-    in trigger : bits[1]
-    out result : bits[8] = 0
+    in trigger : [1]
+    out result : [8] = 0
 
-    A(x : bits[8]) : bits[8] <sequences> {
+    A(x : [8]) : [8] <sequences> {
         tick
         return x + 10
     }
-    B(x : bits[8]) : bits[8] <sequences> {
+    B(x : [8]) : [8] <sequences> {
         tick
         return x + 20
     }
@@ -436,13 +436,13 @@ variable in a model checker, like SVA `$anyseq`. Implementations are checked as
 refinements of specs that declare `chooses`.
 
 ```trace
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses, fails> {
+spec AnyGrant(reqs : [N]) : [clog2(N)] <combines, chooses, fails> {
     let i = any(0..N-1)       -- free variable: the checker picks
     reqs[i]?                  -- constrained: the pick must be a requester
     return i
 }
 
-impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines>
+impl RoundRobin(reqs : [N]) : [clog2(N)] <combines>
     refines AnyGrant
 {
     -- deterministic logic; checked against the spec
@@ -463,14 +463,28 @@ and absorb a width from context, range-checked at the point they are used.
 
 Sized literals give a definite width up front: `<width>'<radix?><value>` — for
 example `8'd6`, `8'hFF`, `8'b1010`, `8'o17`, or `8'6` (defaults to decimal). A
-sized literal types directly as `bits[width]` and is range-checked immediately,
+sized literal types directly as `[width]` and is range-checked immediately,
 against its own declared width — `4'd20` is an error even in a context that
 could absorb a wider value. Overflow is always a compile error, never silent
 truncation. `reg`/`out` may omit an explicit `: ty` when the initializer is a
-sized literal: `reg a = 8'd6` declares `bits[8]`.
+sized literal: `reg a = 8'd6` declares `[8]`.
 
-`bit` is sugar for `bits[1]`. `bit[N]` means `bits[1][N]`. `uN` (`u8`, `u16`,
-`u32`, ...) is sugar for `bits[N]`: `reg a : u8` means `reg a : bits[8]`.
+A bit-vector type is written `[N]` — no `bits` keyword. Told apart from a list
+literal (`[a, b, c]`) purely by content, not position: a bracket holding
+exactly one item with no trailing comma is always the `[N]` type; anything
+else (empty, or 2+ comma-separated items) is a list value. Nothing about a
+type expression is otherwise special — arithmetic (`[N+1]`), a call
+(`[clog2(N)]`), or bracket application (a memory's `elem_ty[depth]`, a fifo's
+own `{depth}elem_ty`) all parse the same as any other expression in that
+position. `[N]` is unambiguous everywhere it nests too — inside `list[[8]]`,
+a call argument, a struct field type — since every bracket parses through
+this same primary rule regardless of depth. A genuine one-element list VALUE
+(as opposed to a type) needs a trailing comma to tell it apart — `[x]` is
+the `[N]` type shorthand, `[x,]` is the one-element list, the same
+Rust-style escape hatch a one-element tuple literal uses for an identical
+reason. Omitting the comma (`Foo([x])`) fails with a clear type error (a
+`[N]` type appearing where a value was expected) rather than silently doing
+the wrong thing.
 
 Arithmetic and bitwise operators follow Chisel-style modular width rules:
 
@@ -486,13 +500,13 @@ Arithmetic and bitwise operators follow Chisel-style modular width rules:
   bits repeat the operand's own top bit instead of filling with zero. This
   language has no signed type (see TODO.md), so arithmetic-vs-logical shift is
   a per-operator choice, not a property of the operand's own type — `x >>> n`
-  and `x >> n` are both legal on the same `bits[N]` value, with different
+  and `x >> n` are both legal on the same `[N]` value, with different
   results whenever the top bit is set.
-- Comparisons produce `bits[1]`.
+- Comparisons produce `[1]`.
 - Unary `-` is two's-complement negate, wrapping within the operand's width.
   Unary `~` is bitwise complement.
-- `not` is logical negation, distinct from `~`: it requires a `bits[1]` operand.
-  Every position where `not` is meaningful already carries `bits[1]`, so the
+- `not` is logical negation, distinct from `~`: it requires a `[1]` operand.
+  Every position where `not` is meaningful already carries `[1]`, so the
   two operators agree there; `not` on a wider value is a type error, since
   this language has no "nonzero is true" coercion.
 
@@ -531,8 +545,8 @@ not configurable — there is no separate `..=` form.
 Two declarations, alongside `reg`/`mem`/`fifo`:
 
 ```trace
-in inc : bits[8]              -- external combinational signal, read-only
-out sum : bits[8] = 0         -- register-backed, exposed as a port
+in inc : [8]              -- external combinational signal, read-only
+out sum : [8] = 0         -- register-backed, exposed as a port
 ```
 
 `in` is a pure wire driven from outside the module. Reading one inside a rule
@@ -549,8 +563,8 @@ expressible in v0.
 
 ```trace
 module Accumulator {
-    in inc : bits[8]
-    out sum : bits[8] = 0
+    in inc : [8]
+    out sum : [8] = 0
 
     rule accumulate {
         sum := sum + inc
@@ -562,9 +576,9 @@ module Accumulator {
 
 ```trace
 reg   name : ty (= init)?     -- one register
-mem   name : ty                -- a memory: ty is elem[depth], e.g. bits[16][256]
+mem   name : ty                -- a memory: ty is elem[depth], e.g. [16][256]
 fifo  name : ty                -- a fifo; ty is an element type (depth 1) or
-                                --   [depth]elem_ty (e.g. [4]bits[8])
+                                --   {depth}elem_ty (e.g. {4}[8])
 inst  name : Module            -- a child module instance
 ```
 
@@ -600,9 +614,9 @@ value (one `Enq[x]` fills one slot, not one slot per statement), and a second
 Use a `reg` instead if a rule needs to hold more than one candidate value in a
 cycle.
 
-A fifo's depth defaults to 1; `[depth]elem_ty` (e.g. `fifo f : [4]bits[8]`)
+A fifo's depth defaults to 1; `{depth}elem_ty` (e.g. `fifo f : {4}[8]`)
 declares a deeper one — depth-first, the preferred spelling, though a
-memory's postfix `elem_ty[depth]` (`bits[8][4]`) also works for a fifo:
+memory's postfix `elem_ty[depth]` (`[8][4]`) also works for a fifo:
 both parse to the same underlying elem/depth pair.
 
 An instance's ports are read and written through `.`: `adder.a := x` writes a
@@ -637,7 +651,7 @@ rule step {
 ```trace
 struct Pair {
     valid : bit
-    data : bits[8]
+    data : [8]
 }
 ```
 
@@ -648,7 +662,7 @@ compile-time errors. `.field` reads a field back:
 
 ```trace
 module M {
-    fifo input : bits[8]
+    fifo input : [8]
     reg p : Pair = Pair{ valid: 0, data: 0 }
 
     rule fill {
@@ -669,12 +683,12 @@ just one level:
 ```trace
 struct Header {
     valid : bit
-    seq : bits[4]
+    seq : [4]
 }
 
 struct Frame {
     header : Header
-    data : bits[8]
+    data : [8]
 }
 ```
 
@@ -687,7 +701,7 @@ caught before it ever reaches flattening (see "Struct emission" under Part
 2), not a stack overflow.
 
 v0 restrictions, all enforced as clean compile-time errors rather than left to
-miscompile: a field's type must be `bits[N]`, another struct, or `?T` (no
+miscompile: a field's type must be `[N]`, another struct, or `?T` (no
 `list`, no fifo/mem); a struct has no per-field write — `p.field := x` is rejected,
 assign the whole value instead (`p := Pair{...}`, same restriction a `spawn`
 handle's `.result`/`.done` fields already have); a struct-typed write's
@@ -713,7 +727,7 @@ TODO.md.
 
 ## Option types
 
-`?T` is sugar for a compiler-synthesized `{ valid: bit, data: T }` struct —
+`?T` is sugar for a compiler-synthesized `{ valid: [1], data: T }` struct —
 it reuses every bit of struct flattening/read/write machinery, not a parallel
 mechanism of its own. Verse spells the absent case `false` rather than a
 dedicated `none` keyword, tying it into Verse's logic-programming failure
@@ -722,7 +736,7 @@ it's *written* (a reg/output/local init, a state write, an ordinary
 assignable position):
 
 ```trace
-reg opt : ?bits[8] = false   -- absent
+reg opt : ?[8] = false       -- absent
 ...
 opt := 8'd5                  -- present(5), no wrapper syntax needed
 opt := false                 -- absent again
@@ -730,21 +744,21 @@ opt := false                 -- absent again
 
 `false` is a real lexer keyword, not a general boolean literal — there is no
 `true` counterpart. This is deliberate: if `false` doubled as a plain zero
-bit, `?bit` would be ambiguous between "absent" and "present, holding 0".
+bit, `?[1]` would be ambiguous between "absent" and "present, holding 0".
 `false` only type-checks against a `?T` target.
 
 Unwrapping goes through the *same* `?` guard operator a fifo `Deq[]` or a
 `<fails>` call already uses, generalized: when its operand types as `?T`
-instead of `bits[1]`, `opt?` fails the rule (discarding any writes it would
+instead of `[1]`, `opt?` fails the rule (discarding any writes it would
 have made) if `opt` is absent, or evaluates to the unwrapped `T` if present —
 the exact same `fails`-folding machinery a fifo occupancy check already
 threads into a rule's guard:
 
 ```trace
 module M {
-    fifo input : bits[8]
-    reg opt : ?bits[8] = false
-    out result : bits[8] = 0
+    fifo input : [8]
+    reg opt : ?[8] = false
+    out result : [8] = 0
 
     rule fill {
         let d = input.Deq[]
@@ -843,7 +857,7 @@ rule r {
 }
 ```
 
-A local whose width never resolves to a concrete `bits[w]` anywhere in the rule
+A local whose width never resolves to a concrete `[w]` anywhere in the rule
 (for example, one used only as a memory-read index) still rejects reassignment.
 
 Inside a `sequences` body, a local can cross a `tick` regardless of whether it
@@ -872,15 +886,15 @@ so `return <expr>` at a rule's top level is a compile-time error rather than
 something to write here.
 
 ```trace
-Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
+Avg(a : [8], b : [8]) : [8] <combines> {
     let sum = a + b
     return sum >> 1
 }
 
 module Top {
-    in a : bits[8]
-    in b : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    out result : [8] = 0
 
     rule compute {
         result := Avg(a, b)
@@ -909,7 +923,7 @@ the caller's own rule guard, substituted against that call's actual
 arguments, exactly as if they had been written directly in the caller:
 
 ```trace
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
@@ -918,7 +932,7 @@ rule step {
     result := Classify(a)    -- rule's own guard becomes (a <> 0)?
 }
 
-Push(x : bits[8]) : bits[8] <combines, fails> {
+Push(x : [8]) : [8] <combines, fails> {
     buf.Enq[x]
     return x
 }
@@ -970,16 +984,16 @@ another same-typed param, chased through to that value's own flat fields:
 ```trace
 struct Pair {
     valid : bit
-    data : bits[8]
+    data : [8]
 }
 
-UsePair(p : Pair) : bits[8] <combines> {
+UsePair(p : Pair) : [8] <combines> {
     return p.data
 }
 
 module M {
     reg q : Pair = Pair{ valid: 1, data: 8'd7 }
-    out out_v : bits[8] = 0
+    out out_v : [8] = 0
     rule r {
         out_v := UsePair(q)    -- p.data resolves to q_data
     }
@@ -993,8 +1007,8 @@ reg reference (see "Option emission" under Part 2). Chasing through an
 argument only happens when the argument is itself a plain reference of the
 *same* type as the param (genuine aliasing, `UsePair(q)` with `q : Pair`) —
 a plain `T`-typed value or local passed to a `?T` param still coerces to
-present the ordinary way, unaffected (`UseIt(x)` with `x : bits[8]` and
-`UseIt(o : ?bits[8])` coerces `x` present, it does not chase `x`).
+present the ordinary way, unaffected (`UseIt(x)` with `x : [8]` and
+`UseIt(o : ?[8])` coerces `x` present, it does not chase `x`).
 Chaining through nested calls composes (`Outer(p) { return Inner(p) }`,
 called as `Outer(q)`, resolves all the way back to `q`'s own fields) — one
 restriction carries over from ordinary struct/Option LOCALS: a `let` INSIDE
@@ -1052,7 +1066,7 @@ Of the builtins, `prio`, `trunc`, `pack`, and `logic` are synthesizable as calls
   first argument becomes the high bits, matching FIRRTL's `cat`, Chisel's `Cat`,
   and Verilog's `{a, b}` concatenation. The result width is the sum of the
   argument widths.
-- **`logic(e)`** converts a fallible expression into a plain `bits[1]` value —
+- **`logic(e)`** converts a fallible expression into a plain `[1]` value —
   `1` if `e` would succeed, `0` if it would fail — without gating the enclosing
   rule (the failure is *discharged*, not propagated) and without performing
   `e`'s own side effect. `e` must be exactly one of two shapes: a fifo op
@@ -1087,8 +1101,11 @@ Of the builtins, `prio`, `trunc`, `pack`, and `logic` are synthesizable as calls
   split.
 
 `clog2` and `len` type as `Ty::Int`: they are compile-time-only, not synthesizable
-values. `bits`, `wire`, `list`, and `any` are type- or elaboration-position
-constructs with no runtime hardware meaning. `sync` and `race` are covered above.
+values. `wire`, `list`, and `any` are type- or elaboration-position constructs
+with no runtime hardware meaning (`bits` no longer has surface syntax of its
+own — see "Expression surface" — but the AST node it used to name is still
+synthesized internally by every `[N]` type). `sync` and `race` are covered
+above.
 
 ## The schedule block
 
@@ -1192,9 +1209,9 @@ elaboration time, where recursion is legal.
 ```trace
 Fifo(depth : int, T : type) { ... }
 
-f := Fifo(_, bits[8])
-f.Enq[x]                  -- x : bits[8] unifies; depth still free
-g := connect(f, deep16)   -- deep16 : Fifo(16, _) → depth := 16, T := bits[8]
+f := Fifo(_, [8])
+f.Enq[x]                  -- x : [8] unifies; depth still free
+g := connect(f, deep16)   -- deep16 : Fifo(16, _) → depth := 16, T := [8]
 ```
 
 **Pass 2: width inference.** A monotone fixed-point over an interval lattice.
@@ -1205,7 +1222,7 @@ growing without bound) is a compile error naming the enclosing item.
 ```trace
 let sum = a + b           -- |sum| = max(|a|, |b|); modular, Chisel-style
 let prod = a * b          -- |prod| = |a| + |b|
-let idx = pc + 3          -- an int literal absorbs the other width: bits[16]
+let idx = pc + 3          -- an int literal absorbs the other width: [16]
 sum := trunc(sum, 8)      -- explicit narrowing; silent truncation is an error
 ```
 
@@ -1277,7 +1294,7 @@ A `sequences` block is sugar. `tick` cuts it into segments; each segment
 lowers to an ordinary single-cycle rule, guarded on a continuation register.
 
 ```trace
-Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
+Rmw(addr : [8]) <sequences, reads {mem}, writes {mem}> {
     let v = mem[addr]
     tick
     mem[addr] := v + 1
@@ -1288,7 +1305,7 @@ lowers to (shown as source; the real lowering is internal):
 
 ```trace
 reg cont   : {S0, S1} = S0
-reg v_save : bits[8]
+reg v_save : [8]
 
 rule rmw_s0 {
     (cont = S0)?
@@ -1319,7 +1336,7 @@ register would change its semantics from "sees the new value" to "sees the old
 value" (a register is speculative until the clock edge). A local reassigned
 across segments, or read in its own assignment segment, is a compile error
 rather than a silent miscompile. A captured local's type must be a concrete
-`bits[w]`.
+`[w]`.
 
 The lowering splices the original binding statement verbatim into the
 generated segment rule, relying on it staying a valid register write once
@@ -1339,7 +1356,7 @@ Because `let` may shadow, two textually-distinct `let x = ...` bindings
 (different `DefId`s) can both need to cross a `tick` within the same rule —
 one arm of a sequence, then a later arm shadowing the same name. Both would
 otherwise become captures sharing the name `x`, and thus the same save
-register (`reg x : bits[8] = 0` emitted twice), which fails to re-resolve
+register (`reg x : [8] = 0` emitted twice), which fails to re-resolve
 downstream rather than erroring cleanly at lowering time. `compute_captures`
 rejects this directly once two captures resolve to the same name, before any
 text is generated.
@@ -1499,11 +1516,11 @@ being ported into the emitter (`examples/fifo_depth.tr`,
 
 ```trace
 module FifoPassthrough {
-    fifo f : bits[8]
+    fifo f : [8]
 
-    in seed : bits[1]
-    in seed_value : bits[8]
-    out last_out : bits[8] = 0
+    in seed : [1]
+    in seed_value : [8]
+    out last_out : [8] = 0
 
     rule load {
         (seed = 1)?
@@ -1534,12 +1551,12 @@ write.
 
 ```trace
 module PortRam {
-    mem m : bits[16][256]
+    mem m : [16][256]
 
-    in addr : bits[8]
-    in write_data : bits[16]
-    in write_en : bits[1]
-    out read_data : bits[16] = 0
+    in addr : [8]
+    in write_data : [16]
+    in write_en : [1]
+    out read_data : [16] = 0
 
     rule write {
         (write_en = 1)?
@@ -1614,7 +1631,7 @@ LEAF field, named `name_field`; a struct-typed `out`/`in` follows the same
 `{port}_{field}` naming an `Output`'s existing internal-backing-register
 split already uses. `Types::struct_fields` (an ordered `(name, Ty)` list per
 struct `DefId`) drives the expansion; every leaf field's type must resolve
-to a concrete `bits[N]` or emission errors, mirroring the "no concrete bit
+to a concrete `[N]` or emission errors, mirroring the "no concrete bit
 width" check an ordinary scalar reg already has.
 
 A struct field may itself be another struct — `struct_field_widths`
@@ -1663,7 +1680,7 @@ explicitly at instance-collection time instead of surfacing as either.
 
 `?T` never emits a real FIRRTL bundle either, for the identical reason a
 `struct` doesn't — it flattens to exactly two leaf entries, `valid` (1 bit)
-and `data` (`T`'s own flat shape: one register if `T` is `bits[N]`, or `T`'s
+and `data` (`T`'s own flat shape: one register if `T` is `[N]`, or `T`'s
 own recursive field list, `data`-prefixed, if `T` is itself a struct or
 another `?T`). `option_field_widths` is `struct_field_widths`'s Option
 counterpart, sharing the exact same recursion/joining convention.
@@ -1709,7 +1726,7 @@ The `?` guard operator, generalized: `opt?` used as a *value*
 same FIRRTL text (the difference is entirely on the *guard* side). `opt?`'s
 contribution to a rule's *guard* (`compile_guard_unwrap_cond`, writes.rs) is
 computed separately: for a `?T`-typed operand it reads `valid` instead of
-compiling the operand as an ordinary `bits[1]` condition, then folds into
+compiling the operand as an ordinary `[1]` condition, then folds into
 the rule's guard through the same `fails`-folding machinery a fifo
 occupancy check or a `<fails>` callee's condition already uses. This fold
 only runs at the three positions `check_guard_positions` (checks.rs) allows
@@ -1755,8 +1772,8 @@ inliner performs, bottoming out at a reg/output/input's own flat field names
 (or, for an argument that's genuinely a literal/coercible value instead, the
 existing `compile_field_path_value` decompose/coercion path, untouched). The
 exact-type-match guard is what keeps this from misfiring on the ordinary
-coercion case: a plain `bits[8]` argument passed to a `?bits[8]` param has a
-DIFFERENT type from the param (`bits[8]` vs `?bits[8]`), so it correctly
+coercion case: a plain `[8]` argument passed to a `?[8]` param has a
+DIFFERENT type from the param (`[8]` vs `?[8]`), so it correctly
 falls through to being coerced present rather than chased. This chase-
 through is deliberately PARAM-only, not extended to plain rule-level `let`
 aliasing (`let o = opt`, no call involved) — that stays rejected exactly as
@@ -1823,7 +1840,7 @@ field`'s own `Return` arm, checking `ret_expr` directly: only a LITERAL
 `return p` (never a param reached by chasing through some intermediate
 local) delegates to `compile_struct_field_read`, gated on `ret_expr`'s type
 exactly matching the target type — an ordinary `T`-into-`?T` present-
-coercion (`return x`, `x : bits[8]`, callee returns `?bits[8]`) has a
+coercion (`return x`, `x : [8]`, callee returns `?[8]`) has a
 DIFFERENT type and must still fall through to the ordinary coercion-
 synthesis path, a second real regression this fix caught and fixed before
 shipping (a probe built specifically for the guard-fold intersection, per
@@ -1940,7 +1957,7 @@ all), read exactly as many times as the source references it, so there is no
 aliasing/re-instantiation risk `wire` would need to guard against. A list's
 concrete length is real only inside the interpreter (`ElabValue::List`);
 `Ty::List` (`types.rs`) deliberately never tracks it, the same way a generic
-`bits[N]` callee body is checked once regardless of call-site width.
+`[N]` callee body is checked once regardless of call-site width.
 
 `MAX_DEPTH` (64) is a hard compiler backstop against non-terminating
 recursion, an explicit error rather than a stack overflow or a hang. This
@@ -2006,8 +2023,8 @@ noted:
 - `chooses`/`any`/spec refinement (checked, not synthesized).
 - The full expression surface: arithmetic, bitwise ops, static and dynamic
   shifts including arithmetic (sign-extending) `>>>`, unary negate/complement/
-  not, bit-select and slice, indexed part-select, sized literals, `bit`/`uN`
-  sugar for `bits[1]`/`bits[N]`.
+  not, bit-select and slice, indexed part-select, sized literals, the `[N]`
+  bit-vector type (told apart from a list literal by content, not position).
 - Module ports (`in`/`out`), including boot-loading a memory through
   ports with a `boot_done` handshake (`examples/subleq_boot.tr`).
 - FIFO synthesis, including the enqueue/dequeue pass-through case
@@ -2024,7 +2041,7 @@ noted:
   guard, including the Enq+Deq pass-through case split across the call
   boundary — `examples/call_guard.tr`, `examples/call_fifo.tr`), the
   synthesizable builtins `prio`/`trunc`/`pack` (`examples/call*.tr`).
-- `logic(e)`: a fallible expression's success as a plain `bits[1]` value,
+- `logic(e)`: a fallible expression's success as a plain `[1]` value,
   discharged rather than propagated, with no side effect of its own
   (`examples/logic_probe.tr`).
 - `A or B or C`: a fallback chain over fifo `Deq[]` alternatives, with an

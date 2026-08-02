@@ -32,8 +32,8 @@ fn locals_vs_state_writes() {
     // `let x = ...` binds a local; `count := ...` writes the register.
     let src = "\
 module M {
-    reg count : bits[8] = 0
-    fifo input : bits[8]
+    reg count : [8] = 0
+    fifo input : [8]
 
     rule drain {
         let x = input.Deq[]
@@ -76,7 +76,7 @@ fn unresolved_name_is_an_error() {
 
 #[test]
 fn input_ports_are_read_only() {
-    let (_, _, errors) = run("module M {\n in x : bits[8]\n \
+    let (_, _, errors) = run("module M {\n in x : [8]\n \
          rule r {\n x := x + 1\n}\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("input port"));
@@ -86,7 +86,7 @@ fn input_ports_are_read_only() {
 #[test]
 fn output_ports_are_writable_state() {
     let (_, res) = run_ok(
-        "module M {\n out x : bits[8] = 0\n \
+        "module M {\n out x : [8] = 0\n \
          rule r {\n x := x + 1\n}\n}\n",
     );
     assert!(resolved_kinds(&res).contains(&DefKind::Output));
@@ -95,9 +95,9 @@ fn output_ports_are_writable_state() {
 #[test]
 fn inst_resolves_to_a_module_and_ports_are_fields() {
     let (_, res) = run_ok(
-        "module Child {\n in a : bits[8]\n out b : bits[8] = 0\n \
+        "module Child {\n in a : [8]\n out b : [8] = 0\n \
          rule r {\n b := a\n}\n}\n\
-         module Top {\n inst c : Child\n reg v : bits[8] = 0\n \
+         module Top {\n inst c : Child\n reg v : [8] = 0\n \
          rule w {\n c.a := v\n v := c.b\n}\n}\n",
     );
     assert!(resolved_kinds(&res).contains(&DefKind::Inst));
@@ -106,9 +106,9 @@ fn inst_resolves_to_a_module_and_ports_are_fields() {
 #[test]
 fn nested_module_resolves_and_can_be_instantiated_from_its_parent() {
     let (_, res) = run_ok(
-        "module Top {\n module Adder {\n in a : bits[8]\n out b : bits[8] = 0\n \
+        "module Top {\n module Adder {\n in a : [8]\n out b : [8] = 0\n \
          rule r {\n b := a\n}\n}\n \
-         inst c : Adder\n reg v : bits[8] = 0\n \
+         inst c : Adder\n reg v : [8] = 0\n \
          rule w {\n c.a := v\n v := c.b\n}\n}\n",
     );
     assert!(resolved_kinds(&res).contains(&DefKind::Inst));
@@ -126,7 +126,7 @@ fn nested_module_is_not_visible_outside_its_lexical_scope() {
     // name it, same as a `reg`/`rule` declared inside one module was
     // already invisible to another.
     let (_, _, errors) = run(
-        "module Top {\n module Adder {\n in a : bits[8]\n}\n inst c : Adder\n}\n\
+        "module Top {\n module Adder {\n in a : [8]\n}\n inst c : Adder\n}\n\
          module Sibling {\n inst also_adder : Adder\n}\n",
     );
     assert!(errors.iter().any(|e| e.message.contains("cannot find")));
@@ -139,8 +139,8 @@ fn nested_module_cannot_read_its_parents_state() {
     // own emitted FIRRTL scope (modules share nothing but ports) — must
     // be a clean resolve-time error, not a name that silently resolves
     // and only fails once it's invalid FIRRTL text firtool rejects.
-    let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
-         module Adder {\n in a : bits[8]\n out sum : bits[8] = 0\n \
+    let (_, _, errors) = run("module Top {\n reg v : [8] = 0\n \
+         module Adder {\n in a : [8]\n out sum : [8] = 0\n \
          rule add {\n sum := a + v\n}\n}\n inst c : Adder\n}\n");
     assert!(
         errors
@@ -151,8 +151,8 @@ fn nested_module_cannot_read_its_parents_state() {
 
 #[test]
 fn nested_module_cannot_write_its_parents_state() {
-    let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
-         module Adder {\n in a : bits[8]\n rule set {\n v := a\n}\n}\n inst c : Adder\n}\n");
+    let (_, _, errors) = run("module Top {\n reg v : [8] = 0\n \
+         module Adder {\n in a : [8]\n rule set {\n v := a\n}\n}\n inst c : Adder\n}\n");
     assert!(
         errors
             .iter()
@@ -162,7 +162,7 @@ fn nested_module_cannot_write_its_parents_state() {
 
 #[test]
 fn nested_module_cannot_declare_reads_on_its_parents_state() {
-    let (_, _, errors) = run("module Top {\n reg v : bits[8] = 0\n \
+    let (_, _, errors) = run("module Top {\n reg v : [8] = 0\n \
          module Adder {\n rule r <reads {v}> {\n tick\n}\n}\n inst c : Adder\n}\n");
     assert!(
         errors
@@ -178,8 +178,8 @@ fn sibling_state_names_do_not_falsely_trigger_the_boundary_check() {
     // owner is its own module; neither is an ancestor of the other, so
     // this must resolve via ordinary shadowing, not an error).
     run_ok(
-        "module A {\n reg v : bits[8] = 0\n rule r {\n v := v + 1\n}\n}\n\
-         module B {\n reg v : bits[8] = 0\n rule r {\n v := v + 1\n}\n}\n",
+        "module A {\n reg v : [8] = 0\n rule r {\n v := v + 1\n}\n}\n\
+         module B {\n reg v : [8] = 0\n rule r {\n v := v + 1\n}\n}\n",
     );
 }
 
@@ -191,8 +191,8 @@ fn nested_module_shadowing_its_parents_state_name_binds_its_own() {
     // second-guess it (this is the parent/child case the sibling test
     // above doesn't exercise: same name, one nested INSIDE the other).
     let (ast, res) = run_ok(
-        "module Top {\n reg v : bits[8] = 0\n \
-         module Child {\n reg v : bits[8] = 0\n rule r {\n v := v + 1\n}\n}\n inst c : Child\n}\n",
+        "module Top {\n reg v : [8] = 0\n \
+         module Child {\n reg v : [8] = 0\n rule r {\n v := v + 1\n}\n}\n inst c : Child\n}\n",
     );
 
     let Item::Module {
@@ -247,9 +247,9 @@ fn inst_port_accesses_share_one_resource() {
     // this: two rules touching the same port need to land on one DefId,
     // not two distinct ones that happen to share a name).
     let (ast, res) = run_ok(
-        "module Child {\n in a : bits[8]\n out b : bits[8] = 0\n \
+        "module Child {\n in a : [8]\n out b : [8] = 0\n \
          rule r {\n b := a\n}\n}\n\
-         module Top {\n inst c : Child\n reg v : bits[8] = 0\n reg w : bits[8] = 0\n \
+         module Top {\n inst c : Child\n reg v : [8] = 0\n reg w : [8] = 0\n \
          rule p {\n c.a := v\n}\n rule q {\n c.a := w\n}\n}\n",
     );
     let field_exprs: Vec<trace::ast::ExprId> = (0..ast.exprs.len())
@@ -265,29 +265,27 @@ fn inst_port_accesses_share_one_resource() {
 
 #[test]
 fn inst_target_must_be_a_module() {
-    let (_, _, errors) = run("reg NotAModule : bits[1] = 0\nmodule M {\n inst x : NotAModule\n}\n");
+    let (_, _, errors) = run("reg NotAModule : [1] = 0\nmodule M {\n inst x : NotAModule\n}\n");
     assert!(errors.iter().any(|e| e.message.contains("not a module")));
 }
 
 #[test]
 fn struct_literal_naming_a_non_struct_is_an_error() {
-    let (_, _, errors) = run(
-        "module NotAStruct {\n}\nmodule M {\n reg r : bits[8] = 0\n \
-         rule x {\n r := NotAStruct{ a: 1 }\n }\n}\n",
-    );
+    let (_, _, errors) = run("module NotAStruct {\n}\nmodule M {\n reg r : [8] = 0\n \
+         rule x {\n r := NotAStruct{ a: 1 }\n }\n}\n");
     assert!(errors.iter().any(|e| e.message.contains("not a struct")));
 }
 
 #[test]
 fn inst_cannot_be_assigned_directly() {
-    let (_, _, errors) = run("module Child {\n in a : bits[8]\n}\n\
+    let (_, _, errors) = run("module Child {\n in a : [8]\n}\n\
          module Top {\n inst c : Child\n rule w {\n c := c\n}\n}\n");
     assert!(errors.iter().any(|e| e.message.contains("module instance")));
 }
 
 #[test]
 fn duplicate_definition_is_an_error() {
-    let (_, _, errors) = run("module M {\n reg a : bits[1] = 0\n fifo a : bits[1]\n}\n");
+    let (_, _, errors) = run("module M {\n reg a : [1] = 0\n fifo a : [1]\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("already defined"));
     assert!(errors[0].message.contains("register"));
@@ -301,7 +299,7 @@ fn let_shadowing_is_allowed() {
 #[test]
 fn signature_types_bind_implicit_params() {
     let src = "\
-spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
+spec AnyGrant(reqs : [N]) : [clog2(N)] <combines, chooses> {
     let i = any(0..N-1)
     reqs[i]?
     return i
@@ -318,15 +316,14 @@ spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
 #[test]
 fn body_names_do_not_bind_implicitly() {
     // Free names bind only in signature types, never in bodies.
-    let (_, _, errors) = run("F(x : bits[8]) : bits[8] <combines> {\n return M\n}\n");
+    let (_, _, errors) = run("F(x : [8]) : [8] <combines> {\n return M\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("cannot find `M`"));
 }
 
 #[test]
 fn refines_must_name_a_spec() {
-    let (_, _, errors) =
-        run("impl I(x : bits[1]) : bits[1] <combines> refines Ghost {\n return x\n}\n");
+    let (_, _, errors) = run("impl I(x : [1]) : [1] <combines> refines Ghost {\n return x\n}\n");
     assert!(
         errors
             .iter()
@@ -334,11 +331,11 @@ fn refines_must_name_a_spec() {
     );
 
     let src = "\
-Helper(x : bits[1]) : bits[1] <combines> {
+Helper(x : [1]) : [1] <combines> {
     return x
 }
 
-impl I(x : bits[1]) : bits[1] <combines> refines Helper {
+impl I(x : [1]) : [1] <combines> refines Helper {
     return x
 }
 ";
@@ -350,7 +347,7 @@ impl I(x : bits[1]) : bits[1] <combines> refines Helper {
 fn effect_args_must_be_state() {
     let src = "\
 module M {
-    reg pc : bits[8] = 0
+    reg pc : [8] = 0
     rule r <reads {pc, ghost}> {
         tick
     }
@@ -379,7 +376,7 @@ module M {
 fn schedule_names_must_be_rules() {
     let src = "\
 module M {
-    reg pc : bits[8] = 0
+    reg pc : [8] = 0
     rule a {
         tick
     }
@@ -402,7 +399,7 @@ module M {
     }
 }
 
-Helper(v : bits[8]) : bits[8] <combines> {
+Helper(v : [8]) : [8] <combines> {
     return v
 }
 ";
@@ -429,12 +426,12 @@ Helper(v : bits[8]) : bits[8] <combines> {
 #[test]
 fn unread_local_in_a_fn_body_is_rejected() {
     let src = "\
-Bump(d : bits[8]) : bits[8] <combines> {
+Bump(d : [8]) : [8] <combines> {
     let doubled = d + d
     return d
 }
 module M {
-    in x : bits[8]
+    in x : [8]
     rule r {
         Bump(x)
     }
@@ -458,13 +455,13 @@ module M {
 #[test]
 fn a_top_level_fn_writing_an_out_of_scope_name_is_a_clean_error() {
     let src = "\
-Bump(d : bits[8]) : bits[8] <combines> {
+Bump(d : [8]) : [8] <combines> {
     log := d
     return d
 }
 module M {
-    in x : bits[8]
-    reg log : bits[8] = 0
+    in x : [8]
+    reg log : [8] = 0
     rule r {
         Bump(x)
     }
@@ -487,13 +484,13 @@ module M {
 #[test]
 fn explicit_writes_effect_naming_out_of_scope_state_is_rejected() {
     let src = "\
-Bump(d : bits[8]) : bits[8] <combines, writes {log}> {
+Bump(d : [8]) : [8] <combines, writes {log}> {
     log := d
     return d
 }
 module M {
-    in x : bits[8]
-    reg log : bits[8] = 0
+    in x : [8]
+    reg log : [8] = 0
     rule r {
         Bump(x)
     }
@@ -517,7 +514,7 @@ module M {
 #[test]
 fn read_locals_in_a_fn_body_are_unaffected_including_nested_in_if_else() {
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines> {
+Classify(x : [8]) : [8] <combines> {
     let doubled = x + x
     if x > 10 {
         let big = doubled + 1
@@ -527,8 +524,8 @@ Classify(x : bits[8]) : bits[8] <combines> {
     }
 }
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule r {
         result := Classify(a)
     }
@@ -549,8 +546,8 @@ module M {
 fn unread_local_in_a_rule_body_is_not_flagged() {
     let src = "\
 module M {
-    reg count : bits[8] = 0
-    fifo input : bits[8]
+    reg count : [8] = 0
+    fifo input : [8]
     rule drain {
         let x = input.Deq[]
         count := count - 1

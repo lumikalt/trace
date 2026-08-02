@@ -1,16 +1,16 @@
 module Fetch2 {
-    mem bank0 : bits[16][8]
-    mem bank1 : bits[16][8]
-    in pc : bits[16]
-    out ir : bits[32] = 0
+    mem bank0 : [16][8]
+    mem bank1 : [16][8]
+    in pc : [16]
+    out ir : [32] = 0
 
-    ReadBank0(addr : bits[16]) : bits[16] <sequences> {
+    ReadBank0(addr : [16]) : [16] <sequences> {
         let v = bank0[addr]
         tick
         return v
     }
 
-    ReadBank1(addr : bits[16]) : bits[16] <sequences> {
+    ReadBank1(addr : [16]) : [16] <sequences> {
         let v = bank1[addr]
         tick
         return v

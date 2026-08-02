@@ -1,4 +1,4 @@
-Max(a : bits[8], b : bits[8]) : bits[8] <combines> {
+Max(a : [8], b : [8]) : [8] <combines> {
     if a > b {
         return a
     } else {
@@ -7,9 +7,9 @@ Max(a : bits[8], b : bits[8]) : bits[8] <combines> {
 }
 
 module Top {
-    in a : bits[8]
-    in b : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    out result : [8] = 0
 
     rule compute {
         result := Max(a, b)

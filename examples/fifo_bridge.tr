@@ -1,8 +1,8 @@
 -- First example from DESIGN.md: the compiler derives all handshaking
 -- from the two failure conditions in `transfer`.
 module FifoBridge {
-    fifo input  : bits[8]
-    fifo output : bits[8]
+    fifo input  : [8]
+    fifo output : [8]
 
     rule transfer {
         let x = input.Deq[]   -- fails when input is empty

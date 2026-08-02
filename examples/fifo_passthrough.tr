@@ -9,11 +9,11 @@
 -- proving the old value is read (not the just-written new one) and the
 -- new value correctly lands for the NEXT cycle's Deq.
 module FifoPassthrough {
-    fifo f : bits[8]
+    fifo f : [8]
 
-    in seed : bits[1]
-    in seed_value : bits[8]
-    out last_out : bits[8] = 0
+    in seed : [1]
+    in seed_value : [8]
+    out last_out : [8] = 0
 
     rule load {
         (seed = 1)?

@@ -1,22 +1,22 @@
 -- A callee's own body may call another callee for a pure value -- FIRRTL
 -- has no call concept, so this splices `Inner` into `Outer`, then `Outer`
 -- into `Top`'s rule, all at their call sites. `Outer`'s `doubled = Inner(x)
--- * 2` deliberately overflows bits[8] for some inputs, proving the nesting
+-- * 2` deliberately overflows [8] for some inputs, proving the nesting
 -- reuses the same modular arithmetic as any other expression, not some
 -- widened intermediate the call boundary might otherwise hide -- see
 -- sim/call_nested_tb.v.
-Inner(x : bits[8]) : bits[8] <combines> {
+Inner(x : [8]) : [8] <combines> {
     return x + 1
 }
 
-Outer(x : bits[8]) : bits[8] <combines> {
+Outer(x : [8]) : [8] <combines> {
     let doubled = Inner(x) * 2
     return doubled
 }
 
 module Top {
-    in x : bits[8]
-    out result : bits[8] = 0
+    in x : [8]
+    out result : [8] = 0
 
     rule compute {
         result := Outer(x)

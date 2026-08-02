@@ -9,16 +9,16 @@
 -- becomes part of the rule's own guard (`fired` stays 0, and nothing
 -- advances, on a cycle where neither `c` nor `d` is ready).
 module OrFifos {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    fifo c : bits[8]
-    fifo d : bits[8]
+    fifo a : [8]
+    fifo b : [8]
+    fifo c : [8]
+    fifo d : [8]
 
-    out result_default : bits[8] = 0
-    out tick_count : bits[8] = 0
+    out result_default : [8] = 0
+    out tick_count : [8] = 0
 
-    out result_strict : bits[8] = 0
-    out fired_strict : bit = 0
+    out result_strict : [8] = 0
+    out fired_strict : [1] = 0
 
     rule pick_default {
         result_default := a.Deq[] or b.Deq[] or 0

@@ -1,15 +1,15 @@
 -- `reg`/`out` may omit `: ty` when initialized with a sized literal --
 -- the literal's own width becomes the declared type. Proves the
--- inferred width is a real bits[8]/bits[16], not just accepted syntax:
--- `acc` resets to 6 (from `8'd6`, an inferred bits[8] reg) and `hi`
--- resets to 0xFF00 (from `16'hFF00`, an inferred bits[16] output, never
+-- inferred width is a real [8]/[16], not just accepted syntax:
+-- `acc` resets to 6 (from `8'd6`, an inferred [8] reg) and `hi`
+-- resets to 0xFF00 (from `16'hFF00`, an inferred [16] output, never
 -- written again so it holds its reset value), observed through real
 -- ports -- see sim/infer_reg_ty_tb.v.
 module InferRegTy {
-    in inc : bits[8]
+    in inc : [8]
     reg acc = 8'd6
     out hi = 16'hFF00
-    out sum : bits[8] = 0
+    out sum : [8] = 0
 
     rule step {
         acc := acc + inc

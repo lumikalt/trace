@@ -8,15 +8,15 @@
 -- load_addr/load_data/load_en ports, exactly PortRam's pattern, with
 -- no assumption about program length or word count.
 module SubleqBoot {
-    reg pc : bits[16] = 0
-    reg ir : bits[16] = 0
-    mem m  : bits[16][4096]
-    reg booted : bits[1] = 0
+    reg pc : [16] = 0
+    reg ir : [16] = 0
+    mem m  : [16][4096]
+    reg booted : [1] = 0
 
-    in load_addr : bits[16]
-    in load_data : bits[16]
-    in load_en : bits[1]
-    in boot_done : bits[1]
+    in load_addr : [16]
+    in load_data : [16]
+    in load_en : [1]
+    in boot_done : [1]
 
     rule load {
         (booted = 0)?

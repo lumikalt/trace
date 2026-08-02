@@ -10,7 +10,7 @@ fn kinds(src: &str) -> Vec<TokenKind> {
 fn fifo_bridge_module() {
     let src = "\
 module FifoBridge {
-    fifo buf : bits[8]
+    fifo buf : [8]
 
     rule transfer {
         x := buf.Deq[]      -- fails when buf is empty
@@ -21,7 +21,7 @@ module FifoBridge {
         kinds(src),
         vec![
             Module, Ident, LBrace, Newline, // module FifoBridge {
-            Fifo, Ident, Colon, Ident, LBracket, Int, RBracket, Newline, // fifo decl
+            Fifo, Ident, Colon, LBracket, Int, RBracket, Newline, // fifo decl
             Newline, // blank line
             Rule, Ident, LBrace, Newline, // rule transfer {
             Ident, ColonEq, Ident, Dot, Ident, LBracket, RBracket, Newline, // x := buf.Deq[]
@@ -107,18 +107,6 @@ fn keywords_are_not_idents() {
     assert_eq!(kinds("tick"), vec![Tick]);
     assert_eq!(kinds("ticker"), vec![Ident]); // longest match wins
     assert_eq!(kinds("spawn ReadBank"), vec![Spawn, Ident]);
-}
-
-#[test]
-fn bit_is_its_own_keyword_distinct_from_bits() {
-    // `bit` (sugar for `bits[1]`) is a real lexer keyword, not a
-    // `resolve.rs` BUILTINS identifier like `bits` itself — same
-    // longest-match-wins guarantee already covers the prefix overlap
-    // (`bits`, `bitmask`, ... all still lex as one `Ident`, not `Bit`
-    // followed by leftover characters).
-    assert_eq!(kinds("bit"), vec![Bit]);
-    assert_eq!(kinds("bits"), vec![Ident]);
-    assert_eq!(kinds("bitmask"), vec![Ident]);
 }
 
 #[test]

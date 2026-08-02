@@ -9,14 +9,14 @@
 -- if/else mux-threading, but with an explicit write-enable boolean --
 -- a memory write has no "hold" fallback the way a register does).
 module MemWriteBranch {
-    mem m : bits[8][16]
+    mem m : [8][16]
 
-    in we : bits[1]
-    in addr : bits[4]
-    in data : bits[8]
-    in read_addr : bits[4]
-    out read_data : bits[8] = 0
-    out count : bits[8] = 0
+    in we : [1]
+    in addr : [4]
+    in data : [8]
+    in read_addr : [4]
+    out read_data : [8] = 0
+    out count : [8] = 0
 
     rule step {
         count := count + 1

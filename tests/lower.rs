@@ -86,7 +86,7 @@ fn rmw_structural_shape() {
 
     let rendered = render(&c.ast, &src, &c.lowered);
     assert_round_trips(&rendered);
-    assert!(rendered.contains("reg v : bits[8] = 0"));
+    assert!(rendered.contains("reg v : [8] = 0"));
     assert!(rendered.contains("rule step_s0 {"));
     assert!(rendered.contains("rule step_s1 {"));
     assert!(rendered.contains(&format!("({} = 0)?", lr.cont_name)));
@@ -116,7 +116,7 @@ fn subleq_structural_shape() {
         assert_eq!(
             cap.ty,
             Ty::Bits(Width::Known(16)),
-            "{} should be bits[16]",
+            "{} should be [16]",
             cap.name
         );
     }
@@ -130,7 +130,7 @@ fn subleq_structural_shape() {
     let rendered = render(&c.ast, &src, std::slice::from_ref(lr));
     for cap_name in ["a", "b", "c", "va", "r"] {
         assert!(
-            rendered.contains(&format!("reg {cap_name} : bits[16] = 0")),
+            rendered.contains(&format!("reg {cap_name} : [16] = 0")),
             "missing save register for {cap_name}\n{rendered}"
         );
     }
@@ -211,7 +211,7 @@ fn subleq_schedule_directive_rewrites_and_only_s5_conflicts() {
 fn rejects_nested_tick() {
     let src = "\
 module M {
-    reg x : bits[8] = 0
+    reg x : [8] = 0
     rule r <sequences> {
         if x = 0 {
             tick
@@ -229,7 +229,7 @@ module M {
 fn rejects_reassignment_across_segments() {
     let src = "\
 module M {
-    reg x : bits[8] = 0
+    reg x : [8] = 0
     rule r <sequences> {
         let v = 1
         tick
@@ -250,8 +250,8 @@ fn rejects_same_segment_read_of_a_captured_value() {
     // stale register value once promoted) as well as a later segment.
     let src = "\
 module M {
-    reg x : bits[8] = 0
-    reg y : bits[8] = 0
+    reg x : [8] = 0
+    reg y : [8] = 0
     rule r <sequences> {
         let v = 1
         y := v + 1
@@ -270,7 +270,7 @@ fn uncaptured_locals_are_left_alone() {
     // A local used only within its own segment needs no save register.
     let src = "\
 module M {
-    reg x : bits[8] = 0
+    reg x : [8] = 0
     rule r <sequences> {
         let w = 1 + 1
         x := w
@@ -300,7 +300,7 @@ fn let_bound_value_crossing_a_tick_now_works() {
     // instead of needing a dedicated rejection.
     let src = "\
 module M {
-    out out : bits[8] = 0
+    out out : [8] = 0
     rule r <sequences> {
         let v = 8'd5
         tick
@@ -312,7 +312,7 @@ module M {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     assert_eq!(c.lowered[0].captures.len(), 1);
     let rendered = render(&c.ast, src, &c.lowered);
-    assert!(rendered.contains("reg v : bits[8] = 0"));
+    assert!(rendered.contains("reg v : [8] = 0"));
     assert!(rendered.contains("v := 8'd5"));
     assert_round_trips(&rendered);
 }
@@ -326,14 +326,14 @@ fn let_bound_value_crossing_a_tick_in_a_spawn_callee_now_works() {
     // since a spawn callee's captures always go through the rename
     // scheme.
     let src = "\
-Foo() : bits[8] <sequences> {
+Foo() : [8] <sequences> {
     let v = 8'd5
     tick
     return v + 1
 }
 
 module M {
-    out out : bits[8] = 0
+    out out : [8] = 0
     rule r <sequences> {
         let h = spawn Foo()
         tick sync[h]
@@ -354,7 +354,7 @@ fn let_bound_value_within_one_segment_is_unaffected() {
     // -- only a `let` that must survive past a tick is rejected.
     let src = "\
 module M {
-    out out : bits[8] = 0
+    out out : [8] = 0
     rule r <sequences> {
         let v = 8'd5
         out := v + 1
@@ -371,15 +371,15 @@ module M {
 fn shadowed_let_captures_of_the_same_name_are_rejected() {
     // Two DISTINCT `let x` bindings (different DefIds, one shadowing the
     // other) that both cross a tick would otherwise both become captures
-    // named "x" -- `render_rule` would emit two `reg x : bits[8] = 0`
+    // named "x" -- `render_rule` would emit two `reg x : [8] = 0`
     // lines, producing lowered output that fails to re-resolve rather
     // than a clean error at plan time.
     let src = "\
 module M {
-    in a : bits[8]
-    in b : bits[8]
-    out out1 : bits[8] = 0
-    out out2 : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    out out1 : [8] = 0
+    out out2 : [8] = 0
     rule r <sequences> {
         let x = a
         tick
@@ -406,13 +406,13 @@ fn spawn_bound_with_let_now_works() {
     // brand-new register-write lines from the extracted handle rather
     // than splicing the trigger statement's own text.
     let src = "\
-Foo() : bits[8] <sequences> {
+Foo() : [8] <sequences> {
     tick
     return 8'd1
 }
 
 module M {
-    out out : bits[8] = 0
+    out out : [8] = 0
     rule r <sequences> {
         let h = spawn Foo()
         tick sync[h]
@@ -435,18 +435,18 @@ fn no_tick_no_lowering() {
 
 const FETCH2: &str = "\
 module Fetch2 {
-    mem bank0 : bits[16][8]
-    mem bank1 : bits[16][8]
-    in pc : bits[16]
-    out ir : bits[32] = 0
+    mem bank0 : [16][8]
+    mem bank1 : [16][8]
+    in pc : [16]
+    out ir : [32] = 0
 
-    ReadBank0(addr : bits[16]) : bits[16] <sequences> {
+    ReadBank0(addr : [16]) : [16] <sequences> {
         let v = bank0[addr]
         tick
         return v
     }
 
-    ReadBank1(addr : bits[16]) : bits[16] <sequences> {
+    ReadBank1(addr : [16]) : [16] <sequences> {
         let v = bank1[addr]
         tick
         return v
@@ -486,8 +486,8 @@ fn spawn_sync_structural_shape() {
 
     let rendered = render(&c.ast, FETCH2, &c.lowered);
     let rendered = assert_round_trips(&rendered);
-    assert!(rendered.contains("__cont_fetch2_h1 : bits[1] = 0"));
-    assert!(rendered.contains("__cont_fetch2_h2 : bits[1] = 0"));
+    assert!(rendered.contains("__cont_fetch2_h1 : [1] = 0"));
+    assert!(rendered.contains("__cont_fetch2_h2 : [1] = 0"));
     assert!(rendered.contains("__arg_fetch2_h1_addr := pc"));
     assert!(rendered.contains("__done_fetch2_h1 = 1"));
     assert!(rendered.contains("__done_fetch2_h2 = 1"));
@@ -505,7 +505,7 @@ fn spawn_sync_structural_shape() {
 #[test]
 fn spawn_nested_in_if_is_rejected() {
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     return x
 }
@@ -528,7 +528,7 @@ module M {
 #[test]
 fn sync_nested_in_if_is_rejected() {
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     return x
 }
@@ -558,13 +558,13 @@ fn race_value_form_lowers() {
     // guard, same as a bare `race[...]` statement never needed one
     // either), though `tick out := race[...]` is the idiomatic spelling.
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     return x
 }
 
 module M {
-    out out : bits[8] = 0
+    out out : [8] = 0
     rule r <sequences> {
         let h1 = spawn Slow(1)
         let h2 = spawn Slow(2)
@@ -584,7 +584,7 @@ fn race_bracket_used_elsewhere_is_still_rejected() {
     // `w := race[...]`) lower -- embedded in a larger expression still
     // falls through to the generic unsupported-construct message.
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     return x
 }
@@ -606,13 +606,13 @@ module M {
 #[test]
 fn race_value_bound_with_let_now_works() {
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     return x
 }
 
 module M {
-    out out : bits[8] = 0
+    out out : [8] = 0
     rule r <sequences> {
         let h1 = spawn Slow(1)
         let h2 = spawn Slow(2)
@@ -632,7 +632,7 @@ module M {
 #[test]
 fn race_nested_in_if_is_rejected() {
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     return x
 }
@@ -656,18 +656,18 @@ module M {
 #[test]
 fn race_structural_shape() {
     let src = "\
-Fast(x : bits[8]) : bits[8] <sequences> {
+Fast(x : [8]) : [8] <sequences> {
     tick
     return x + 1
 }
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     tick
     return x + 2
 }
 
 module M {
-    out out : bits[8] = 0
+    out out : [8] = 0
     rule pick <sequences> {
         let hf = spawn Fast(1)
         let hs = spawn Slow(1)
@@ -717,7 +717,7 @@ fn spawning_the_same_handle_twice_is_rejected() {
     // defined" resolve error several passes later on an auto-generated
     // register name.
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     tick
     return x
 }
@@ -749,7 +749,7 @@ module M {
 #[test]
 fn spawn_callee_early_return_is_rejected() {
     let src = "\
-Slow(x : bits[8]) : bits[8] <sequences> {
+Slow(x : [8]) : [8] <sequences> {
     if x = 0 {
         return x
     }

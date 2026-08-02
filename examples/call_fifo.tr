@@ -7,11 +7,11 @@
 -- it reads/writes `input`/`output`, module state it can only reach
 -- from within that module's own boundary.
 module CallFifoBridge {
-    fifo input : bits[8]
-    fifo output : bits[8]
-    out last : bits[8] = 0
+    fifo input : [8]
+    fifo output : [8]
+    out last : [8] = 0
 
-    Bridge() : bits[8] <combines, fails> {
+    Bridge() : [8] <combines, fails> {
         let x = input.Deq[]
         output.Enq[x]
         return x

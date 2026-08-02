@@ -791,7 +791,7 @@ fn infer_reg_ty_runs_through_real_ports() {
     );
 }
 
-/// Proves `/`/`%` end to end: `a` (bits[8]) = 200, `b` (bits[4]) = 13,
+/// Proves `/`/`%` end to end: `a` ([8]) = 200, `b` ([4]) = 13,
 /// deliberately different widths so both the pad and no-pad branches of
 /// compile_binop's Div/Rem arms actually run, not just the equal-width
 /// case tests/firrtl.rs's unit tests already pin.
@@ -1035,7 +1035,7 @@ fn fifo_passthrough_runs_through_real_ports() {
     );
 }
 
-/// A depth-3 fifo (`[3]bits[8]`, non-power-of-2 to stress head/tail
+/// A depth-3 fifo (`[3][8]`, non-power-of-2 to stress head/tail
 /// wraparound): fills to full, exercises a full-buffer combined
 /// Enq+Deq pass-through, drains to empty, then refills and drains a
 /// second time so the internal pointers wrap past the top slot index.
@@ -1309,7 +1309,7 @@ fn checksum_runs_through_real_ports() {
 /// firtool and Icarus: `elaborate.rs`'s pre-pass unrolls `AdderTree([a,
 /// b, c, d])` into `((a + b) + (c + d))` entirely at compile time, and
 /// the resulting hardware both sums correctly and wraps modularly past
-/// `bits[32]` — see sim/adder_tree_tb.v.
+/// `[32]` — see sim/adder_tree_tb.v.
 #[test]
 fn adder_tree_runs_through_real_ports() {
     if !tool_available("firtool") || !tool_available("iverilog") {
@@ -1418,7 +1418,7 @@ fn struct_pair_runs_through_real_ports() {
 }
 
 /// Proves NESTED structs end to end: `examples/struct_nested.tr`'s
-/// `Frame { header: Header, data: bits[8] }` flattens all the way down
+/// `Frame { header: Header, data: [8] }` flattens all the way down
 /// to per-leaf-field registers/ports (`f_header_valid`, `f_header_seq`,
 /// `f_data`), a nested struct literal write updates every leaf field
 /// together in one cycle, and a chained field read (`f.header.valid`)

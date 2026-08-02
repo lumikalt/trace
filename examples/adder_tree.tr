@@ -5,18 +5,18 @@
 -- d))` before this file's own type-checking/scheduling/emission ever
 -- runs -- see sim/adder_tree_tb.v for the proof it computes the right
 -- sum through real hardware, not just that it compiles.
-AdderTree(xs : list[bits[32]]) : bits[32] <elaborates> {
+AdderTree(xs : list[[32]]) : [32] <elaborates> {
     if len(xs) = 1 { return xs[0] }
     let mid = len(xs) / 2
     return AdderTree(xs[..mid]) + AdderTree(xs[mid..])
 }
 
 module Top {
-    in a : bits[32]
-    in b : bits[32]
-    in c : bits[32]
-    in d : bits[32]
-    out total : bits[32] = 0
+    in a : [32]
+    in b : [32]
+    in c : [32]
+    in d : [32]
+    out total : [32] = 0
 
     rule sum {
         total := AdderTree([a, b, c, d])

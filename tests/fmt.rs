@@ -17,16 +17,16 @@ fn reindents_nested_blocks() {
 
 #[test]
 fn already_formatted_input_is_unchanged() {
-    let src = "module M {\n    reg x : bits[8] = 0\n\n    rule r {\n        x := x + 1\n    }\n}\n";
+    let src = "module M {\n    reg x : [8] = 0\n\n    rule r {\n        x := x + 1\n    }\n}\n";
     assert_eq!(format(src), src);
 }
 
 #[test]
 fn fixes_wrong_indentation() {
-    let src = "module M {\nreg x : bits[8] = 0\n        rule r {\nx := x + 1\n}\n}\n";
+    let src = "module M {\nreg x : [8] = 0\n        rule r {\nx := x + 1\n}\n}\n";
     assert_eq!(
         format(src),
-        "module M {\n    reg x : bits[8] = 0\n    rule r {\n        x := x + 1\n    }\n}\n"
+        "module M {\n    reg x : [8] = 0\n    rule r {\n        x := x + 1\n    }\n}\n"
     );
 }
 
@@ -45,14 +45,14 @@ fn comments_and_blank_lines_survive_and_inherit_surrounding_indent() {
 
 #[test]
 fn trailing_whitespace_is_trimmed() {
-    let src = "module M {   \n    reg x : bits[8] = 0\t\n}\n";
+    let src = "module M {   \n    reg x : [8] = 0\t\n}\n";
     let out = format(src);
     assert!(!out.lines().any(|l| l != l.trim_end()));
 }
 
 #[test]
 fn no_trailing_newline_is_preserved() {
-    let src = "module M {\n    reg x : bits[8] = 0\n}";
+    let src = "module M {\n    reg x : [8] = 0\n}";
     let out = format(src);
     assert!(!out.ends_with('\n'));
 }
@@ -82,7 +82,7 @@ fn idempotent_on_every_shipped_example_except_the_known_continuation_case() {
 #[test]
 fn known_limitation_continuation_line_before_brace() {
     let src = "\
-impl RoundRobin(reqs : bits[N]) : bits[clog2(N)] <combines>
+impl RoundRobin(reqs : [N]) : [clog2(N)] <combines>
     refines AnyGrant
 {
     return prio(reqs)

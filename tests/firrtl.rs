@@ -196,7 +196,7 @@ fn errors_on_unlowered_sequences_rule() {
     // <sequences> rule with a tick reaches the emitter unlowered.
     let src = "\
 module M {
-    reg x : bits[1] = 0
+    reg x : [1] = 0
     rule r <sequences> {
         if x = 1 {
             tick
@@ -249,13 +249,13 @@ fn fifo_depth_n_emits_a_slot_array_plus_head_and_count() {
     // a full buffer).
     let src = "\
 module M {
-    fifo f : [4]bits[8]
+    fifo f : {4}[8]
     rule r {
         (want = 1)?
         let x = f.Deq[]
         f.Enq[x + 1]
     }
-    in want : bits[1]
+    in want : [1]
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
@@ -280,6 +280,34 @@ module M {
 }
 
 #[test]
+fn fifo_depth_via_a_mems_own_postfix_form_also_works() {
+    // `{depth}elem_ty` is the preferred, depth-first spelling, but a
+    // memory's postfix `elem_ty[depth]` parses to the identical
+    // `Bracket { callee: elem_ty, args: [depth] }` shape and works for a
+    // fifo too (see DESIGN.md's "Memory, fifo, and submodule
+    // declarations" section) -- `eval_fifo_ty`'s own `is_builtin(callee,
+    // "bits")` guard only matches an `Ident` callee, so a `Bracket`
+    // callee (what `[8][4]` parses to: `[8]` itself, then a postfix `[4]`
+    // application) falls through to the depth path exactly like an
+    // ordinary named element type would.
+    let src = "\
+module M {
+    fifo f : [8][4]
+    in a : [8]
+    rule enq {
+        f.Enq[a]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset __fifo_f_slot0 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_f_slot1 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_f_slot2 : UInt<8>"));
+    assert!(fir.contains("regreset __fifo_f_slot3 : UInt<8>"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn fifo_depth_n_fifo_op_reached_via_a_callee_still_uses_the_slot_array() {
     // `rule_fifo_ops` (fifo.rs) finds a fifo op reached through exactly
     // one failing-callee call, not just a rule's own top-level
@@ -287,11 +315,11 @@ fn fifo_depth_n_fifo_op_reached_via_a_callee_still_uses_the_slot_array() {
     // the direct-op path the other tests above exercise.
     let src = "\
 module M {
-    fifo input : [3]bits[8]
-    fifo output : bits[8]
-    out last : bits[8] = 0
+    fifo input : {3}[8]
+    fifo output : [8]
+    out last : [8] = 0
 
-    Bridge() : bits[8] <combines, fails> {
+    Bridge() : [8] <combines, fails> {
         let x = input.Deq[]
         output.Enq[x]
         return x
@@ -319,7 +347,7 @@ module M {
 fn fifo_depth_zero_is_an_error() {
     let src = "\
 module M {
-    fifo f : [0]bits[8]
+    fifo f : {0}[8]
     rule r {
         f.Enq[8'd1]
     }
@@ -339,7 +367,7 @@ fn fifo_enq_and_deq_same_cycle_is_a_passthrough() {
     // individual guard.
     let src = "\
 module M {
-    fifo f : bits[8]
+    fifo f : [8]
     rule r {
         let x = f.Deq[]
         f.Enq[x + 1]
@@ -357,8 +385,8 @@ module M {
 fn fifo_enqueued_twice_in_one_rule_is_an_error() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg x : bits[8] = 0
+    fifo f : [8]
+    reg x : [8] = 0
     rule r {
         f.Enq[x]
         f.Enq[x + 1]
@@ -376,7 +404,7 @@ module M {
 fn fifo_dequeued_twice_in_one_rule_is_an_error() {
     let src = "\
 module M {
-    fifo f : bits[8]
+    fifo f : [8]
     rule r {
         let x = f.Deq[]
         let y = f.Deq[]
@@ -399,8 +427,8 @@ fn let_bound_fifo_op_gates_the_rule() {
     // reading __fifo_f_data even while the fifo was empty.
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg out : bits[8] = 0
+    fifo f : [8]
+    reg out : [8] = 0
     rule r {
         let x = f.Deq[]
         out := x + 1
@@ -416,8 +444,8 @@ module M {
 fn fifo_dequeued_twice_via_let_is_also_an_error() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg out : bits[8] = 0
+    fifo f : [8]
+    reg out : [8] = 0
     rule r {
         let x = f.Deq[]
         let y = f.Deq[]
@@ -438,9 +466,9 @@ fn fifo_enqueued_twice_on_different_fifos_is_fine() {
     // two DIFFERENT fifos once each is ordinary, unrelated work.
     let src = "\
 module M {
-    fifo f : bits[8]
-    fifo g : bits[8]
-    reg x : bits[8] = 0
+    fifo f : [8]
+    fifo g : [8]
+    reg x : [8] = 0
     rule r {
         f.Enq[x]
         g.Enq[x]
@@ -459,8 +487,8 @@ fn let_bound_fifo_op_nested_in_if_is_an_error() {
     // look inside a `Stmt::Let`.
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg cond : bits[1] = 0
+    fifo f : [8]
+    reg cond : [1] = 0
     rule r {
         if cond = 1 {
             let x = f.Deq[]
@@ -476,8 +504,8 @@ module M {
 fn fifo_op_nested_in_if_is_an_error() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg cond : bits[1] = 0
+    fifo f : [8]
+    reg cond : [1] = 0
     rule r {
         if cond = 1 {
             f.Enq[cond]
@@ -493,8 +521,8 @@ module M {
 fn fifo_op_after_state_write_is_an_error() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg x : bits[8] = 0
+    fifo f : [8]
+    reg x : [8] = 0
     rule r {
         x := x + 1
         f.Enq[x]
@@ -522,9 +550,9 @@ module M {
 fn fifo_op_after_a_write_is_still_an_error_when_its_own_lhs_is_also_state() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg r0 : bits[8] = 0
-    reg r1 : bits[8] = 0
+    fifo f : [8]
+    reg r0 : [8] = 0
+    reg r1 : [8] = 0
     rule r {
         r1 := 2
         r0 := f.Deq[]
@@ -547,10 +575,10 @@ module M {
 fn two_independent_fifo_op_driven_writes_both_stay_open() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    fifo g : bits[8]
-    out a : bits[8] = 0
-    out b : bits[8] = 0
+    fifo f : [8]
+    fifo g : [8]
+    out a : [8] = 0
+    out b : [8] = 0
     rule r {
         a := f.Deq[]
         b := g.Deq[]
@@ -575,8 +603,8 @@ fn a_fifo_op_nested_in_a_larger_expression_is_an_error_not_a_dropped_dequeue() {
     // with plain arithmetic, no `not` involved.
     let src = "\
 module M {
-    fifo input : bits[8]
-    out result : bits[8] = 0
+    fifo input : [8]
+    out result : [8] = 0
     rule compute {
         result := input.Deq[] + 1
     }
@@ -598,8 +626,8 @@ fn a_fifo_op_in_an_if_condition_is_an_error_not_a_dropped_dequeue() {
     // exact-shape match entirely.
     let src = "\
 module M {
-    fifo input : bits[8]
-    out result : bits[8] = 0
+    fifo input : [8]
+    out result : [8] = 0
     rule compute {
         if input.Deq[] = 1 {
             result := 5
@@ -619,13 +647,13 @@ module M {
 #[test]
 fn a_fifo_op_wrapped_in_not_is_an_error_not_a_dropped_dequeue() {
     // The original entry point into this bug class: `not` needs a
-    // `bits[1]` operand, so only a `bit`-payload fifo type-checks here,
+    // `[1]` operand, so only a `bit`-payload fifo type-checks here,
     // but the underlying gap (`fifo_op_stmt`'s exact-shape match) is the
     // same one the two tests above hit without `not` at all.
     let src = "\
 module M {
-    fifo input : bit
-    out result : bit = 0
+    fifo input : [1]
+    out result : [1] = 0
     rule compute {
         not (input.Deq[])
         result := 1
@@ -648,8 +676,8 @@ fn reassigned_local_read_between_two_bindings_sees_the_first() {
     // outright to avoid miscompiling.
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg r : bits[8] = 0
+    fifo f : [8]
+    reg r : [8] = 0
     rule test {
         let x = r
         let y = x
@@ -674,10 +702,10 @@ fn reassigned_local_write_between_two_bindings_sees_old_then_new() {
     // would give) fails this by making `before` ALSO read `b`.
     let src = "\
 module M {
-    in a : bits[8]
-    in b : bits[8]
-    reg before : bits[8] = 0
-    reg after : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    reg before : [8] = 0
+    reg after : [8] = 0
     rule r {
         let x = a
         before := x
@@ -701,8 +729,8 @@ fn reassigned_local_chain_resolves_each_reference_at_its_own_position() {
     // single reassigned name referenced directly.
     let src = "\
 module M {
-    mem m : bits[16][4]
-    out result : bits[16] = 0
+    mem m : [16][4]
+    out result : [16] = 0
     rule r {
         let z = m[0]
         let y = z + m[1]
@@ -721,14 +749,14 @@ module M {
 #[test]
 fn reassigned_local_with_no_concrete_width_still_errors() {
     // A local used ONLY as a mem-read address never gets a concrete
-    // `bits[w]` type from the checker (see `type_expr_inner`'s `Ty::Mem`
+    // `[w]` type from the checker (see `type_expr_inner`'s `Ty::Mem`
     // arm) -- eager compilation has no width to resolve it with at bind
     // time, so THIS narrow shape still rejects reassignment explicitly,
     // same spirit as the old blanket check but scoped to just this case.
     let src = "\
 module M {
-    mem m : bits[16][256]
-    reg out : bits[16] = 0
+    mem m : [16][256]
+    reg out : [16] = 0
     rule r {
         let x = 5
         out := m[x]
@@ -750,10 +778,10 @@ fn nested_mem_write_threads_an_explicit_write_enable() {
     // produce en=0, not just addr/data defaulting to 0.
     let src = "\
 module M {
-    reg cond : bits[1] = 0
-    mem m : bits[8][16]
-    reg addr : bits[8] = 0
-    reg v : bits[8] = 0
+    reg cond : [1] = 0
+    mem m : [8][16]
+    reg addr : [8] = 0
+    reg v : [8] = 0
 
     rule r {
         if cond = 1 {
@@ -783,12 +811,12 @@ fn nested_mem_write_with_both_branches_writing_muxes_real_addr_and_data() {
     // conditional), but WHICH addr/data is muxed by `cond`.
     let src = "\
 module M {
-    reg cond : bits[1] = 0
-    mem m : bits[8][16]
-    reg addr_a : bits[8] = 0
-    reg addr_b : bits[8] = 0
-    reg va : bits[8] = 0
-    reg vb : bits[8] = 0
+    reg cond : [1] = 0
+    mem m : [8][16]
+    reg addr_a : [8] = 0
+    reg addr_b : [8] = 0
+    reg va : [8] = 0
+    reg vb : [8] = 0
 
     rule r {
         if cond = 1 {
@@ -818,9 +846,9 @@ fn a_second_unconditional_mem_write_in_one_rule_is_an_error() {
     // wins" is ordinary, expected reassignment of the same location.
     let src = "\
 module M {
-    mem m : bits[8][256]
-    in addr0 : bits[8]
-    in addr1 : bits[8]
+    mem m : [8][256]
+    in addr0 : [8]
+    in addr1 : [8]
 
     rule r {
         m[addr0] := 8'd11
@@ -842,10 +870,10 @@ fn an_unconditional_mem_write_after_a_conditional_one_is_also_an_error() {
     // unconditional write after it just overwrote `current` outright.
     let src = "\
 module M {
-    mem m : bits[8][256]
-    in cond : bits[1]
-    in addr0 : bits[8]
-    in addr1 : bits[8]
+    mem m : [8][256]
+    in cond : [1]
+    in addr0 : [8]
+    in addr1 : [8]
 
     rule r {
         if cond = 1 {
@@ -871,11 +899,11 @@ fn two_conditional_writes_to_the_same_mem_chain_correctly_and_are_not_an_error()
     // swept up by too broad a fix.
     let src = "\
 module M {
-    mem m : bits[8][256]
-    in condA : bits[1]
-    in condB : bits[1]
-    in addrA : bits[8]
-    in addrB : bits[8]
+    mem m : [8][256]
+    in condA : [1]
+    in condB : [1]
+    in addrA : [8]
+    in addrB : [8]
 
     rule r {
         if condA = 1 {
@@ -903,10 +931,10 @@ fn an_unconditional_write_followed_by_a_conditional_one_is_not_an_error() {
     // ordering was never broken and must stay legal.
     let src = "\
 module M {
-    mem m : bits[8][256]
-    in cond : bits[1]
-    in addr0 : bits[8]
-    in addr1 : bits[8]
+    mem m : [8][256]
+    in cond : [1]
+    in addr0 : [8]
+    in addr1 : [8]
 
     rule r {
         m[addr0] := 8'd11
@@ -930,9 +958,9 @@ fn let_bound_mem_read_emits_a_real_read_port() {
     // Same Assign-vs-Let parity gap as the fifo-op bug this session.
     let src = "\
 module M {
-    mem m : bits[8][256]
-    in addr : bits[8]
-    out out : bits[8] = 0
+    mem m : [8][256]
+    in addr : [8]
+    out out : [8] = 0
 
     rule r {
         let v = m[addr]
@@ -953,10 +981,10 @@ fn errors_on_ambiguous_top_module() {
     // the other (see `emits_submodule_instance`).
     let src = "\
 module A {
-    reg x : bits[1] = 0
+    reg x : [1] = 0
 }
 module B {
-    reg y : bits[1] = 0
+    reg y : [1] = 0
 }
 ";
     let err = emit_from_source(src).unwrap_err();
@@ -1008,16 +1036,16 @@ fn nested_inst_write_threads_through_a_mux() {
     // (same claim as `subleq_emits_and_compiles`'s `pc` mux, for a port).
     let src = "\
 module Child {
-    in a : bits[8]
-    out b : bits[8] = 0
+    in a : [8]
+    out b : [8] = 0
     rule pass {
         b := a
     }
 }
 module Top {
     inst c : Child
-    reg cond : bits[1] = 0
-    reg v : bits[8] = 0
+    reg cond : [1] = 0
+    reg v : [8] = 0
     rule r {
         if cond = 1 {
             c.a := v
@@ -1039,16 +1067,16 @@ fn inst_write_on_only_one_side_of_an_if_falls_back_to_the_default() {
     // (a port has no memory of its own, unlike a register).
     let src = "\
 module Child {
-    in a : bits[8]
-    out b : bits[8] = 0
+    in a : [8]
+    out b : [8] = 0
     rule pass {
         b := a
     }
 }
 module Top {
     inst c : Child
-    reg cond : bits[1] = 0
-    reg v : bits[8] = 0
+    reg cond : [1] = 0
+    reg v : [8] = 0
     rule r {
         if cond = 1 {
             c.a := v
@@ -1089,9 +1117,9 @@ fn emits_multiple_instances_of_the_same_module() {
     // name, are the risk this pins).
     let src = "\
 module Adder {
-    in a : bits[8]
-    in b : bits[8]
-    out sum : bits[8] = 0
+    in a : [8]
+    in b : [8]
+    out sum : [8] = 0
     rule add {
         sum := a + b
     }
@@ -1099,9 +1127,9 @@ module Adder {
 module Top {
     inst a1 : Adder
     inst a2 : Adder
-    in x : bits[8]
-    out r1 : bits[8] = 0
-    out r2 : bits[8] = 0
+    in x : [8]
+    out r1 : [8] = 0
+    out r2 : [8] = 0
     rule wire {
         a1.a := x
         a1.b := x
@@ -1138,17 +1166,17 @@ fn nested_module_emits_as_its_own_top_level_firrtl_block() {
     let src = "\
 module Top {
     module Adder {
-        in a : bits[8]
-        in b : bits[8]
-        out sum : bits[8] = 0
+        in a : [8]
+        in b : [8]
+        out sum : [8] = 0
         rule add {
             sum := a + b
         }
     }
     inst adder : Adder
-    in x : bits[8]
-    in y : bits[8]
-    out result : bits[8] = 0
+    in x : [8]
+    in y : [8]
+    out result : [8] = 0
     rule wire {
         adder.a := x
         adder.b := y
@@ -1202,8 +1230,8 @@ fn multiply_by_a_literal_truncates_back_to_the_declared_width() {
     // here, not a constant 1).
     let src = "\
 module M {
-    in x : bits[8]
-    out y : bits[8] = 0
+    in x : [8]
+    out y : [8] = 0
     rule r {
         y := x * 3
     }
@@ -1218,10 +1246,10 @@ module M {
 fn sized_literal_emits_its_own_declared_width() {
     let src = "\
 module M {
-    out a : bits[8] = 0
-    out b : bits[8] = 0
-    out c : bits[8] = 0
-    out d : bits[8] = 0
+    out a : [8] = 0
+    out b : [8] = 0
+    out c : [8] = 0
+    out d : [8] = 0
     rule r {
         a := 8'd6
         b := 8'hFF
@@ -1239,48 +1267,6 @@ module M {
 }
 
 #[test]
-fn bit_emits_byte_identical_firrtl_to_bits_1() {
-    // `bit` is pure parser sugar (tests/parser.rs's
-    // `bit_is_pure_sugar_for_bits_1`) -- proved here at the emission
-    // layer too, for a scalar port/reg AND a mem element type
-    // (`mem m : bit[16]` == `mem m : bits[1][16]`), by generating both
-    // spellings and asserting the FIRRTL text is identical apart from
-    // the module's own name.
-    let bit_src = "\
-module Bit {
-    in a : bit
-    reg v : bit = 0
-    mem m : bit[16]
-    out o : bit = 0
-    rule r {
-        v := a
-        o := v
-    }
-}
-";
-    let bits_src = "\
-module Bits {
-    in a : bits[1]
-    reg v : bits[1] = 0
-    mem m : bits[1][16]
-    out o : bits[1] = 0
-    rule r {
-        v := a
-        o := v
-    }
-}
-";
-    let bit_fir = emit_from_source(bit_src).expect("emission should succeed");
-    let bits_fir = emit_from_source(bits_src).expect("emission should succeed");
-    assert_eq!(
-        bit_fir.replace("Bit", "M"),
-        bits_fir.replace("Bits", "M"),
-        "bit and bits[1] should emit identical FIRRTL"
-    );
-    run_firtool(&bit_fir, &[]);
-}
-
-#[test]
 fn sized_literal_widens_in_arithmetic_against_a_wider_operand() {
     // `8'd6`'s own width (8) is narrower than `x`'s (16) -- FIRRTL's own
     // `add` primop already handles two differently-sized UInt operands
@@ -1289,8 +1275,8 @@ fn sized_literal_widens_in_arithmetic_against_a_wider_operand() {
     // `Int` literal would.
     let src = "\
 module M {
-    in x : bits[16]
-    out result : bits[16] = 0
+    in x : [16]
+    out result : [16] = 0
     rule r {
         result := x + 8'd6
     }
@@ -1305,9 +1291,9 @@ module M {
 fn sized_literal_works_as_a_bit_select_bound_and_a_shift_amount() {
     let src = "\
 module M {
-    in x : bits[16]
-    out bit3 : bits[1] = 0
-    out shifted : bits[16] = 0
+    in x : [16]
+    out bit3 : [1] = 0
+    out shifted : [16] = 0
     rule r {
         bit3 := x[8'd3]
         shifted := x << 4'd2
@@ -1350,7 +1336,7 @@ fn sized_literal_widens_via_a_bare_connect_into_a_wider_target() {
     // width here (not the sink's) is correct, not a gap.
     let src = "\
 module M {
-    out result : bits[16] = 0
+    out result : [16] = 0
     rule r {
         result := 8'd6
     }
@@ -1364,14 +1350,14 @@ module M {
 #[test]
 fn sized_literal_compares_against_a_wider_operand() {
     // Comparison ops don't unify operand widths in types.rs (Eq/Ne/etc.
-    // always type as bits[1] regardless of operand widths), and FIRRTL's
+    // always type as [1] regardless of operand widths), and FIRRTL's
     // `eq` primop itself implicitly extends the narrower operand -- so
-    // `x = 8'd6` with `x : bits[16]` needs no special-casing beyond
+    // `x = 8'd6` with `x : [16]` needs no special-casing beyond
     // what the sized literal already does (emit at its own width).
     let src = "\
 module M {
-    in x : bits[16]
-    out eq : bits[1] = 0
+    in x : [16]
+    out eq : [1] = 0
     rule r {
         eq := x = 8'd6
     }
@@ -1389,16 +1375,16 @@ fn dynamic_shift_grows_then_trims_shl_but_shr_needs_no_adjustment() {
     // `b`'s own WIDTH, a static quantity, bounding the largest possible
     // shift amount `b` could hold) -- trimmed back to `x`'s declared
     // width (8) by dropping exactly `2^w(n) - 1` bits, `2^3 - 1 = 7`
-    // here since `n : bits[3]`. `dshr`, unlike static `shr`, does NOT
+    // here since `n : [3]`. `dshr`, unlike static `shr`, does NOT
     // shrink at all -- it's already exactly `w(a)`, so no `pad`/`tail`
     // wrapper is needed there, unlike every other shift/mul/div/rem case
     // in this file.
     let src = "\
 module M {
-    in x : bits[8]
-    in n : bits[3]
-    out shl_out : bits[8] = 0
-    out shr_out : bits[8] = 0
+    in x : [8]
+    in n : [3]
+    out shl_out : [8] = 0
+    out shr_out : [8] = 0
     rule r {
         shl_out := x << n
         shr_out := x >> n
@@ -1424,10 +1410,10 @@ fn arith_shift_wraps_in_as_sint_as_uint_confirmed_against_real_firtool() {
     // examples/arith_shift.tr's own sim/arith_shift_tb.v).
     let src = "\
 module M {
-    in x : bits[8]
-    in n : bits[3]
-    out static_out : bits[8] = 0
-    out dynamic_out : bits[8] = 0
+    in x : [8]
+    in n : [3]
+    out static_out : [8] = 0
+    out dynamic_out : [8] = 0
     rule r {
         static_out := x >>> 3
         dynamic_out := x >>> n
@@ -1448,9 +1434,9 @@ fn dynamic_single_index_select_compiles_to_a_dynamic_shift() {
     // rather than erroring the way it used to (v0 restriction lifted).
     let src = "\
 module M {
-    in x : bits[8]
-    in i : bits[8]
-    out y : bits[1] = 0
+    in x : [8]
+    in i : [8]
+    out y : [1] = 0
     rule r {
         y := x[i]
     }
@@ -1475,10 +1461,10 @@ fn indexed_part_select_up_and_down_use_dshr_plus_a_static_truncate() {
     // tests/types.rs).
     let src = "\
 module M {
-    in x : bits[8]
-    in base : bits[3]
-    out up : bits[4] = 0
-    out down : bits[4] = 0
+    in x : [8]
+    in base : [3]
+    out up : [4] = 0
+    out down : [4] = 0
     rule r {
         up := x[base +: 4]
         down := x[base -: 4]
@@ -1500,13 +1486,13 @@ fn indexed_part_select_width_folds_a_non_literal_constant_expression() {
     // `rhs` at emission time. types.rs's `const_eval` folds binary ops
     // (`2 + 2`), but firrtl's own `const_eval` only recognizes a bare
     // literal -- an earlier version fell back to `unwrap_or(1)` here,
-    // silently emitting a 1-bit select for a `bits[4]` output instead of
+    // silently emitting a 1-bit select for a `[4]` output instead of
     // erroring or using the real width.
     let src = "\
 module M {
-    in x : bits[8]
-    in base : bits[3]
-    out y : bits[4] = 0
+    in x : [8]
+    in base : [3]
+    out y : [4] = 0
     rule r {
         y := x[base +: 2 + 2]
     }
@@ -1525,8 +1511,8 @@ fn reversed_slice_bounds_are_an_error_not_invalid_firrtl() {
     // rejects with no span back into the .tr source.
     let src = "\
 module M {
-    in x : bits[8]
-    out y : bits[4] = 0
+    in x : [8]
+    out y : [4] = 0
     rule r {
         y := x[0..3]
     }
@@ -1542,15 +1528,15 @@ fn logical_not_compiles_identically_to_bitwise_not_on_a_bits_1_value() {
     // `not` a real, distinct operator (not just a parse-time alias) is a
     // types.rs restriction (tests/types.rs's
     // `logical_not_needs_a_bits_1_operand`): `not` requires its operand
-    // already be `bits[1]`, `~` accepts any width. Once that's enforced,
+    // already be `[1]`, `~` accepts any width. Once that's enforced,
     // bitwise-complementing the single bit IS logical negation, so
     // there's nothing left for emission to do differently -- proved here
     // by asserting both compile to the exact same FIRRTL text.
     let src = "\
 module M {
-    in x : bits[8]
-    out lnot : bits[1] = 0
-    out tilde : bits[1] = 0
+    in x : [8]
+    out lnot : [1] = 0
+    out tilde : [1] = 0
     rule r {
         lnot := not (x = 0)
         tilde := ~(x = 0)
@@ -1575,10 +1561,10 @@ fn div_and_rem_of_equal_width_operands_need_no_pad() {
     // extends up from `min`, never keeps the full width automatically.
     let src = "\
 module M {
-    in x : bits[8]
-    in y : bits[8]
-    out q : bits[8] = 0
-    out r : bits[8] = 0
+    in x : [8]
+    in y : [8]
+    out q : [8] = 0
+    out r : [8] = 0
     rule rule1 {
         q := x / y
         r := x % y
@@ -1593,7 +1579,7 @@ module M {
 
 #[test]
 fn div_and_rem_of_differing_width_operands_pad_up_to_the_wider_target() {
-    // `b : bits[4]`, `a : bits[8]` -- the checker's target width for
+    // `b : [4]`, `a : [8]` -- the checker's target width for
     // `b / a` and `b % a` is `max(4, 8) = 8`, but FIRRTL's own `div`
     // width is the DIVIDEND's width (4 here, not 8) and `rem`'s is
     // `min(4, 8) = 4` -- both narrower than the target, so both need an
@@ -1603,12 +1589,12 @@ fn div_and_rem_of_differing_width_operands_pad_up_to_the_wider_target() {
     // needs padding up to 8 even though the DIVIDEND already matches.
     let src = "\
 module M {
-    in a : bits[8]
-    in b : bits[4]
-    out q1 : bits[8] = 0
-    out q2 : bits[8] = 0
-    out r1 : bits[8] = 0
-    out r2 : bits[8] = 0
+    in a : [8]
+    in b : [4]
+    out q1 : [8] = 0
+    out q2 : [8] = 0
+    out r1 : [8] = 0
+    out r2 : [8] = 0
     rule rule1 {
         q1 := a / b
         q2 := b / a
@@ -1653,14 +1639,14 @@ fn nested_call_to_the_same_function_does_not_clobber_the_outer_arguments() {
     // `compile_call`'s save/restore, this silently produced `(x-y)-y`,
     // dropping `z` entirely, instead of `(x-y)-z`.
     let src = "\
-Avg(a : bits[8], b : bits[8]) : bits[8] <combines> {
+Avg(a : [8], b : [8]) : [8] <combines> {
     return a - b
 }
 module Top {
-    in x : bits[8]
-    in y : bits[8]
-    in z : bits[8]
-    out result : bits[8] = 0
+    in x : [8]
+    in y : [8]
+    in z : [8]
+    out result : [8] = 0
     rule r {
         result := Avg(Avg(x, y), z)
     }
@@ -1679,11 +1665,11 @@ fn call_to_a_same_module_fn_that_reads_state_still_works() {
     // every state def `Bump`'s (merged) signature reaches.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         return v + x
     }
 
@@ -1708,11 +1694,11 @@ fn call_reaching_a_different_modules_state_is_an_error() {
     // error instead of a clear trace-level one.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    Bump(x : bits[8]) : bits[8] <combines> { return v + x }
+    reg v : [8] = 0
+    Bump(x : [8]) : [8] <combines> { return v + x }
     module N {
-        in a : bits[8]
-        out result : bits[8] = 0
+        in a : [8]
+        out result : [8] = 0
         rule r { result := Bump(a) }
     }
     inst n : N
@@ -1732,16 +1718,16 @@ fn a_callee_may_call_another_callee_for_a_pure_value() {
     // (Inner: +1, Outer: *2) so a wrong nesting order or a dropped call
     // shows up as a wrong number, not just "it compiled."
     let src = "\
-Inner(x : bits[8]) : bits[8] <combines> {
+Inner(x : [8]) : [8] <combines> {
     return x + 1
 }
-Outer(x : bits[8]) : bits[8] <combines> {
+Outer(x : [8]) : [8] <combines> {
     let doubled = Inner(x) * 2
     return doubled
 }
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule r {
         result := Outer(a)
     }
@@ -1761,17 +1747,17 @@ fn calling_the_same_nested_function_twice_independently_is_not_a_cycle() {
     // neither call trips the cycle check regardless of how many times
     // `Outer` happens to reference `Inner`.
     let src = "\
-Inner(x : bits[8]) : bits[8] <combines> {
+Inner(x : [8]) : [8] <combines> {
     return x + 1
 }
-Outer(x : bits[8]) : bits[8] <combines> {
+Outer(x : [8]) : [8] <combines> {
     let a = Inner(x)
     let b = Inner(x + 1)
     return a + b
 }
 module M {
-    in x : bits[8]
-    out result : bits[8] = 0
+    in x : [8]
+    out result : [8] = 0
     rule r {
         result := Outer(x)
     }
@@ -1788,21 +1774,21 @@ fn a_generic_nested_call_through_a_binop_is_a_clean_error_not_a_miscompile() {
     // `known_width(id)` (`types.expr_tys` for the binop's own id),
     // ignoring whatever hint its caller threaded down — fine for a
     // CONCRETE callee body, but `Outer`'s body here is generic
-    // (`bits[N]`), type-checked once with `N` never resolved, so
+    // (`[N]`), type-checked once with `N` never resolved, so
     // `known_width` returns nothing and the nested `Inner(x)` call
     // falls back to `width_of`, which also finds nothing. Pinned as a
     // clean error (not a hang, not a wrong width silently emitted) —
     // the same latent gap already documented for `prio`'s own argument
     // width (`concrete_width_of`), not something this feature fixes.
     let src = "\
-Inner(x : bits[N]) : bits[N] <combines> {
+Inner(x : [N]) : [N] <combines> {
     return x
 }
-Outer(x : bits[N]) : bits[N] <combines> {
+Outer(x : [N]) : [N] <combines> {
     return Inner(x) + 1
 }
 module M {
-    reg r : bits[8] = 0
+    reg r : [8] = 0
     rule compute {
         r := Outer(r)
     }
@@ -1823,15 +1809,15 @@ fn an_indirect_call_cycle_is_a_clean_error_not_a_hang() {
     // catch, and this cycle is only ever caught here, by
     // `find_call_cycle`'s static call graph, at emission time.
     let src = "\
-A(x : bits[8]) : bits[8] <combines> {
+A(x : [8]) : [8] <combines> {
     return B(x)
 }
-B(x : bits[8]) : bits[8] <combines> {
+B(x : [8]) : [8] <combines> {
     return A(x)
 }
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule r {
         result := A(a)
     }
@@ -1873,14 +1859,14 @@ fn a_nested_call_used_as_a_let_value_that_writes_state_is_still_an_error() {
     // not just this one.
     let src = "\
 module M {
-    reg w : bits[8] = 0
-    out result : bits[8] = 0
+    reg w : [8] = 0
+    out result : [8] = 0
 
-    Inner(x : bits[8]) : bits[8] <combines, writes {w}> {
+    Inner(x : [8]) : [8] <combines, writes {w}> {
         w := x
         return x + 1
     }
-    Outer(x : bits[8]) : bits[8] <combines, writes {w}> {
+    Outer(x : [8]) : [8] <combines, writes {w}> {
         let t = Inner(x)
         return t
     }
@@ -1916,15 +1902,15 @@ fn a_nested_writing_call_used_as_a_bare_statement_threads_its_write_through() {
     // write landed.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Inner(x : bits[8]) : bits[8] <combines, writes {v}> {
+    Inner(x : [8]) : [8] <combines, writes {v}> {
         v := x
         return x
     }
-    Outer(x : bits[8]) : bits[8] <combines, writes {v}> {
+    Outer(x : [8]) : [8] <combines, writes {v}> {
         Inner(x)
         return x + 1
     }
@@ -1949,14 +1935,14 @@ fn a_state_writing_callee_may_still_call_a_pure_helper() {
     // never fires for it.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Helper(x : bits[8]) : bits[8] <combines> {
+    Helper(x : [8]) : [8] <combines> {
         return x + 1
     }
-    Bump(x : bits[8]) : bits[8] <combines, writes {v}> {
+    Bump(x : [8]) : [8] <combines, writes {v}> {
         v := Helper(x)
         return x
     }
@@ -1980,13 +1966,13 @@ fn a_pure_nested_bare_statement_call_compiles_away_harmlessly() {
     // hardware: `result` depends only on `Outer`'s own `return x + 1`.
     let src = "\
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Inner(x : bits[8]) : bits[8] <combines> {
+    Inner(x : [8]) : [8] <combines> {
         return x + 1
     }
-    Outer(x : bits[8]) : bits[8] <combines> {
+    Outer(x : [8]) : [8] <combines> {
         Inner(x)
         return x + 1
     }
@@ -2011,11 +1997,11 @@ fn call_inlines_a_function_that_writes_state_and_returns_a_value() {
     // the other.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         v := x
         return x + 1
     }
@@ -2035,10 +2021,10 @@ module M {
 fn call_to_a_writing_function_as_a_bare_statement_discards_the_return_value() {
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
+    reg v : [8] = 0
+    in a : [8]
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         v := x
         return x + 1
     }
@@ -2064,10 +2050,10 @@ fn call_writes_state_conditionally_inside_its_own_if_else() {
     // way.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
+    reg v : [8] = 0
+    in a : [8]
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         if x > 10 {
             v := x
         } else {
@@ -2100,11 +2086,11 @@ fn call_to_a_conditionally_writing_function_whose_return_value_is_used_requires_
     // value.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         if x > 10 {
             v := x
         } else {
@@ -2129,12 +2115,12 @@ module M {
 fn same_writing_function_called_from_two_rules_gates_each_write_separately() {
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    in b : bits[8]
-    in sel : bits[1]
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    in sel : [1]
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         v := x
         return x + 1
     }
@@ -2159,17 +2145,17 @@ module M {
 fn call_writes_an_instance_port() {
     let src = "\
 module Child {
-    in a : bits[8]
-    out b : bits[8] = 0
+    in a : [8]
+    out b : [8] = 0
     rule pass {
         b := a
     }
 }
 module Top {
     inst c : Child
-    in x : bits[8]
+    in x : [8]
 
-    Drive(v : bits[8]) : bits[8] <combines> {
+    Drive(v : [8]) : [8] <combines> {
         c.a := v
         return v
     }
@@ -2194,11 +2180,11 @@ fn a_writing_call_nested_in_a_larger_expression_is_an_error_not_a_dropped_write(
     // explicit error, not a silent miscompile.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         v := x
         return x + 1
     }
@@ -2219,11 +2205,11 @@ module M {
 fn a_writing_call_bound_to_a_let_is_an_error_not_a_dropped_write() {
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines> {
+    Bump(x : [8]) : [8] <combines> {
         v := x
         return x + 1
     }
@@ -2250,14 +2236,14 @@ fn call_folds_a_guard_that_references_a_preceding_callee_local() {
     // resolve `y` at all (a clean error, not a miscompile, but a real
     // gap) until `bind_callee_context` started binding both.
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     let y = x + 1
     (y <> 0)?
     return y
 }
 module Top {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule compute {
         result := Classify(a)
     }
@@ -2276,13 +2262,13 @@ fn call_folds_a_callees_bare_guard_into_the_callers_own_guard() {
     // callee's own parameter name (`x`) unbound — the exact
     // param-substitution trap this fold has to get right.
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
 module Top {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule compute {
         result := Classify(a)
     }
@@ -2298,8 +2284,8 @@ fn a_bare_condition_implicitly_folds_into_the_rule_guard() {
     // `a <> 0` alone (no `?`) means the same thing as `(a <> 0)?`.
     let src = "\
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule compute {
         a <> 0
         result := a
@@ -2315,16 +2301,16 @@ module M {
 fn a_bare_bit_select_implicitly_folds_into_the_rule_guard() {
     // The OTHER example from the request that motivated this feature
     // (`A[b]` alongside `a = 1`): a single (non-slice) bit-select is
-    // always exactly bits[1] by construction, so `flags[i]` alone
+    // always exactly [1] by construction, so `flags[i]` alone
     // means the same thing as `(flags[i])?` -- a different code path
     // through `is_guard_like` than a comparison (`Expr::Bracket`, not
     // `Expr::Binary`), and a different one again from a fifo op's own
     // `Enq`/`Deq` Bracket shape.
     let src = "\
 module M {
-    in flags : bits[8]
-    in i : bits[8]
-    out result : bits[8] = 0
+    in flags : [8]
+    in i : [8]
+    out result : [8] = 0
     rule r {
         flags[i]
         result := flags
@@ -2343,13 +2329,13 @@ fn a_callees_bare_implicit_guard_also_folds_into_the_callers_guard() {
     // `callee_fail_cond` (calls.rs) handles the implicit case too, not
     // just an explicit `Expr::Guard`.
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     x <> 0
     return x
 }
 module Top {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule compute {
         result := Classify(a)
     }
@@ -2364,8 +2350,8 @@ module Top {
 fn a_bare_condition_after_a_state_write_is_an_error() {
     let src = "\
 module M {
-    reg a : bits[1] = 0
-    reg b : bits[1] = 0
+    reg a : [1] = 0
+    reg b : [1] = 0
     rule r {
         b := 1
         a = 1
@@ -2383,8 +2369,8 @@ module M {
 fn a_bare_condition_nested_in_if_is_an_error() {
     let src = "\
 module M {
-    reg a : bits[1] = 0
-    reg b : bits[1] = 0
+    reg a : [1] = 0
+    reg b : [1] = 0
     rule r {
         if a = 1 {
             b = 1
@@ -2411,10 +2397,10 @@ fn call_folds_a_guard_and_threads_a_state_write_from_the_same_callee() {
     // `a = 0`) — this pins the emitted shape.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out result : bits[8] = 0
-    Bump(x : bits[8]) : bits[8] <combines, fails> {
+    reg v : [8] = 0
+    in a : [8]
+    out result : [8] = 0
+    Bump(x : [8]) : [8] <combines, fails> {
         (x <> 0)?
         v := x
         return x + 1
@@ -2444,13 +2430,13 @@ fn a_failing_call_nested_in_a_larger_expression_is_an_error_not_a_dropped_guard(
     // nested inside `+ 1` would never be found there, silently letting
     // the caller's rule fire on a cycle `Classify` should have blocked.
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
 module Top {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule compute {
         result := Classify(a) + 1
     }
@@ -2473,7 +2459,7 @@ fn a_failing_callee_with_a_guard_nested_in_if_else_is_still_rejected() {
     // `x = 0`. `check_fails_is_foldable_guard` must catch this by
     // comparing "guards anywhere" against "guards at the top level".
     let src = "\
-Classify(x : bits[8], flag : bits[1]) : bits[8] <combines, fails> {
+Classify(x : [8], flag : [1]) : [8] <combines, fails> {
     if flag = 1 {
         (x <> 0)?
         return x
@@ -2482,9 +2468,9 @@ Classify(x : bits[8], flag : bits[1]) : bits[8] <combines, fails> {
     }
 }
 module Top {
-    in a : bits[8]
-    in f : bits[1]
-    out result : bits[8] = 0
+    in a : [8]
+    in f : [1]
+    out result : [8] = 0
     rule compute {
         result := Classify(a, f)
     }
@@ -2506,11 +2492,11 @@ fn call_folds_a_callees_fifo_op_into_the_callers_own_guard() {
     // condition already gets.
     let src = "\
 module Top {
-    fifo buf : bits[8]
-    in a : bits[8]
-    out result : bits[8] = 0
+    fifo buf : [8]
+    in a : [8]
+    out result : [8] = 0
 
-    Classify(x : bits[8]) : bits[8] <combines, fails> {
+    Classify(x : [8]) : [8] <combines, fails> {
         buf.Enq[x]
         return x
     }
@@ -2535,10 +2521,10 @@ fn call_folds_both_a_guard_and_a_fifo_op_from_the_same_callee() {
     // other's contribution before this shipped.
     let src = "\
 module Top {
-    fifo buf : bits[8]
-    in a : bits[8]
-    out result : bits[8] = 0
-    Push(x : bits[8]) : bits[8] <combines, fails> {
+    fifo buf : [8]
+    in a : [8]
+    out result : [8] = 0
+    Push(x : [8]) : [8] <combines, fails> {
         (x <> 0)?
         buf.Enq[x]
         return x
@@ -2562,12 +2548,12 @@ fn a_rule_enqueuing_directly_and_via_a_callee_is_still_a_double_enq_error() {
     // level.
     let src = "\
 module Top {
-    fifo buf : bits[8]
-    in a : bits[8]
-    in b : bits[8]
-    out result : bits[8] = 0
+    fifo buf : [8]
+    in a : [8]
+    in b : [8]
+    out result : [8] = 0
 
-    Classify(x : bits[8]) : bits[8] <combines, fails> {
+    Classify(x : [8]) : [8] <combines, fails> {
         buf.Enq[x]
         return x
     }
@@ -2597,12 +2583,12 @@ fn a_direct_deq_and_a_via_callee_enq_combine_into_one_pass_through() {
     // match.
     let src = "\
 module Top {
-    fifo buf : bits[8]
-    in a : bits[8]
-    out result : bits[8] = 0
-    out val : bits[8] = 0
+    fifo buf : [8]
+    in a : [8]
+    out result : [8] = 0
+    out val : [8] = 0
 
-    Classify(x : bits[8]) : bits[8] <combines, fails> {
+    Classify(x : [8]) : [8] <combines, fails> {
         buf.Enq[x]
         return x
     }
@@ -2631,16 +2617,16 @@ fn a_failing_callee_that_calls_another_failing_callee_is_still_rejected() {
     // Folding would need to recurse into `Inner`'s own body too, not
     // built here.
     let src = "\
-Inner(x : bits[8]) : bits[8] <combines, fails> {
+Inner(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
-Outer(x : bits[8]) : bits[8] <combines, fails> {
+Outer(x : [8]) : [8] <combines, fails> {
     return Inner(x)
 }
 module Top {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule compute {
         result := Outer(a)
     }
@@ -2662,14 +2648,14 @@ fn a_failing_call_nested_in_if_else_at_the_rule_level_is_still_rejected() {
     // behave that way, so it's rejected for clarity, matching existing
     // precedent exactly.
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
 module Top {
-    in a : bits[8]
-    in cond : bits[1]
-    out result : bits[8] = 0
+    in a : [8]
+    in cond : [1]
+    out result : [8] = 0
     rule compute {
         if cond = 1 {
             result := Classify(a)
@@ -2689,13 +2675,13 @@ module Top {
 #[test]
 fn a_failing_call_as_a_bare_statement_after_a_state_write_is_still_rejected() {
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
 module Top {
-    in a : bits[8]
-    reg r : bits[8] = 0
+    in a : [8]
+    reg r : [8] = 0
     rule compute {
         r := a
         Classify(a)
@@ -2722,14 +2708,14 @@ fn a_write_transitively_reached_through_a_bare_statement_call_threads_through() 
     // silently vanishes.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    reg w : bits[8] = 0
-    in a : bits[8]
-    Inner(y : bits[8]) : bits[8] <combines> {
+    reg v : [8] = 0
+    reg w : [8] = 0
+    in a : [8]
+    Inner(y : [8]) : [8] <combines> {
         w := y
         return y
     }
-    Outer(x : bits[8]) : bits[8] <combines> {
+    Outer(x : [8]) : [8] <combines> {
         v := Inner(x)
         return x
     }
@@ -2752,15 +2738,15 @@ fn call_to_a_function_with_a_non_tail_if_is_still_too_complex_to_inline() {
     // it, which is rejected the same as any other non-`let` leading
     // statement.
     let src = "\
-Pick(x : bits[8]) : bits[8] <combines> {
+Pick(x : [8]) : [8] <combines> {
     if x > 10 {
         return x
     }
     return 0
 }
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule r {
         result := Pick(a)
     }
@@ -2776,7 +2762,7 @@ module M {
 #[test]
 fn call_inlines_a_function_with_an_if_else_branching_return() {
     let src = "\
-Max(a : bits[8], b : bits[8]) : bits[8] <combines> {
+Max(a : [8], b : [8]) : [8] <combines> {
     if a > b {
         return a
     } else {
@@ -2784,9 +2770,9 @@ Max(a : bits[8], b : bits[8]) : bits[8] <combines> {
     }
 }
 module M {
-    in x : bits[8]
-    in y : bits[8]
-    out result : bits[8] = 0
+    in x : [8]
+    in y : [8]
+    out result : [8] = 0
     rule r {
         result := Max(x, y)
     }
@@ -2800,14 +2786,14 @@ module M {
 #[test]
 fn call_to_a_function_with_a_tail_if_and_no_else_is_an_error() {
     let src = "\
-Pick(x : bits[8]) : bits[8] <combines> {
+Pick(x : [8]) : [8] <combines> {
     if x > 10 {
         return x
     }
 }
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule r {
         result := Pick(a)
     }
@@ -2829,7 +2815,7 @@ fn call_inlines_a_function_with_lets_inside_branches_that_do_not_leak_out() {
     // `else` branch after the `then` branch doesn't see the `then`
     // branch's local still bound.
     let src = "\
-Pick(a : bits[8], b : bits[8]) : bits[8] <combines> {
+Pick(a : [8], b : [8]) : [8] <combines> {
     if a > b {
         let winner = a
         return winner
@@ -2839,9 +2825,9 @@ Pick(a : bits[8], b : bits[8]) : bits[8] <combines> {
     }
 }
 module M {
-    in x : bits[8]
-    in y : bits[8]
-    out result : bits[8] = 0
+    in x : [8]
+    in y : [8]
+    out result : [8] = 0
     rule r {
         result := Pick(x, y)
     }
@@ -2861,8 +2847,8 @@ fn call_to_an_unsynthesizable_builtin_is_still_an_error() {
     // that it doesn't get conflated with the others.
     let src = "\
 module M {
-    in a : bits[8]
-    out result : bits[8] = 0
+    in a : [8]
+    out result : [8] = 0
     rule r {
         result := clog2(a)
     }
@@ -2879,9 +2865,9 @@ module M {
 fn pack_concatenates_msb_first() {
     let src = "\
 module M {
-    in a : bits[8]
-    in b : bits[8]
-    out result : bits[16] = 0
+    in a : [8]
+    in b : [8]
+    out result : [16] = 0
     rule r {
         result := pack(a, b)
     }
@@ -2896,10 +2882,10 @@ module M {
 fn pack_of_three_folds_left_to_right() {
     let src = "\
 module M {
-    in a : bits[8]
-    in b : bits[8]
-    in c : bits[8]
-    out result : bits[24] = 0
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    out result : [24] = 0
     rule r {
         result := pack(a, b, c)
     }
@@ -2916,11 +2902,11 @@ fn pack_inlines_through_a_user_fn_that_wraps_it() {
     // enclosing callee from inlining.
     let src = "\
 module M {
-    in a : bits[8]
-    in b : bits[8]
-    out result : bits[16] = 0
+    in a : [8]
+    in b : [8]
+    out result : [16] = 0
 
-    Combine(x : bits[8], y : bits[8]) : bits[16] <combines> {
+    Combine(x : [8], y : [8]) : [16] <combines> {
         return pack(x, y)
     }
 
@@ -2938,8 +2924,8 @@ module M {
 fn trunc_takes_the_low_bits() {
     let src = "\
 module M {
-    in a : bits[16]
-    out result : bits[8] = 0
+    in a : [16]
+    out result : [8] = 0
     rule r {
         result := trunc(a, 8)
     }
@@ -2957,10 +2943,10 @@ fn trunc_inlines_through_a_user_fn_that_wraps_it() {
     // still does.
     let src = "\
 module M {
-    in a : bits[16]
-    out result : bits[8] = 0
+    in a : [16]
+    out result : [8] = 0
 
-    Narrow(x : bits[16]) : bits[8] <combines> {
+    Narrow(x : [16]) : [8] <combines> {
         return trunc(x, 8)
     }
 
@@ -2978,8 +2964,8 @@ module M {
 fn prio_encodes_the_lowest_set_bit_as_a_priority_mux_chain() {
     let src = "\
 module M {
-    in reqs : bits[4]
-    out grant : bits[2] = 0
+    in reqs : [4]
+    out grant : [2] = 0
     rule r {
         grant := prio(reqs)
     }
@@ -3003,10 +2989,10 @@ fn prio_inlines_through_a_user_fn_that_wraps_it() {
     // `nested_user_call_inside_a_builtins_argument_still_disqualifies`).
     let src = "\
 module M {
-    in reqs : bits[4]
-    out grant : bits[2] = 0
+    in reqs : [4]
+    out grant : [2] = 0
 
-    RoundRobin(r : bits[4]) : bits[2] <combines> {
+    RoundRobin(r : [4]) : [2] <combines> {
         return prio(r)
     }
 
@@ -3030,13 +3016,13 @@ fn user_call_nested_inside_a_builtins_argument_composes() {
     // `Mask` actually ran first, not just that emission succeeded.
     let src = "\
 module M {
-    in reqs : bits[4]
-    out grant : bits[2] = 0
+    in reqs : [4]
+    out grant : [2] = 0
 
-    Mask(x : bits[4]) : bits[4] <combines> {
+    Mask(x : [4]) : [4] <combines> {
         return x & 4'd7
     }
-    RoundRobin(r : bits[4]) : bits[2] <combines> {
+    RoundRobin(r : [4]) : [2] <combines> {
         return prio(Mask(r))
     }
 
@@ -3059,10 +3045,10 @@ fn mutually_exclusive_claim_emits_a_simulation_assertion() {
     // insert a real check, not just silently accept the annotation.
     let src = "\
 module M {
-    reg a : bits[8] = 0
-    reg b : bits[8] = 0
-    in we_a : bits[1]
-    in we_b : bits[1]
+    reg a : [8] = 0
+    reg b : [8] = 0
+    in we_a : [1]
+    in we_b : [1]
 
     rule set_a {
         (we_a = 1)?
@@ -3104,10 +3090,10 @@ fn conflict_free_claim_waives_the_stall_but_emits_no_assertion() {
     // emit NO assertion at all, not an inverted or placeholder one.
     let src = "\
 module M {
-    reg a : bits[8] = 0
-    reg b : bits[8] = 0
-    in we_a : bits[1]
-    in we_b : bits[1]
+    reg a : [8] = 0
+    reg b : [8] = 0
+    in we_a : [1]
+    in we_b : [1]
 
     rule set_a {
         (we_a = 1)?
@@ -3147,9 +3133,9 @@ fn mem_read_address_is_a_local_in_a_rule_that_isnt_last_in_urgency_order() {
     // hypothetical.
     let src = "\
 module M {
-    mem m : bits[16][256]
-    reg out : bits[16] = 0
-    reg counter : bits[8] = 0
+    mem m : [16][256]
+    reg out : [16] = 0
+    reg counter : [8] = 0
 
     rule read_at_five {
         let x = 5
@@ -3176,9 +3162,9 @@ module M {
 fn mem_read_address_is_a_local_bound_to_an_input() {
     let src = "\
 module M {
-    mem m : bits[16][256]
-    in addr : bits[8]
-    reg out : bits[16] = 0
+    mem m : [16][256]
+    in addr : [8]
+    reg out : [16] = 0
     rule r {
         let x = addr
         out := m[x]
@@ -3194,8 +3180,8 @@ module M {
 fn logic_of_a_fifo_op_reads_occupancy_with_no_dequeue() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    out ready : bit = 0
+    fifo f : [8]
+    out ready : [1] = 0
     rule r {
         ready := logic(f.Deq[])
     }
@@ -3212,13 +3198,13 @@ module M {
 #[test]
 fn logic_of_a_guard_only_call_reads_its_condition() {
     let src = "\
-Classify(x : bits[8]) : bits[8] <combines, fails> {
+Classify(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
 module M {
-    in a : bits[8]
-    out ok : bit = 0
+    in a : [8]
+    out ok : [1] = 0
     rule r {
         ok := logic(Classify(a))
     }
@@ -3239,11 +3225,11 @@ fn logic_rejects_a_call_that_also_writes_state() {
     // (...)` would be a confusing footgun, not a supported feature.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out ok : bit = 0
+    reg v : [8] = 0
+    in a : [8]
+    out ok : [1] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines, fails> {
+    Bump(x : [8]) : [8] <combines, fails> {
         v := x
         (x <> 0)?
         return x
@@ -3270,9 +3256,9 @@ module M {
 fn logic_of_a_fifo_op_enqueue_reads_space_availability() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    in x : bits[8]
-    out has_space : bit = 0
+    fifo f : [8]
+    in x : [8]
+    out has_space : [1] = 0
     rule r {
         has_space := logic(f.Enq[x])
     }
@@ -3295,10 +3281,10 @@ fn logic_of_a_fifo_op_works_inside_a_callees_own_body() {
     // accepted.
     let src = "\
 module M {
-    fifo f : bits[8]
-    out ready : bit = 0
+    fifo f : [8]
+    out ready : [1] = 0
 
-    Probe() : bit <combines> {
+    Probe() : [1] <combines> {
         return logic(f.Deq[])
     }
 
@@ -3324,17 +3310,17 @@ fn logic_rejects_a_write_callee_wrapped_inside_a_callees_own_body() {
     // exists to prevent.
     let src = "\
 module M {
-    reg v : bits[8] = 0
-    in a : bits[8]
-    out ok : bit = 0
+    reg v : [8] = 0
+    in a : [8]
+    out ok : [1] = 0
 
-    Bump(x : bits[8]) : bits[8] <combines, fails> {
+    Bump(x : [8]) : [8] <combines, fails> {
         v := x
         (x <> 0)?
         return x
     }
 
-    Probe(x : bits[8]) : bit <combines> {
+    Probe(x : [8]) : [1] <combines> {
         return logic(Bump(x))
     }
 
@@ -3353,16 +3339,16 @@ fn logic_after_a_state_write_is_not_rejected_by_guard_placement() {
     // state write" restriction looks for the raw shapes directly
     // (`self.fifo_op(e)`, `self.is_failing_call(e)`, `is_guard_like`) --
     // `logic(...)` is none of those (a plain `Expr::Call` to a builtin
-    // returning a `bits[1]` VALUE), so it correctly falls outside that
+    // returning a `[1]` VALUE), so it correctly falls outside that
     // restriction entirely and may appear anywhere an ordinary value
     // can, including after a write. Pins that this is real, deliberate
     // behavior (a plain value has nothing left to fold into a guard),
     // not an accidental gap in `check_guard_placement`'s shape matching.
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg v : bits[8] = 0
-    out ready : bit = 0
+    fifo f : [8]
+    reg v : [8] = 0
+    out ready : [1] = 0
     rule r {
         v := v + 1
         ready := logic(f.Deq[])
@@ -3377,12 +3363,12 @@ module M {
 #[test]
 fn logic_rejects_a_call_that_never_fails() {
     let src = "\
-Pure(x : bits[8]) : bits[8] <combines> {
+Pure(x : [8]) : [8] <combines> {
     return x + 1
 }
 module M {
-    in a : bits[8]
-    out ok : bit = 0
+    in a : [8]
+    out ok : [1] = 0
     rule r {
         ok := logic(Pure(a))
     }
@@ -3399,9 +3385,9 @@ module M {
 fn logic_rejects_a_non_fallible_argument() {
     let src = "\
 module M {
-    in a : bits[8]
-    in b : bits[8]
-    out ok : bit = 0
+    in a : [8]
+    in b : [8]
+    out ok : [1] = 0
     rule r {
         ok := logic(a + b)
     }
@@ -3425,9 +3411,9 @@ fn logic_of_a_fifo_op_composes_with_a_real_conflict_free_dequeue() {
     // legal, sufficient annotation).
     let src = "\
 module M {
-    fifo input : bits[8]
-    out ready : bit = 0
-    out consumed : bits[8] = 0
+    fifo input : [8]
+    out ready : [1] = 0
+    out consumed : [8] = 0
 
     rule probe {
         ready := logic(input.Deq[])
@@ -3456,18 +3442,18 @@ fn logic_wrapped_call_is_allowed_inside_an_if_condition() {
     // fifo_op_positions`/`check_writing_call_positions_in`) already did
     // — found while probing whether `logic(A) & logic(B)` fully
     // replaces a Verse-style `and` operator (it does, once this compiled
-    // at all): `logic(Check(a))` here is a plain `bits[1]` value with no
+    // at all): `logic(Check(a))` here is a plain `[1]` value with no
     // remaining guard-fold obligation, and belongs anywhere any other
     // value does, including an `if` condition combined with `&`.
     let src = "\
-Check(x : bits[8]) : bits[8] <combines, fails> {
+Check(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
 }
 module M {
-    fifo f : bits[8]
-    in a : bits[8]
-    out ok : bit = 0
+    fifo f : [8]
+    in a : [8]
+    out ok : [1] = 0
     rule r {
         if logic(f.Deq[]) & logic(Check(a)) {
             ok := 1
@@ -3492,10 +3478,10 @@ module M {
 fn or_with_default_is_unconditional_and_prioritized() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    out result : bits[8] = 0
-    out counter : bits[8] = 0
+    fifo a : [8]
+    fifo b : [8]
+    out result : [8] = 0
+    out counter : [8] = 0
     rule r {
         result := a.Deq[] or b.Deq[] or 0
         counter := counter + 1
@@ -3519,9 +3505,9 @@ module M {
 fn or_bound_via_let_folds_the_same_guard_as_assign() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    out result : bits[8] = 0
+    fifo a : [8]
+    fifo b : [8]
+    out result : [8] = 0
     rule r {
         let v = a.Deq[] or b.Deq[]
         result := v
@@ -3539,9 +3525,9 @@ module M {
 fn or_without_default_folds_an_ored_guard() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    out result : bits[8] = 0
+    fifo a : [8]
+    fifo b : [8]
+    out result : [8] = 0
     rule r {
         result := a.Deq[] or b.Deq[]
     }
@@ -3556,9 +3542,9 @@ module M {
 fn or_rejects_a_non_fifo_op_alternative_in_a_middle_position() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    in x : bits[8]
-    out result : bits[8] = 0
+    fifo a : [8]
+    in x : [8]
+    out result : [8] = 0
     rule r {
         result := a.Deq[] or x or 0
     }
@@ -3575,9 +3561,9 @@ module M {
 fn or_rejects_depth_greater_than_one() {
     let src = "\
 module M {
-    fifo a : [4]bits[8]
-    fifo b : bits[8]
-    out result : bits[8] = 0
+    fifo a : {4}[8]
+    fifo b : [8]
+    out result : [8] = 0
     rule r {
         result := a.Deq[] or b.Deq[]
     }
@@ -3591,10 +3577,10 @@ module M {
 fn or_rejects_a_fifo_also_touched_directly_elsewhere_in_the_rule() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    in x : bits[8]
-    out result : bits[8] = 0
+    fifo a : [8]
+    fifo b : [8]
+    in x : [8]
+    out result : [8] = 0
     rule r {
         a.Enq[x]
         result := a.Deq[] or b.Deq[]
@@ -3612,10 +3598,10 @@ module M {
 fn or_without_default_after_a_state_write_is_rejected() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    reg r0 : bits[8] = 0
-    out result : bits[8] = 0
+    fifo a : [8]
+    fifo b : [8]
+    reg r0 : [8] = 0
+    out result : [8] = 0
     rule r {
         r0 := 1
         result := a.Deq[] or b.Deq[]
@@ -3639,10 +3625,10 @@ module M {
 fn or_nested_in_if_is_rejected_by_the_generic_fifo_position_check() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    in cond : bit
-    out result : bits[8] = 0
+    fifo a : [8]
+    fifo b : [8]
+    in cond : [1]
+    out result : [8] = 0
     rule r {
         if cond {
             result := a.Deq[] or b.Deq[]
@@ -3671,10 +3657,10 @@ module M {
 fn or_inside_a_callees_own_body_with_a_default_is_rejected() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    out result : bits[8] = 0
-    Pick() : bits[8] <combines> {
+    fifo a : [8]
+    fifo b : [8]
+    out result : [8] = 0
+    Pick() : [8] <combines> {
         return a.Deq[] or b.Deq[] or 0
     }
     rule r {
@@ -3695,10 +3681,10 @@ module M {
 fn or_inside_a_callees_own_body_without_a_default_is_rejected() {
     let src = "\
 module M {
-    fifo a : bits[8]
-    fifo b : bits[8]
-    out result : bits[8] = 0
-    Pick() : bits[8] <combines, fails> {
+    fifo a : [8]
+    fifo b : [8]
+    out result : [8] = 0
+    Pick() : [8] <combines, fails> {
         return a.Deq[] or b.Deq[]
     }
     rule r {
@@ -3723,8 +3709,8 @@ module M {
 fn a_fifo_op_after_a_tick_gets_the_ordinary_per_segment_guard_fold() {
     let src = "\
 module M {
-    fifo f : bits[8]
-    reg r0 : bits[8] = 0
+    fifo f : [8]
+    reg r0 : [8] = 0
     rule go <sequences, writes {r0, f}, reads {f}> {
         r0 := 1
         tick
@@ -3764,8 +3750,8 @@ fn struct_reg_and_output_flatten_to_per_field_registers() {
 fn struct_typed_instance_port_is_rejected() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module Child {
@@ -3777,7 +3763,7 @@ module Child {
 
 module Parent {
     inst c : Child
-    out v : bit = 0
+    out v : [1] = 0
     rule read {
         v := c.p.valid
     }
@@ -3801,13 +3787,13 @@ module Parent {
 fn struct_reg_write_nested_in_if_else_mux_threads_per_field() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
     reg p : Pair = Pair{ valid: 0, data: 0 }
-    in go : bit
+    in go : [1]
 
     rule r {
         if go = 1 {
@@ -3828,13 +3814,13 @@ module M {
 fn struct_reg_write_nested_in_if_with_no_else_holds_the_flat_field_name() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
     reg p : Pair = Pair{ valid: 0, data: 0 }
-    in go : bit
+    in go : [1]
 
     rule r {
         if go = 1 {
@@ -3857,13 +3843,13 @@ module M {
 fn struct_typed_input_port_flattens_and_reads_by_field() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
     in q : Pair
-    out ok : bit = 0
+    out ok : [1] = 0
 
     rule r {
         ok := q.valid
@@ -3879,17 +3865,17 @@ module M {
 
 /// A struct-typed local bound directly to a struct literal resolves its
 /// field reads through the lazy `locals` map (not `locals_snapshots`,
-/// since a struct-typed local's width is never a concrete `bits[N]`).
+/// since a struct-typed local's width is never a concrete `[N]`).
 #[test]
 fn struct_typed_local_bound_to_a_literal_resolves_field_reads() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
-    out out_v : bits[8] = 0
+    out out_v : [8] = 0
 
     rule r {
         let q = Pair{ valid: 1, data: 8'd7 }
@@ -3910,12 +3896,12 @@ module M {
 fn struct_typed_local_aliasing_another_local_is_rejected() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
-    out out_v : bits[8] = 0
+    out out_v : [8] = 0
 
     rule r {
         let q = Pair{ valid: 1, data: 8'd7 }
@@ -3957,18 +3943,18 @@ fn nested_struct_flattens_all_the_way_down() {
 fn nested_struct_typed_input_port_flattens_and_reads_by_chained_field() {
     let src = "\
 struct Header {
-    valid : bit
-    seq : bits[4]
+    valid : [1]
+    seq : [4]
 }
 
 struct Frame {
     header : Header
-    data : bits[8]
+    data : [8]
 }
 
 module M {
     in q : Frame
-    out ok : bits[4] = 0
+    out ok : [4] = 0
 
     rule r {
         ok := q.header.seq
@@ -3992,18 +3978,18 @@ module M {
 fn nested_struct_write_in_if_with_no_else_holds_the_flat_leaf_name() {
     let src = "\
 struct Header {
-    valid : bit
-    seq : bits[4]
+    valid : [1]
+    seq : [4]
 }
 
 struct Frame {
     header : Header
-    data : bits[8]
+    data : [8]
 }
 
 module M {
     reg f : Frame = Frame{ header: Header{ valid: 0, seq: 0 }, data: 0 }
-    in go : bit
+    in go : [1]
 
     rule r {
         if go = 1 {
@@ -4033,13 +4019,13 @@ module M {
 fn a_multiline_struct_literal_still_parses_as_one() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
     reg p : Pair = Pair{ valid: 0, data: 0 }
-    in go : bit
+    in go : [1]
 
     rule r {
         if go = 1 {
@@ -4066,8 +4052,8 @@ module M {
 fn if_with_a_bare_ident_condition_and_a_newline_before_its_body_still_parses_as_a_block() {
     let src = "\
 module M {
-    reg x : bits[8] = 0
-    in cond : bit
+    reg x : [8] = 0
+    in cond : [1]
 
     rule r {
         if cond {
@@ -4116,7 +4102,7 @@ fn option_reg_and_output_flatten_to_valid_data_registers() {
 fn option_typed_instance_port_is_rejected() {
     let src = "\
 module Child {
-    out p : ?bits[8] = false
+    out p : ?[8] = false
     rule fill {
         p := 8'd5
     }
@@ -4124,7 +4110,7 @@ module Child {
 
 module Parent {
     inst c : Child
-    out v : bit = 0
+    out v : [1] = 0
     rule read {
         v := c.p.valid
     }
@@ -4137,7 +4123,7 @@ module Parent {
     );
 }
 
-/// `?bit` is the discriminating case for spelling absent as `false`
+/// `?[1]` is the discriminating case for spelling absent as `false`
 /// rather than a general boolean zero: `opt_valid`/`opt_data` are both
 /// `UInt<1>`, but they're two DISTINCT signals, not the same bit doing
 /// double duty -- `false` clears both, while a present `1` sets both
@@ -4148,9 +4134,9 @@ module Parent {
 fn option_of_bit_flattens_to_two_distinct_one_bit_registers() {
     let src = "\
 module M {
-    reg opt : ?bit = false
-    in go : bit
-    in present : bit
+    reg opt : ?[1] = false
+    in go : [1]
+    in present : [1]
 
     rule fill {
         go?
@@ -4182,14 +4168,14 @@ module M {
 fn nested_option_struct_field_flattens_and_inits_correctly() {
     let src = "\
 struct Frame {
-    id : bits[4]
-    maybe : ?bits[8]
+    id : [4]
+    maybe : ?[8]
 }
 
 module M {
     reg fr : Frame = Frame{ id: 3, maybe: 8'd5 }
-    out ok : bit = 0
-    out val : bits[8] = 0
+    out ok : [1] = 0
+    out val : [8] = 0
 
     rule r {
         if fr.maybe.valid {
@@ -4219,9 +4205,9 @@ module M {
 fn let_bound_option_unwrap_folds_its_guard() {
     let src = "\
 module M {
-    reg opt : ?bits[8] = false
-    out val : bits[8] = 0
-    in go : bit
+    reg opt : ?[8] = false
+    out val : [8] = 0
+    in go : [1]
 
     rule fill {
         go?
@@ -4246,8 +4232,8 @@ module M {
 fn let_bound_option_unwrap_after_a_state_write_is_rejected() {
     let src = "\
 module M {
-    reg opt : ?bits[8] = false
-    reg other : bits[8] = 0
+    reg opt : ?[8] = false
+    reg other : [8] = 0
     rule r {
         other := 1
         let x = opt?
@@ -4275,9 +4261,9 @@ module M {
 fn a_guard_nested_in_arithmetic_is_rejected() {
     let src = "\
 module M {
-    reg opt : ?bits[8] = false
-    out val : bits[8] = 0
-    in go : bit
+    reg opt : ?[8] = false
+    out val : [8] = 0
+    in go : [1]
 
     rule fill {
         go?
@@ -4309,13 +4295,13 @@ module M {
 fn a_guard_field_accessed_directly_is_rejected() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
     reg o : ?Pair = Pair{ valid: 1, data: 8'd7 }
-    out ok : bit = 0
+    out ok : [1] = 0
     rule r {
         ok := o?.valid
     }
@@ -4340,13 +4326,13 @@ module M {
 fn option_of_a_struct_flattens_and_inits_correctly() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
     reg o : ?Pair = Pair{ valid: 1, data: 8'd7 }
-    out ok : bit = 0
+    out ok : [1] = 0
     rule r {
         ok := o.data.valid
     }
@@ -4376,10 +4362,10 @@ module M {
 fn a_callee_bodys_option_guard_folds_correctly() {
     let src = "\
 module M {
-    reg opt : ?bits[8] = false
-    out result : bits[8] = 0
+    reg opt : ?[8] = false
+    out result : [8] = 0
 
-    Consume() : bits[8] <combines, fails> {
+    Consume() : [8] <combines, fails> {
         opt?
         return opt.data
     }
@@ -4411,9 +4397,9 @@ module M {
 fn option_typed_output_written_nested_in_if_with_no_else_holds_correctly() {
     let src = "\
 module M {
-    reg opt : ?bits[8] = false
-    out relayed : ?bits[8] = false
-    in go : bit
+    reg opt : ?[8] = false
+    out relayed : ?[8] = false
+    in go : [1]
     rule r {
         if go {
             relayed := opt.data
@@ -4435,8 +4421,8 @@ module M {
 fn option_typed_input_flattens_to_two_ports() {
     let src = "\
 module M {
-    in i : ?bits[8]
-    out ok : bit = 0
+    in i : ?[8]
+    out ok : [1] = 0
     rule r {
         ok := i.valid
     }
@@ -4451,7 +4437,7 @@ module M {
 
 /// `??T` (`T` itself `?U`) compiles and simulates correctly for the two
 /// states actually reachable through today's syntax -- fully absent
-/// (`false`) and fully present (a bare `bits[8]` value, coerced through
+/// (`false`) and fully present (a bare `[8]` value, coerced through
 /// BOTH Option layers by `check_assignable`'s recursive coercion rule).
 /// It is NOT a general two-independent-layers nested Option, though:
 /// `oo_valid` and `oo_data_valid` get byte-identical mux expressions in
@@ -4466,12 +4452,12 @@ module M {
 fn nested_option_reaches_only_fully_absent_or_fully_present() {
     let src = "\
 module M {
-    reg oo : ??bits[8] = false
-    out outer_valid : bit = 0
-    out inner_valid : bit = 0
-    out val : bits[8] = 0
-    in go : bit
-    in present : bit
+    reg oo : ??[8] = false
+    out outer_valid : [1] = 0
+    out inner_valid : [1] = 0
+    out val : [8] = 0
+    in go : [1]
+    in present : [1]
 
     rule fill {
         go?
@@ -4500,7 +4486,7 @@ module M {
 }
 
 /// A local bound to ANOTHER `?T`-typed value (`let o = opt`, `opt`
-/// itself `?bits[8]`) is rejected, the identical restriction a
+/// itself `?[8]`) is rejected, the identical restriction a
 /// struct-typed local has (`struct_typed_local_aliasing_another_local_
 /// is_rejected`) -- pins a real bug found while investigating `?T`-
 /// typed fn params (which bind an argument through this exact same
@@ -4515,8 +4501,8 @@ module M {
 fn option_typed_local_aliasing_another_option_value_is_rejected() {
     let src = "\
 module M {
-    reg opt : ?bits[8] = false
-    out ok : bit = 0
+    reg opt : ?[8] = false
+    out ok : [1] = 0
     rule r {
         let o = opt
         ok := o.valid
@@ -4542,8 +4528,8 @@ module M {
 fn option_typed_local_aliasing_is_rejected_through_the_guard_fold_too() {
     let src = "\
 module M {
-    reg opt : ?bits[8] = false
-    out val : bits[8] = 0
+    reg opt : ?[8] = false
+    out val : [8] = 0
     rule r {
         let o = opt
         val := o?
@@ -4566,17 +4552,17 @@ module M {
 fn struct_typed_fn_param_resolves_a_reg_argument() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
-UsePair(p : Pair) : bits[8] <combines> {
+UsePair(p : Pair) : [8] <combines> {
     return p.data
 }
 
 module M {
     reg q : Pair = Pair{ valid: 1, data: 8'd7 }
-    out out_v : bits[8] = 0
+    out out_v : [8] = 0
     rule r {
         out_v := UsePair(q)
     }
@@ -4596,14 +4582,14 @@ module M {
 #[test]
 fn option_typed_fn_param_resolves_a_reg_argument_and_folds_its_guard() {
     let src = "\
-Consume(o : ?bits[8]) : bits[8] <combines, fails> {
+Consume(o : ?[8]) : [8] <combines, fails> {
     o?
     return o.data
 }
 
 module M {
-    reg opt : ?bits[8] = false
-    out result : bits[8] = 0
+    reg opt : ?[8] = false
+    out result : [8] = 0
 
     rule r {
         result := Consume(opt)
@@ -4625,21 +4611,21 @@ module M {
 fn struct_typed_fn_param_chains_through_a_nested_call() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
-Inner(p : Pair) : bits[8] <combines> {
+Inner(p : Pair) : [8] <combines> {
     return p.data
 }
 
-Outer(p : Pair) : bits[8] <combines> {
+Outer(p : Pair) : [8] <combines> {
     return Inner(p)
 }
 
 module M {
     reg q : Pair = Pair{ valid: 1, data: 8'd9 }
-    out out_v : bits[8] = 0
+    out out_v : [8] = 0
     rule r {
         out_v := Outer(q)
     }
@@ -4654,17 +4640,17 @@ module M {
 /// still coerces to present, unaffected by the new param chase-through
 /// -- the chase-through only fires when the argument's OWN type
 /// exactly matches the param's declared type (genuine aliasing), so a
-/// `bits[8]` argument for a `?bits[8]` param falls through to the
+/// `[8]` argument for a `?[8]` param falls through to the
 /// ordinary coercion-synthesis path instead of being (wrongly) chased.
 #[test]
 fn plain_value_argument_still_coerces_to_a_present_option_param() {
     let src = "\
-UseIt(o : ?bits[8]) : bit <combines> {
+UseIt(o : ?[8]) : [1] <combines> {
     return o.valid
 }
 module M {
-    reg x : bits[8] = 0
-    out ok : bit = 0
+    reg x : [8] = 0
+    out ok : [1] = 0
     rule r {
         ok := UseIt(x)
     }
@@ -4686,16 +4672,16 @@ module M {
 fn a_callee_local_bound_to_a_struct_literal_is_unaffected_by_param_chase_through() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
-UsePair(p : Pair) : bits[8] <combines> {
+UsePair(p : Pair) : [8] <combines> {
     let x = Pair{ valid: 1, data: 8'd3 }
     return x.data
 }
 module M {
     reg q : Pair = Pair{ valid: 1, data: 8'd7 }
-    out out_v : bits[8] = 0
+    out out_v : [8] = 0
     rule r {
         out_v := UsePair(q)
     }
@@ -4716,16 +4702,16 @@ module M {
 fn a_callee_local_aliasing_a_struct_typed_param_is_rejected() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
-UsePair(p : Pair) : bits[8] <combines> {
+UsePair(p : Pair) : [8] <combines> {
     let x = p
     return x.data
 }
 module M {
     reg q : Pair = Pair{ valid: 1, data: 8'd7 }
-    out out_v : bits[8] = 0
+    out out_v : [8] = 0
     rule r {
         out_v := UsePair(q)
     }
@@ -4754,8 +4740,8 @@ module M {
 fn struct_typed_fn_return_builds_a_fresh_literal() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 MakePair() : Pair <combines> {
@@ -4764,7 +4750,7 @@ MakePair() : Pair <combines> {
 
 module M {
     reg p : Pair = Pair{ valid: 0, data: 0 }
-    out v : bits[8] = 0
+    out v : [8] = 0
     rule r {
         p := MakePair()
         v := p.data
@@ -4783,20 +4769,20 @@ module M {
 /// guard (`callee_fail_cond`) COMPLETELY INDEPENDENTLY of its return
 /// value's own per-leaf decomposition (`compile_callee_body_field`) --
 /// two separate passes over the same body that need to compose, not
-/// interfere. `x`'s present-coercion into `?bits[8]` (not an alias --
-/// `x : bits[8]`, a DIFFERENT type from the `?bits[8]` return) must
+/// interfere. `x`'s present-coercion into `?[8]` (not an alias --
+/// `x : [8]`, a DIFFERENT type from the `?[8]` return) must
 /// still synthesize via the ordinary `Ty::Option` coercion path.
 #[test]
 fn option_typed_fn_return_coerces_present_and_folds_its_guard() {
     let src = "\
-Consume(x : bits[8]) : ?bits[8] <combines, fails> {
+Consume(x : [8]) : ?[8] <combines, fails> {
     (x <> 0)?
     return x
 }
 
 module M {
-    in x : bits[8]
-    reg opt : ?bits[8] = false
+    in x : [8]
+    reg opt : ?[8] = false
     rule r {
         opt := Consume(x)
     }
@@ -4824,8 +4810,8 @@ module M {
 fn struct_typed_fn_return_passes_through_a_param_unchanged() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 Passthrough(p : Pair) : Pair <combines> {
@@ -4835,7 +4821,7 @@ Passthrough(p : Pair) : Pair <combines> {
 module M {
     reg src : Pair = Pair{ valid: 0, data: 0 }
     reg dst : Pair = Pair{ valid: 0, data: 0 }
-    in go : bit
+    in go : [1]
     rule fill {
         go?
         src := Pair{ valid: 1, data: 8'd9 }
@@ -4861,8 +4847,8 @@ module M {
 fn a_callee_local_aliasing_a_param_is_rejected_through_a_struct_return_too() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 Passthrough2(p : Pair) : Pair <combines> {
@@ -4895,8 +4881,8 @@ module M {
 fn struct_typed_fn_return_chains_through_a_nested_call() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 MakePair() : Pair <combines> {
@@ -4928,8 +4914,8 @@ module M {
 fn let_bound_struct_returning_call_resolves_field_reads() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 MakePair() : Pair <combines> {
@@ -4937,7 +4923,7 @@ MakePair() : Pair <combines> {
 }
 
 module M {
-    out v : bits[8] = 0
+    out v : [8] = 0
     rule r {
         let q = MakePair()
         v := q.data
@@ -4958,20 +4944,20 @@ module M {
 fn struct_returning_call_used_directly_as_another_calls_argument() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 MakePair() : Pair <combines> {
     return Pair{ valid: 1, data: 8'd7 }
 }
 
-UsePair(p : Pair) : bits[8] <combines> {
+UsePair(p : Pair) : [8] <combines> {
     return p.data
 }
 
 module M {
-    out v : bits[8] = 0
+    out v : [8] = 0
     rule r {
         v := UsePair(MakePair())
     }
@@ -4992,11 +4978,11 @@ module M {
 fn struct_typed_fn_return_if_else_muxes_per_leaf() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
-Pick(c : bit) : Pair <combines> {
+Pick(c : [1]) : Pair <combines> {
     if c {
         return Pair{ valid: 1, data: 8'd1 }
     } else {
@@ -5005,7 +4991,7 @@ Pick(c : bit) : Pair <combines> {
 }
 
 module M {
-    in c : bit
+    in c : [1]
     reg p : Pair = Pair{ valid: 0, data: 0 }
     rule r {
         p := Pick(c)
@@ -5026,11 +5012,11 @@ module M {
 fn struct_typed_fn_return_if_else_passes_a_param_through_one_branch() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
-PickPassthrough(p : Pair, c : bit) : Pair <combines> {
+PickPassthrough(p : Pair, c : [1]) : Pair <combines> {
     if c {
         return p
     } else {
@@ -5039,7 +5025,7 @@ PickPassthrough(p : Pair, c : bit) : Pair <combines> {
 }
 
 module M {
-    in c : bit
+    in c : [1]
     reg src : Pair = Pair{ valid: 1, data: 8'd9 }
     reg dst : Pair = Pair{ valid: 0, data: 0 }
     rule r {
@@ -5063,8 +5049,8 @@ module M {
 fn struct_typed_output_as_a_fn_return_write_target() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 MakePair() : Pair <combines> {
@@ -5096,16 +5082,16 @@ module M {
 fn struct_returning_callee_that_also_writes_state() {
     let src = "\
 struct Pair {
-    valid : bit
-    data : bits[8]
+    valid : [1]
+    data : [8]
 }
 
 module M {
-    in x : bits[8]
-    reg log : bits[8] = 0
+    in x : [8]
+    reg log : [8] = 0
     reg p : Pair = Pair{ valid: 0, data: 0 }
 
-    MakeAndLog(d : bits[8]) : Pair <combines> {
+    MakeAndLog(d : [8]) : Pair <combines> {
         log := d
         return Pair{ valid: 1, data: d }
     }

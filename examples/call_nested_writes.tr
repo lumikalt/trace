@@ -5,15 +5,15 @@
 -- bare statement), which writes `v_out` -- two levels of call between
 -- the rule and the actual write. See sim/call_nested_writes_tb.v.
 module Top {
-    in a : bits[8]
-    out v_out : bits[8] = 0
+    in a : [8]
+    out v_out : [8] = 0
 
-    Inner(x : bits[8]) : bits[8] <combines> {
+    Inner(x : [8]) : [8] <combines> {
         v_out := x
         return x
     }
 
-    Outer(x : bits[8]) : bits[8] <combines> {
+    Outer(x : [8]) : [8] <combines> {
         Inner(x + 1)
         return x
     }

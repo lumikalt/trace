@@ -3,8 +3,8 @@
 -- function's calling convention is a separate, undecided problem).
 -- One tick, one captured value (`v`): the minimal nontrivial case.
 module Rmw {
-    mem m : bits[8][256]
-    reg addr : bits[8] = 0
+    mem m : [8][256]
+    reg addr : [8] = 0
 
     rule step <sequences> {
         let v = m[addr]

@@ -61,7 +61,7 @@
 //!   `if`/`while` (a conditional cycle boundary is real scheduler work,
 //!   not yet designed). `spawn` has the identical restriction.
 //! - `race` is not handled by this pass.
-//! - a captured local's type must be a concrete `bits[w]`.
+//! - a captured local's type must be a concrete `[w]`.
 //! - a spawn callee's `return` must be the last statement of its last
 //!   segment; no early return.
 
@@ -724,7 +724,7 @@ fn plan_spawn(
         errors.push(LowerError {
             span: ast.expr_spans[return_expr.0 as usize].clone(),
             message: format!(
-                "spawn's return value has type {result_ty}, not a concrete `bits[w]`; \
+                "spawn's return value has type {result_ty}, not a concrete `[w]`; \
                  sequences lowering needs a known width to declare `.result`'s register"
             ),
         });
@@ -851,7 +851,7 @@ fn compute_captures(
             errors.push(LowerError {
                 span: res.def(*def).span.clone(),
                 message: format!(
-                    "`{name}` has type {ty}, not a concrete `bits[w]`; sequences lowering \
+                    "`{name}` has type {ty}, not a concrete `[w]`; sequences lowering \
                      needs a known width to declare its save register"
                 ),
             });
@@ -1546,7 +1546,7 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
         render_spawn_regs(&mut out, spawn);
     }
     out.push_str(&format!(
-        "reg {} : bits[{}] = 0\n\n",
+        "reg {} : [{}] = 0\n\n",
         lr.cont_name, lr.cont_width
     ));
 
@@ -1679,13 +1679,13 @@ fn render_spawn_regs(out: &mut String, spawn: &SpawnPlan) {
             .unwrap_or_else(|| cap.name.clone());
         out.push_str(&format!("reg {name} : {} = 0\n", cap.ty));
     }
-    out.push_str(&format!("reg {} : bits[1] = 0\n", spawn.done_name));
+    out.push_str(&format!("reg {} : [1] = 0\n", spawn.done_name));
     out.push_str(&format!(
         "reg {} : {} = 0\n",
         spawn.result_name, spawn.result_ty
     ));
     out.push_str(&format!(
-        "reg {} : bits[{}] = 0\n",
+        "reg {} : [{}] = 0\n",
         spawn.cont_name, spawn.cont_width
     ));
 }

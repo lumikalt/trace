@@ -4,14 +4,14 @@
 -- convention as `prio`) means `result` must always come from `A`, never
 -- `B`, no matter how many times this rule fires.
 module RaceValue {
-    in trigger : bits[1]
-    out result : bits[8] = 0
+    in trigger : [1]
+    out result : [8] = 0
 
-    A(x : bits[8]) : bits[8] <sequences> {
+    A(x : [8]) : [8] <sequences> {
         tick
         return x + 10
     }
-    B(x : bits[8]) : bits[8] <sequences> {
+    B(x : [8]) : [8] <sequences> {
         tick
         return x + 20
     }

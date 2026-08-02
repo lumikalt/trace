@@ -1,4 +1,4 @@
--- A depth-3 fifo (`[3]bits[8]`, chosen non-power-of-2 to stress
+-- A depth-3 fifo (`{3}[8]`, chosen non-power-of-2 to stress
 -- head/tail wraparound) -- N data-slot registers plus `head`/`count`
 -- pointers rather than depth-1's single valid bit/data register pair.
 -- `rule pushpop` exercises the SAME combined Enq+Deq pass-through
@@ -10,12 +10,12 @@
 -- pass-through, drain-to-empty, and a second fill that wraps the
 -- internal pointers past the top slot index.
 module FifoDepth {
-    fifo f : [3]bits[8]
+    fifo f : {3}[8]
 
-    in want_push : bits[1]
-    in want_pop : bits[1]
-    in push_data : bits[8]
-    out last_deq : bits[8] = 0
+    in want_push : [1]
+    in want_pop : [1]
+    in push_data : [8]
+    out last_deq : [8] = 0
 
     rule pushpop {
         (want_push = 1)?

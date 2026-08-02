@@ -7,10 +7,10 @@
 -- same `x`, proving this is genuinely dynamic per-cycle behavior, not a
 -- shift amount baked in at synthesis time.
 module Top {
-    in x : bits[8]
-    in n : bits[3]
-    out shl_out : bits[8] = 0
-    out shr_out : bits[8] = 0
+    in x : [8]
+    in n : [3]
+    out shl_out : [8] = 0
+    out shr_out : [8] = 0
 
     rule compute {
         shl_out := x << n
