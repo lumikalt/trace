@@ -28,10 +28,10 @@
     (static call-graph check) — nested any deeper than those two write
     positions (an argument, a `let`, `Bump(a) + 1`) is a clean, explicit
     error.
-  - Of the builtins, only `prio`/`trunc`/`pack` are synthesizable as
-    calls; `clog2`/`len` are compile-time-only (`Ty::Int`), and
-    `bits`/`wire`/`list`/`any`/`sync`/`race` aren't applicable to a
-    plain combinational callee body at all.
+  - Of the builtins, only `prio`/`trunc`/`pack`/`logic` are
+    synthesizable as calls; `clog2`/`len` are compile-time-only
+    (`Ty::Int`), and `bits`/`wire`/`list`/`any`/`sync`/`race` aren't
+    applicable to a plain combinational callee body at all.
   - A generic callee parameter's own width (`bits[N]`) is only
     resolvable for its own return value or by following it through
     `self.locals` back to a concrete call-site expression — used
@@ -143,6 +143,12 @@ committed to.
 
 Worth building:
 
+- `logic(...)` boolean-success operator ACHIEVED — see DESIGN.md's
+  "Builtins" section for the full write-up (semantics, the guard+write
+  v0 restriction and why it mirrors Verse's own `<decides>`/`<transacts>`
+  split, examples). Confirmed as a real Verse port (`02_primitives`'s
+  `logic{ exp }`), not just a plausible trace-only name. `or` below
+  still needs it as its per-alternative "did this succeed" primitive.
 - **`or` fallback operator** — Verse's `X? or Default` / `A or B or C`:
   try the left fallible expression, and if it fails, use the right side
   instead, DISCHARGING the failure rather than propagating it — this is
@@ -164,7 +170,15 @@ Worth building:
   the alternatives succeed (an `or` chain ending in a non-fallible
   default is always infallible, but `A or B` with no default stays
   fallible — needs the same fold-through-the-chain treatment
-  `callee_fail_cond` already does for calls). `and` isn't listed as a
+  `callee_fail_cond` already does for calls). `logic(...)` (ACHIEVED,
+  DESIGN.md's "Builtins" section) is this question's actual answer, not
+  just a related feature: `A or B or C` needs "did this alternative
+  succeed?" as a boolean before deciding whether to fall through, per
+  alternative — that's `logic(...)`'s exact job. `logic(...)` alone
+  doesn't finish `or`, though: `or` still needs its own priority-mux/
+  exclusivity machinery (which alternative's REAL, effectful op
+  actually executes) built on top, the same shape `prio`/`__race_value`
+  already establish. `and` isn't listed as a
   companion gap: sequential bare guards already conjoin into one rule's
   readiness for free, and bitwise `&` already covers AND in expression
   position for `bits[1]` operands — there's no missing capability to

@@ -32,7 +32,7 @@ use super::fifo::*;
 use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
 use crate::lexer::Span;
-use crate::resolve::{DefKind, Resolution, is_guard_like};
+use crate::resolve::{DefKind, Resolution, is_builtin_named, is_guard_like};
 use std::collections::HashMap;
 
 pub(crate) fn is_mem_write_to(ast: &Ast, res: &Resolution, stmt: StmtId, mem_name: &str) -> bool {
@@ -224,6 +224,8 @@ impl<'a> Emitter<'a> {
     pub(crate) fn check_writing_call_positions_in(&mut self, stmts: &[StmtId]) {
         let mut bad = Vec::new();
         self.calls_outside_allowed_positions(stmts, false, &mut bad);
+        let logic_args = self.logic_arg_exprs(stmts);
+        bad.retain(|e| !logic_args.contains(e));
         for call in bad {
             let Some(fn_item) = self.call_target_fn(call) else {
                 continue;
@@ -239,6 +241,152 @@ impl<'a> Emitter<'a> {
                      of `:=` (v0 restriction: not nested inside a larger \
                      expression, a `let`, or as an argument to another \
                      call — the write would not be found there)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    /// Every `logic(...)` call's sole argument, found anywhere within
+    /// `stmts` (any nesting depth, any statement, including inside
+    /// `if`/`while`) — regardless of whether that argument is actually a
+    /// VALID `logic(...)` argument (`check_logic_args_in` decides that
+    /// separately). This is the exemption list `check_failing_call_
+    /// positions`/`check_fifo_op_positions`/`check_writing_call_
+    /// positions_in` all subtract from their own "outside allowed
+    /// positions" findings: once wrapped in `logic(...)`, a fifo op or a
+    /// failing/writing call is no longer something that needs to be
+    /// foldable into a rule's own guard, or found by the write-hunt —
+    /// `logic` converts it into a plain, already-composable `bits[1]`
+    /// VALUE with no fold/write obligation left, so the position
+    /// restrictions that exist specifically to guarantee foldability/
+    /// write-discovery no longer apply. `stmts` generic (not rule-
+    /// specific) since `check_writing_call_positions_in` is ALSO the
+    /// callee-body check `validate_call` runs (calls.rs) — a `logic(...)`
+    /// inside a callee's own body needs the identical exemption a rule
+    /// body does. Reuses `collect_calls` (an ordinary `Expr::Call` IS
+    /// what `logic(...)` looks like syntactically) rather than a new
+    /// generic expression walker — same "roots per statement, recurse
+    /// into if/while" traversal shape as `calls_outside_allowed_
+    /// positions`/`fifo_ops_outside_allowed_positions`, kept as its own
+    /// copy for the same reason those two are already separate copies of
+    /// each other.
+    fn logic_arg_exprs(&self, stmts: &[StmtId]) -> Vec<ExprId> {
+        fn roots_of(ast: &Ast, stmts: &[StmtId], out: &mut Vec<ExprId>) {
+            for stmt in stmts {
+                match ast.stmt(*stmt).clone() {
+                    Stmt::Expr(e) => out.push(e),
+                    Stmt::Assign { lhs, rhs } => {
+                        out.push(lhs);
+                        out.push(rhs);
+                    }
+                    Stmt::Let { init, .. } => out.push(init),
+                    Stmt::Return(Some(e)) => out.push(e),
+                    Stmt::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        out.push(cond);
+                        roots_of(ast, &then_body, out);
+                        if let Some(b) = &else_body {
+                            roots_of(ast, b, out);
+                        }
+                    }
+                    Stmt::While { cond, body } => {
+                        out.push(cond);
+                        roots_of(ast, &body, out);
+                    }
+                    Stmt::Return(None) | Stmt::Tick => {}
+                }
+            }
+        }
+        let mut roots = Vec::new();
+        roots_of(self.ast, stmts, &mut roots);
+        let mut out = Vec::new();
+        for root in roots {
+            let mut calls = Vec::new();
+            collect_calls(self.ast, root, &mut calls);
+            for call in calls {
+                let Expr::Call { callee, args } = self.ast.expr(call) else {
+                    continue;
+                };
+                if args.len() == 1 && is_builtin_named(self.res, *callee, "logic") {
+                    out.push(args[0]);
+                }
+            }
+        }
+        out
+    }
+
+    /// `logic(e)`'s ONLY legal `e`: a direct fifo op (`f.Deq[]`/
+    /// `f.Enq[x]`), or a direct call to a `sig.fails` fn/impl whose OWN
+    /// `sig.writes` is empty. Anything else is rejected here with a
+    /// specific reason, rather than falling through to `check_failing_
+    /// call_positions`/`check_fifo_op_positions`/`check_writing_call_
+    /// positions_in`'s generic "nested in a larger expression" messages
+    /// (those three are told to ignore every `logic(...)` argument
+    /// entirely via `logic_arg_exprs`, so this is the one and only error
+    /// source for anything wrong inside a `logic(...)` call — including
+    /// inside a callee's own body, via `check_logic_args`'s callee-body
+    /// caller `validate_call`, calls.rs). The guard+write restriction
+    /// mirrors Verse's own `logic{ exp }`, confirmed against its primary
+    /// source (`02_primitives`): it only accepts a `<decides>`-effect
+    /// expression, and `<decides>` means side-effect-free-but-fallible
+    /// BY Verse's own effect system — a state-writing computation isn't
+    /// legal `logic{}` input there either. This isn't merely "hard to
+    /// implement": silently discarding a callee's write because it
+    /// happened to be reached through `logic(...)` would be a confusing
+    /// footgun even if internally safe, so it's rejected outright rather
+    /// than silently honored.
+    pub(crate) fn check_logic_args(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        self.check_logic_args_in(&body);
+    }
+
+    pub(crate) fn check_logic_args_in(&mut self, stmts: &[StmtId]) {
+        for arg in self.logic_arg_exprs(stmts) {
+            let span = self.ast.expr_spans[arg.0 as usize].clone();
+            if is_fifo_op(self.ast, self.res, arg) {
+                continue;
+            }
+            let Expr::Call { .. } = self.ast.expr(arg).clone() else {
+                self.error(
+                    span,
+                    "`logic(...)` needs a fifo op or a call to a function that can \
+                     fail as its sole argument"
+                        .to_string(),
+                );
+                continue;
+            };
+            let Some(fn_item) = self.call_target_fn(arg) else {
+                self.error(
+                    span,
+                    "`logic(...)` needs a fifo op or a call to a function that can \
+                     fail as its sole argument"
+                        .to_string(),
+                );
+                continue;
+            };
+            let Some(callee_sig) = self.fx.sigs.get(&fn_item) else {
+                continue;
+            };
+            if !callee_sig.fails {
+                self.error(
+                    span,
+                    "`logic(...)`'s call argument must be able to fail (declare \
+                     `<fails>`, or a bare condition/fifo op inside it) — a call \
+                     that always succeeds has nothing for `logic(...)` to test"
+                        .to_string(),
+                );
+            } else if !callee_sig.writes.is_empty() {
+                self.error(
+                    span,
+                    "`logic(...)` cannot test a function that also writes state \
+                     (v0 restriction): testing success here would either silently \
+                     discard the write or require it to happen regardless of \
+                     whether the result is used — write the call directly instead \
+                     if you need its effect"
                         .to_string(),
                 );
             }
@@ -265,6 +413,8 @@ impl<'a> Emitter<'a> {
         let body = rule_body(self.ast, rule);
         let mut bad = Vec::new();
         self.calls_outside_allowed_positions(&body, false, &mut bad);
+        let logic_args = self.logic_arg_exprs(&body);
+        bad.retain(|e| !logic_args.contains(e));
         for call in bad {
             let Some(fn_item) = self.call_target_fn(call) else {
                 continue;
@@ -304,6 +454,8 @@ impl<'a> Emitter<'a> {
         let body = rule_body(self.ast, rule);
         let mut bad = Vec::new();
         self.fifo_ops_outside_allowed_positions(&body, &mut bad);
+        let logic_args = self.logic_arg_exprs(&body);
+        bad.retain(|e| !logic_args.contains(e));
         for op in bad {
             self.error(
                 self.ast.expr_spans[op.0 as usize].clone(),
@@ -472,11 +624,23 @@ impl<'a> Emitter<'a> {
     }
 
     /// Whether `stmt` (an `if`/`while`, recursively) contains a call to
-    /// a failing function anywhere within it.
+    /// a failing function anywhere within it — excluding one wrapped in
+    /// `logic(...)` (found via the `and`-redundancy probes when adding
+    /// `or`: `logic(...)`'s whole point is converting a failing call
+    /// into a plain, already-composable `bits[1]` value with no
+    /// remaining guard-fold obligation, so it may appear inside an
+    /// `if`/`while` condition same as any other value — this is the
+    /// same exemption `check_failing_call_positions`/`check_fifo_op_
+    /// positions`/`check_writing_call_positions_in` already apply,
+    /// `check_guard_placement`'s own if/while sub-check had simply never
+    /// been taught about it).
     fn contains_failing_call(&self, stmt: StmtId) -> bool {
         let mut calls = Vec::new();
         collect_all_calls_in(self.ast, std::slice::from_ref(&stmt), &mut calls);
-        calls.iter().any(|call| self.is_failing_call(*call))
+        let logic_args = self.logic_arg_exprs(std::slice::from_ref(&stmt));
+        calls
+            .iter()
+            .any(|call| !logic_args.contains(call) && self.is_failing_call(*call))
     }
 
     /// A `sig.fails` callee is only inlinable when its ENTIRE fail

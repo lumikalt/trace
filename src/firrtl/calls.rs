@@ -14,6 +14,7 @@
 //! is the one synthesizable builtin, a fixed-priority `mux` chain.
 
 use super::Emitter;
+use super::fifo::fifo_guard_cond;
 use super::writes::item_name;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::lexer::Span;
@@ -323,8 +324,14 @@ impl<'a> Emitter<'a> {
         // is how `validate_call` notices a bad position was found and
         // bails out here instead of proceeding to splice a callee whose
         // body it just flagged as broken.
+        // `check_logic_args_in` needs the same callee-body reach for the
+        // identical reason: a `logic(...)` inside `fn_item`'s own body
+        // (e.g. `Probe() <combines> { return logic(f.Deq[]) }`) needs its
+        // argument's shape validated here too, not just at the rule
+        // level — same choke point, same before/after bail-out.
         let errors_before = self.errors.len();
         self.check_writing_call_positions_in(&body);
+        self.check_logic_args_in(&body);
         if self.errors.len() > errors_before {
             return Err(());
         }
@@ -404,6 +411,7 @@ impl<'a> Emitter<'a> {
             "prio" => self.compile_prio(id, args, hint),
             "trunc" => self.compile_trunc(id, args, hint),
             "pack" => self.compile_pack(id, args),
+            "logic" => self.compile_logic(id, args),
             "__race_value" => self.compile_race_value(id, args, hint),
             name => {
                 self.error(
@@ -411,8 +419,9 @@ impl<'a> Emitter<'a> {
                     format!(
                         "calling the builtin `{name}` is not yet supported in FIRRTL \
                          emission (v0 restriction: only `prio` — a fixed-priority \
-                         encoder — `trunc` — bit truncation — and `pack` — \
-                         concatenation — are synthesizable today)"
+                         encoder — `trunc` — bit truncation — `pack` — \
+                         concatenation — and `logic` — a fallible expression's \
+                         success as a boolean — are synthesizable today)"
                     ),
                 );
                 Err(())
@@ -442,6 +451,52 @@ impl<'a> Emitter<'a> {
             acc = format!("cat({acc}, {piece})");
         }
         Ok(acc)
+    }
+
+    /// `logic(e)`: `e`'s success as a plain `bits[1]` value — 1 if `e`
+    /// would succeed, 0 if it would fail — WITHOUT gating this rule and
+    /// WITHOUT performing `e`'s own side effect (no real dequeue/
+    /// enqueue, no callee write). `checks.rs`'s `check_logic_args` has
+    /// already confirmed `arg` is one of the two shapes below by the
+    /// time this runs, so both branches here are read-only lookups, not
+    /// validation: a fifo op compiles straight to `fifo_guard_cond`
+    /// (the existing occupancy/space check `compile_guard` already
+    /// computes for a real op — reading it here performs no dequeue/
+    /// enqueue of its own, just a register read); a call compiles
+    /// straight to `callee_fail_cond` (the existing guard-condition
+    /// computation `compile_guard`'s call-folding path already uses —
+    /// deliberately NOT `compile_call`/`compile_callee_body`, which
+    /// would compute the callee's RETURN value and is a completely
+    /// separate, unused-here code path). Neither ever reaches the
+    /// write-hunting machinery (`callee_reg_write`/`callee_port_write`),
+    /// so a guard-only callee's write genuinely never gets emitted for
+    /// this call site — but `check_logic_args` already rejects a callee
+    /// that writes anything at all, so that path is unreachable here in
+    /// practice, not silently relied upon.
+    fn compile_logic(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let Some(&arg) = args.first() else {
+            self.error(span, "`logic` takes one argument".to_string());
+            return Err(());
+        };
+        if let Some((fifo, depth, is_enq, _)) = self.fifo_op(arg) {
+            return Ok(fifo_guard_cond(&fifo, is_enq, depth));
+        }
+        if let Expr::Call {
+            callee: inner_callee,
+            args: inner_args,
+        } = self.ast.expr(arg).clone()
+            && let Some(cond) = self.callee_fail_cond(arg, inner_callee, &inner_args)
+        {
+            return Ok(cond);
+        }
+        self.error(
+            span,
+            "`logic`'s argument is not a fifo op or a failing call (should have \
+             been caught earlier by check_logic_args)"
+                .to_string(),
+        );
+        Err(())
     }
 
     /// `trunc(value, width)`: the low `width` bits of `value` — exactly

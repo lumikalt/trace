@@ -682,7 +682,7 @@ value (for example, as an argument to `prio` inside a generic callee), is only
 resolvable by following it back to a concrete call site; used elsewhere, this
 fails cleanly rather than compiling to the wrong width.
 
-Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
+Of the builtins, `prio`, `trunc`, `pack`, and `logic` are synthesizable as calls:
 
 - **`prio(reqs)`** is a fixed-priority encoder. The lowest set bit wins (bit 0 is
   highest priority); `reqs = 0` returns `0`, a defined but not meaningful value
@@ -692,6 +692,39 @@ Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
   first argument becomes the high bits, matching FIRRTL's `cat`, Chisel's `Cat`,
   and Verilog's `{a, b}` concatenation. The result width is the sum of the
   argument widths.
+- **`logic(e)`** converts a fallible expression into a plain `bits[1]` value —
+  `1` if `e` would succeed, `0` if it would fail — without gating the enclosing
+  rule (the failure is *discharged*, not propagated) and without performing
+  `e`'s own side effect. `e` must be exactly one of two shapes: a fifo op
+  (`logic(f.Deq[])`/`logic(f.Enq[x])`, which reads the fifo's own occupancy/
+  space condition but never actually dequeues/enqueues) or a call to a
+  guard-only `<fails>` fn/impl (`logic(Classify(x))`, which reads the callee's
+  already-substituted guard condition but never runs its body). A call whose
+  fail condition also writes state is a compile-time error, not silently
+  supported or silently wrong — see below. Ported from Verse's own `logic{
+  exp }` (a curly-brace cast in Verse's syntax; `logic(...)`, parens, matches
+  this language's own `prio`/`trunc`/`pack` call convention instead), confirmed
+  against Verse's `02_primitives` chapter: "To convert an expression that has
+  the `<decides>` effect to `true` on success or `false` on failure, use
+  `logic{ exp }`". See `examples/logic_probe.tr` + `sim/logic_probe_tb.v`,
+  which also proves a `logic(...)`-probing rule and a rule doing the real fifo
+  touch coexist correctly the same cycle under `conflict_free` (a plain
+  occupancy read has nothing to hazard against a same-cycle write to the same
+  register — the read always sees the pre-edge value regardless).
+
+  The guard+write restriction is not just "hard to implement": a callee whose
+  fail condition folds into a caller's guard AND also writes state is fully
+  supported for an ordinary direct call (see above), but wrapping one in
+  `logic(...)` would mean silently discarding its write — running only the
+  guard-fold half of what a real call does — which is a confusing footgun even
+  where it would be internally safe, not a feature. It also isn't an ad hoc
+  trace limitation: Verse's own `logic{}` only accepts a `<decides>`-effect
+  expression, and `<decides>` in Verse's effect system means
+  side-effect-free-but-fallible by construction — a `<transacts>`
+  (state-writing) computation is not legal `logic{}` input there either. trace
+  enforces the same boundary with an explicit check rather than a separate
+  effect category, since trace has no `<decides>`/`<transacts>` type-level
+  split.
 
 `clog2` and `len` type as `Ty::Int`: they are compile-time-only, not synthesizable
 values. `bits`, `wire`, `list`, and `any` are type- or elaboration-position
@@ -1390,6 +1423,9 @@ noted:
   guard, including the Enq+Deq pass-through case split across the call
   boundary — `examples/call_guard.tr`, `examples/call_fifo.tr`), the
   synthesizable builtins `prio`/`trunc`/`pack` (`examples/call*.tr`).
+- `logic(e)`: a fallible expression's success as a plain `bits[1]` value,
+  discharged rather than propagated, with no side effect of its own
+  (`examples/logic_probe.tr`).
 - The `schedule` block: `urgency`, `mutually_exclusive` (checked simulation
   assertion), `conflict_free` (trusted, unchecked; rejected outright on a
   write/write conflict).

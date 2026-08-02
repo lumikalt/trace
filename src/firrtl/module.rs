@@ -284,6 +284,7 @@ pub(crate) fn emit_module(
         cx.check_writing_call_positions(*rule);
         cx.check_failing_call_positions(*rule);
         cx.check_fifo_op_positions(*rule);
+        cx.check_logic_args(*rule);
         cx.check_fifo_op_counts(*rule);
     }
     if !cx.errors.is_empty() {

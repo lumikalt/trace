@@ -3135,3 +3135,297 @@ module M {
     assert!(fir.contains("connect m.r0.addr, addr"));
     run_firtool(&fir, &[]);
 }
+
+#[test]
+fn logic_of_a_fifo_op_reads_occupancy_with_no_dequeue() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    out ready : bit = 0
+    rule r {
+        ready := logic(f.Deq[])
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ready, __fifo_f_valid"));
+    // No dequeue side effect anywhere -- `logic(...)` alone never
+    // touches the fifo's own state, only reads it.
+    assert!(!fir.contains("connect __fifo_f_valid, UInt<1>(0)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_of_a_guard_only_call_reads_its_condition() {
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+module M {
+    in a : bits[8]
+    out ok : bit = 0
+    rule r {
+        ok := logic(Classify(a))
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ok, neq(a, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_rejects_a_call_that_also_writes_state() {
+    // The v0 restriction mirroring Verse's own `<decides>`-only rule for
+    // `logic{}` (confirmed against `02_primitives`, see TODO.md): a
+    // callee that both guard-folds AND writes state is fine as a DIRECT
+    // call (`call_writes_runs_through_real_ports` etc.), but silently
+    // discarding its write just because it's reached through `logic
+    // (...)` would be a confusing footgun, not a supported feature.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    in a : bits[8]
+    out ok : bit = 0
+
+    Bump(x : bits[8]) : bits[8] <combines, fails> {
+        v := x
+        (x <> 0)?
+        return x
+    }
+
+    rule r {
+        ok := logic(Bump(a))
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("also writes state")));
+    // Exactly one error, not also the generic writing-call-position
+    // message `check_writing_call_positions` would otherwise ALSO raise
+    // on the same span (`Bump(a)` genuinely does sit nested inside a
+    // larger expression) -- pins the exemption added to
+    // `check_writing_call_positions_in` alongside the fifo/failing-call
+    // ones, found by an advisor review after this test initially passed
+    // for the wrong reason (two errors, `.any` didn't notice the extra).
+    assert_eq!(err.len(), 1, "expected exactly one error, got {err:?}");
+}
+
+#[test]
+fn logic_of_a_fifo_op_enqueue_reads_space_availability() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    in x : bits[8]
+    out has_space : bit = 0
+    rule r {
+        has_space := logic(f.Enq[x])
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_has_space, not(__fifo_f_valid)"));
+    // No enqueue side effect -- the fifo's own data register never gets
+    // written by `logic(...)` alone.
+    assert!(!fir.contains("connect __fifo_f_data"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_of_a_fifo_op_works_inside_a_callees_own_body() {
+    // Advisor flagged this as untested: `check_logic_args` originally
+    // only ran per-RULE (module.rs's loop), never on a callee's own
+    // body -- this proves the positive case actually compiles correctly
+    // through `validate_call`'s callee-body reach, not just that it's
+    // accepted.
+    let src = "\
+module M {
+    fifo f : bits[8]
+    out ready : bit = 0
+
+    Probe() : bit <combines> {
+        return logic(f.Deq[])
+    }
+
+    rule r {
+        ready := Probe()
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ready, __fifo_f_valid"));
+    assert!(!fir.contains("connect __fifo_f_valid, UInt<1>(0)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_rejects_a_write_callee_wrapped_inside_a_callees_own_body() {
+    // The sharper version of the write-callee rejection: `Bump` isn't
+    // called directly from the rule, it's nested one level deeper,
+    // inside `Probe`'s own body -- reached only via `validate_call`'s
+    // callee-body check, not the rule-level one. Before `check_logic_
+    // args_in` was wired into `validate_call`, this compiled clean and
+    // silently dropped `v`'s write, exactly the bug this whole check
+    // exists to prevent.
+    let src = "\
+module M {
+    reg v : bits[8] = 0
+    in a : bits[8]
+    out ok : bit = 0
+
+    Bump(x : bits[8]) : bits[8] <combines, fails> {
+        v := x
+        (x <> 0)?
+        return x
+    }
+
+    Probe(x : bits[8]) : bit <combines> {
+        return logic(Bump(x))
+    }
+
+    rule r {
+        ok := Probe(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("also writes state")));
+}
+
+#[test]
+fn logic_after_a_state_write_is_not_rejected_by_guard_placement() {
+    // `check_guard_placement`'s "guard/fifo op/failing call after a
+    // state write" restriction looks for the raw shapes directly
+    // (`self.fifo_op(e)`, `self.is_failing_call(e)`, `is_guard_like`) --
+    // `logic(...)` is none of those (a plain `Expr::Call` to a builtin
+    // returning a `bits[1]` VALUE), so it correctly falls outside that
+    // restriction entirely and may appear anywhere an ordinary value
+    // can, including after a write. Pins that this is real, deliberate
+    // behavior (a plain value has nothing left to fold into a guard),
+    // not an accidental gap in `check_guard_placement`'s shape matching.
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg v : bits[8] = 0
+    out ready : bit = 0
+    rule r {
+        v := v + 1
+        ready := logic(f.Deq[])
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ready, __fifo_f_valid"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_rejects_a_call_that_never_fails() {
+    let src = "\
+Pure(x : bits[8]) : bits[8] <combines> {
+    return x + 1
+}
+module M {
+    in a : bits[8]
+    out ok : bit = 0
+    rule r {
+        ok := logic(Pure(a))
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("must be able to fail"))
+    );
+}
+
+#[test]
+fn logic_rejects_a_non_fallible_argument() {
+    let src = "\
+module M {
+    in a : bits[8]
+    in b : bits[8]
+    out ok : bit = 0
+    rule r {
+        ok := logic(a + b)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| {
+        e.message
+            .contains("needs a fifo op or a call to a function")
+    }));
+}
+
+#[test]
+fn logic_of_a_fifo_op_composes_with_a_real_conflict_free_dequeue() {
+    // Mirrors examples/logic_probe.tr: `probe`'s `logic(input.Deq[])`
+    // must not interfere with `drain`'s real, separately-scheduled
+    // dequeue of the SAME fifo -- proving effects.rs correctly excludes
+    // the probe from `sig.writes` (a naive merge would make `probe`
+    // conflict with `drain` on a write/write basis, forcing one to
+    // stall the other via urgency instead of `conflict_free` being a
+    // legal, sufficient annotation).
+    let src = "\
+module M {
+    fifo input : bits[8]
+    out ready : bit = 0
+    out consumed : bits[8] = 0
+
+    rule probe {
+        ready := logic(input.Deq[])
+    }
+
+    rule drain {
+        consumed := input.Deq[]
+    }
+
+    schedule {
+        conflict_free { probe, drain }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_drain = __fifo_input_valid"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_wrapped_call_is_allowed_inside_an_if_condition() {
+    // `check_guard_placement`'s if/while sub-checks (`contains_guard`/
+    // `contains_fifo_op`/`contains_failing_call`) predate `logic(...)`
+    // and originally had no exemption for it, even though the other
+    // three position checks (`check_failing_call_positions`/`check_
+    // fifo_op_positions`/`check_writing_call_positions_in`) already did
+    // — found while probing whether `logic(A) & logic(B)` fully
+    // replaces a Verse-style `and` operator (it does, once this compiled
+    // at all): `logic(Check(a))` here is a plain `bits[1]` value with no
+    // remaining guard-fold obligation, and belongs anywhere any other
+    // value does, including an `if` condition combined with `&`.
+    let src = "\
+Check(x : bits[8]) : bits[8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+module M {
+    fifo f : bits[8]
+    in a : bits[8]
+    out ok : bit = 0
+    rule r {
+        if logic(f.Deq[]) & logic(Check(a)) {
+            ok := 1
+        } else {
+            ok := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_ok, mux(and(__fifo_f_valid, neq(a, UInt<8>(0))), UInt<1>(1), UInt<1>(0))"
+    ));
+    run_firtool(&fir, &[]);
+}

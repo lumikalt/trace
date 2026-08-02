@@ -1331,3 +1331,31 @@ fn adder_tree_runs_through_real_ports() {
         "simulation did not report PASSED:\n{output}"
     );
 }
+
+/// Proves `logic(...)` end to end: `examples/logic_probe.tr`'s `probe`
+/// rule reads a fifo's occupancy and a guard-only `<fails>` call's
+/// condition as plain status outputs, with neither side effect (no real
+/// dequeue, no callee write) — `drain`, a SEPARATE rule doing the real
+/// dequeue, coexists in the same cycle (`conflict_free`) without either
+/// rule disturbing the other. See sim/logic_probe_tb.v.
+#[test]
+fn logic_probe_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/logic_probe.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/logic_probe_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}

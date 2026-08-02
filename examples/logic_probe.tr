@@ -1,0 +1,32 @@
+-- `logic(...)`: converts a fallible expression into a plain `bits[1]`
+-- value -- 1 if it would succeed, 0 if it would fail -- without gating
+-- the enclosing rule and without performing the underlying op's own
+-- side effect. `probe` tests both supported shapes (a fifo op, a
+-- guard-only `<fails>` call) as pure status outputs; `drain` performs
+-- the REAL dequeue in a SEPARATE rule, proving the probe alone doesn't
+-- disturb it -- both fire the same cycle, with no conflict between them.
+Validate(x : bits[8]) : bits[8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+
+module LogicProbe {
+    fifo input : bits[8]
+    in x : bits[8]
+    out input_ready : bit = 0
+    out x_valid : bit = 0
+    out consumed : bits[8] = 0
+
+    rule probe {
+        input_ready := logic(input.Deq[])
+        x_valid := logic(Validate(x))
+    }
+
+    rule drain {
+        consumed := input.Deq[]
+    }
+
+    schedule {
+        conflict_free { probe, drain }
+    }
+}

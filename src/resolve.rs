@@ -171,6 +171,19 @@ pub fn is_guard_like(ast: &Ast, res: &Resolution, expr: ExprId) -> bool {
     }
 }
 
+/// Whether `expr` is a call to the builtin named `name` — e.g. spotting
+/// a `logic(...)` call site specifically, not just "any builtin".
+/// Shared by effects.rs and firrtl/checks.rs, which both need this
+/// beyond `is_guard_like`'s coarser "is this ANY builtin" check
+/// (`types.rs` keeps its own pre-existing private copy, predating this
+/// function, rather than being migrated to avoid an unrelated churn).
+pub fn is_builtin_named(res: &Resolution, expr: ExprId, name: &str) -> bool {
+    res.expr_defs.get(&expr).is_some_and(|d| {
+        let def = res.def(*d);
+        def.kind == DefKind::Builtin && def.name == name
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveError {
     pub span: Span,
@@ -194,6 +207,7 @@ const BUILTINS: &[&str] = &[
     "sync",
     "race",
     "prio",
+    "logic",
     "__race_value",
 ];
 
