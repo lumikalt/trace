@@ -44,6 +44,29 @@
   `examples/call_trunc.tr`, `examples/call_pack.tr`,
   `examples/call_nested.tr`, `examples/call_nested_writes.tr`,
   `examples/call_guard.tr`, `examples/call_fifo.tr`.
+- **Newly-discovered gap, not yet investigated**: a state-writing `fn`
+  declared at FILE top level (outside any `module` block) that
+  references a register by NAME (`log := d`, no explicit qualification)
+  silently fails to write it — no error, no `connect` line, the write
+  just vanishes — when that name happens to match a register declared
+  inside some module. Found by advisor's third probe while verifying
+  struct-returning-callee-that-also-writes-state (this session's return
+  work): `MakeAndLog`/`Bump` declared OUTSIDE `module M { reg log :
+  bits[8] = 0 ... }` reproduces it even for a plain scalar-returning
+  callee with no struct/Option involved at all — confirmed via `git
+  stash` that it predates this session's changes entirely, so it's
+  unrelated to struct/Option returns specifically. Every EXISTING
+  passing test for a state-writing callee (`call_inlines_a_function_
+  that_writes_state_and_returns_a_value`, etc., tests/firrtl.rs)
+  declares the callee NESTED INSIDE the module instead, which is why
+  this never surfaced before. Root cause not yet identified — resolve.rs
+  apparently resolves the top-level fn's `log` reference to SOMETHING
+  (no "unresolved identifier" error), but neither `callee_reg_write`
+  nor `call_writes_reg` (writes.rs) end up emitting a `connect` for it.
+  Whether this should even be legal syntax (should a top-level fn be
+  allowed to write module-scoped state it has no lexical relationship
+  to at all?) is itself an open question — this needs a dedicated
+  investigation, not a quick patch.
 - `<elaborates>` recursion/unrolling (`src/elaborate.rs`) is ACHIEVED —
   DESIGN.md's own `AdderTree` example (compile-time tree recursion over a
   `list[bits[N]]`, one-sided slices `xs[..mid]`/`xs[mid..]`). Separate
@@ -228,28 +251,70 @@ Speculative, bigger, not committed to:
   (`examples/option.tr`'s `relayed` output exercises a `?T`-typed
   OUTPUT port's own separate write-threading bookkeeping directly, not
   just the reg case). What's left, not attempted this pass:
-  - **Struct- and `?T`-typed fn/rule params and returns.** One shared
-    feature, not two — `check_body`'s rejection is a single
-    `matches!(ty, Ty::Struct {..} | Ty::Option(_))`, so implementing
-    one without the other means deleting half a shared check and
-    leaving the other half, worse than either. Coercion today only
-    reaches direct writes and ordinary assignable positions
-    (`check_assignable`'s own broad reach); a call boundary needs its
-    own design pass, and the two directions aren't equally hard:
-    **params** are plausibly cheap (`compile_struct_field_read`'s
-    Local/Param case already dispatches on a `root_ty` via
-    `compile_field_path_value`, so a struct-literal/coerced-Option
-    argument may partly work already — though
-    `struct_typed_local_aliasing_another_local_is_rejected` suggests a
-    reg-typed argument's path is deliberately closed and would need
-    opening); **returns** need a real signature change —
-    `compile_callee_body` returns one FIRRTL expression
-    (`Result<String, ()>`), but a struct/Option return needs N values
-    (one per leaf field) threaded back to N flat register writes, all
-    the way through the inlining path. Scope (params-only first vs.
-    params+returns together) is Lumi's call, not self-executed — ask
-    before starting, the same way `conflict_free`/`race`'s scope
-    questions were settled via AskUserQuestion.
+  - **Struct- and `?T`-typed fn/rule PARAMS — ACHIEVED.** Scoped via
+    AskUserQuestion (params-only first, Lumi's pick — returns followed
+    in a same-day follow-up, see below). An argument may be a struct
+    literal/`false`/a
+    plain value of `T`, or a reg/output/input/another same-typed
+    param, resolved by CHASING through the alias to that value's own
+    flat fields (`compile_struct_field_read`'s param-only chase-
+    through, expr.rs — see DESIGN.md's "Calling a function from a
+    rule"/"Calling a function: inlining" sections,
+    `examples/call_struct_param.tr`) — not just the literal-argument
+    case, which is what "lifting the type-check gate alone" would have
+    given. Chains through nested calls correctly (`Outer(p) {
+    return Inner(p) }` resolves back to the original reg through TWO
+    levels of param binding). Building this surfaced a real pre-
+    existing miscompile, found and fixed BEFORE writing any of the
+    params machinery: `let o = opt` (`opt` itself `?T`, no call
+    involved at all) typed fine via ordinary inference and reached
+    `compile_field_path_value`'s `Ty::Option` arm with its "not itself
+    Option-typed" invariant already broken (that invariant is normally
+    enforced by `type_write`'s Option-to-Option rejection, which only
+    runs for a state WRITE with a known target type — a plain `let`
+    has none), silently hardcoding `o.valid`/`o.data` to wrong
+    constants instead of reading `opt`'s actual register. Fixed by
+    rejecting the alias at the arm itself (matching struct's own
+    existing local-aliasing restriction) — a separate commit, before
+    params, per advisor's explicit "verify these two before writing
+    the test" pre-commit review. A plain rule-level `let` merely
+    re-binding a param/aliasing another `?T` value STILL rejects
+    (deliberately narrower than "params work" — general alias
+    resolution for `let` wasn't asked for and wasn't built).
+  - **Struct- and `?T`-typed RETURNS — ACHIEVED.** Same-day follow-up
+    to params, per Lumi's "continue the optional stuff." A new
+    field-path-aware sibling, `compile_callee_body_field` (calls.rs),
+    extracts ONE leaf field's value per call, re-walking/re-binding the
+    callee's body independently per leaf (the exact `Avg(Avg(x, y), z)`
+    reentrancy discipline params already established, now on the
+    return side); `compile_field_path_value` (writes.rs) gained a new
+    `Expr::Call` case dispatching into it — see DESIGN.md's "Calling a
+    function from a rule"/"Calling a function: inlining" sections,
+    `examples/call_struct_return.tr`. Supports a fresh literal return,
+    chaining through a nested struct/Option-returning call, and a
+    callee returning one of its OWN params unchanged (`Passthrough(p) {
+    return p }`) — but NOT a callee-local that merely re-binds a param
+    and returns THAT (`let x = p; return x`), the identical restriction
+    the param side already has one level in. An advisor-recommended
+    probe (compile with the type-check gate disabled, see WHERE it
+    breaks before designing further) surfaced a second self-caught
+    silent-drop bug of the SAME shape the `?T`-aliasing bug earlier
+    this session had: with no `Expr::Call` case, `struct_field_value_
+    in_stmts` treated a matching-but-unresolvable `Assign` as "doesn't
+    write this field" rather than an error — fixed by having the new
+    dispatch always emit a real error on genuine failure. Getting the
+    param-passthrough case right took two more self-caught fixes before
+    it shipped: a first attempt put the `Expr::Ident` chase-through
+    generically inside `compile_field_path_value`, which is ALSO
+    reached from `compile_struct_field_read`'s pre-existing Local-arm
+    fallback — silently relegalizing a callee-local aliasing a param,
+    caught by an EXISTING regression test failing, not by inspection;
+    moved instead into `compile_callee_body_field`'s own `Return` arm,
+    checked directly against `ret_expr` only. That version then needed
+    its own exact-type-match gate (mirroring the param side's) to avoid
+    misfiring on an ordinary `T`-into-`?T` present-coercion return — a
+    dedicated guard-fold-intersection probe (per advisor's flagged
+    priority) caught this one before it shipped, not after.
   - **`??T` (nested Option) — verified, with a real limitation, not
     just "untested."** Compiles and simulates correctly for the two
     states reachable through today's syntax (fully absent via `false`,

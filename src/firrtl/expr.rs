@@ -322,6 +322,7 @@ impl<'a> Emitter<'a> {
             }
             Some(d) if matches!(d.kind, DefKind::Local | DefKind::Param) => {
                 let def = def.unwrap();
+                let is_param = d.kind == DefKind::Param;
                 let Some(bound) = self.locals.get(&def).copied() else {
                     self.error(
                         self.ast.expr_spans[root.0 as usize].clone(),
@@ -340,6 +341,32 @@ impl<'a> Emitter<'a> {
                     );
                     return Err(());
                 };
+                // A PARAM bound to another struct/Option-typed value via
+                // a plain `Expr::Ident` (a reg/output/input, or another
+                // param/local of the SAME type -- `UseIt(q)`, `q` a
+                // struct-typed reg) resolves by chasing through to that
+                // value's own root, reusing this same fn one level
+                // deeper -- exactly the substitution a real inliner
+                // performs, and the actually-useful case ("pass a reg
+                // as an argument"), not just a literal argument.
+                // Deliberately PARAM-only, not LOCAL: a plain rule-level
+                // `let` aliasing another struct/Option value stays
+                // rejected (`option_typed_local_aliasing_another_
+                // option_value_is_rejected`) -- general alias
+                // resolution for `let` is a separate, wider capability
+                // than "params work," not implied by it. The type-
+                // equality check (not just "both struct"/"both Option")
+                // excludes the coercion case: a plain `T`-typed
+                // value/local passed to a `?T` param has a DIFFERENT
+                // type from `root_ty` and correctly falls through to
+                // `compile_field_path_value`'s coercion-synthesis path
+                // below instead.
+                if is_param
+                    && matches!(self.ast.expr(bound), Expr::Ident(_))
+                    && self.types.expr_tys.get(&bound) == Some(&root_ty)
+                {
+                    return self.compile_struct_field_read(id, bound, path, hint);
+                }
                 let width = hint.unwrap_or_else(|| self.width_of(id));
                 let bound_is_option_alias = matches!(root_ty, Ty::Option(_))
                     && matches!(self.types.expr_tys.get(&bound), Some(Ty::Option(_)));

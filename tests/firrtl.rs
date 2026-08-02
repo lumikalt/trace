@@ -4557,3 +4557,567 @@ module M {
         "expected an option-aliasing rejection, got: {err:?}"
     );
 }
+
+/// A struct-typed fn param resolves a REG-typed argument -- the
+/// actually-useful case, not just a literal -- by chasing through the
+/// param binding to the reg's own flat field registers
+/// (`compile_struct_field_read`'s PARAM-only chase-through, expr.rs).
+#[test]
+fn struct_typed_fn_param_resolves_a_reg_argument() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+UsePair(p : Pair) : bits[8] <combines> {
+    return p.data
+}
+
+module M {
+    reg q : Pair = Pair{ valid: 1, data: 8'd7 }
+    out out_v : bits[8] = 0
+    rule r {
+        out_v := UsePair(q)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_out_v, q_data"));
+    run_firtool(&fir, &[]);
+}
+
+/// The `?T` sibling of the above -- a reg-typed argument resolves
+/// through an Option-typed param, AND the callee's own bare-statement
+/// guard (`o?`) folds through the SAME param binding into the caller's
+/// rule guard (the `callee_fail_cond` cross-file fold site from
+/// earlier this session, now exercised with a PARAM alias in between
+/// rather than a bare module-level reg reference).
+#[test]
+fn option_typed_fn_param_resolves_a_reg_argument_and_folds_its_guard() {
+    let src = "\
+Consume(o : ?bits[8]) : bits[8] <combines, fails> {
+    o?
+    return o.data
+}
+
+module M {
+    reg opt : ?bits[8] = false
+    out result : bits[8] = 0
+
+    rule r {
+        result := Consume(opt)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = opt_valid"));
+    assert!(fir.contains("connect __out_result, opt_data"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct/Option-typed param CHAIN (one callee passing its own param
+/// straight through to another callee's SAME-typed param) resolves all
+/// the way back to the original reg -- `bind_callee_context`'s
+/// reentrant substitution plus the param chase-through compose
+/// correctly across two levels of call nesting, not just one.
+#[test]
+fn struct_typed_fn_param_chains_through_a_nested_call() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+Inner(p : Pair) : bits[8] <combines> {
+    return p.data
+}
+
+Outer(p : Pair) : bits[8] <combines> {
+    return Inner(p)
+}
+
+module M {
+    reg q : Pair = Pair{ valid: 1, data: 8'd9 }
+    out out_v : bits[8] = 0
+    rule r {
+        out_v := Outer(q)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_out_v, q_data"));
+    run_firtool(&fir, &[]);
+}
+
+/// A plain `T`-typed argument (not itself `?T`) passed to a `?T` param
+/// still coerces to present, unaffected by the new param chase-through
+/// -- the chase-through only fires when the argument's OWN type
+/// exactly matches the param's declared type (genuine aliasing), so a
+/// `bits[8]` argument for a `?bits[8]` param falls through to the
+/// ordinary coercion-synthesis path instead of being (wrongly) chased.
+#[test]
+fn plain_value_argument_still_coerces_to_a_present_option_param() {
+    let src = "\
+UseIt(o : ?bits[8]) : bit <combines> {
+    return o.valid
+}
+module M {
+    reg x : bits[8] = 0
+    out ok : bit = 0
+    rule r {
+        ok := UseIt(x)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ok, UInt<1>(1)"));
+    run_firtool(&fir, &[]);
+}
+
+/// The param chase-through's `Expr::Ident`-only gate correctly leaves a
+/// callee-local bound to a struct LITERAL (no aliasing at all) alone --
+/// it takes the ordinary literal-decompose path, unaffected by whether
+/// a DIFFERENT local in the same callee happens to be a param.
+/// Advisor-verified before commit: the gate keys off `bound`'s own AST
+/// shape (`Expr::Ident` vs `Expr::StructLit`), not off "is this
+/// callee's `p` a param", so it can't over-reject this case.
+#[test]
+fn a_callee_local_bound_to_a_struct_literal_is_unaffected_by_param_chase_through() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+UsePair(p : Pair) : bits[8] <combines> {
+    let x = Pair{ valid: 1, data: 8'd3 }
+    return x.data
+}
+module M {
+    reg q : Pair = Pair{ valid: 1, data: 8'd7 }
+    out out_v : bits[8] = 0
+    rule r {
+        out_v := UsePair(q)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_out_v, UInt<8>(3)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A callee-local re-BINDING a param (`let x = p`, no literal, just an
+/// alias) still rejects, with the STRUCT-flavored message specifically
+/// (not the Option one -- `bound_is_option_alias` keys on `root_ty`
+/// being `Ty::Option`, so this pins that the two messages don't cross-
+/// contaminate). The chase-through is deliberately PARAM-only: `x`
+/// here is a LOCAL, not a param, so it doesn't get chased.
+#[test]
+fn a_callee_local_aliasing_a_struct_typed_param_is_rejected() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+UsePair(p : Pair) : bits[8] <combines> {
+    let x = p
+    return x.data
+}
+module M {
+    reg q : Pair = Pair{ valid: 1, data: 8'd7 }
+    out out_v : bits[8] = 0
+    rule r {
+        out_v := UsePair(q)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("not aliased from another local")),
+        "expected a struct-local-aliasing rejection, got: {err:?}"
+    );
+}
+
+/// A struct-RETURNING fn (`compile_callee_body_field`, calls.rs)
+/// decomposes its trailing `return <struct literal>` one leaf field at
+/// a time, threading each leaf back through the SAME per-field write
+/// machinery a struct literal's own direct write already uses
+/// (`compile_field_path_value`'s new `Expr::Call` case, writes.rs).
+/// Before this, `p := MakePair()` type-checked as a plain type error
+/// (struct writes required a literal RHS) -- with that gate lifted, the
+/// write must actually decompose correctly, not silently vanish (the
+/// exact class of bug this session's `?T`-aliasing fix caught earlier:
+/// a self-caught probe of this very case found the write disappearing
+/// entirely, zero error, zero `connect` -- fixed by this dispatch).
+#[test]
+fn struct_typed_fn_return_builds_a_fresh_literal() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+MakePair() : Pair <combines> {
+    return Pair{ valid: 1, data: 8'd7 }
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    out v : bits[8] = 0
+    rule r {
+        p := MakePair()
+        v := p.data
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect p_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect p_data, UInt<8>(7)"));
+    run_firtool(&fir, &[]);
+}
+
+/// The `?T` sibling, AND the guard-fold intersection advisor flagged as
+/// the one composition this session's params work hadn't tested yet: a
+/// `<fails>` callee's bare-statement guard folds into the caller's rule
+/// guard (`callee_fail_cond`) COMPLETELY INDEPENDENTLY of its return
+/// value's own per-leaf decomposition (`compile_callee_body_field`) --
+/// two separate passes over the same body that need to compose, not
+/// interfere. `x`'s present-coercion into `?bits[8]` (not an alias --
+/// `x : bits[8]`, a DIFFERENT type from the `?bits[8]` return) must
+/// still synthesize via the ordinary `Ty::Option` coercion path.
+#[test]
+fn option_typed_fn_return_coerces_present_and_folds_its_guard() {
+    let src = "\
+Consume(x : bits[8]) : ?bits[8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+
+module M {
+    in x : bits[8]
+    reg opt : ?bits[8] = false
+    rule r {
+        opt := Consume(x)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = neq(x, UInt<8>(0))"));
+    assert!(fir.contains("connect opt_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect opt_data, x"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-returning callee that just returns one of its OWN params
+/// UNCHANGED (`Passthrough(p) { return p }`) is the return-side twin of
+/// `struct_typed_fn_param_resolves_a_reg_argument` -- a param binding IS
+/// this call's actual argument substituted in, so `dst := Passthrough
+/// (src)` must thread `src`'s own flat fields straight through to
+/// `dst`'s, not error as "too complex to inline". Handled directly in
+/// `compile_callee_body_field`'s `Return` arm (calls.rs), NOT as a
+/// general `Expr::Ident` case inside `compile_field_path_value` --an
+/// earlier version of this fix put it there and it silently
+/// relegalized `a_callee_local_aliasing_a_struct_typed_param_is_
+/// rejected`'s exact pattern, caught by that regression test.
+#[test]
+fn struct_typed_fn_return_passes_through_a_param_unchanged() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+Passthrough(p : Pair) : Pair <combines> {
+    return p
+}
+
+module M {
+    reg src : Pair = Pair{ valid: 0, data: 0 }
+    reg dst : Pair = Pair{ valid: 0, data: 0 }
+    in go : bit
+    rule fill {
+        go?
+        src := Pair{ valid: 1, data: 8'd9 }
+    }
+    rule copy {
+        dst := Passthrough(src)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect dst_valid, src_valid"));
+    assert!(fir.contains("connect dst_data, src_data"));
+    run_firtool(&fir, &[]);
+}
+
+/// A callee-LOCAL that re-binds a struct-typed param, then returns the
+/// WHOLE local (not just a field read off it), stays rejected -- the
+/// return-side twin of `a_callee_local_aliasing_a_struct_typed_param_
+/// is_rejected`, pinning that the `compile_field_path_value` restriction
+/// (no generic `Expr::Ident` case) actually holds for a bare `return x`
+/// too, not just a `return x.data` field access.
+#[test]
+fn a_callee_local_aliasing_a_param_is_rejected_through_a_struct_return_too() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+Passthrough2(p : Pair) : Pair <combines> {
+    let x = p
+    return x
+}
+
+module M {
+    reg q : Pair = Pair{ valid: 1, data: 8'd7 }
+    reg dst : Pair = Pair{ valid: 0, data: 0 }
+    rule r {
+        dst := Passthrough2(q)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("too complex to inline")),
+        "expected a struct-return inlining rejection, got: {err:?}"
+    );
+}
+
+/// A struct-returning callee whose own trailing `return` is itself
+/// ANOTHER struct-returning call (`WrapPair() { return MakePair() }`)
+/// chains correctly -- `compile_call_field_value` re-enters `compile_
+/// field_path_value` on the nested call's return expr exactly the way
+/// the params work's own nested-call chaining already does for reads.
+#[test]
+fn struct_typed_fn_return_chains_through_a_nested_call() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+MakePair() : Pair <combines> {
+    return Pair{ valid: 1, data: 8'd7 }
+}
+
+WrapPair() : Pair <combines> {
+    return MakePair()
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    rule r {
+        p := WrapPair()
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect p_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect p_data, UInt<8>(7)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A `let`-bound struct-returning call resolves through the SAME
+/// dispatch a direct write already gets -- `compile_struct_field_read`'s
+/// existing Local-arm fallback reaches `compile_field_path_value`'s new
+/// `Expr::Call` case for free, no separate machinery needed.
+#[test]
+fn let_bound_struct_returning_call_resolves_field_reads() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+MakePair() : Pair <combines> {
+    return Pair{ valid: 1, data: 8'd7 }
+}
+
+module M {
+    out v : bits[8] = 0
+    rule r {
+        let q = MakePair()
+        v := q.data
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_v, UInt<8>(7)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-returning call passed DIRECTLY as another call's struct-
+/// typed argument (`UsePair(MakePair())`, no intermediate `let`) also
+/// resolves -- `compile_struct_field_read`'s Param-arm fallback (the
+/// bound expr isn't a bare `Expr::Ident`, so no chase-through, straight
+/// to `compile_field_path_value`) reaches the same `Expr::Call` case.
+#[test]
+fn struct_returning_call_used_directly_as_another_calls_argument() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+MakePair() : Pair <combines> {
+    return Pair{ valid: 1, data: 8'd7 }
+}
+
+UsePair(p : Pair) : bits[8] <combines> {
+    return p.data
+}
+
+module M {
+    out v : bits[8] = 0
+    rule r {
+        v := UsePair(MakePair())
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_v, UInt<8>(7)"));
+    run_firtool(&fir, &[]);
+}
+
+/// The `if`/`else` arm of `compile_callee_body_field` -- untouched by
+/// every OTHER struct-return test, which all use a single trailing
+/// `return` -- muxes each leaf field INDEPENDENTLY: `p_valid` and
+/// `p_data` each get their own `mux(c, ...)`, not the same value copied
+/// to both (advisor-flagged gap: written but never actually exercised
+/// until this test).
+#[test]
+fn struct_typed_fn_return_if_else_muxes_per_leaf() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+Pick(c : bit) : Pair <combines> {
+    if c {
+        return Pair{ valid: 1, data: 8'd1 }
+    } else {
+        return Pair{ valid: 0, data: 8'd2 }
+    }
+}
+
+module M {
+    in c : bit
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    rule r {
+        p := Pick(c)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect p_valid, mux(c, UInt<1>(1), UInt<1>(0))"));
+    assert!(fir.contains("connect p_data, mux(c, UInt<8>(1), UInt<8>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// The `if`/`else` arm combined with the param-passthrough special
+/// case: one branch returns a param unchanged, the other a fresh
+/// literal -- the passthrough chase-through sits INSIDE the per-branch
+/// recursion, not just at a bare top-level `return`.
+#[test]
+fn struct_typed_fn_return_if_else_passes_a_param_through_one_branch() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+PickPassthrough(p : Pair, c : bit) : Pair <combines> {
+    if c {
+        return p
+    } else {
+        return Pair{ valid: 0, data: 8'd2 }
+    }
+}
+
+module M {
+    in c : bit
+    reg src : Pair = Pair{ valid: 1, data: 8'd9 }
+    reg dst : Pair = Pair{ valid: 0, data: 0 }
+    rule r {
+        dst := PickPassthrough(src, c)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect dst_valid, mux(c, src_valid, UInt<1>(0))"));
+    assert!(fir.contains("connect dst_data, mux(c, src_data, UInt<8>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-typed OUTPUT (not just a reg) as a struct-returning call's
+/// write target -- `reg`/`out` go through separate bookkeeping
+/// (`struct_reg_source` vs the output equivalent), so this pins that
+/// the new `Expr::Call` dispatch in `compile_field_path_value` reaches
+/// the output path too, not just regs (every other test in this file
+/// writes to a `reg`).
+#[test]
+fn struct_typed_output_as_a_fn_return_write_target() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+MakePair() : Pair <combines> {
+    return Pair{ valid: 1, data: 8'd7 }
+}
+
+module M {
+    out p : Pair = Pair{ valid: 0, data: 0 }
+    rule r {
+        p := MakePair()
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_p_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect __out_p_data, UInt<8>(7)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct-returning callee that ALSO writes a module register as a
+/// side effect: the write-hunt (`callee_reg_write`, an existing,
+/// separate pass) and the new per-leaf return decomposition
+/// (`compile_callee_body_field`) are two fully independent walks over
+/// the SAME callee body -- the composition class that's bitten this
+/// session three times already (guard+write, guard+fifo, `callee_fail_
+/// cond`+Option), so this pins that both connects appear from one
+/// clean compile rather than one silently winning over the other.
+#[test]
+fn struct_returning_callee_that_also_writes_state() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    in x : bits[8]
+    reg log : bits[8] = 0
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+
+    MakeAndLog(d : bits[8]) : Pair <combines> {
+        log := d
+        return Pair{ valid: 1, data: d }
+    }
+
+    rule r {
+        p := MakeAndLog(x)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect log, x"));
+    assert!(fir.contains("connect p_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect p_data, x"));
+    run_firtool(&fir, &[]);
+}

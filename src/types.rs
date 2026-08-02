@@ -632,28 +632,19 @@ impl<'a> TypeChecker<'a> {
                 // resolve.rs mapped every ident use. Bind by span match.
                 let _ = def;
             }
-            // A struct or `?T` (itself struct-shaped under the hood) fn
-            // param isn't wired up in `calls.rs`'s inlining machinery
-            // yet — reject explicitly rather than let it silently
-            // type-check (`check_assignable`'s own coercion rule for
-            // `Ty::Option` would otherwise happily accept an argument
-            // here) and fail confusingly downstream at FIRRTL emission.
-            // `self.emit` is false here (only set true inside `collect_
-            // structs`/`collect_state`'s own brackets and this fn's
-            // stable-pass block below) — bracket explicitly, or this
-            // silently discards like the struct feature's first cut did.
-            if matches!(ty, Ty::Struct { .. } | Ty::Option(_)) {
-                self.emit = true;
-                self.error(
-                    self.expr_span(param.ty),
-                    format!(
-                        "a struct or `?T` fn parameter isn't supported yet (v0 \
-                         restriction): `{}` is {ty}",
-                        param.name.text
-                    ),
-                );
-                self.emit = false;
-            }
+            // A struct or `?T` fn param IS supported: `calls.rs`'s
+            // `compile_struct_field_read` chases a param bound to a
+            // reg/output/input, another param/local of the same type,
+            // OR a struct/`?T`-returning call, through to that value's
+            // own root/return (see its own doc comment, and `compile_
+            // field_path_value`'s `Expr::Call` case). An argument
+            // that's none of those (an arithmetic expression) still
+            // errors at emission time, cleanly, not silently. The
+            // RETURN-type side is ALSO supported now, the same way: a
+            // struct/`?T`-returning callee's value is decomposed one
+            // leaf field at a time by `compile_callee_body_field`,
+            // reusing the same per-leaf write-threading a struct
+            // literal already gets (see TODO.md for the design story).
             // Param defs: resolve declared them; find by name+span.
             for (i, d) in self.res.defs.iter().enumerate() {
                 if d.span == param.name.span {
@@ -663,19 +654,6 @@ impl<'a> TypeChecker<'a> {
             }
         }
         let ret_ty = ret.map(|r| self.eval_ty(r, &empty));
-        if let (Some(rt), Some(r)) = (&ret_ty, ret)
-            && matches!(rt, Ty::Struct { .. } | Ty::Option(_))
-        {
-            self.emit = true;
-            self.error(
-                self.expr_span(r),
-                format!(
-                    "a struct or `?T` fn return type isn't supported yet (v0 \
-                     restriction), got {rt}"
-                ),
-            );
-            self.emit = false;
-        }
 
         for _ in 0..WIDEN_CAP {
             let before = locals.clone();
@@ -802,7 +780,10 @@ impl<'a> TypeChecker<'a> {
                     self.check_assignable(&rhs_ty, &state, self.expr_span(rhs), "state write");
                     self.check_literal_fits(rhs, &state);
                     if matches!(state, Ty::Struct { .. })
-                        && !matches!(self.ast.expr(rhs), Expr::StructLit { .. })
+                        && !matches!(
+                            self.ast.expr(rhs),
+                            Expr::StructLit { .. } | Expr::Call { .. }
+                        )
                     {
                         self.error(
                             self.expr_span(rhs),
@@ -831,7 +812,10 @@ impl<'a> TypeChecker<'a> {
                     // second, misleadingly-worded "copy" error on top of
                     // that one (self-caught while probing `??T`: `oo :=
                     // inner` used to emit both).
-                    if matches!(state, Ty::Option(_)) && state == rhs_ty {
+                    if matches!(state, Ty::Option(_))
+                        && state == rhs_ty
+                        && !matches!(self.ast.expr(rhs), Expr::Call { .. })
+                    {
                         self.error(
                             self.expr_span(rhs),
                             "a `?T`-typed write's right-hand side must be `false` or a \

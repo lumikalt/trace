@@ -19,6 +19,7 @@ use super::writes::item_name;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
+use crate::types::Ty;
 
 /// Every `fn`/`impl` item directly called anywhere within `stmts` — a
 /// `let`'s init, the tail return expression, a state write's RHS, an
@@ -900,6 +901,171 @@ impl<'a> Emitter<'a> {
                     self.locals.remove(&def);
                 }
             }
+        }
+        result
+    }
+
+    /// A struct- or `?T`-returning callee's return value, decomposed to
+    /// just ONE leaf field's own value -- the return-value analogue of
+    /// `struct_field_value_in_stmts`'s per-field write-threading over a
+    /// rule body, called once per leaf field from `compile_field_path_
+    /// value`'s new `Expr::Call` case (writes.rs) rather than once for
+    /// the whole struct: `compile_callee_body` builds ONE FIRRTL string
+    /// (a scalar return has exactly one leaf), so a struct/Option return
+    /// instead calls this once per flat field, each call independently
+    /// re-walking the body and re-binding params/lets via `bind_callee_
+    /// context`/`restore_callee_context` -- sharing one binding across
+    /// leaves is the exact reentrancy bug `Avg(Avg(x, y), z)` already
+    /// taught this codebase not to repeat.
+    ///
+    /// Same body shape as `compile_callee_body` (`let`s and bare-
+    /// statement calls, then a trailing `return`, or an `if`/`else`
+    /// whose branches both recurse and combine via a per-leaf `mux`) --
+    /// deliberately not re-validated with `compile_callee_body`'s own
+    /// specific wording here; an unsupported shape returns `None`, and
+    /// the caller (`compile_field_path_value`) is the one that turns
+    /// that into a real, emitted error, never a silently-dropped write.
+    pub(crate) fn compile_callee_body_field(
+        &mut self,
+        stmts: &[StmtId],
+        path: &[String],
+        root_ty: &Ty,
+        width: u64,
+    ) -> Option<String> {
+        let (&last, rest) = stmts.split_last()?;
+
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
+        for s in rest {
+            let Stmt::Let { name, init } = self.ast.stmt(*s) else {
+                continue;
+            };
+            if let Some((i, _)) = self
+                .res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == name.span)
+            {
+                let def = DefId(i as u32);
+                saved.push((def, self.locals.insert(def, *init)));
+            }
+        }
+
+        let result = match self.ast.stmt(last).clone() {
+            Stmt::Return(Some(ret_expr)) => {
+                // `return p` (`p` this callee's OWN struct/`?T` param,
+                // UNCHANGED) is the return-side twin of `compile_struct_
+                // field_read`'s param chase-through -- handled HERE,
+                // specifically, rather than as a general `Expr::Ident`
+                // case inside `compile_field_path_value` itself: that
+                // function is ALSO reached from `compile_struct_field_
+                // read`'s pre-existing Local-arm fallback (an ordinary
+                // struct field READ off a local aliasing something
+                // unresolvable), and putting the chase-through there
+                // instead fires in THAT context too, silently
+                // relegalizing a callee-local-aliases-a-param
+                // (`let x = p; return x.data`) -- a pattern `a_callee_
+                // local_aliasing_a_struct_typed_param_is_rejected` pins
+                // as rejected. Checking `ret_expr` directly, right here,
+                // means only a LITERAL `return p` (never a param reached
+                // by chasing through some intermediate local) resolves
+                // this way. Gated on `ret_expr`'s type EXACTLY matching
+                // `root_ty` for the same reason `compile_struct_field_
+                // read`'s own gate is: an ordinary `T`-into-`?T`
+                // present-coercion (`return x`, `x : bits[8]`, this fn
+                // returns `?bits[8]`) has a DIFFERENT type and must fall
+                // through to `compile_field_path_value`'s own coercion-
+                // synthesis path below instead.
+                if matches!(self.ast.expr(ret_expr), Expr::Ident(_))
+                    && self.types.expr_tys.get(&ret_expr) == Some(root_ty)
+                    && matches!(
+                        self.res
+                            .expr_defs
+                            .get(&ret_expr)
+                            .map(|d| self.res.def(*d).kind),
+                        Some(DefKind::Param)
+                    )
+                {
+                    self.compile_struct_field_read(ret_expr, ret_expr, path, Some(width))
+                        .ok()
+                } else {
+                    self.compile_field_path_value(ret_expr, path, root_ty, width)
+                }
+            }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body: Some(else_body),
+            } => match (
+                self.compile_callee_body_field(&then_body, path, root_ty, width),
+                self.compile_callee_body_field(&else_body, path, root_ty, width),
+            ) {
+                (Some(t), Some(e)) => {
+                    let cond_str = self
+                        .compile_expr(cond)
+                        .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                    Some(format!("mux({cond_str}, {t}, {e})"))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
+            }
+        }
+        result
+    }
+
+    /// Entry point for `compile_field_path_value`'s `Expr::Call` case
+    /// (writes.rs): binds `callee`'s params/lets to this specific call's
+    /// arguments via `bind_callee_context` (reentrant -- safe to call
+    /// once per leaf field, see `compile_callee_body_field`'s own doc
+    /// comment), then extracts just `path`'s leaf value from the
+    /// callee's return. `root_ty` is the CALLER's already-type-checked
+    /// target type (the reg/field this call's result is being written
+    /// into) -- trusted directly rather than re-derived from the
+    /// callee's own declared return type, since `type_write`'s
+    /// `check_assignable` already proved the two match before emission
+    /// ever runs.
+    pub(crate) fn compile_call_field_value(
+        &mut self,
+        call_expr: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        path: &[String],
+        root_ty: &Ty,
+        width: u64,
+    ) -> Option<String> {
+        let span = self.ast.expr_spans[call_expr.0 as usize].clone();
+        let errors_before = self.errors.len();
+        let (_, params, body) = self.validate_call(span.clone(), callee).ok()?;
+        let saved = self.bind_callee_context(&params, args, &body);
+        let result = self.compile_callee_body_field(&body, path, root_ty, width);
+        self.restore_callee_context(saved);
+        // `validate_call` always emits its own error before returning
+        // `Err` (see its own doc comment), so a `None` result reaching
+        // here with no new error recorded means `compile_callee_body_
+        // field` itself hit an unsupported body shape -- give that its
+        // own message rather than letting it surface as the CALLER's
+        // generic "cannot resolve this field" (or, worse for a write,
+        // silently drop the write entirely the way the pre-fix aliasing
+        // bug did).
+        if result.is_none() && self.errors.len() == errors_before {
+            self.error(
+                span,
+                "this function's struct/`?T` return value is too complex to inline \
+                 here (v0 restriction: the callee's body must end with `return \
+                 <expr>`, or an `if`/`else` whose branches both do)"
+                    .to_string(),
+            );
         }
         result
     }

@@ -963,42 +963,60 @@ fn option_field_write_is_rejected() {
 }
 
 #[test]
-fn option_fn_param_is_rejected() {
-    let src = "Consume(o : ?bits[8]) : bit <combines> {\n\
-                   return 1\n\
-               }\n\
-               module M {\n\
-                   out ok : bit = 0\n\
-                   rule r {\n\
-                       ok := Consume(8'd5)\n\
-                   }\n\
-               }\n";
-    let (_, _, errors) = run(src);
-    assert!(
-        errors
-            .iter()
-            .any(|e| e.message.contains("fn parameter isn't supported yet")),
-        "expected an option-fn-param rejection, got: {errors:?}"
+fn option_and_struct_fn_params_type_check() {
+    // A struct/`?T`-typed fn param IS supported: both a literal
+    // argument and a reg-typed argument (chased through by
+    // `compile_struct_field_read`'s emission-side logic, not a type-
+    // checking concern here) type-check fine. Returns are ALSO
+    // supported now, see `option_and_struct_fn_returns_type_check`.
+    run_ok(
+        "struct Pair {\n\
+             valid : bit\n\
+             data : bits[8]\n\
+         }\n\
+         Consume(o : ?bits[8]) : bit <combines> {\n\
+             return o.valid\n\
+         }\n\
+         UsePair(p : Pair) : bits[8] <combines> {\n\
+             return p.data\n\
+         }\n\
+         module M {\n\
+             reg opt : ?bits[8] = false\n\
+             reg q : Pair = Pair{ valid: 1, data: 8'd7 }\n\
+             out ok : bit = 0\n\
+             out v : bits[8] = 0\n\
+             rule r {\n\
+                 ok := Consume(8'd5)\n\
+                 v := UsePair(q)\n\
+             }\n\
+         }\n",
     );
 }
 
 #[test]
-fn option_fn_return_is_rejected() {
-    let src = "Wrap(x : bits[8]) : ?bits[8] <combines> {\n\
-                   return x\n\
-               }\n\
-               module M {\n\
-                   reg opt : ?bits[8] = false\n\
-                   rule r {\n\
-                       opt := Wrap(8'd5)\n\
-                   }\n\
-               }\n";
-    let (_, _, errors) = run(src);
-    assert!(
-        errors
-            .iter()
-            .any(|e| e.message.contains("fn return type isn't supported yet")),
-        "expected an option-fn-return rejection, got: {errors:?}"
+fn option_and_struct_fn_returns_type_check() {
+    // A struct/`?T`-typed fn RETURN is now supported too (`compile_
+    // callee_body_field`, calls.rs, decomposes it one leaf field at a
+    // time -- an emission-side concern, not a type-checking one here).
+    run_ok(
+        "struct Pair {\n\
+             valid : bit\n\
+             data : bits[8]\n\
+         }\n\
+         Wrap(x : bits[8]) : ?bits[8] <combines> {\n\
+             return x\n\
+         }\n\
+         MakePair() : Pair <combines> {\n\
+             return Pair{ valid: 1, data: 8'd7 }\n\
+         }\n\
+         module M {\n\
+             reg opt : ?bits[8] = false\n\
+             reg p : Pair = Pair{ valid: 0, data: 0 }\n\
+             rule r {\n\
+                 opt := Wrap(8'd5)\n\
+                 p := MakePair()\n\
+             }\n\
+         }\n",
     );
 }
 

@@ -1,0 +1,48 @@
+-- A struct- or `?T`-returning fn's return value decomposes one leaf
+-- field at a time (`compile_callee_body_field`, calls.rs) -- the same
+-- per-field write-threading a struct LITERAL's own fields already get
+-- for a WRITE, reused here for a CALL's return value instead.
+-- `MakePair` builds a fresh struct value from its own body; `Wrap` is a
+-- `<fails>` callee whose `?T` return folds its OWN guard into the
+-- caller's rule guard, exactly the way a scalar-returning `<fails>`
+-- callee already does (`callee_fail_cond`).
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+MakePair(d : bits[8]) : Pair <combines> {
+    return Pair{ valid: 1, data: d }
+}
+
+Wrap(x : bits[8]) : ?bits[8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+
+module CallStructReturn {
+    fifo pair_input : bits[8]
+    fifo opt_input : bits[8]
+    reg pair : Pair = Pair{ valid: 0, data: 0 }
+    reg opt : ?bits[8] = false
+    out from_pair : bits[8] = 0
+    out from_opt : bits[8] = 0
+
+    rule fill_pair {
+        let d = pair_input.Deq[]
+        pair := MakePair(d)
+    }
+
+    rule read_pair {
+        from_pair := pair.data
+    }
+
+    rule fill_opt {
+        let d = opt_input.Deq[]
+        opt := Wrap(d)
+    }
+
+    rule read_opt {
+        from_opt := opt.data
+    }
+}

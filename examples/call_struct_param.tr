@@ -1,0 +1,51 @@
+-- A struct- or `?T`-typed fn param resolves a reg-typed argument by
+-- chasing through the alias to the reg's own flat field registers
+-- (`compile_struct_field_read`, expr.rs) -- the same substitution an
+-- ordinary scalar param already gets, generalized. A literal argument
+-- (`UsePair(Pair{...})`) also works, decomposed the same way a
+-- struct-typed reg's own write already is. The struct/`?T`-typed
+-- RETURN side stays a v0 restriction (see DESIGN.md/TODO.md) -- both
+-- callees here return a plain `bits[8]`.
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+UsePair(p : Pair) : bits[8] <combines> {
+    return p.data
+}
+
+Consume(o : ?bits[8]) : bits[8] <combines, fails> {
+    o?
+    return o.data
+}
+
+module CallStructParam {
+    fifo input : bits[8]
+    reg pair : Pair = Pair{ valid: 0, data: 0 }
+    reg opt : ?bits[8] = false
+    in go : bit
+    out from_pair : bits[8] = 0
+    out from_opt : bits[8] = 0
+
+    rule fill_pair {
+        let d = input.Deq[]
+        pair := Pair{ valid: 1, data: d }
+    }
+
+    rule read_pair {
+        from_pair := UsePair(pair)
+    }
+
+    rule fill_opt {
+        go?
+        opt := 8'd42
+    }
+
+    rule read_opt {
+        -- `Consume`'s own bare-statement guard (`o?`) folds through the
+        -- param binding into `read_opt`'s rule guard -- it only fires
+        -- (and only writes `from_opt`) on a cycle `opt` is present.
+        from_opt := Consume(opt)
+    }
+}

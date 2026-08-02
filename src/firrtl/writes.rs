@@ -641,6 +641,45 @@ impl<'a> Emitter<'a> {
         root_ty: &Ty,
         width: u64,
     ) -> Option<String> {
+        // A struct/`?T`-returning call (`p := MakePair()`, or the same
+        // shape reached one level deeper for a nested field) decomposes
+        // the exact same way a struct LITERAL's own fields do -- one
+        // leaf value at a time -- except each leaf's value comes from
+        // re-inlining the callee's own body (`compile_call_field_value`,
+        // calls.rs) instead of reading a literal's field expression
+        // directly. Checked once here, ahead of either the `Ty::Struct`
+        // or `Ty::Option` literal-shape cases below, since the dispatch
+        // itself doesn't depend on which of the two `root_ty` is.
+        if let Expr::Call { callee, args } = self.ast.expr(expr).clone() {
+            return self.compile_call_field_value(expr, callee, &args, path, root_ty, width);
+        }
+        // The return-side analogue of `compile_struct_field_read`'s own
+        // param chase-through: a callee that just returns one of its OWN
+        // struct/`?T`-typed params unchanged (`Passthrough(p) { return p
+        // }`) is not aliasing in the sense the struct/Option write-RHS
+        // checks (`type_write`, types.rs) reject -- a param binding IS
+        // this call's actual argument substituted in, the same
+        // substitution a scalar param already gets for free. Gated
+        // exactly like the read-side version: PARAM only (never a plain
+        // LOCAL -- that stays rejected, see `option_typed_local_
+        // aliasing_another_option_value_is_rejected`), and only when
+        // `expr`'s own type is EXACTLY `root_ty` -- an ordinary T-into-
+        // `?T` present-coercion (the param's declared type is `?T`, but
+        // `expr` here is the wrapped `T`) must fall through to the
+        // ordinary `Ty::Option` arm below instead, not be chased through
+        // as if it were itself already `?T`-shaped.
+        // NOTE: deliberately NO generic `Expr::Ident` case here (see
+        // `compile_callee_body_field`'s own `Return` arm, calls.rs, for
+        // where a bare `return p` param-passthrough is handled instead)
+        // -- this function is ALSO reached from `compile_struct_field_
+        // read`'s pre-existing Local-arm fallback (an ordinary struct
+        // field READ off a local bound to something unresolvable), and
+        // an Ident-chasing case added HERE would fire in that context
+        // too, silently re-legalizing the exact local-aliases-a-param
+        // pattern `a_callee_local_aliasing_a_struct_typed_param_is_
+        // rejected` pins as rejected (caught by that regression test
+        // failing, not by inspection -- an earlier version of this
+        // fix put the chase-through here and broke it).
         match root_ty {
             Ty::Struct { def, .. } => {
                 let Expr::StructLit { fields, .. } = self.ast.expr(expr) else {

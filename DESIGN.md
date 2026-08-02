@@ -677,11 +677,19 @@ assign the whole value instead (`p := Pair{...}`, same restriction a `spawn`
 handle's `.result`/`.done` fields already have); a struct-typed write's
 right-hand side must itself be a struct literal, not another struct-typed
 value (`p := q` between two struct-typed regs is rejected, not silently
-compiled to a frozen register); a struct-typed fn/rule param or return type
-isn't supported yet; a struct-typed port on an *instantiated* submodule is
-rejected (its target module flattens the port to N real ports internally,
-see "Struct emission" under Part 2 — wiring it from outside by its bare name has no
-way to reach those).
+compiled to a frozen register); a struct-typed fn/rule param IS supported —
+an argument may be a struct literal or a reg/another same-typed param,
+resolved by chasing through the alias to its flat fields (see "Calling a
+function from a rule" below) — and a struct-typed RETURN is too: a callee's
+trailing `return <expr>` (a fresh struct literal, another struct-returning
+call, or one of the callee's own params passed through unchanged) decomposes
+one leaf field at a time, threaded back through the same per-field write
+machinery a direct struct-literal write already uses (see "Calling a
+function: inlining" under Part 2); a struct-typed port on an *instantiated*
+submodule is rejected
+(its target module flattens the port to N real ports internally, see
+"Struct emission" under Part 2 — wiring it from outside by its bare name has
+no way to reach those).
 
 Struct destructuring (binding several locals from one struct value in a
 single statement) is a natural follow-on but not yet implemented — see
@@ -756,13 +764,20 @@ are two distinct idioms, not composable into one chain — pick one per read.
 
 v0 restrictions, matching structs': a `?T`-typed write's right-hand side must
 be `false` or a plain value of `T` — copying one `?T` value into another
-(`p := q`, both `?T`) isn't supported yet, and neither is a plain local
+(`p := q`, both `?T`) isn't supported yet, and neither is a plain LOCAL
 merely aliasing another `?T`-typed value (`let o = opt; o.valid` — the exact
 restriction a struct-typed local has, `let p = q; p.field`, whether the
 alias is read via `.valid`/`.data` or through `?`'s guard fold); `.valid`/
-`.data` are read-only; a `?T`-typed fn/rule param or return type isn't
-supported yet (see TODO.md); a `?T`-typed port on an instantiated submodule
-is rejected, same reason and same fix a struct-typed port needs. `T` may
+`.data` are read-only; a `?T`-typed fn/rule PARAM is supported (an argument
+may be `false`, a plain value of `T`, or a reg/another same-typed param,
+resolved the same alias-chasing way a struct-typed param is — see "Calling a
+function from a rule" below), and a `?T`-typed RETURN is too, the same way a
+struct-typed one is — a `<fails>` callee's own guard fold (`callee_fail_
+cond`) and its return value's per-leaf decomposition are two fully
+independent passes over the same body, composing exactly the way a scalar
+`<fails>` callee's guard and return value already do; a `?T`-typed port on
+an instantiated submodule is rejected, same
+reason and same fix a struct-typed port needs. `T` may
 itself be a struct (`reg o : ?Pair`), or a struct's own field may itself be
 `?T` — nested arbitrarily either way, reusing struct's own recursive
 flattening; both a `?T`-typed `reg` and a `?T`-typed `out` write-thread
@@ -898,6 +913,80 @@ statement or the entire right-hand side of `:=` — the same two positions a
 state-writing call is already restricted to, and for the identical reason:
 nested any deeper (an argument, a `let`, `Classify(a) + 1`), the guard
 wouldn't be found there and would silently stop gating the rule.
+
+A struct- or `?T`-typed param is supported: the argument may be a struct
+literal/`false`/a plain value of the wrapped type, or a reg/output/input/
+another same-typed param, chased through to that value's own flat fields:
+
+```trace
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+UsePair(p : Pair) : bits[8] <combines> {
+    return p.data
+}
+
+module M {
+    reg q : Pair = Pair{ valid: 1, data: 8'd7 }
+    out out_v : bits[8] = 0
+    rule r {
+        out_v := UsePair(q)    -- p.data resolves to q_data
+    }
+}
+```
+
+A `?T`-typed param's own guard (`o?` inside the callee) folds into the
+caller's rule guard exactly as a module-level `?T` reg's does — reusing the
+identical fold, just with a param binding in between rather than a bare
+reg reference (see "Option emission" under Part 2). Chasing through an
+argument only happens when the argument is itself a plain reference of the
+*same* type as the param (genuine aliasing, `UsePair(q)` with `q : Pair`) —
+a plain `T`-typed value or local passed to a `?T` param still coerces to
+present the ordinary way, unaffected (`UseIt(x)` with `x : bits[8]` and
+`UseIt(o : ?bits[8])` coerces `x` present, it does not chase `x`).
+Chaining through nested calls composes (`Outer(p) { return Inner(p) }`,
+called as `Outer(q)`, resolves all the way back to `q`'s own fields) — one
+restriction carries over from ordinary struct/Option LOCALS: a `let` INSIDE
+a callee body that merely re-binds a param (`let x = p; x.field`) is
+rejected, the identical restriction a rule-level `let o = opt` has (see
+"Option types" above) — reference the param directly, don't re-bind it to
+a local first.
+
+A struct- or `?T`-typed RETURN is supported too. The trailing `return <expr>`
+(or an `if`/`else` whose branches both end that way) may build a fresh
+literal, chain into another struct/Option-returning call, or pass one of the
+callee's own params through unchanged:
+
+```trace
+MakePair() : Pair <combines> {
+    return Pair{ valid: 1, data: 8'd7 }
+}
+
+Passthrough(p : Pair) : Pair <combines> {
+    return p                     -- src's own fields, unchanged
+}
+
+module M {
+    reg src : Pair = Pair{ valid: 1, data: 8'd9 }
+    reg dst : Pair = Pair{ valid: 0, data: 0 }
+    rule copy {
+        dst := Passthrough(src)  -- dst_valid := src_valid, dst_data := src_data
+    }
+}
+```
+
+A `<fails>` callee's guard fold and its struct/Option return's own per-leaf
+decomposition are two fully independent passes over the same body — the
+guard folds exactly the same way regardless of the callee's return type, and
+the return decomposes exactly the same way regardless of whether the callee
+also fails. `return p` (a bare param, unchanged) is the ONLY shape a callee's
+own return may chase through an alias for — the identical restriction the
+param side has one level deeper: a callee-local that merely re-binds a param
+and returns THAT (`let x = p; return x`, as opposed to reading a field off
+it, `let x = p; return x.data`, which resolves the ordinary way through the
+field-read path) is rejected, not silently resolved.
 
 A generic parameter's own width, used independently of the callee's return
 value (for example, as an argument to `prio` inside a generic callee), is only
@@ -1585,6 +1674,92 @@ its own value. Compiling a call saves and restores each parameter's previous
 binding around the call, making calls properly reentrant regardless of how
 deeply or indirectly they nest — including a call nested inside an argument to
 another call of the _same_ function.
+
+A struct/Option-typed param resolves a `.field` read (`compile_struct_field_
+read`, expr.rs) by CHASING through the binding rather than trying (and
+failing) to decompose it as a literal: when the bound argument is itself a
+plain `Expr::Ident` whose type EXACTLY matches the param's own declared type
+— a reg/output/input, or another same-typed param/local — this calls itself
+again with that argument as the new root, the identical substitution a real
+inliner performs, bottoming out at a reg/output/input's own flat field names
+(or, for an argument that's genuinely a literal/coercible value instead, the
+existing `compile_field_path_value` decompose/coercion path, untouched). The
+exact-type-match guard is what keeps this from misfiring on the ordinary
+coercion case: a plain `bits[8]` argument passed to a `?bits[8]` param has a
+DIFFERENT type from the param (`bits[8]` vs `?bits[8]`), so it correctly
+falls through to being coerced present rather than chased. This chase-
+through is deliberately PARAM-only, not extended to plain rule-level `let`
+aliasing (`let o = opt`, no call involved) — that stays rejected exactly as
+before (see "Option types" under Part 1), a narrower, separate capability
+than "params work" implies.
+
+This same chase-through is what closed a real miscompile found while
+building it: `compile_field_path_value`'s `Ty::Option` arm assumed its
+expression was always `Expr::Absent` or a plain `T`-typed value coerced
+present — an invariant `type_write`'s Option-to-Option rejection enforces
+for a state WRITE, but a plain `let` has no target type to check against,
+so `let o = opt` (`opt` itself `?T`) typed fine by ordinary inference and
+reached the arm with that invariant already broken. Without a matching
+guard INSIDE the arm, `o.valid`/`o.data` silently hardcoded `UInt<1>(1)`/a
+zero constant, completely ignoring `opt`'s actual runtime value — surfaced
+by passing a reg as a param argument (`UseIt(opt)`, binding `o` to `opt` the
+exact same way a `let` would), fixed at the arm itself (checking whether the
+expression's OWN type is itself `Ty::Option` before treating it as
+"definitely present") so it covers both the rule-`let` case (now a clean
+error) and the param case (now correctly resolved) from one choke point.
+
+A struct/Option-typed RETURN decomposes the same way a struct-literal WRITE
+does — one leaf field at a time — except each leaf's value comes from
+re-inlining the callee's own body instead of reading a literal's field
+expression directly. `compile_field_path_value` (writes.rs) gained a new
+`Expr::Call` case, checked ahead of its existing `Ty::Struct`/`Ty::Option`
+literal-shape dispatch: when the expression being decomposed is itself a
+call, `compile_call_field_value` (calls.rs) binds that call's params/`let`s
+via the same reentrant `bind_callee_context`/`restore_callee_context` the
+guard fold already uses, then hands off to `compile_callee_body_field` — a
+field-path-aware sibling of `compile_callee_body` with the identical body
+shape (`let`s, then a trailing `return`, or an `if`/`else` whose branches
+both recurse and combine via a per-leaf `mux`) but extracting just ONE leaf
+field's value at the `Return` arm instead of one whole scalar. Each leaf
+field re-walks the callee's body and re-binds independently — sharing one
+binding across leaves is the exact reentrancy bug `Avg(Avg(x, y), z)`
+already taught this codebase not to repeat (see the params-work paragraph
+above), now at the return side instead of the argument side.
+
+Before this, `p := MakePair()` (a struct-returning call as a struct write's
+RHS) was rejected outright by `type_write`'s literal-only check — with that
+gate lifted, an advisor-recommended probe (compile with the gate disabled,
+see WHERE it breaks before designing further) surfaced that the write
+vanished SILENTLY: `struct_field_value_in_stmts`'s per-statement scan finds
+a matching `Assign`, calls `compile_field_path_value`, gets `None` back (no
+`Expr::Call` case existed yet), and treats that exactly like "this
+statement doesn't write the field" — the same silent-drop shape the
+`?T`-aliasing bug earlier this session had, just one call deeper. Closed by
+giving the new dispatch its own real error (`compile_call_field_value`
+checks whether `validate_call` already reported one — it always does on
+`Err` — and only adds its own "too complex to inline" message when neither
+did, so a genuine emission failure is never silent either).
+
+The return-side twin of a param's passthrough (`Passthrough(p) { return p
+}`) needed its own placement, not a blanket `Expr::Ident` case inside
+`compile_field_path_value`: that function is ALSO reached from `compile_
+struct_field_read`'s pre-existing Local-arm fallback (an ordinary struct
+field READ off a local bound to something unresolvable), and adding Ident-
+chasing there fires in THAT context too — a first attempt did exactly this
+and silently relegalized a callee-local aliasing a param (`let x = p; return
+x.data`), caught by the EXISTING regression test for that exact rejection
+failing, not by inspection. The fix lives instead in `compile_callee_body_
+field`'s own `Return` arm, checking `ret_expr` directly: only a LITERAL
+`return p` (never a param reached by chasing through some intermediate
+local) delegates to `compile_struct_field_read`, gated on `ret_expr`'s type
+exactly matching the target type — an ordinary `T`-into-`?T` present-
+coercion (`return x`, `x : bits[8]`, callee returns `?bits[8]`) has a
+DIFFERENT type and must still fall through to the ordinary coercion-
+synthesis path, a second real regression this fix caught and fixed before
+shipping (a probe built specifically for the guard-fold intersection, per
+advisor's flagged priority, is what surfaced it: `opt_valid`/`opt_data` were
+briefly reading nonexistent `x_valid`/`x_data` registers instead of
+coercing `x` present).
 
 Cycle detection on the call graph is a static property of a function's own body
 (which other functions it names, found by walking `let` inits, return

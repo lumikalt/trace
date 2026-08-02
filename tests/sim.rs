@@ -1486,3 +1486,69 @@ fn option_runs_through_real_ports() {
         "opt/result/was_present/relayed did not settle correctly:\n{output}"
     );
 }
+
+/// Proves struct/`?T`-typed fn PARAMS end to end:
+/// `examples/call_struct_param.tr`'s `UsePair`/`Consume` callees each
+/// resolve a REG-typed argument (not just a literal) by chasing
+/// through the param binding to the reg's own flat field registers,
+/// and `Consume`'s bare-statement guard (`o?`) folds through that same
+/// param binding into the caller's own rule guard. See
+/// sim/call_struct_param_tb.v.
+#[test]
+fn call_struct_param_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_struct_param.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_struct_param_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: from_pair=2a from_opt= 42"),
+        "from_pair/from_opt did not settle correctly:\n{output}"
+    );
+}
+
+/// The return-side twin of `call_struct_param_runs_through_real_ports`:
+/// `MakePair`'s struct return and `Wrap`'s `?T` return (a `<fails>`
+/// callee whose guard folds into `fill_opt`'s own rule guard) both
+/// decompose correctly through real ports/fifos, AND a zero item
+/// (Wrap's guard failing) stays stuck in `opt_input` rather than
+/// silently overwriting `opt` with a bogus present(0). See
+/// sim/call_struct_return_tb.v.
+#[test]
+fn call_struct_return_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_struct_return.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_struct_return_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: from_pair=2a from_opt= 42"),
+        "from_pair/from_opt did not settle correctly:\n{output}"
+    );
+}
