@@ -508,6 +508,60 @@ module M {
     );
 }
 
+/// `check_guard_placement`'s `Stmt::Assign` arm used to chain the fifo-
+/// op/failing-call checks behind an `else if is_state_write(lhs)` —
+/// meaning a fifo op after a write was only caught when its OWN lhs was
+/// a plain local, never when the lhs was ALSO state (`r0 := f.Deq[]`,
+/// an entirely ordinary pattern). Found while auditing whether a post-
+/// `tick` guard/fifo-op is caught (TODO.md); reproduced here with no
+/// `sequences` involved at all, since the gap was general, not
+/// tick-specific. `compile_guard` still folded the fifo op's occupancy
+/// correctly regardless (no wrong hardware), but the v0 "not yet
+/// supported" validation silently didn't fire.
+#[test]
+fn fifo_op_after_a_write_is_still_an_error_when_its_own_lhs_is_also_state() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg r0 : bits[8] = 0
+    reg r1 : bits[8] = 0
+    rule r {
+        r1 := 2
+        r0 := f.Deq[]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("after a state write"))
+    );
+}
+
+/// The fix for the above must NOT close the guard window on the
+/// fifo-op-driven write's OWN statement: two independent dequeues each
+/// driving their own output is an entirely ordinary pattern (advisor-
+/// caught: a first version of the fix set `seen_write` unconditionally
+/// whenever the lhs was state, which would have rejected exactly this).
+#[test]
+fn two_independent_fifo_op_driven_writes_both_stay_open() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    fifo g : bits[8]
+    out a : bits[8] = 0
+    out b : bits[8] = 0
+    rule r {
+        a := f.Deq[]
+        b := g.Deq[]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = and(__fifo_f_valid, __fifo_g_valid)"));
+    run_firtool(&fir, &[]);
+}
+
 #[test]
 fn a_fifo_op_nested_in_a_larger_expression_is_an_error_not_a_dropped_dequeue() {
     // Mirrors `a_failing_call_nested_in_a_larger_expression_is_an_error_
@@ -3654,4 +3708,33 @@ module M {
 ";
     let err = emit_from_source(src).unwrap_err();
     assert!(!err.is_empty());
+}
+
+/// Cross-tick guard/fifo-op audit (TODO.md): a fifo op sitting AFTER a
+/// `tick` gets the full ordinary per-rule guard-placement treatment, not
+/// some special-cased or missing check. `sequences` lowering splits each
+/// segment into its OWN `rule {name}_s{N}` (`render_rule`, lower.rs),
+/// gated by `(cont = N)?` — so post-tick code is simply a fresh rule's
+/// own top-level statement by the time `check_guard_placement`/`compile_
+/// guard` ever see it, not a special "after a tick" position needing its
+/// own machinery. Confirmed by asserting the segment-1 guard folds
+/// `__cont_go`'s own gate together with the fifo's occupancy.
+#[test]
+fn a_fifo_op_after_a_tick_gets_the_ordinary_per_segment_guard_fold() {
+    let src = "\
+module M {
+    fifo f : bits[8]
+    reg r0 : bits[8] = 0
+    rule go <sequences, writes {r0, f}, reads {f}> {
+        r0 := 1
+        tick
+        r0 := f.Deq[]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "node fires_go_s1 = and(and(eq(__cont_go, UInt<1>(1)), __fifo_f_valid), not(fires_go_s0))"
+    ));
+    run_firtool(&fir, &[]);
 }

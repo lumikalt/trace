@@ -175,23 +175,39 @@ Worth building:
   fifo's raw register read as if valid). Rule bodies only — a callee's
   own body already independently rejects any shape this permissive
   (`check_fails_is_foldable_guard`), confirmed separately.
-- **Cross-tick fails/rollback safety in `sequences`** — ties directly
-  into the existing "Cost model and formal verification" section below:
-  Verse's `<transacts>` explicitly notes state changes are provisional
-  until the whole context succeeds, rolling back on failure. trace
-  already does this for free within one cycle (nothing's committed
-  yet), and a `let`-bound value crossing a `tick` is already rejected
-  (`compute_captures`'s `let_bound: HashSet<DefId>`, from the earlier
-  fifo/spawn audit) — but that's a different question from this one.
-  What's unverified: whether a guard/fifo-op/failing call appearing
-  AFTER a `tick` inside a `sequences` body is caught by that same
-  check, some other existing machinery, or slips through uncaught —
-  grep for where `let_bound` is consulted and trace whether a bare
-  post-tick guard hits it. Silent wrong behavior (a partial,
-  already-committed prior cycle with no way to undo it) would be worse
-  than an explicit "not yet supported" compile error. Audit first; only
-  build real checkpoint/squash machinery if the audit finds it's
-  actually reachable today.
+- Cross-tick fails/rollback safety in `sequences` AUDITED, no gap found:
+  a guard/fifo-op/failing-call after a `tick` gets the ordinary
+  per-rule guard-placement treatment, not some special-cased or missing
+  check — `sequences` lowering splits each segment into its OWN `rule
+  {name}_s{N}` (`render_rule`, lower.rs), gated by `(cont = N)?`, so
+  post-tick code is simply a fresh rule's own top-level statement by
+  the time `check_guard_placement`/`compile_guard` ever see it. No
+  checkpoint/squash machinery needed; confirmed against real firtool,
+  not just reasoned through (`a_fifo_op_after_a_tick_gets_the_ordinary_
+  per_segment_guard_fold`, tests/firrtl.rs). The audit's OWN probing
+  did surface a real, GENERAL (not tick-specific) gap along the way:
+  `check_guard_placement`'s `Stmt::Assign` arm chained the fifo-op/
+  failing-call checks behind an `else if is_state_write(lhs)`, so "fifo
+  op after a write" was only ever caught when the op's own lhs was a
+  plain local, never when the lhs was ALSO state (`r0 := f.Deq[]`, an
+  entirely ordinary pattern) — reproduced with no `sequences` involved
+  at all. Not a wrong-hardware bug (`compile_guard` already folds
+  regardless of position), a validation-completeness one, same else-if-
+  behind-`is_state_write` class the `or` guard-placement check was
+  fixed for earlier this session. Fixed by checking independently and
+  only closing the guard window on a PLAIN write (`contributes_guard`);
+  a first version of the fix set the flag unconditionally and broke a
+  real pattern (two independent fifo-op-driven writes) — advisor-
+  caught before commit, both directions now pinned by tests.
+  Message-quality note, not a gap: a `<sequences>` rule that spawns
+  something but has no top-level `tick`/`sync` of its own (`rule go
+  <sequences> { h := spawn Body() }`) is never touched by `lower::
+  plan` (skips any `<sequences>` rule with no top-level tick) and
+  correctly errors — "still a `<sequences>` rule with `tick`; run
+  sequences lowering first" — but that message is misleading here since
+  lowering DID run, it just had nothing to do; could be sharpened to
+  name the real issue (a spawning rule needs its own tick/sync to
+  observe the result) if this trips someone up in practice.
 
 Speculative, bigger, not committed to:
 

@@ -70,12 +70,27 @@ impl<'a> Emitter<'a> {
                 Stmt::Assign { lhs, rhs } => {
                     // Checked independently of the `is_state_write`
                     // branch below (not chained onto it as another
-                    // `else if`): unlike a bare fifo op/failing call,
-                    // `or`'s LHS is routinely ALSO state (`result :=
-                    // a.Deq[] or b.Deq[]` writes an output) — an
-                    // else-if chain keyed on "is the lhs a write" would
-                    // take the `seen_write = true` branch and silently
-                    // skip this check on that exact statement.
+                    // `else if`, which is how this arm read before this
+                    // audit): a fifo op's or failing call's own LHS is
+                    // routinely ALSO state (`r0 := f.Deq[]`, `out :=
+                    // SomeFailingCall()` — an entirely ordinary,
+                    // idiomatic shape, not an edge case), so an else-if
+                    // chain keyed on "is the lhs a write" took the
+                    // `seen_write = true` branch and silently skipped
+                    // this check on exactly that statement — found while
+                    // auditing whether a post-`tick` guard/fifo-op is
+                    // caught (TODO.md), reproduced with no `sequences`
+                    // involved at all: `r1 := 2` then `r0 := f.Deq[]` in
+                    // a PLAIN rule compiled clean with no error. Not a
+                    // wrong-hardware bug (`compile_guard` already folds
+                    // every fifo op in the body regardless of position,
+                    // so the emitted guard was still correct) — a
+                    // validation-completeness gap, the same else-if-
+                    // behind-`is_state_write` class the `or` case above
+                    // was fixed for earlier this session.
+                    let contributes_guard = fallible_or.contains(stmt)
+                        || self.fifo_op(rhs).is_some()
+                        || self.is_failing_call(rhs);
                     if fallible_or.contains(stmt) && seen_write {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -84,9 +99,6 @@ impl<'a> Emitter<'a> {
                              must gate the whole rule"
                                 .to_string(),
                         );
-                    }
-                    if is_state_write(self.ast, self.res, lhs) {
-                        seen_write = true;
                     } else if self.fifo_op(rhs).is_some() && seen_write {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -102,6 +114,22 @@ impl<'a> Emitter<'a> {
                              gate the whole rule"
                                 .to_string(),
                         );
+                    }
+                    // A write only closes the guard window when it's a
+                    // PLAIN, unconditional write — not when the SAME
+                    // statement is itself the thing contributing a
+                    // failure condition (`r0 := f.Deq[]`: the write and
+                    // the guard are one statement, so there's no "already
+                    // committed before a failure is checked" hazard for
+                    // mod.rs's own restriction to protect against). Two
+                    // independent fifo-op-driven writes (`a := f.Deq[]`
+                    // then `b := g.Deq[]`) must both stay open — advisor-
+                    // caught: an EARLIER version of this fix set
+                    // `seen_write` unconditionally on any state-writing
+                    // LHS, which would have rejected exactly that
+                    // ordinary pattern.
+                    if is_state_write(self.ast, self.res, lhs) && !contributes_guard {
+                        seen_write = true;
                     }
                 }
                 Stmt::Expr(e) => {
