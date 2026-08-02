@@ -1,7 +1,7 @@
 -- A rule may `Enq` AND `Deq` the SAME fifo -- a "pass-through": `step`
 -- dequeues the fifo's current value, increments it, and enqueues the
 -- result back into the same slot, every cycle the fifo holds a value.
--- The combined guard is just `valid == 1` (there must be something to
+-- The combined guard is just `valid = 1` (there must be something to
 -- dequeue) -- not the always-false AND of Deq's own guard (`valid`) and
 -- Enq's own guard (`not(valid)`), which would forbid this outright. See
 -- DESIGN.md's "Fifo synthesis" section and sim/fifo_passthrough_tb.v,
@@ -16,7 +16,7 @@ module FifoPassthrough {
     out last_out : bits[8] = 0
 
     rule load {
-        (seed == 1)?
+        (seed = 1)?
         f.Enq[seed_value]
     }
 

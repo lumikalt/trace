@@ -89,7 +89,7 @@ fn rmw_structural_shape() {
     assert!(rendered.contains("reg v : bits[8] = 0"));
     assert!(rendered.contains("rule step_s0 {"));
     assert!(rendered.contains("rule step_s1 {"));
-    assert!(rendered.contains(&format!("({} == 0)?", lr.cont_name)));
+    assert!(rendered.contains(&format!("({} = 0)?", lr.cont_name)));
     assert!(rendered.contains(&format!("{} := 1", lr.cont_name)));
     assert!(
         rendered.contains(&format!("{} := 0", lr.cont_name)),
@@ -167,7 +167,7 @@ fn subleq_schedule_directive_rewrites_and_only_s5_conflicts() {
 
     // Every segment writes the shared continuation register, so all
     // C(6,2) segment pairs conflict there too — harmless, since their
-    // guards (cont == i) are mutually exclusive by construction and can
+    // guards (cont = i) are mutually exclusive by construction and can
     // never fire together regardless. The interesting fact is which
     // pairs conflict on real state: only step_s5 (the sole writer of
     // pc/m) should conflict with refill, not step_s0..s4.
@@ -213,7 +213,7 @@ fn rejects_nested_tick() {
 module M {
     reg x : bits[8] = 0
     rule r <sequences> {
-        if x == 0 {
+        if x = 0 {
             tick
         }
         tick
@@ -445,8 +445,8 @@ fn spawn_sync_structural_shape() {
     assert!(rendered.contains("__cont_fetch2_h1 : bits[1] = 0"));
     assert!(rendered.contains("__cont_fetch2_h2 : bits[1] = 0"));
     assert!(rendered.contains("__arg_fetch2_h1_addr := pc"));
-    assert!(rendered.contains("__done_fetch2_h1 == 1"));
-    assert!(rendered.contains("__done_fetch2_h2 == 1"));
+    assert!(rendered.contains("__done_fetch2_h1 = 1"));
+    assert!(rendered.contains("__done_fetch2_h2 = 1"));
     assert!(rendered.contains("pack(__result_fetch2_h1, __result_fetch2_h2)"));
     assert!(
         !rendered.contains("spawn"),
@@ -468,8 +468,8 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 
 module M {
     rule r <sequences> {
-        (1 == 1)?
-        if 1 == 1 {
+        (1 = 1)?
+        if 1 = 1 {
             h := spawn Slow(1)
         }
         tick
@@ -493,7 +493,7 @@ module M {
     rule r <sequences> {
         h := spawn Slow(1)
         tick
-        if 1 == 1 {
+        if 1 = 1 {
             sync[h]
         }
     }
@@ -592,7 +592,7 @@ module M {
         h1 := spawn Slow(1)
         h2 := spawn Slow(2)
         tick
-        if 1 == 1 {
+        if 1 = 1 {
             race[h1, h2]
         }
     }
@@ -623,7 +623,7 @@ module M {
         hs := spawn Slow(1)
         tick
         race[hf, hs]
-        if hf.done == 1 {
+        if hf.done = 1 {
             out := hf.result
         } else {
             out := hs.result
@@ -642,14 +642,14 @@ module M {
     let rendered = render(&c.ast, src, &c.lowered);
     let rendered = assert_round_trips(&rendered);
     // Race's own guard: an OR of both handles' done registers.
-    assert!(rendered.contains("__done_pick_hf | __done_pick_hs) == 1"));
+    assert!(rendered.contains("__done_pick_hf | __done_pick_hs) = 1"));
     // Every one of the losing side's OWN segments gains an extra guard
     // requiring the OTHER handle hasn't already finished -- checked on
     // BOTH spawns' segments, not just one, since either could lose.
-    assert!(rendered.contains("__cont_pick_hf == 0"));
-    assert!(rendered.contains("__done_pick_hs == 0"));
-    assert!(rendered.contains("__cont_pick_hs == 0"));
-    assert!(rendered.contains("__done_pick_hf == 0"));
+    assert!(rendered.contains("__cont_pick_hf = 0"));
+    assert!(rendered.contains("__done_pick_hs = 0"));
+    assert!(rendered.contains("__cont_pick_hs = 0"));
+    assert!(rendered.contains("__done_pick_hf = 0"));
     assert!(
         !rendered.contains("race["),
         "no `race` call should survive lowering"
@@ -698,7 +698,7 @@ module M {
 fn spawn_callee_early_return_is_rejected() {
     let src = "\
 Slow(x : bits[8]) : bits[8] <sequences> {
-    if x == 0 {
+    if x = 0 {
         return x
     }
     tick

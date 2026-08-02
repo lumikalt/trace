@@ -54,7 +54,7 @@ fn infix_bp(kind: TokenKind) -> Option<(u8, u8)> {
     use TokenKind::*;
     let bp = match kind {
         DotDot | PlusColon | MinusColon => (1, 2),
-        EqEq | BangEq | Lt | Le | Gt | Ge => (3, 4),
+        Eq | LtGt | Lt | Le | Gt | Ge => (3, 4),
         Pipe => (5, 6),
         Caret => (7, 8),
         Amp => (9, 10),
@@ -81,8 +81,8 @@ fn binop_of(kind: TokenKind) -> BinOp {
         DotDot => BinOp::Range,
         PlusColon => BinOp::PlusColon,
         MinusColon => BinOp::MinusColon,
-        EqEq => BinOp::Eq,
-        BangEq => BinOp::Ne,
+        Eq => BinOp::Eq,
+        LtGt => BinOp::Ne,
         Lt => BinOp::Lt,
         Le => BinOp::Le,
         Gt => BinOp::Gt,
@@ -928,7 +928,7 @@ impl<'a> Parser<'a> {
                 )
             }
             Some(Minus) => self.parse_prefix(UnOp::Neg)?,
-            Some(Bang) => self.parse_prefix(UnOp::Not)?,
+            Some(Not) => self.parse_prefix(UnOp::Not)?,
             Some(Tilde) => self.parse_prefix(UnOp::BitNot)?,
             _ => {
                 self.error_here("expected an expression".to_string());

@@ -300,17 +300,17 @@ module M {
     assert!(errors[0].message.contains("bits[1]"));
 
     run_ok(
-        "module M {\n reg a : bits[8] = 0\n reg b : bits[8] = 0\n rule r {\n if a != 0 { b := 1 }\n }\n}\n",
+        "module M {\n reg a : bits[8] = 0\n reg b : bits[8] = 0\n rule r {\n if a <> 0 { b := 1 }\n }\n}\n",
     );
 }
 
 #[test]
 fn a_bare_condition_implicitly_guards_and_must_be_bits_1() {
-    // `a == 1` alone (no `?`, value unused) now means the same thing
-    // as `(a == 1)?` -- including the bits[1] enforcement `if`/`while`
+    // `a = 1` alone (no `?`, value unused) now means the same thing
+    // as `(a = 1)?` -- including the bits[1] enforcement `if`/`while`
     // conditions already get.
     run_ok(
-        "module M {\n reg a : bits[8] = 0\n reg b : bits[8] = 0\n rule r {\n a == 1\n b := 1\n }\n}\n",
+        "module M {\n reg a : bits[8] = 0\n reg b : bits[8] = 0\n rule r {\n a = 1\n b := 1\n }\n}\n",
     );
 
     // A bare non-bits[1] expression (its value computed and left
@@ -380,30 +380,30 @@ module M {
 
 #[test]
 fn logical_not_needs_a_bits_1_operand() {
-    // `!` and `~` compile to the identical FIRRTL `not` primop (see
-    // firrtl/expr.rs) -- what makes `!` a real, distinct operator rather
+    // `not` and `~` compile to the identical FIRRTL `not` primop (see
+    // firrtl/expr.rs) -- what makes `not` a real, distinct operator rather
     // than pure aliasing is this restriction: unlike `~`, which accepts
-    // any width, `!` requires its operand already be `bits[1]`, since
+    // any width, `not` requires its operand already be `bits[1]`, since
     // there's no implicit "nonzero is true" coercion anywhere in this
-    // language (`conditions_must_be_one_bit`, above) for a wider `!x` to
-    // usefully mean.
+    // language (`conditions_must_be_one_bit`, above) for a wider `not x`
+    // to usefully mean.
     let src = "\
 module M {
     reg a : bits[8] = 0
     out b : bits[8] = 0
 
     rule r {
-        b := !a
+        b := not a
     }
 }
 ";
     let (_, _, errors) = run(src);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("`!` needs a bits[1] operand"));
+    assert!(errors[0].message.contains("`not` needs a bits[1] operand"));
 
     // A genuine bits[1] value -- a comparison's own result -- is fine.
     run_ok(
-        "module M {\n reg a : bits[8] = 0\n out b : bits[1] = 0\n rule r {\n b := !(a == 0)\n }\n}\n",
+        "module M {\n reg a : bits[8] = 0\n out b : bits[1] = 0\n rule r {\n b := not (a = 0)\n }\n}\n",
     );
 }
 
@@ -542,7 +542,7 @@ module M {
     rule r <sequences> {
         h := spawn Slow(1)
         tick
-        (h.done == 1)?
+        (h.done = 1)?
         out := h.result
     }
 }

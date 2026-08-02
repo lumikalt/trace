@@ -84,8 +84,8 @@ impl BinOp {
             BinOp::BitAnd => "&",
             BinOp::BitOr => "|",
             BinOp::BitXor => "^",
-            BinOp::Eq => "==",
-            BinOp::Ne => "!=",
+            BinOp::Eq => "=",
+            BinOp::Ne => "<>",
             BinOp::Lt => "<",
             BinOp::Le => "<=",
             BinOp::Gt => ">",
@@ -334,7 +334,7 @@ impl Ast {
             Expr::Unary { op, operand } => {
                 let sym = match op {
                     UnOp::Neg => "-",
-                    UnOp::Not => "!",
+                    UnOp::Not => "not",
                     UnOp::BitNot => "~",
                 };
                 format!("({sym} {})", self.expr_sexpr(*operand))

@@ -64,6 +64,13 @@ pub enum TokenKind {
     While,
     #[token("let")]
     Let,
+    /// Verse-spelled prefix logical negation, replacing the symbolic `!`
+    /// this project used before aligning operator spelling with Verse
+    /// (see DESIGN.md's "Expression surface"). Purely a spelling change —
+    /// same `UnOp::Not` semantics (requires a `bits[1]` operand, distinct
+    /// from bitwise `~`) as before.
+    #[token("not")]
+    Not,
 
     #[token("_", priority = 100)]
     Underscore,
@@ -86,12 +93,19 @@ pub enum TokenKind {
     ColonEq,
     #[token(":")]
     Colon,
-    #[token("==")]
-    EqEq,
+    /// Verse-spelled equality (`=`, replacing the old `==`) — also, at
+    /// declaration level, the `reg`/`out` initializer marker (`reg a :
+    /// bits[8] = 0`); the two uses never collide since the initializer's
+    /// `=` is consumed by `parse_state_decl` before any expression (and
+    /// so before the Pratt loop's own infix dispatch) ever sees a token.
     #[token("=")]
     Eq,
-    #[token("!=")]
-    BangEq,
+    /// Verse-spelled not-equal (`<>`, replacing the old `!=`). Matched
+    /// before `<` the same way `>>>` beats `>>` — logos always prefers
+    /// the longest token at a given position, so this needs no explicit
+    /// priority annotation.
+    #[token("<>")]
+    LtGt,
     #[token("<=")]
     Le,
     #[token(">=")]
@@ -144,8 +158,6 @@ pub enum TokenKind {
     Percent,
     #[token("~")]
     Tilde,
-    #[token("!")]
-    Bang,
     #[token(",")]
     Comma,
     #[token(";")]

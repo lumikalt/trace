@@ -69,13 +69,13 @@ fn return_is_rejected_inside_a_rule() {
 fn while_needs_sequences_or_elaborates() {
     // DESIGN.md's E012 example.
     let (_, _, errors) = run(
-        "Bad(x : bits[8]) : bits[8] <combines> {\n while x != 0 { x := x >> 1 }\n return x\n}\n",
+        "Bad(x : bits[8]) : bits[8] <combines> {\n while x <> 0 { x := x >> 1 }\n return x\n}\n",
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("one iteration per cycle"));
 
     run_ok(
-        "Ok(x : bits[8]) : bits[8] <sequences> {\n while x != 0 { x := x >> 1 }\n return x\n}\n",
+        "Ok(x : bits[8]) : bits[8] <sequences> {\n while x <> 0 { x := x >> 1 }\n return x\n}\n",
     );
 }
 
@@ -159,7 +159,7 @@ fn fails_infers_through_calls() {
     // gate existed -- only the DECLARATION requirement is new.
     let src = "\
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 
@@ -181,13 +181,13 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
     // own "unhandled failure" (a bare failing expression outside a
     // `<decides>` context does not compile there either).
     let (_, _, errors) =
-        run("Classify(x : bits[8]) : bits[8] <combines> {\n (x != 0)?\n return x\n}\n");
+        run("Classify(x : bits[8]) : bits[8] <combines> {\n (x <> 0)?\n return x\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("does not declare `<fails>`"));
 
     // The implicit (bare, no `?`) case gets the identical requirement.
     let (_, _, errors) =
-        run("Classify(x : bits[8]) : bits[8] <combines> {\n x != 0\n return x\n}\n");
+        run("Classify(x : bits[8]) : bits[8] <combines> {\n x <> 0\n return x\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("does not declare `<fails>`"));
 
@@ -205,7 +205,7 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
     // propagating caller up the chain needs it, not just the site
     // that directly uses `?`/a fifo op).
     let (_, _, errors) = run(
-        "Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x != 0)?\n return x\n}\n\
+        "Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x <> 0)?\n return x\n}\n\
          Wrap(x : bits[8]) : bits[8] <combines> {\n return Classify(x)\n}\n",
     );
     assert_eq!(errors.len(), 1);
@@ -214,8 +214,8 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
 
     // Declaring `<fails>` is exactly what's needed to make any of the
     // above legal.
-    run_ok("Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x != 0)?\n return x\n}\n");
-    run_ok("Classify(x : bits[8]) : bits[8] <combines, fails> {\n x != 0\n return x\n}\n");
+    run_ok("Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x <> 0)?\n return x\n}\n");
+    run_ok("Classify(x : bits[8]) : bits[8] <combines, fails> {\n x <> 0\n return x\n}\n");
     run_ok(
         "module M {\n fifo f : bits[8]\n Drain() : bits[8] <combines, fails> {\n return f.Deq[]\n }\n}\n",
     );
@@ -223,9 +223,9 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
     // A rule needs no declaration at all -- always a failure context,
     // for any of the three constructs, including calling a `<fails>`
     // function directly.
-    run_ok("module M {\n fifo f : bits[8]\n rule r {\n x := f.Deq[]\n x != 0\n }\n}\n");
+    run_ok("module M {\n fifo f : bits[8]\n rule r {\n x := f.Deq[]\n x <> 0\n }\n}\n");
     run_ok(
-        "Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x != 0)?\n return x\n}\n\
+        "Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x <> 0)?\n return x\n}\n\
          module M {\n out result : bits[8] = 0\n rule r {\n result := Classify(1)\n }\n}\n",
     );
 }
@@ -243,7 +243,7 @@ spec AnyNonZero(x : bits[8]) : bits[8] <combines, chooses> {
 impl PickNonZero(x : bits[8]) : bits[8] <combines>
     refines AnyNonZero
 {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 ";
@@ -260,7 +260,7 @@ spec AnyNonZero(x : bits[8]) : bits[8] <combines, chooses> {
 impl PickNonZero(x : bits[8]) : bits[8] <combines, fails>
     refines AnyNonZero
 {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 ";
@@ -330,7 +330,7 @@ fn recursion_requires_elaborates() {
 
     // AdderTree-style elaboration recursion is legal.
     run_ok(
-        "G(x : bits[8]) : bits[8] <elaborates> {\n if x == 0 { return 0 }\n return G(x - 1)\n}\n",
+        "G(x : bits[8]) : bits[8] <elaborates> {\n if x = 0 { return 0 }\n return G(x - 1)\n}\n",
     );
 }
 
@@ -342,7 +342,7 @@ fn guards_forbidden_at_elaboration_time() {
     assert!(errors[0].message.contains("elaboration time"));
 
     // In an <elaborates> body.
-    let (_, _, errors) = run("H(x : bits[8]) : bits[8] <elaborates> {\n (x != 0)?\n return x\n}\n");
+    let (_, _, errors) = run("H(x : bits[8]) : bits[8] <elaborates> {\n (x <> 0)?\n return x\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("elaboration time"));
 }
@@ -353,7 +353,7 @@ fn implicit_guards_forbidden_at_elaboration_time_too() {
     // `expr?` -- and is rejected identically in an elaboration-time
     // body, with exactly one error (not two: the explicit-Guard arm
     // must not ALSO fire for this).
-    let (_, _, errors) = run("H(x : bits[8]) : bits[8] <elaborates> {\n x != 0\n return x\n}\n");
+    let (_, _, errors) = run("H(x : bits[8]) : bits[8] <elaborates> {\n x <> 0\n return x\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("elaboration time"));
 }

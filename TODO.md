@@ -72,7 +72,7 @@
 
   Everything else is implemented: arithmetic/bitwise/compare ops, static
   AND dynamic-amount shifts (logical `<<`/`>>` and arithmetic
-  sign-extending `>>>`), unary `-`/`~`/`!`, `/`/`%`, static AND dynamic
+  sign-extending `>>>`), unary `-`/`~`/`not`, `/`/`%`, static AND dynamic
   bit-select/indexed part-select, Verilog-style sized literals (+
   inferred `reg`/`out` types from one), `bit` sugar for `bits[1]`, `uN`
   (`u8`, `u32`, ...) sugar for `bits[N]`.
@@ -130,6 +130,141 @@
   ordinary `bits[N]` rather than a new type. Revisit only if a real
   design needs more than a shift — signed compare/add/mul, or
   sign-aware truncation/widening.
+
+## Verse alignment: more of its failure system and operators (design-level, not scheduled)
+
+`fails` gating (commit `e97795e`) ported Verse's `<decides>`-requires-a-
+context rule. Verse's book has more in this vein — surveyed
+[08_failure](https://verselang.github.io/book/08_failure/),
+[04_operators](https://verselang.github.io/book/04_operators/), and
+[13_effects](https://verselang.github.io/book/13_effects/) for what else
+might translate to an HDL. Triaged below; nothing here is scheduled or
+committed to.
+
+Worth building:
+
+- **`or` fallback operator** — Verse's `X? or Default` / `A or B or C`:
+  try the left fallible expression, and if it fails, use the right side
+  instead, DISCHARGING the failure rather than propagating it — this is
+  the actual "escape hatch" Lumi named when scoping the `fails` gate
+  ("the only way to escape needing a fallible context is... with the
+  `or` keyword"). Highest-value single item here: closes a real
+  expressiveness gap (today a failing sub-expression has no way to
+  supply a fallback value short of restructuring into `if`/`else`), and
+  gives fallible fifo reads/calls a priority-chain idiom
+  (`Deq[fifoA] or Deq[fifoB] or default`) that's a natural fit for
+  arbitration hardware. Open questions to settle before writing any
+  Rust, ideally by hand-lowering a `fifo_bridge`-style example to raw
+  FIRRTL first (this project's established playbook, paid off for
+  spawn/sync/race and fifo depth): whether `or` is spelled as the bare
+  word (matching Verse, and free of collision with the existing bitwise
+  `|`) or as symbolic sugar; whether the muxing reuses `prio`'s
+  first-match machinery or needs its own; and how a chain's fail
+  condition composes back into the enclosing rule's guard when NONE of
+  the alternatives succeed (an `or` chain ending in a non-fallible
+  default is always infallible, but `A or B` with no default stays
+  fallible — needs the same fold-through-the-chain treatment
+  `callee_fail_cond` already does for calls). `and` isn't listed as a
+  companion gap: sequential bare guards already conjoin into one rule's
+  readiness for free, and bitwise `&` already covers AND in expression
+  position for `bits[1]` operands — there's no missing capability to
+  port, just `or`'s missing discharge behavior. The `or` semantics
+  above are paraphrased from a fetched summary, not the primary text —
+  re-read [08_failure](https://verselang.github.io/book/08_failure/)
+  itself before writing any Rust, same as the hand-lowering step.
+- **Audit: does trace's `not` actually discharge a guard/fifo-op the way
+  Verse's `not` does?** (trace's own unary logical negation is now
+  spelled `not` too, since the operator-spelling pass below aligned it
+  with Verse's word — this is a real semantics question independent of
+  that spelling match.) Verse states plainly that "effects are not
+  committed under `not`" — a fallible expression wrapped in `not` tests
+  success/failure as a plain boolean without contributing to the
+  enclosing failure context. Unverified in trace: `is_guard_like`,
+  `callee_fail_cond`, and the guard-folding walk in `firrtl/checks.rs`/
+  `calls.rs`/`writes.rs` all recurse into arbitrary subexpressions to
+  find `Expr::Guard`/fifo-op nodes — it's not yet confirmed whether one
+  of those wrapped in `not (...)` still gets folded into the rule's AND
+  guard (matching trace's current, simpler "any fail site anywhere
+  gates the rule" model, which predates and is unrelated to `not`'s
+  respelling) or whether that's actually a latent Verse-semantics
+  mismatch worth closing. This is a real trace question worth answering
+  on its own regardless of the exact Verse wording above (also a
+  fetched paraphrase, not the primary text) — re-read
+  [08_failure](https://verselang.github.io/book/08_failure/) to confirm
+  the `not` claim precisely, but check trace's own behavior either way.
+  Check before building anything else in this section — it may already
+  be fine as-is, in which case this is a one-line confirmation, not a
+  change.
+- **Cross-tick fails/rollback safety in `sequences`** — ties directly
+  into the existing "Cost model and formal verification" section below:
+  Verse's `<transacts>` explicitly notes state changes are provisional
+  until the whole context succeeds, rolling back on failure. trace
+  already does this for free within one cycle (nothing's committed
+  yet), and a `let`-bound value crossing a `tick` is already rejected
+  (`compute_captures`'s `let_bound: HashSet<DefId>`, from the earlier
+  fifo/spawn audit) — but that's a different question from this one.
+  What's unverified: whether a guard/fifo-op/failing call appearing
+  AFTER a `tick` inside a `sequences` body is caught by that same
+  check, some other existing machinery, or slips through uncaught —
+  grep for where `let_bound` is consulted and trace whether a bare
+  post-tick guard hits it. Silent wrong behavior (a partial,
+  already-committed prior cycle with no way to undo it) would be worse
+  than an explicit "not yet supported" compile error. Audit first; only
+  build real checkpoint/squash machinery if the audit finds it's
+  actually reachable today.
+
+Speculative, bigger, not committed to:
+
+- **Option type** (`?T`, `option{...}` construction, `?.` safe access,
+  nested `??T`) — Verse's general mechanism for a value that may be
+  absent. Could generalize the valid-bit-plus-payload pattern fifos
+  already use into a first-class type, but "absence" has no free
+  representation in hardware (every wire has SOME bit pattern) the way
+  it does in a language with a heap — would need a real design decision
+  (a struct-shaped `{valid: bit, data: T}` under the hood, most likely)
+  before this is worth prototyping, not just a syntax port.
+  `?.`/nested-option unwrapping would also need TODO's existing "field
+  access beyond `instance.port`" gap (see "Expression surface" above)
+  closed first, since both are about accessing into a value's shape.
+- **Fallible bindings scoped to a single `if`** (Verse's
+  `if (X := Expr, Y > 0):`, where `X` only exists in the `then` branch
+  and a failure skips straight past it) — uncertain fit. trace's guard
+  model is per-RULE (one composed readiness condition for the whole
+  body), not per-statement with real sequential abort/rollback the way
+  Verse's `if` is; grafting Verse's fine-grained scoping onto that
+  without just reinventing `if`/`else` restructuring needs a real
+  design discussion, not an implementation attempt, before committing
+  to anything.
+
+Explicitly considered and NOT being ported, so a future session doesn't
+re-propose these from a fresh read of the same chapters:
+
+- **`Err()`** (Verse's unrecoverable runtime error) — synthesized
+  hardware has no runtime to propagate an error into; the closest
+  analogue, an elaboration-TIME fatal check, is a different feature
+  already reachable via a plain compile error, not a gap.
+- **Comparisons returning their left operand in a failure context**
+  (Verse: `X > 0` yields `X` on success) — would blur trace's clean
+  condition/value type split (a condition is always `bits[1]`, a
+  compared operand can be any width) for a cosmetic win only; not worth
+  the type-system ambiguity.
+- **`first`/`for` runtime failure-filtering** — the synthesizable case
+  (pick the first of several candidates that's actually valid) is
+  already covered by the `prio` builtin; no new control-flow syntax
+  needed.
+- **Compound assignment** (`+=`/`-=`/etc.) — purely cosmetic sugar over
+  existing `:=`/`Assign`; low value, skip unless a real example makes
+  the spelled-out form genuinely painful.
+- **Classes/structs/interfaces/persistence/module-path generality**
+  from Verse's later chapters (09–12, 14–18) — general-purpose OOP/heap/
+  persistence machinery with no hardware analogue; trace's `spec`/
+  `impl`/`refines` already covers the HDL-relevant slice of "an
+  interface," see DESIGN.md's "`chooses`: specification, not synthesis."
+- **Verse's effect-subtyping rules** (fewer effects ⊆ more effects,
+  join-on-conditional-selection) — already effectively matched: trace's
+  standing overstate-ok/understate-error policy for `reads`/`writes`/
+  `fails` gives "fewer effects is a safe substitute for more" without a
+  separate subtyping mechanism.
 
 ## Cost model and formal verification (design-level, not scheduled)
 

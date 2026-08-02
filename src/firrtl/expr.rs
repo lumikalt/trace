@@ -282,9 +282,9 @@ impl<'a> Emitter<'a> {
                 let e = self.compile_expr_hinted(operand, Some(w))?;
                 Ok(format!("tail(sub(UInt<{w}>(0), {e}), 1)"))
             }
-            // `!` and `~` emit the IDENTICAL FIRRTL `not` primop — types.rs
+            // `not` and `~` emit the IDENTICAL FIRRTL `not` primop — types.rs
             // already made them a real, distinct operator, not pure
-            // aliasing at this layer's expense: `!`'s own typing rule
+            // aliasing at this layer's expense: `not`'s own typing rule
             // requires a `bits[1]` operand (a guardrail against
             // accidentally bitwise-negating a wider value), while `~`
             // accepts any width. Bitwise-complementing a single bit IS

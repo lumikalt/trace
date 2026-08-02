@@ -8,10 +8,10 @@ fn format(src: &str) -> String {
 
 #[test]
 fn reindents_nested_blocks() {
-    let src = "module M {\nrule r {\nif x == 1 {\ny := 1\n}\n}\n}\n";
+    let src = "module M {\nrule r {\nif x = 1 {\ny := 1\n}\n}\n}\n";
     assert_eq!(
         format(src),
-        "module M {\n    rule r {\n        if x == 1 {\n            y := 1\n        }\n    }\n}\n"
+        "module M {\n    rule r {\n        if x = 1 {\n            y := 1\n        }\n    }\n}\n"
     );
 }
 

@@ -3,7 +3,7 @@
 -- pointers rather than depth-1's single valid bit/data register pair.
 -- `rule pushpop` exercises the SAME combined Enq+Deq pass-through
 -- depth-1 fifos support (see fifo_passthrough.tr), generalized: the
--- guard is `count > 0` (not `valid == 1`), and `count` itself is left
+-- guard is `count > 0` (not `valid = 1`), and `count` itself is left
 -- unchanged (the Enq's +1 and the Deq's -1 net to zero). See
 -- DESIGN.md's "FIFO synthesis emission" section and
 -- sim/fifo_depth_tb.v, which drives fill-to-full, a full-buffer
@@ -18,20 +18,20 @@ module FifoDepth {
     out last_deq : bits[8] = 0
 
     rule pushpop {
-        (want_push == 1)?
-        (want_pop == 1)?
+        (want_push = 1)?
+        (want_pop = 1)?
         x := f.Deq[]
         f.Enq[push_data]
         last_deq := x
     }
 
     rule push_only {
-        (want_push == 1)?
+        (want_push = 1)?
         f.Enq[push_data]
     }
 
     rule pop_only {
-        (want_pop == 1)?
+        (want_pop = 1)?
         x := f.Deq[]
         last_deq := x
     }

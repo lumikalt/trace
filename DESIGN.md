@@ -43,7 +43,7 @@ A bare `?` tests a condition. Failure of the test aborts the rule.
 
 ```trace
 rule drain {
-    (mode == Draining)?       -- guard: rule only fires in Draining mode
+    (mode = Draining)?       -- guard: rule only fires in Draining mode
     x := input.Deq[]
     count := count - 1
 }
@@ -51,8 +51,8 @@ rule drain {
 
 `?` is optional sugar, not required: any expression sitting alone as a
 statement — its value computed and then left unused — implicitly guards the
-rule the same way, so `mode == Draining` alone means the same thing as
-`(mode == Draining)?`. This applies to a fifo op, a call, and a `spawn` too
+rule the same way, so `mode = Draining` alone means the same thing as
+`(mode = Draining)?`. This applies to a fifo op, a call, and a `spawn` too
 in the sense that each already has its own established meaning as a bare
 statement (a call may or may not fail on its own terms; a fifo op's fail
 condition already folds in on its own; a `spawn`'s handle being unused is
@@ -108,7 +108,7 @@ The checker rejects circuit-value loops in `combines` code:
 
 ```trace
 Bad(x : bits[8]) : bits[8] <combines> {
-    while x != 0 { x := x >> 1 }
+    while x <> 0 { x := x >> 1 }
     -- error[E012]: loop bound depends on a circuit value.
     -- Loops over circuit values need `<sequences>` (one iteration per cycle)
     -- or an elaboration-time bound under `<elaborates>`.
@@ -122,7 +122,7 @@ and dynamic allocation are legal here and only here.
 
 ```trace
 AdderTree(xs : list[wire[bits[32]]]) : wire[bits[32]] <elaborates> {
-    if len(xs) == 1 { return xs[0] }        -- `if` on an elab value: unrolls
+    if len(xs) = 1 { return xs[0] }        -- `if` on an elab value: unrolls
     mid := len(xs) / 2
     return Add(AdderTree(xs[..mid]), AdderTree(xs[mid..]))   -- recursion: legal
 }
@@ -160,7 +160,7 @@ needs the declaration, not just the site with the `?`.
 
 ```trace
 Classify(x : bits[8]) : bits[2] <combines, fails> {
-    (x != 0)?                 -- fallible: aborts the calling rule's cycle
+    (x <> 0)?                 -- fallible: aborts the calling rule's cycle
     return clog2(x)
 }
 
@@ -304,7 +304,7 @@ module FirstWins {
         hs := spawn Slow(1)
         tick
         race[hf, hs]                        -- waits until either finishes
-        if hf.done == 1 {
+        if hf.done = 1 {
             result := hf.result
         } else {
             result := hs.result
@@ -423,10 +423,21 @@ Arithmetic and bitwise operators follow Chisel-style modular width rules:
 - Comparisons produce `bits[1]`.
 - Unary `-` is two's-complement negate, wrapping within the operand's width.
   Unary `~` is bitwise complement.
-- `!` is logical negation, distinct from `~`: it requires a `bits[1]` operand.
-  Every position where `!` is meaningful already carries `bits[1]`, so the two
-  operators agree there; `!` on a wider value is a type error, since this
-  language has no "nonzero is true" coercion.
+- `not` is logical negation, distinct from `~`: it requires a `bits[1]` operand.
+  Every position where `not` is meaningful already carries `bits[1]`, so the
+  two operators agree there; `not` on a wider value is a type error, since
+  this language has no "nonzero is true" coercion.
+
+Equality follows Verse's spelling rather than C's: `=` is equality
+(`x = 1`, not `x == 1`) and `<>` is not-equal (`x <> 1`, not `x != 1`).
+`:=` (bind/reassign) and a `reg`/`out` declaration's own `= init`
+initializer are unrelated uses of `=`-shaped tokens, disambiguated by
+parser position, not by the equality operator itself. `<`/`<=`/`>`/`>=`
+already matched Verse's spelling and are unchanged. Bitwise `&`/`|`/`^`/`~`
+have no Verse operator equivalent (Verse spells them as functions,
+`BitAnd`/`BitOr`/`BitXor`/`BitNot`) and stay symbolic — an HDL leans on
+bitwise operators far too heavily for function-call spelling to be a real
+improvement.
 
 Writing a wider value into a narrower target is always an error, naming
 `trunc(value, width)` as the fix. There is no silent truncation anywhere in the
@@ -546,7 +557,7 @@ rule's top level.
 ```trace
 rule step {
     count := count + 1
-    if we == 1 {
+    if we = 1 {
         m[addr] := data
     }
     read_data := m[read_addr]
@@ -620,12 +631,12 @@ arguments, exactly as if they had been written directly in the caller:
 
 ```trace
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 
 rule step {
-    result := Classify(a)    -- rule's own guard becomes (a != 0)?
+    result := Classify(a)    -- rule's own guard becomes (a <> 0)?
 }
 
 Push(x : bits[8]) : bits[8] <combines, fails> {
@@ -674,8 +685,8 @@ fails cleanly rather than compiling to the wrong width.
 Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
 
 - **`prio(reqs)`** is a fixed-priority encoder. The lowest set bit wins (bit 0 is
-  highest priority); `reqs == 0` returns `0`, a defined but not meaningful value
-  — gating on `reqs != 0` is the caller's job.
+  highest priority); `reqs = 0` returns `0`, a defined but not meaningful value
+  — gating on `reqs <> 0` is the caller's job.
 - **`trunc(value, width)`** truncates to the low `width` bits.
 - **`pack(a, b, ...)`** concatenates its arguments, most significant first: the
   first argument becomes the high bits, matching FIRRTL's `cat`, Chisel's `Cat`,
@@ -732,7 +743,7 @@ provably different at compile time:
 ```trace
 rule a { x := m[i] }      -- reads {m}
 rule b { m[j] := y }      -- writes {m}
--- v0: a conflicts with b, even if i != j always holds.
+-- v0: a conflicts with b, even if i <> j always holds.
 ```
 
 A design with one memory serializes on it, one access per cycle. That is honest
@@ -887,13 +898,13 @@ reg cont   : {S0, S1} = S0
 reg v_save : bits[8]
 
 rule rmw_s0 {
-    (cont == S0)?
+    (cont = S0)?
     v_save := mem[addr]
     cont := S1
 }
 
 rule rmw_s1 {
-    (cont == S1)?
+    (cont = S1)?
     mem[addr] := v_save + 1
     cont := S0
 }
@@ -966,7 +977,7 @@ behind the rule's own mandatory `tick`.
 what makes "spawn counts are static" hold: no loop construct can contain a
 spawn, so there is no dynamic spawn count to reason about.
 
-`sync[h1, h2, ...]` lowers to one `(h{i}.done == 1)?` guard per handle, inserted
+`sync[h1, h2, ...]` lowers to one `(h{i}.done = 1)?` guard per handle, inserted
 in place of the call, gating the segment it is written in exactly like any other
 guard. The segment containing `sync` does not fire, and does not advance its
 own enclosing continuation, until every named handle has finished.
@@ -978,9 +989,9 @@ sync[h1, h2]` and writing `tick` then `sync[h1, h2]` on the next line produce
 identical trees. Every pass downstream of parsing (segmentation, capture
 computation, sync detection, effect checking) sees only the desugared form.
 
-`race[h1, h2, ...]` lowers to one `((h1.done | h2.done | ...) == 1)?` guard —
+`race[h1, h2, ...]` lowers to one `((h1.done | h2.done | ...) = 1)?` guard —
 the OR-mirror of `sync`'s AND — plus, for EVERY handle named in the group, an
-extra `(h{other}.done == 0)?` guard clause on EVERY ONE of that handle's own
+extra `(h{other}.done = 0)?` guard clause on EVERY ONE of that handle's own
 segment rules, for every OTHER handle in the same group. This needs no separate
 cancellation latch/register at all: a competitor's `done` register IS the
 resolving signal, read directly, so there is no one-cycle lag for a stray write
@@ -1049,7 +1060,7 @@ failure conditions combine, by AND, into the rule's own guard signal — the sam
 signal that carries every explicit `?`.
 
 A rule that both enqueues and dequeues the same fifo combines the two guards
-into one: `valid == 1` alone, since this cycle's `Deq` frees the slot this
+into one: `valid = 1` alone, since this cycle's `Deq` frees the slot this
 cycle's `Enq` refills. The `Enq` side's own `not(valid)` guard is dropped for
 this specific pairing, not weakened.
 
@@ -1081,7 +1092,7 @@ module FifoPassthrough {
     out last_out : bits[8] = 0
 
     rule load {
-        (seed == 1)?
+        (seed = 1)?
         f.Enq[seed_value]
     }
 
@@ -1117,7 +1128,7 @@ module PortRam {
     out read_data : bits[16] = 0
 
     rule write {
-        (write_en == 1)?
+        (write_en = 1)?
         m[addr] := write_data
     }
 
@@ -1214,7 +1225,7 @@ into the caller's rule guard in two independent pieces that both write into
   top-level `let`s, via the shared `bind_callee_context`/`restore_callee_
 context` helpers, so a guard referencing a preceding callee-local resolves
   too, not just a parameter) bind to the call's actual arguments, the
-  callee's guard conditions compile under that binding (so `(x != 0)?`
+  callee's guard conditions compile under that binding (so `(x <> 0)?`
   compiles to `neq(a, 0)` when called `Classify(a)`, never a reference to the
   unbound parameter name), AND-reduced.
 - **Fifo ops**: `fifo.rs`'s `rule_fifo_ops` is the single enumerator every

@@ -126,7 +126,7 @@ impl Resolution {
 /// condition to test), or a bracket-dispatched builtin (`sync[...]`/
 /// `race[...]`, which use brackets for the same fallibility-marking
 /// convention `Enq`/`Deq` do, and already have their own meaning as a
-/// bare statement). Anything else sitting bare — `a == 1`, a
+/// bare statement). Anything else sitting bare — `a = 1`, a
 /// single bit-select `A[b]`, a bare boolean local — means the same
 /// thing whether or not it's written with `?`; `types.rs` separately
 /// enforces that it's actually `bits[1]` (the same check `if`/`while`

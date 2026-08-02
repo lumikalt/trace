@@ -503,7 +503,7 @@ impl<'a> Interp<'a> {
                     self.ast.expr_spans[id.0 as usize].clone(),
                     format!(
                         "an `<elaborates>` `if`'s condition must be an elaboration-\
-                         time value (e.g. `len(xs) == 1`), got {}",
+                         time value (e.g. `len(xs) = 1`), got {}",
                         other.describe()
                     ),
                 );
@@ -846,7 +846,7 @@ impl<'a> Interp<'a> {
 fn unop_symbol(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
-        UnOp::Not => "!",
+        UnOp::Not => "not",
         UnOp::BitNot => "~",
     }
 }

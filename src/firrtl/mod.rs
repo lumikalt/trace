@@ -74,7 +74,7 @@
 //!   (`x[i]`/`x[hi..lo]`, literal bounds only), memory indexing,
 //!   `instance.port`, and a call to a simple user `fn`/`impl` (see
 //!   above). No other field access, `/`/`%`, dynamic-amount shifts,
-//!   computed bit-select bounds, or logical `!` yet.
+//!   computed bit-select bounds, or logical `not` yet.
 //!
 //! Fifos default to depth 1 (one data register plus one valid bit);
 //! `[depth]elem_ty` declares a deeper one (N data-slot registers plus

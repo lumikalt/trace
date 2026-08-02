@@ -201,10 +201,10 @@ mod tests {
         // by eye, same double-repeat `split_hint`'s own doc comment
         // exists specifically to avoid).
         let (main, hint) = split_hint(
-            "`!` needs a bits[1] operand, got bits[8]; use `~` for a bitwise complement \
+            "`not` needs a bits[1] operand, got bits[8]; use `~` for a bitwise complement \
              of a wider value, or compare explicitly",
         );
-        assert_eq!(main, "`!` needs a bits[1] operand, got bits[8]");
+        assert_eq!(main, "`not` needs a bits[1] operand, got bits[8]");
         assert_eq!(
             hint,
             Some("use `~` for a bitwise complement of a wider value, or compare explicitly")

@@ -473,8 +473,8 @@ impl<'a> Emitter<'a> {
 
     /// `prio(reqs)`: a fixed-priority encoder over `reqs`'s bits — the
     /// LOWEST set bit wins (bit 0 highest priority), matching the
-    /// classic fixed-priority-arbiter convention. `reqs == 0` returns
-    /// `0`, a defined but not-meaningful value; gating on `reqs != 0`
+    /// classic fixed-priority-arbiter convention. `reqs = 0` returns
+    /// `0`, a defined but not-meaningful value; gating on `reqs <> 0`
     /// (when that matters) is the CALLER's job, the same way a `fails`
     /// precondition is established by the caller, not the failing
     /// primop itself. Built as a right-nested `mux` chain, checked from
@@ -568,7 +568,7 @@ impl<'a> Emitter<'a> {
     /// into `self.locals`, saving whatever was there before so it can be
     /// restored via `restore_callee_context`. Shared by `callee_fail_
     /// cond` (a guard referencing a preceding callee-local, not just a
-    /// param, needs this too — `let y = x + 1 / (y != 0)?` previously
+    /// param, needs this too — `let y = x + 1 / (y <> 0)?` previously
     /// failed to resolve `y` at all) and `fifo.rs`'s `compile_fifo_op_
     /// value` (an `Enq`'s value referencing a `let`-bound `Deq` result
     /// from earlier in the same callee, the "bridge" pattern).

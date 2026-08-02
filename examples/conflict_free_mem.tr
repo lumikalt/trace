@@ -21,7 +21,7 @@ module ConflictFreeMem {
     out read_data : bits[16] = 0
 
     rule write {
-        (write_en == 1)?
+        (write_en = 1)?
         m[write_addr] := write_data
     }
 

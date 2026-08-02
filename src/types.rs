@@ -762,18 +762,18 @@ impl<'a> TypeChecker<'a> {
                         return Ty::Unknown;
                     }
                 }
-                // `!` is a real, distinct operator from `~`, not pure
+                // `not` is a real, distinct operator from `~`, not pure
                 // sugar for it: both compile to the identical FIRRTL
-                // `not` primop (see firrtl/expr.rs), but `!` additionally
+                // `not` primop (see firrtl/expr.rs), but `not` additionally
                 // requires its operand already be `bits[1]` — a
                 // guardrail against accidentally bitwise-negating a
-                // wider value (`!x` on a `bits[8]` almost certainly means
-                // "did you mean a comparison, or `~`?", not "flip every
-                // bit"), since `check_cond` below already requires every
-                // condition position to be exactly `bits[1]` anyway —
-                // there is no implicit "nonzero is true" coercion
-                // anywhere in this language for `!` to usefully mean
-                // something wider.
+                // wider value (`not x` on a `bits[8]` almost certainly
+                // means "did you mean a comparison, or `~`?", not "flip
+                // every bit"), since `check_cond` below already requires
+                // every condition position to be exactly `bits[1]`
+                // anyway — there is no implicit "nonzero is true"
+                // coercion anywhere in this language for `not` to
+                // usefully mean something wider.
                 if op == UnOp::Not
                     && !matches!(
                         t,
@@ -786,7 +786,7 @@ impl<'a> TypeChecker<'a> {
                     self.error(
                         self.expr_span(id),
                         format!(
-                            "`!` needs a bits[1] operand, got {t}; use `~` for a \
+                            "`not` needs a bits[1] operand, got {t}; use `~` for a \
                              bitwise complement of a wider value, or compare \
                              explicitly"
                         ),

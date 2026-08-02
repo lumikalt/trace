@@ -34,8 +34,13 @@ module FifoBridge {
 #[test]
 fn assign_family_disambiguates() {
     assert_eq!(kinds("x := y"), vec![Ident, ColonEq, Ident]);
+    // Bare `=` does double duty: a `reg`/`out` initializer marker here,
+    // equality inside an expression below — disambiguated purely by
+    // parser position (`parse_state_decl` consumes it before any
+    // expression parsing begins), same as `<...>` already disambiguates
+    // an effect list from less-than/greater-than.
     assert_eq!(kinds("x : t = 0"), vec![Ident, Colon, Ident, Eq, Int]);
-    assert_eq!(kinds("x == y"), vec![Ident, EqEq, Ident]);
+    assert_eq!(kinds("x = y"), vec![Ident, Eq, Ident]);
 }
 
 #[test]
@@ -43,6 +48,10 @@ fn comparison_and_shift_disambiguate() {
     assert_eq!(kinds("a <= b"), vec![Ident, Le, Ident]);
     assert_eq!(kinds("a < b"), vec![Ident, Lt, Ident]);
     assert_eq!(kinds("a >> 1"), vec![Ident, Shr, Int]);
+    // `<>` (not-equal) is matched greedily over a bare `<` the same way
+    // `>>>` beats `>>` — no explicit priority needed, logos always
+    // prefers the longest token at a position.
+    assert_eq!(kinds("a <> b"), vec![Ident, LtGt, Ident]);
     // Effect brackets are plain Lt/Gt; the parser owns that grammar.
     assert_eq!(kinds("<combines>"), vec![Lt, Ident, Gt]);
 }
@@ -84,8 +93,8 @@ fn sized_integer_literals() {
 #[test]
 fn guard_and_fallible_call() {
     assert_eq!(
-        kinds("(mode == Draining)?"),
-        vec![LParen, Ident, EqEq, Ident, RParen, Question]
+        kinds("(mode = Draining)?"),
+        vec![LParen, Ident, Eq, Ident, RParen, Question]
     );
     assert_eq!(
         kinds("buf.Enq[x]"),
@@ -110,6 +119,17 @@ fn bit_is_its_own_keyword_distinct_from_bits() {
     assert_eq!(kinds("bit"), vec![Bit]);
     assert_eq!(kinds("bits"), vec![Ident]);
     assert_eq!(kinds("bitmask"), vec![Ident]);
+}
+
+#[test]
+fn not_is_a_keyword_not_an_identifier_prefix() {
+    // `not` (Verse-spelled logical negation, replacing the old symbolic
+    // `!`) is a real lexer keyword — same longest-match-wins guarantee
+    // as `bit`/`bits` above covers the identifier-prefix overlap
+    // (`notify`, etc. still lex as one `Ident`, not `Not` followed by
+    // leftover characters).
+    assert_eq!(kinds("not"), vec![Not]);
+    assert_eq!(kinds("notify"), vec![Ident]);
 }
 
 #[test]

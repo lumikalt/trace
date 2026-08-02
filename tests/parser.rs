@@ -51,7 +51,7 @@ module FifoBridge
 #[test]
 fn precedence_matches_rust_not_c() {
     assert_eq!(stmt_sexpr("x := a + b * c"), "(:= x (+ a (* b c)))");
-    assert_eq!(stmt_sexpr("x := a & b == c"), "(:= x (== (& a b) c))");
+    assert_eq!(stmt_sexpr("x := a & b = c"), "(:= x (= (& a b) c))");
     assert_eq!(stmt_sexpr("x := a >> 1 + b"), "(:= x (>> a (+ 1 b)))");
 }
 
@@ -97,7 +97,7 @@ fn sized_integer_literals_parse() {
 
 #[test]
 fn guard_postfix() {
-    assert_eq!(stmt_sexpr("(mode == Draining)?"), "(? (== mode Draining))");
+    assert_eq!(stmt_sexpr("(mode = Draining)?"), "(? (= mode Draining))");
     assert_eq!(stmt_sexpr("reqs[i]?"), "(? (index reqs i))");
 }
 
@@ -170,8 +170,8 @@ fn tick_with_trailing_expr_desugars_to_two_statements() {
 
 #[test]
 fn tick_with_guard_expr_parses_same_as_a_separate_guard_statement() {
-    let fused = "rule t {\n tick (x == 0)?\n}\n";
-    let split = "rule t {\n tick\n (x == 0)?\n}\n";
+    let fused = "rule t {\n tick (x = 0)?\n}\n";
+    let split = "rule t {\n tick\n (x = 0)?\n}\n";
     let fused_ast = parse_ok(fused);
     let split_ast = parse_ok(split);
     let Item::Rule { body: fb, .. } = fused_ast.item(fused_ast.roots[0]) else {

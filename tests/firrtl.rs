@@ -198,7 +198,7 @@ fn errors_on_unlowered_sequences_rule() {
 module M {
     reg x : bits[1] = 0
     rule r <sequences> {
-        if x == 1 {
+        if x = 1 {
             tick
         }
         tick
@@ -251,7 +251,7 @@ fn fifo_depth_n_emits_a_slot_array_plus_head_and_count() {
 module M {
     fifo f : [4]bits[8]
     rule r {
-        (want == 1)?
+        (want = 1)?
         x := f.Deq[]
         f.Enq[x + 1]
     }
@@ -462,7 +462,7 @@ module M {
     fifo f : bits[8]
     reg cond : bits[1] = 0
     rule r {
-        if cond == 1 {
+        if cond = 1 {
             let x = f.Deq[]
         }
     }
@@ -479,7 +479,7 @@ module M {
     fifo f : bits[8]
     reg cond : bits[1] = 0
     rule r {
-        if cond == 1 {
+        if cond = 1 {
             f.Enq[cond]
         }
     }
@@ -625,7 +625,7 @@ module M {
     reg v : bits[8] = 0
 
     rule r {
-        if cond == 1 {
+        if cond = 1 {
             m[addr] := v
         }
     }
@@ -660,7 +660,7 @@ module M {
     reg vb : bits[8] = 0
 
     rule r {
-        if cond == 1 {
+        if cond = 1 {
             m[addr_a] := va
         } else {
             m[addr_b] := vb
@@ -717,7 +717,7 @@ module M {
     in addr1 : bits[8]
 
     rule r {
-        if cond == 1 {
+        if cond = 1 {
             m[addr0] := 8'd11
         }
         m[addr1] := 8'd22
@@ -747,10 +747,10 @@ module M {
     in addrB : bits[8]
 
     rule r {
-        if condA == 1 {
+        if condA = 1 {
             m[addrA] := 8'd11
         }
-        if condB == 1 {
+        if condB = 1 {
             m[addrB] := 8'd22
         }
     }
@@ -779,7 +779,7 @@ module M {
 
     rule r {
         m[addr0] := 8'd11
-        if cond == 1 {
+        if cond = 1 {
             m[addr1] := 8'd22
         }
     }
@@ -888,7 +888,7 @@ module Top {
     reg cond : bits[1] = 0
     reg v : bits[8] = 0
     rule r {
-        if cond == 1 {
+        if cond = 1 {
             c.a := v
         } else {
             c.a := 1
@@ -919,7 +919,7 @@ module Top {
     reg cond : bits[1] = 0
     reg v : bits[8] = 0
     rule r {
-        if cond == 1 {
+        if cond = 1 {
             c.a := v
         }
     }
@@ -1235,14 +1235,14 @@ fn sized_literal_compares_against_a_wider_operand() {
     // Comparison ops don't unify operand widths in types.rs (Eq/Ne/etc.
     // always type as bits[1] regardless of operand widths), and FIRRTL's
     // `eq` primop itself implicitly extends the narrower operand -- so
-    // `x == 8'd6` with `x : bits[16]` needs no special-casing beyond
+    // `x = 8'd6` with `x : bits[16]` needs no special-casing beyond
     // what the sized literal already does (emit at its own width).
     let src = "\
 module M {
     in x : bits[16]
     out eq : bits[1] = 0
     rule r {
-        eq := x == 8'd6
+        eq := x = 8'd6
     }
 }
 ";
@@ -1407,10 +1407,10 @@ module M {
 
 #[test]
 fn logical_not_compiles_identically_to_bitwise_not_on_a_bits_1_value() {
-    // `!` and `~` emit the IDENTICAL FIRRTL `not` primop -- what makes
-    // `!` a real, distinct operator (not just a parse-time alias) is a
+    // `not` and `~` emit the IDENTICAL FIRRTL `not` primop -- what makes
+    // `not` a real, distinct operator (not just a parse-time alias) is a
     // types.rs restriction (tests/types.rs's
-    // `logical_not_needs_a_bits_1_operand`): `!` requires its operand
+    // `logical_not_needs_a_bits_1_operand`): `not` requires its operand
     // already be `bits[1]`, `~` accepts any width. Once that's enforced,
     // bitwise-complementing the single bit IS logical negation, so
     // there's nothing left for emission to do differently -- proved here
@@ -1418,16 +1418,16 @@ fn logical_not_compiles_identically_to_bitwise_not_on_a_bits_1_value() {
     let src = "\
 module M {
     in x : bits[8]
-    out bang : bits[1] = 0
+    out lnot : bits[1] = 0
     out tilde : bits[1] = 0
     rule r {
-        bang := !(x == 0)
-        tilde := ~(x == 0)
+        lnot := not (x = 0)
+        tilde := ~(x = 0)
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_bang, not(eq(x, UInt<8>(0)))"));
+    assert!(fir.contains("connect __out_lnot, not(eq(x, UInt<8>(0)))"));
     assert!(fir.contains("connect __out_tilde, not(eq(x, UInt<8>(0)))"));
     run_firtool(&fir, &[]);
 }
@@ -2009,11 +2009,11 @@ module M {
     }
 
     rule r1 {
-        (sel == 1)?
+        (sel = 1)?
         Bump(a)
     }
     rule r2 {
-        (sel == 0)?
+        (sel = 0)?
         Bump(b)
     }
 }
@@ -2115,13 +2115,13 @@ fn call_folds_a_guard_that_references_a_preceding_callee_local() {
     // Regression test for a real gap found while extending this area to
     // fifo ops: `callee_fail_cond` originally only bound the callee's
     // PARAMS, not its own top-level `let`s, so a guard written in terms
-    // of a preceding local (`let y = x + 1 / (y != 0)?`) failed to
+    // of a preceding local (`let y = x + 1 / (y <> 0)?`) failed to
     // resolve `y` at all (a clean error, not a miscompile, but a real
     // gap) until `bind_callee_context` started binding both.
     let src = "\
 Classify(x : bits[8]) : bits[8] <combines, fails> {
     let y = x + 1
-    (y != 0)?
+    (y <> 0)?
     return y
 }
 module Top {
@@ -2139,14 +2139,14 @@ module Top {
 
 #[test]
 fn call_folds_a_callees_bare_guard_into_the_callers_own_guard() {
-    // `Classify`'s `(x != 0)?` isn't the caller's own guard textually —
+    // `Classify`'s `(x <> 0)?` isn't the caller's own guard textually —
     // it's DESIGN.md's own "fails" example. The fold must compile the
     // condition against the CALL SITE's argument (`a`), not the
     // callee's own parameter name (`x`) unbound — the exact
     // param-substitution trap this fold has to get right.
     let src = "\
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 module Top {
@@ -2164,13 +2164,13 @@ module Top {
 
 #[test]
 fn a_bare_condition_implicitly_folds_into_the_rule_guard() {
-    // `a != 0` alone (no `?`) means the same thing as `(a != 0)?`.
+    // `a <> 0` alone (no `?`) means the same thing as `(a <> 0)?`.
     let src = "\
 module M {
     in a : bits[8]
     out result : bits[8] = 0
     rule compute {
-        a != 0
+        a <> 0
         result := a
     }
 }
@@ -2183,7 +2183,7 @@ module M {
 #[test]
 fn a_bare_bit_select_implicitly_folds_into_the_rule_guard() {
     // The OTHER example from the request that motivated this feature
-    // (`A[b]` alongside `a == 1`): a single (non-slice) bit-select is
+    // (`A[b]` alongside `a = 1`): a single (non-slice) bit-select is
     // always exactly bits[1] by construction, so `flags[i]` alone
     // means the same thing as `(flags[i])?` -- a different code path
     // through `is_guard_like` than a comparison (`Expr::Bracket`, not
@@ -2213,7 +2213,7 @@ fn a_callees_bare_implicit_guard_also_folds_into_the_callers_guard() {
     // just an explicit `Expr::Guard`.
     let src = "\
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    x != 0
+    x <> 0
     return x
 }
 module Top {
@@ -2237,7 +2237,7 @@ module M {
     reg b : bits[1] = 0
     rule r {
         b := 1
-        a == 1
+        a = 1
     }
 }
 ";
@@ -2255,8 +2255,8 @@ module M {
     reg a : bits[1] = 0
     reg b : bits[1] = 0
     rule r {
-        if a == 1 {
-            b == 1
+        if a = 1 {
+            b = 1
         }
     }
 }
@@ -2277,14 +2277,14 @@ fn call_folds_a_guard_and_threads_a_state_write_from_the_same_callee() {
     // write) have to agree on the same rule-level guard, not just each
     // compile in isolation. Confirmed through real simulation before
     // this was added (both writes gated identically, `v` holds when
-    // `a == 0`) — this pins the emitted shape.
+    // `a = 0`) — this pins the emitted shape.
     let src = "\
 module M {
     reg v : bits[8] = 0
     in a : bits[8]
     out result : bits[8] = 0
     Bump(x : bits[8]) : bits[8] <combines, fails> {
-        (x != 0)?
+        (x <> 0)?
         v := x
         return x + 1
     }
@@ -2314,7 +2314,7 @@ fn a_failing_call_nested_in_a_larger_expression_is_an_error_not_a_dropped_guard(
     // the caller's rule fire on a cycle `Classify` should have blocked.
     let src = "\
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 module Top {
@@ -2338,13 +2338,13 @@ fn a_failing_callee_with_a_guard_nested_in_if_else_is_still_rejected() {
     // guard is an allowed statement inside an if/else branch), but
     // invisible to `callee_fail_cond`'s flat top-level scan — folding
     // only the (nonexistent) top-level guard would silently drop this
-    // one, letting the caller's rule fire even when `flag == 1` and
-    // `x == 0`. `check_fails_is_foldable_guard` must catch this by
+    // one, letting the caller's rule fire even when `flag = 1` and
+    // `x = 0`. `check_fails_is_foldable_guard` must catch this by
     // comparing "guards anywhere" against "guards at the top level".
     let src = "\
 Classify(x : bits[8], flag : bits[1]) : bits[8] <combines, fails> {
-    if flag == 1 {
-        (x != 0)?
+    if flag = 1 {
+        (x <> 0)?
         return x
     } else {
         return 0
@@ -2408,7 +2408,7 @@ module Top {
     in a : bits[8]
     out result : bits[8] = 0
     Push(x : bits[8]) : bits[8] <combines, fails> {
-        (x != 0)?
+        (x <> 0)?
         buf.Enq[x]
         return x
     }
@@ -2501,7 +2501,7 @@ fn a_failing_callee_that_calls_another_failing_callee_is_still_rejected() {
     // built here.
     let src = "\
 Inner(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 Outer(x : bits[8]) : bits[8] <combines, fails> {
@@ -2532,7 +2532,7 @@ fn a_failing_call_nested_in_if_else_at_the_rule_level_is_still_rejected() {
     // precedent exactly.
     let src = "\
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 module Top {
@@ -2540,7 +2540,7 @@ module Top {
     in cond : bits[1]
     out result : bits[8] = 0
     rule compute {
-        if cond == 1 {
+        if cond = 1 {
             result := Classify(a)
         } else {
             result := 0
@@ -2559,7 +2559,7 @@ module Top {
 fn a_failing_call_as_a_bare_statement_after_a_state_write_is_still_rejected() {
     let src = "\
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 module Top {
@@ -2934,12 +2934,12 @@ module M {
     in we_b : bits[1]
 
     rule set_a {
-        (we_a == 1)?
+        (we_a = 1)?
         a := b
     }
 
     rule set_b {
-        (we_b == 1)?
+        (we_b = 1)?
         b := a
     }
 
@@ -2979,12 +2979,12 @@ module M {
     in we_b : bits[1]
 
     rule set_a {
-        (we_a == 1)?
+        (we_a = 1)?
         a := b
     }
 
     rule set_b {
-        (we_b == 1)?
+        (we_b = 1)?
         b := a
     }
 

@@ -43,7 +43,7 @@
 //! other continuation register in this emitter, no sentinel value
 //! needed. `sync[h1, h2, ...]` (brackets: sync is a fallible operation,
 //! same convention as `f.Deq[]`/`f.Enq[x]`) lowers to one
-//! `(__done_h{i} == 1)?` guard per handle, inserted in place of the
+//! `(__done_h{i} = 1)?` guard per handle, inserted in place of the
 //! call — reusing "guard fails, segment retries next cycle" unchanged,
 //! no new segmentation trigger. `h.result`/`h.done` anywhere in the
 //! enclosing rule rewrite to `__result_*`/`__done_*` reads.
@@ -1481,7 +1481,7 @@ fn expand(
 }
 
 /// `race[h1, h2, ...]`'s own guard (does the enclosing segment advance)
-/// is one `((d1 | d2 | ...) == 1)?` line, an OR of every named handle's
+/// is one `((d1 | d2 | ...) = 1)?` line, an OR of every named handle's
 /// `done` — the mirror of `sync`'s AND. The actual "loser cancellation"
 /// DESIGN.md flagged as undesigned needs no separate latch/register at
 /// all: every handle race names gets an EXTRA guard clause on every one
@@ -1543,7 +1543,7 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
                     competitor_guards
                         .entry(h)
                         .or_default()
-                        .push(format!("({} == 0)?", plan.done_name));
+                        .push(format!("({} = 0)?", plan.done_name));
                 }
             }
         }
@@ -1552,14 +1552,14 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
     let nsegs = lr.segments.len() as u64;
     for seg in &lr.segments {
         out.push_str(&format!("rule {}_s{} {{\n", lr.rule_name, seg.index));
-        out.push_str(&format!("    ({} == {})?\n", lr.cont_name, seg.index));
+        out.push_str(&format!("    ({} = {})?\n", lr.cont_name, seg.index));
         for stmt in &seg.stmts {
             if let Some(spawn) = spawn_by_trigger.get(stmt) {
                 render_spawn_trigger(&mut out, src, ast, spawn, &lr.handle_field_rewrites);
             } else if let Some(handles) = sync_by_stmt.get(stmt) {
                 for h in handles.iter() {
                     if let Some(plan) = spawn_by_handle.get(h) {
-                        out.push_str(&format!("    ({} == 1)?\n", plan.done_name));
+                        out.push_str(&format!("    ({} = 1)?\n", plan.done_name));
                     }
                 }
             } else if let Some(handles) = race_by_stmt.get(stmt) {
@@ -1569,7 +1569,7 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
                     .map(|plan| plan.done_name.as_str())
                     .collect();
                 if !dones.is_empty() {
-                    out.push_str(&format!("    (({}) == 1)?\n", dones.join(" | ")));
+                    out.push_str(&format!("    (({}) = 1)?\n", dones.join(" | ")));
                 }
                 // Value-producing form (`value := race[...]`) additionally
                 // assigns the winner's own result — `__race_value` is the
@@ -1657,7 +1657,7 @@ fn render_spawn_trigger(
 }
 
 /// `extra_guards` is empty unless `spawn`'s handle is named in some
-/// `race[...]` in the enclosing rule — one `(competitor_done == 0)?`
+/// `race[...]` in the enclosing rule — one `(competitor_done = 0)?`
 /// per named competitor, added to EVERY one of this spawn's own
 /// segments, so a handle that loses a race can never fire another
 /// segment again (see `render_rule`'s own doc comment for why this
@@ -1675,7 +1675,7 @@ fn render_spawn_segments(
             "rule {}_{}_s{} {{\n",
             spawn.base_rule_name, spawn.handle_name, seg.index
         ));
-        out.push_str(&format!("    ({} == {})?\n", spawn.cont_name, seg.index));
+        out.push_str(&format!("    ({} = {})?\n", spawn.cont_name, seg.index));
         for guard in extra_guards {
             out.push_str(&format!("    {guard}\n"));
         }

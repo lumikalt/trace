@@ -24,7 +24,7 @@ module Fetch2Gated {
     }
 
     rule fetch2 <sequences> {
-        (go == 1)?
+        (go = 1)?
         h1 := spawn ReadBank0(pc)
         h2 := spawn ReadBank1(pc + 1)
         tick sync[h1, h2]

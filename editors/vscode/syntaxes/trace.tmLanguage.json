@@ -45,6 +45,11 @@
           "match": "\\b(if|else|while|return|tick|spawn|sync|race)\\b"
         },
         {
+          "comment": "Verse-spelled prefix logical negation, replacing the old symbolic `!` — a real lexer keyword (src/lexer.rs), highlighted as an operator since that's how it functions.",
+          "name": "keyword.operator.word.trace",
+          "match": "\\bnot\\b"
+        },
+        {
           "name": "keyword.declaration.trace",
           "match": "\\b(module|rule|reg|mem|fifo|in|out|inst|spec|impl|refines|schedule|let|bit)\\b"
         },
@@ -71,7 +76,7 @@
     },
     "operators": {
       "name": "keyword.operator.trace",
-      "match": ":=|==|!=|<=|>=|<<|>>>|>>|\\.\\.|\\+:|-:|[:=<>.?|^&+\\-*/%~!]"
+      "match": ":=|<>|<=|>=|<<|>>>|>>|\\.\\.|\\+:|-:|[:=<>.?|^&+\\-*/%~]"
     },
     "punctuation": {
       "name": "punctuation.trace",

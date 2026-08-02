@@ -19,12 +19,12 @@ module MutuallyExclusiveCheck {
     in we_b : bits[1]
 
     rule set_a {
-        (we_a == 1)?
+        (we_a = 1)?
         a := b
     }
 
     rule set_b {
-        (we_b == 1)?
+        (we_b = 1)?
         b := a
     }
 

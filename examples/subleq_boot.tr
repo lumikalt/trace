@@ -19,19 +19,19 @@ module SubleqBoot {
     in boot_done : bits[1]
 
     rule load {
-        (booted == 0)?
-        (load_en == 1)?
+        (booted = 0)?
+        (load_en = 1)?
         m[load_addr] := load_data
     }
 
     rule finish_boot {
-        (booted == 0)?
-        (boot_done == 1)?
+        (booted = 0)?
+        (boot_done = 1)?
         booted := 1
     }
 
     rule step <sequences> {
-        (booted == 1)?
+        (booted = 1)?
         a := m[pc]
         tick
         b := m[pc + 1]
@@ -47,7 +47,7 @@ module SubleqBoot {
     }
 
     rule refill <reads {pc, m, booted}, writes {ir}> {
-        (booted == 1)?
+        (booted = 1)?
         ir := m[pc]
     }
 

@@ -1,9 +1,9 @@
 -- A memory write nested inside `if` (no `else`), sitting alongside an
 -- unconditional register write in the SAME rule -- something a
--- top-level guard (`examples/port_ram.tr`'s `(write_en == 1)?`) can't
+-- top-level guard (`examples/port_ram.tr`'s `(write_en = 1)?`) can't
 -- express, since a guard gates the WHOLE rule, not just the write
 -- inside it. `count` increments every cycle regardless of `we`; `m` is
--- only written on cycles where `we == 1`. See DESIGN.md's "Port-based
+-- only written on cycles where `we = 1`. See DESIGN.md's "Port-based
 -- memory access" section for the write-enable threading this needed
 -- (`mem_write_in_stmts`, mirroring `reg_value_in_stmts`'s existing
 -- if/else mux-threading, but with an explicit write-enable boolean --
@@ -20,7 +20,7 @@ module MemWriteBranch {
 
     rule step {
         count := count + 1
-        if we == 1 {
+        if we = 1 {
             m[addr] := data
         }
         read_data := m[read_addr]

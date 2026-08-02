@@ -24,7 +24,7 @@ fn run(src: &str) -> (Vec<(trace::lexer::Span, String)>, Vec<ElabError>) {
 #[test]
 fn adder_tree_reduces_to_a_left_associated_sum_at_each_call_site() {
     let src = "AdderTree(xs: list[bits[32]]) : bits[32] <elaborates> {\n\
-                   if len(xs) == 1 { return xs[0] }\n\
+                   if len(xs) = 1 { return xs[0] }\n\
                    mid := len(xs) / 2\n\
                    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])\n\
                }\n\
@@ -54,7 +54,7 @@ fn an_odd_length_list_exercises_the_asymmetric_split() {
     // truncating on an odd length -- 3 elements split [a] + [b, c], a
     // genuinely different shape than the power-of-two case.
     let src = "AdderTree(xs: list[bits[32]]) : bits[32] <elaborates> {\n\
-                   if len(xs) == 1 { return xs[0] }\n\
+                   if len(xs) = 1 { return xs[0] }\n\
                    mid := len(xs) / 2\n\
                    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])\n\
                }\n\

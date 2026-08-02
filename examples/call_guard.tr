@@ -1,5 +1,5 @@
 Classify(x : bits[8]) : bits[8] <combines, fails> {
-    (x != 0)?
+    (x <> 0)?
     return x
 }
 
