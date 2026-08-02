@@ -52,10 +52,39 @@ impl<'a> Emitter<'a> {
     /// rule, per the module doc comment.
     pub(crate) fn check_guard_placement(&mut self, rule: ItemId) {
         let body = rule_body(self.ast, rule);
+        // An `or` chain WITHOUT a default stays fallible (its
+        // alternatives' combined occupancy folds into the rule's own
+        // guard, `compile_guard`) and so needs the same "before any
+        // write" placement a bare fifo op/failing call needs; a
+        // defaulted chain is unconditional (hand-lowered + Icarus-
+        // confirmed: it contributes NO guard term at all) and so has no
+        // placement restriction of its own.
+        let fallible_or: std::collections::HashSet<StmtId> = or_chains(self.ast, self.res, &body)
+            .into_iter()
+            .filter(|c| c.default.is_none())
+            .map(|c| c.stmt)
+            .collect();
         let mut seen_write = false;
         for stmt in &body {
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Assign { lhs, rhs } => {
+                    // Checked independently of the `is_state_write`
+                    // branch below (not chained onto it as another
+                    // `else if`): unlike a bare fifo op/failing call,
+                    // `or`'s LHS is routinely ALSO state (`result :=
+                    // a.Deq[] or b.Deq[]` writes an output) — an
+                    // else-if chain keyed on "is the lhs a write" would
+                    // take the `seen_write = true` branch and silently
+                    // skip this check on that exact statement.
+                    if fallible_or.contains(stmt) && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "an `or` chain with no default, after a state write, is \
+                             not yet supported (v0 restriction): its alternatives \
+                             must gate the whole rule"
+                                .to_string(),
+                        );
+                    }
                     if is_state_write(self.ast, self.res, lhs) {
                         seen_write = true;
                     } else if self.fifo_op(rhs).is_some() && seen_write {
@@ -98,6 +127,14 @@ impl<'a> Emitter<'a> {
                              gate the whole rule"
                                 .to_string(),
                         );
+                    } else if fallible_or.contains(stmt) && seen_write {
+                        self.error(
+                            self.ast.expr_spans[e.0 as usize].clone(),
+                            "an `or` chain with no default, after a state write, is \
+                             not yet supported (v0 restriction): its alternatives \
+                             must gate the whole rule"
+                                .to_string(),
+                        );
                     }
                 }
                 Stmt::Let { init, .. } => {
@@ -114,6 +151,14 @@ impl<'a> Emitter<'a> {
                             "a call to a function that can fail, after a state write, \
                              is not yet supported (v0 restriction): its guard must \
                              gate the whole rule"
+                                .to_string(),
+                        );
+                    } else if fallible_or.contains(stmt) && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "an `or` chain with no default, after a state write, is \
+                             not yet supported (v0 restriction): its alternatives \
+                             must gate the whole rule"
                                 .to_string(),
                         );
                     }
@@ -193,6 +238,45 @@ impl<'a> Emitter<'a> {
                     self.error(
                         self.ast.stmt_spans[stmts[1].0 as usize].clone(),
                         format!("`{fifo}.{kind}` appears more than once in this rule; {message}"),
+                    );
+                }
+            }
+        }
+        // A fifo used as an `or` alternative may not ALSO be touched
+        // directly (or via a different `or` chain) elsewhere in the same
+        // rule: an alternative's state transition is conditionally gated
+        // (`RuleFifoOp::select`), but the combined pass-through guard
+        // `rule_fifo_guard_cond` computes assumes every op on a fifo is
+        // unconditional — composing the two has not been verified, so
+        // it's rejected outright (v0 restriction) rather than silently
+        // assumed to compose.
+        let mut by_fifo: HashMap<String, (bool, bool)> = HashMap::new();
+        for op in &ops {
+            let entry = by_fifo.entry(op.fifo.clone()).or_default();
+            if op.select.is_some() {
+                entry.1 = true;
+            } else {
+                entry.0 = true;
+            }
+        }
+        let mut fifos: Vec<&String> = by_fifo.keys().collect();
+        fifos.sort();
+        for fifo in fifos {
+            let (unconditional, or_alt) = by_fifo[fifo];
+            if unconditional && or_alt {
+                let stmt = ops
+                    .iter()
+                    .find(|o| &o.fifo == fifo && o.select.is_some())
+                    .map(|o| o.stmt);
+                if let Some(stmt) = stmt {
+                    self.error(
+                        self.ast.stmt_spans[stmt.0 as usize].clone(),
+                        format!(
+                            "`{fifo}` is used as an `or` alternative here but is also \
+                             touched directly elsewhere in this rule (v0 restriction): \
+                             a fifo used as an `or` alternative may only be touched \
+                             through that `or` chain"
+                        ),
                     );
                 }
             }
@@ -344,6 +428,128 @@ impl<'a> Emitter<'a> {
         self.check_logic_args_in(&body);
     }
 
+    /// `or`'s v0 shape: every alternative in a chain must be a plain
+    /// `Deq[]` on a depth-1 fifo — not depth>1 (nothing here has been
+    /// hand-lowered/verified for a multi-slot fifo yet — a separate,
+    /// larger gap), and not a call (call-alternatives are a separate,
+    /// larger gap too — see TODO.md). `Enq` needs no explicit rejection
+    /// here: it has no value of its own for `or` to select between
+    /// (confirmed against DESIGN.md — `Enq[x]` only ever appears as a
+    /// bare statement or wrapped in `logic(...)`, never as a value-
+    /// producing expression), so types.rs's ordinary width-assignability
+    /// check on `Or`'s alternatives already rejects it (a `unit`-typed
+    /// `Enq` bracket can never match a fifo element's `bits[N]`) before
+    /// this ever runs — a dedicated message here would be unreachable
+    /// dead code. Only the chain's LAST element may instead be a plain
+    /// default value; `or_chains` (fifo.rs) already made that
+    /// classification, so `chain.alts` here is exactly the set that must
+    /// be `Deq[]`. Rule-level only — a chain nested in `if`/`while` is a
+    /// DIFFERENT gap surfaced by `check_fifo_op_positions`'s generic
+    /// position message instead (see that check's own comment); a chain
+    /// inside a callee's own body is caught separately, by `check_no_or_
+    /// in_callee_body` below (this check alone does NOT run against a
+    /// callee body at all, unlike `check_logic_args`/`check_writing_
+    /// call_positions_in` — `or_chains` only recognizes rule-body-level
+    /// positions, so a callee-body chain would otherwise produce zero
+    /// `RuleFifoOp` entries and silently compile to a value read with no
+    /// state transition; found by hand-testing before this was written,
+    /// not by construction).
+    pub(crate) fn check_or_shape(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        for chain in or_chains(self.ast, self.res, &body) {
+            for &alt in &chain.alts {
+                let span = self.ast.expr_spans[alt.0 as usize].clone();
+                let Some((_, depth, _, _)) = self.fifo_op(alt) else {
+                    self.error(
+                        span,
+                        "every alternative in an `or` chain must be a fifo `Deq[]` \
+                         (v0 restriction); only the LAST one may instead be a plain \
+                         default value"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                if depth != 1 {
+                    self.error(
+                        span,
+                        "an `or` alternative on a fifo with depth > 1 is not yet \
+                         supported (v0 restriction)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// An `or` chain anywhere inside a callee's own body — v0 restriction,
+    /// called from `validate_call` (calls.rs) against every callee body a
+    /// call reaches, mirroring `check_writing_call_positions_in`/`check_
+    /// logic_args_in`'s own callee-body reuse. Unlike those two, `or`
+    /// itself has NO callee-body support to fall back to (no fold, no
+    /// discharge) — `or_chains` (fifo.rs) only ever looks at a RULE
+    /// body's own top-level statements, so a chain reached only through a
+    /// call would silently produce zero `RuleFifoOp` entries: no `select`,
+    /// no state transition, while `compile_or` (expr.rs) still happily
+    /// compiles its VALUE — a fifo that's read every cycle but never
+    /// actually dequeued. Rejects any `or`, anywhere in the body (not just
+    /// a well-positioned one — position validity is irrelevant when the
+    /// whole feature isn't supported here yet), via the same generic
+    /// recursive descent `collect_read_sites_expr` (module.rs) uses.
+    pub(crate) fn check_no_or_in_callee_body(&mut self, stmts: &[StmtId]) {
+        fn roots_of(ast: &Ast, stmts: &[StmtId], out: &mut Vec<ExprId>) {
+            for stmt in stmts {
+                match ast.stmt(*stmt).clone() {
+                    Stmt::Expr(e) => out.push(e),
+                    Stmt::Assign { lhs, rhs } => {
+                        out.push(lhs);
+                        out.push(rhs);
+                    }
+                    Stmt::Let { init, .. } => out.push(init),
+                    Stmt::Return(Some(e)) => out.push(e),
+                    Stmt::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        out.push(cond);
+                        roots_of(ast, &then_body, out);
+                        if let Some(b) = &else_body {
+                            roots_of(ast, b, out);
+                        }
+                    }
+                    Stmt::While { cond, body } => {
+                        out.push(cond);
+                        roots_of(ast, &body, out);
+                    }
+                    Stmt::Return(None) | Stmt::Tick => {}
+                }
+            }
+        }
+        fn collect_or_exprs(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
+            if matches!(ast.expr(id), Expr::Or(_)) {
+                out.push(id);
+            }
+            for child in crate::lower::sub_exprs(ast, id) {
+                collect_or_exprs(ast, child, out);
+            }
+        }
+        let mut roots = Vec::new();
+        roots_of(self.ast, stmts, &mut roots);
+        for root in roots {
+            let mut ors = Vec::new();
+            collect_or_exprs(self.ast, root, &mut ors);
+            for or_expr in ors {
+                self.error(
+                    self.ast.expr_spans[or_expr.0 as usize].clone(),
+                    "an `or` chain is not yet supported inside a callee's own body \
+                     (v0 restriction: `or` only works directly in a rule) — write \
+                     it directly in the calling rule instead"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     pub(crate) fn check_logic_args_in(&mut self, stmts: &[StmtId]) {
         for arg in self.logic_arg_exprs(stmts) {
             let span = self.ast.expr_spans[arg.0 as usize].clone();
@@ -455,7 +661,19 @@ impl<'a> Emitter<'a> {
         let mut bad = Vec::new();
         self.fifo_ops_outside_allowed_positions(&body, &mut bad);
         let logic_args = self.logic_arg_exprs(&body);
-        bad.retain(|e| !logic_args.contains(e));
+        // `or_chains` only recognizes a chain sitting directly at one of
+        // the three allowed top-level positions (see its own doc
+        // comment, fifo.rs) — it deliberately does NOT recurse into
+        // `if`/`while` or a larger expression, so a misplaced `or`'s
+        // alternatives stay unexempted here and fall through to this
+        // same generic "fifo operation ... not in an allowed position"
+        // message below (see `logic_wrapped_call_is_allowed_inside_an_
+        // if_condition`'s sibling test for `or` pinning this).
+        let or_alts: Vec<ExprId> = or_chains(self.ast, self.res, &body)
+            .into_iter()
+            .flat_map(|c| c.alts)
+            .collect();
+        bad.retain(|e| !logic_args.contains(e) && !or_alts.contains(e));
         for op in bad {
             self.error(
                 self.ast.expr_spans[op.0 as usize].clone(),

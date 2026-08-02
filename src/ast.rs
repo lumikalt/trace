@@ -156,6 +156,13 @@ pub enum Expr {
         lo: Option<ExprId>,
         hi: Option<ExprId>,
     },
+    /// `A or B or C` — Verse's failure-discharging fallback chain
+    /// (`08_failure`). Left-associative but flattened into one list at
+    /// parse time rather than nested `Binary`s: every consumer (effects,
+    /// types, firrtl) needs "all but possibly the last are alternatives,
+    /// the last may be an infallible default" as a direct index, not a
+    /// left-spine walk. Always at least 2 elements.
+    Or(Vec<ExprId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +371,15 @@ impl Ast {
                 lo.map(|e| self.expr_sexpr(e)).unwrap_or_default(),
                 hi.map(|e| self.expr_sexpr(e)).unwrap_or_default(),
             ),
+            Expr::Or(alts) => {
+                let mut out = "(or".to_string();
+                for alt in alts {
+                    out.push(' ');
+                    out.push_str(&self.expr_sexpr(*alt));
+                }
+                out.push(')');
+                out
+            }
         }
     }
 

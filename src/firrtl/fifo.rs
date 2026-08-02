@@ -180,7 +180,87 @@ pub(crate) fn collect_fifo_ops(ast: &Ast, res: &Resolution, id: ExprId, out: &mu
                 collect_fifo_ops(ast, res, *hi, out);
             }
         }
+        // Recursing here (rather than skipping `Or`) is what lets
+        // `check_fifo_op_positions` (checks.rs) catch a MISPLACED `or`
+        // (nested in if/while, or inside a larger expression): its
+        // alternatives are only exempted from that scan when the whole
+        // `Or` sits directly in one of `or_chains`' three recognized
+        // top-level positions — everywhere else, they surface here and
+        // get flagged like any other out-of-position fifo op.
+        Expr::Or(alts) => {
+            for alt in alts {
+                collect_fifo_ops(ast, res, *alt, out);
+            }
+        }
     }
+}
+
+/// Splits `A or B or C`'s flat alt list into its fifo-op alternatives and
+/// an optional trailing default (the last element, when it ISN'T itself
+/// fifo-op-shaped) — the ONE place this classification happens; both
+/// `or_chains` (statement-level enumeration, for checks.rs/`rule_fifo_
+/// ops`) and `Emitter::compile_or` (expr.rs, expression-level value
+/// compilation) read it from here so the two can't drift on what counts
+/// as a default.
+pub(crate) fn classify_or_alts(
+    ast: &Ast,
+    res: &Resolution,
+    alts: &[ExprId],
+) -> (Vec<ExprId>, Option<ExprId>) {
+    let mut alts = alts.to_vec();
+    let default = match alts.last() {
+        Some(&last) if !is_fifo_op(ast, res, last) => {
+            alts.pop();
+            Some(last)
+        }
+        _ => None,
+    };
+    (alts, default)
+}
+
+/// One `A or B or C` chain sitting in an ALLOWED top-level rule position
+/// (a bare statement, the whole RHS of `:=`, or a `let` init) — v0
+/// deliberately does NOT recurse into `if`/`while`: an `or` found there
+/// is instead rejected by checks.rs's `check_fifo_op_positions` as a
+/// fifo op "outside an allowed position" (its alternatives, unlike a
+/// top-level chain's, are never exempted from that scan — see checks.rs)
+/// — same "not yet, not silently" v0 restriction every other position
+/// check in this emitter already applies. `alts`: every alternative
+/// EXCEPT a trailing default (shape-checked separately, `check_or_
+/// shape`, checks.rs). `default`: `Some(expr)` when the chain ends in an
+/// infallible fallback value, per Verse's own `08_failure` semantics —
+/// confirmed by hand-lowering both forms to raw FIRRTL and simulating
+/// via Icarus before this was written (a default-tailed chain
+/// contributes NO guard term at all; a chain with none stays fallible
+/// and its alternatives' combined occupancy becomes part of the rule's
+/// own guard, ORed together — see `Emitter::compile_guard`, writes.rs).
+pub(crate) struct OrChain {
+    pub(crate) stmt: StmtId,
+    pub(crate) alts: Vec<ExprId>,
+    pub(crate) default: Option<ExprId>,
+}
+
+pub(crate) fn or_chains(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Vec<OrChain> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        let root = match ast.stmt(*stmt).clone() {
+            Stmt::Expr(e) => Some(e),
+            Stmt::Assign { rhs, .. } => Some(rhs),
+            Stmt::Let { init, .. } => Some(init),
+            _ => None,
+        };
+        let Some(root) = root else { continue };
+        let Expr::Or(elems) = ast.expr(root).clone() else {
+            continue;
+        };
+        let (alts, default) = classify_or_alts(ast, res, &elems);
+        out.push(OrChain {
+            stmt: *stmt,
+            alts,
+            default,
+        });
+    }
+    out
 }
 
 pub(crate) fn contains_fifo_op(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool {
@@ -273,6 +353,7 @@ impl<'a> Emitter<'a> {
                     is_enq,
                     value,
                     callee_ctx: None,
+                    select: None,
                 });
                 continue;
             }
@@ -320,8 +401,48 @@ impl<'a> Emitter<'a> {
                         is_enq,
                         value,
                         callee_ctx: Some((fn_item, args.clone())),
+                        select: None,
                     });
                 }
+            }
+        }
+        // `A or B or C` — v0: Deq-only alternatives, depth-1 fifos only
+        // (shape/depth violations are `check_or_shape`'s job, checks.rs;
+        // this stays permissive like `fifo_op_stmt` above and simply
+        // skips anything that isn't a plain Deq, so a malformed chain
+        // produces the SAME useful entries for the alts that ARE valid
+        // rather than aborting the whole enumeration). Each alt's
+        // `select` is a priority-pick condition — "this one's ready AND
+        // none of the earlier alternatives were" — built up incrementally
+        // exactly like `prio`'s own mutual-exclusivity convention, hand-
+        // verified against real firtool+Icarus before this was written.
+        for chain in or_chains(self.ast, self.res, &body) {
+            let mut none_selected: Option<String> = None;
+            for &alt in &chain.alts {
+                let Some((fifo, depth, is_enq, _)) = self.fifo_op(alt) else {
+                    continue;
+                };
+                if is_enq {
+                    continue;
+                }
+                let own = fifo_guard_cond(&fifo, false, depth);
+                let select = match &none_selected {
+                    None => own.clone(),
+                    Some(ns) => format!("and({own}, {ns})"),
+                };
+                none_selected = Some(match &none_selected {
+                    None => format!("not({own})"),
+                    Some(ns) => format!("and({ns}, not({own}))"),
+                });
+                out.push(RuleFifoOp {
+                    stmt: chain.stmt,
+                    fifo,
+                    depth,
+                    is_enq: false,
+                    value: None,
+                    callee_ctx: None,
+                    select: Some(select),
+                });
             }
         }
         out
@@ -361,7 +482,17 @@ impl<'a> Emitter<'a> {
 /// when this op was found inside a callee's own body (reached through a
 /// call at `stmt`), so `compile_fifo_op_value` knows to bind that
 /// callee's params/locals before compiling `value`; `None` for a fifo
-/// op sitting directly in the rule.
+/// op sitting directly in the rule. `select`: `None` for every op this
+/// struct represented before `or` existed — gate its state transition on
+/// `fires_rule` alone, and DO contribute its occupancy to the rule's own
+/// guard, exactly today's behavior. `Some(cond)` marks an `or`-
+/// alternative (`Emitter::rule_fifo_ops`'s or-chain handling, below): gate
+/// its state transition on `fires_rule AND cond` instead, and do NOT
+/// contribute occupancy to the rule's guard here — `compile_guard`
+/// (writes.rs) folds a whole chain's alternatives into ONE ORed term
+/// separately. A consumer that forgets this distinction reproduces
+/// exactly the silent-no-state-transition bug class this file's fifo-op-
+/// position checks (checks.rs) exist to close off elsewhere.
 #[derive(Clone)]
 pub(crate) struct RuleFifoOp {
     pub(crate) stmt: StmtId,
@@ -370,4 +501,5 @@ pub(crate) struct RuleFifoOp {
     pub(crate) is_enq: bool,
     pub(crate) value: Option<ExprId>,
     pub(crate) callee_ctx: Option<(ItemId, Vec<ExprId>)>,
+    pub(crate) select: Option<String>,
 }

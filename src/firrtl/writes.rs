@@ -280,6 +280,15 @@ impl<'a> Emitter<'a> {
         let ops = self.rule_fifo_ops(rule);
         let mut fifo_ops: std::collections::HashMap<String, (bool, bool)> = Default::default();
         for op in &ops {
+            // An `or` alternative's occupancy is NOT part of this per-
+            // fifo unconditional aggregation — `check_fifo_op_counts`
+            // (checks.rs) already guarantees a fifo used as an `or`
+            // alternative is touched NOWHERE else in the rule, so there
+            // is nothing for it to legitimately pass-through with; it
+            // gets its own combined OR term below instead.
+            if op.select.is_some() {
+                continue;
+            }
             let entry = fifo_ops.entry(op.fifo.clone()).or_insert((false, false));
             if op.is_enq {
                 entry.0 = true;
@@ -287,19 +296,41 @@ impl<'a> Emitter<'a> {
                 entry.1 = true;
             }
         }
+        let or_chains = or_chains(self.ast, self.res, &body);
         let mut conds = Vec::new();
         let mut fifo_conds_emitted: std::collections::HashSet<String> = Default::default();
         for stmt in &body {
             self.set_pos(rule, *stmt);
             let stmt_fifo_conds: Vec<String> = ops
                 .iter()
-                .filter(|o| o.stmt == *stmt)
+                .filter(|o| o.stmt == *stmt && o.select.is_none())
                 .filter(|o| fifo_conds_emitted.insert(o.fifo.clone()))
                 .map(|o| {
                     let (saw_enq, saw_deq) = fifo_ops[&o.fifo];
                     rule_fifo_guard_cond(&o.fifo, saw_enq, saw_deq, o.depth)
                 })
                 .collect();
+            // An `or` chain with no default stays fallible: at least ONE
+            // alternative must be ready. Unlike every other fold in this
+            // function, the alternatives combine with `or`, not `and` —
+            // hand-lowered and Icarus-confirmed before this was written
+            // (see fifo.rs's `or_chains` doc comment). A defaulted chain
+            // contributes nothing here at all (also confirmed the same
+            // way): it's unconditional, so the rule's own guard doesn't
+            // need to know it's there.
+            if let Some(chain) = or_chains.iter().find(|c| c.stmt == *stmt)
+                && chain.default.is_none()
+            {
+                let term = chain
+                    .alts
+                    .iter()
+                    .filter_map(|&alt| self.fifo_op(alt))
+                    .map(|(fifo, depth, _, _)| fifo_guard_cond(&fifo, false, depth))
+                    .reduce(|a, b| format!("or({a}, {b})"));
+                if let Some(term) = term {
+                    conds.push(term);
+                }
+            }
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Expr(e) => {
                     if let Expr::Guard(inner) = self.ast.expr(e) {

@@ -160,6 +160,11 @@ pub(crate) fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
                 collect_calls(ast, *hi, out);
             }
         }
+        Expr::Or(alts) => {
+            for alt in alts {
+                collect_calls(ast, *alt, out);
+            }
+        }
     }
 }
 
@@ -329,9 +334,19 @@ impl<'a> Emitter<'a> {
         // (e.g. `Probe() <combines> { return logic(f.Deq[]) }`) needs its
         // argument's shape validated here too, not just at the rule
         // level — same choke point, same before/after bail-out.
+        // `check_no_or_in_callee_body` is NOT the same "extend the rule-
+        // level restriction to the callee" pattern the two above are:
+        // `or` has no callee-body support to extend at all yet (no fold,
+        // no discharge — `or_chains`, fifo.rs, only ever looks at a
+        // rule's own top-level statements), so this rejects an `or`
+        // ANYWHERE in the body outright, found by hand-testing a
+        // defaulted (`fails: false`, so it slips past the guard-fold
+        // checks) callee chain that compiled clean with the fifo's own
+        // state transition silently missing.
         let errors_before = self.errors.len();
         self.check_writing_call_positions_in(&body);
         self.check_logic_args_in(&body);
+        self.check_no_or_in_callee_body(&body);
         if self.errors.len() > errors_before {
             return Err(());
         }

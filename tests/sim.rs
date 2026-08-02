@@ -1359,3 +1359,27 @@ fn logic_probe_runs_through_real_ports() {
         "simulation did not report PASSED:\n{output}"
     );
 }
+
+/// Proves `or` end to end: `examples/or_fifos.tr`'s `pick_default` chain
+/// (ends in a default) fires every cycle regardless of fifo occupancy;
+/// `pick_strict` (no default) stays fallible and stalls when neither
+/// alternative is ready. Both pick in priority order and leave the loser
+/// fifo untouched. See sim/or_fifos_tb.v.
+#[test]
+fn or_fifos_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/or_fifos.tr"))
+        .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/or_fifos_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}

@@ -52,6 +52,12 @@ pub enum TokenKind {
     Sync,
     #[token("race")]
     Race,
+    /// Verse's failure-discharging fallback operator (`08_failure`): `A or
+    /// B or C` tries each alternative in order and, unlike every other
+    /// binary operator, is never a plain value expression itself — always
+    /// reserved, no ident-fallback (matching `tick`, not `sync`/`race`).
+    #[token("or")]
+    Or,
     #[token("spawn")]
     Spawn,
     #[token("return")]

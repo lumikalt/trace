@@ -146,6 +146,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            Expr::Or(alts) => self.compile_or(id, &alts, hint),
             _ => {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
@@ -158,6 +159,56 @@ impl<'a> Emitter<'a> {
                 Err(())
             }
         }
+    }
+
+    /// `A or B or C`'s VALUE: a priority mux over each Deq alternative's
+    /// (already-read, pre-edge) data, falling back to the default when
+    /// present or a defined-but-meaningless `0` when not (never actually
+    /// selected there — the rule's own guard already requires at least
+    /// one alternative ready when there's no default, same convention
+    /// `__race_value`'s own dead mux branch uses). Shape violations
+    /// (an alt that isn't `Deq[]`, `Enq` used as an alt, depth>1) are
+    /// `check_or_shape`'s job (checks.rs) and already turned into a
+    /// compile error before this ever runs; `classify_or_alts` (fifo.rs)
+    /// is the SAME default/alternative split `fifo.rs`'s `or_chains`
+    /// uses for the guard fold (`compile_guard`, this file's sibling in
+    /// writes.rs) and `rule_fifo_ops`'s `select` computation, so all
+    /// three agree on what counts as a default without re-deriving it
+    /// independently. Priority order matches `rule_fifo_ops`'s own
+    /// `select` computation exactly — hand-lowered and Icarus-confirmed
+    /// (fifo.rs's `or_chains` doc comment) before either was written.
+    fn compile_or(&mut self, id: ExprId, alts: &[ExprId], hint: Option<u64>) -> Result<String, ()> {
+        let (fifo_alts, default) = classify_or_alts(self.ast, self.res, alts);
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let mut picks: Vec<(String, String)> = Vec::new();
+        let mut none_selected: Option<String> = None;
+        for alt in fifo_alts {
+            let Some((fifo, depth, is_enq, _)) = self.fifo_op(alt) else {
+                return Err(());
+            };
+            if is_enq {
+                return Err(());
+            }
+            let own = fifo_guard_cond(&fifo, false, depth);
+            let value = fifo_deq_read_expr(&fifo, depth);
+            let select = match &none_selected {
+                None => own.clone(),
+                Some(ns) => format!("and({own}, {ns})"),
+            };
+            none_selected = Some(match &none_selected {
+                None => format!("not({own})"),
+                Some(ns) => format!("and({ns}, not({own}))"),
+            });
+            picks.push((select, value));
+        }
+        let mut out = match default {
+            Some(expr) => self.compile_expr_hinted(expr, Some(w))?,
+            None => format!("UInt<{w}>(0)"),
+        };
+        for (select, value) in picks.into_iter().rev() {
+            out = format!("mux({select}, {value}, {out})");
+        }
+        Ok(out)
     }
 
     /// `x[i]` (single index), `x[hi..lo]` (slice), or `x[base +:

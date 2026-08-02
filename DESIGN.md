@@ -191,6 +191,58 @@ Context rules:
   abort. Guards and fifo ops in `elaborates` bodies, state types, and
   initializers are errors.
 
+### `or`: fallback chains
+
+`A or B or C` tries each fallible alternative in priority order (`A` first) and
+uses the first one that succeeds — Verse's own failure-discharging fallback
+operator (`08_failure`). v0 restricts every alternative to a fifo `Deq[]` on a
+depth-1 fifo (call alternatives, `Enq` alternatives, and depth>1 fifos are all
+separate, larger gaps — see TODO.md); a chain's last element may instead be a
+plain, always-succeeding default value.
+
+```trace
+result := a.Deq[] or b.Deq[] or 0     -- tries a, then b, falls back to 0
+result := a.Deq[] or b.Deq[]          -- no default: stays fallible
+```
+
+A default tail makes the *whole* chain infallible: the enclosing rule fires
+unconditionally, regardless of whether either fifo has data — hand-lowered to
+raw FIRRTL and confirmed via Icarus before this was implemented (no guard term
+at all is emitted for a defaulted chain). Without a default, the chain stays
+fallible exactly like a bare fifo op would: the alternatives' combined
+occupancy folds into the rule's own guard, but as an `or` of each alternative's
+readiness rather than the `and` every other guard-folding case in this
+language uses — at least one alternative must be ready, not all of them. A
+winning alternative is dequeued; every other alternative is left untouched,
+same first-match-wins convention `prio` already uses.
+
+`or`'s v0 restrictions, checked explicitly rather than silently mis-compiled:
+an alternative may only be `Deq[]` (an `Enq[x]` alternative is rejected by
+ordinary type-checking — it has no value of its own for `or` to select
+between, so its `unit` type can never match a fifo element's `bits[N]`); a
+fifo used as an `or` alternative may not be touched anywhere else in the same
+rule (composing an alternative's conditional state transition with an
+unconditional touch of the same fifo elsewhere hasn't been verified); and an
+`or` chain may only sit directly in one of the same three positions a bare
+fifo op can (a whole statement, the entire right-hand side of `:=`, or a `let`
+init) — nested inside `if`/`while` or inside a larger expression is rejected
+by the same generic position checks a misplaced fifo op already gets. Inside a
+callee's own body is a DIFFERENT gap with its own dedicated check
+(`check_no_or_in_callee_body`): unlike a bare guard, fifo op, or `logic(...)`,
+`or` has no callee-body support to fall back to at all yet — a first attempt
+compiled a defaulted chain cleanly with the fifo's own dequeue silently
+missing (found by hand-testing, not by construction), which is what that
+check exists to close off.
+
+Verse's `and` needs no dedicated syntax of its own: sequential bare guards
+already conjoin into one rule's readiness for free, and `logic(...)` (see
+"Calling a function from a rule" below) combined with bitwise `&` already
+covers `and` in expression position (`logic(A) & logic(B)` inside an `if`
+condition, for example) — there is no missing capability to port, only `or`'s
+discharge behavior, which is what this section covers.
+
+See `examples/or_fifos.tr` + `sim/or_fifos_tb.v`.
+
 ### `sequences`: multi-cycle code
 
 A `sequences` block spans more than one cycle. There is no cross-cycle rollback,
@@ -1426,6 +1478,8 @@ noted:
 - `logic(e)`: a fallible expression's success as a plain `bits[1]` value,
   discharged rather than propagated, with no side effect of its own
   (`examples/logic_probe.tr`).
+- `A or B or C`: a fallback chain over fifo `Deq[]` alternatives, with an
+  optional infallible default tail (`examples/or_fifos.tr`).
 - The `schedule` block: `urgency`, `mutually_exclusive` (checked simulation
   assertion), `conflict_free` (trusted, unchecked; rejected outright on a
   write/write conflict).

@@ -50,6 +50,11 @@
           "match": "\\bnot\\b"
         },
         {
+          "comment": "Verse's failure-discharging fallback chain (`A or B or C`) — a real lexer keyword (src/lexer.rs), highlighted as an operator like `not` above since that's how it functions.",
+          "name": "keyword.operator.word.trace",
+          "match": "\\bor\\b"
+        },
+        {
           "name": "keyword.declaration.trace",
           "match": "\\b(module|rule|reg|mem|fifo|in|out|inst|spec|impl|refines|schedule|let|bit)\\b"
         },

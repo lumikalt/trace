@@ -127,6 +127,29 @@ module M {
     );
 }
 
+/// `or` needs no dedicated "not `Enq`" check of its own (checks.rs's
+/// `check_or_shape`): `Enq[x]` has no value of its own, so it types as
+/// `unit` — this ordinary width-assignability check on `Or`'s
+/// alternatives already rejects it before firrtl emission's own checks
+/// ever run.
+#[test]
+fn or_alternative_rejects_enq_via_ordinary_type_mismatch() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    in x : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        result := a.Deq[] or b.Enq[x]
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(!errors.is_empty());
+    assert!(errors.iter().any(|e| e.message.contains("or")));
+}
+
 #[test]
 fn mem_reads_give_element_type() {
     // m[pc] : bits[16]; writing it to an bits[8] reg must fail.

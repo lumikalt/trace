@@ -285,6 +285,7 @@ pub(crate) fn emit_module(
         cx.check_failing_call_positions(*rule);
         cx.check_fifo_op_positions(*rule);
         cx.check_logic_args(*rule);
+        cx.check_or_shape(*rule);
         cx.check_fifo_op_counts(*rule);
     }
     if !cx.errors.is_empty() {
@@ -485,13 +486,21 @@ pub(crate) fn emit_module(
     // already confirmed (before this ever runs) that a rule enqueues at
     // most once and dequeues at most once per fifo, however it's spread
     // across a direct op and a callee's own op.
-    type FifoTouch = (ItemId, Option<RuleFifoOp>, bool);
+    // The Deq slot carries the full op (not just a `bool`) so its
+    // `select` — set only for an `or` alternative (fifo.rs's `rule_fifo_
+    // ops`), always `None` otherwise — reaches the depth-1 emission
+    // below. `check_or_shape` (checks.rs) rejects an `or` alternative on
+    // any fifo with depth > 1 before this ever runs, so `emit_fifo_
+    // depth_n`'s own Deq slot is guaranteed `select: None` even though
+    // it's now the same richer type; it only ever reads `is_some()`, not
+    // `select`, so that guarantee is all it needs.
+    type FifoTouch = (ItemId, Option<RuleFifoOp>, Option<RuleFifoOp>);
     let mut fifo_body = String::new();
     for (fifo_name, width, depth) in &fifos {
         let mut touching: Vec<FifoTouch> = Vec::new();
         for rule in &rules {
             let mut enq: Option<RuleFifoOp> = None;
-            let mut saw_deq = false;
+            let mut deq: Option<RuleFifoOp> = None;
             for op in cx.rule_fifo_ops(*rule) {
                 if &op.fifo != fifo_name {
                     continue;
@@ -499,11 +508,11 @@ pub(crate) fn emit_module(
                 if op.is_enq {
                     enq = Some(op);
                 } else {
-                    saw_deq = true;
+                    deq = Some(op);
                 }
             }
-            if enq.is_some() || saw_deq {
-                touching.push((*rule, enq, saw_deq));
+            if enq.is_some() || deq.is_some() {
+                touching.push((*rule, enq, deq));
             }
         }
         if touching.is_empty() {
@@ -513,7 +522,7 @@ pub(crate) fn emit_module(
         if *depth == 1 {
             let valid = fifo_valid_name(fifo_name);
             let data = fifo_data_name(fifo_name);
-            for (rule, enq, _saw_deq) in touching {
+            for (rule, enq, deq) in touching {
                 cx.enter_rule(rule);
                 let f = &fires_name[&rule];
                 let _ = writeln!(fifo_body, "    when {f} :");
@@ -524,8 +533,16 @@ pub(crate) fn emit_module(
                         .unwrap_or_default();
                     let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(1)");
                     let _ = writeln!(fifo_body, "      connect {data}, {value}");
-                } else {
-                    let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(0)");
+                } else if let Some(deq_op) = deq {
+                    match &deq_op.select {
+                        Some(sel) => {
+                            let _ = writeln!(fifo_body, "      when {sel} :");
+                            let _ = writeln!(fifo_body, "        connect {valid}, UInt<1>(0)");
+                        }
+                        None => {
+                            let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(0)");
+                        }
+                    }
                 }
             }
         } else {
@@ -746,7 +763,7 @@ impl<'a> Emitter<'a> {
         fifo_name: &str,
         width: u64,
         depth: u64,
-        touching: &[(ItemId, Option<RuleFifoOp>, bool)],
+        touching: &[(ItemId, Option<RuleFifoOp>, Option<RuleFifoOp>)],
         fires_name: &HashMap<ItemId, String>,
     ) {
         let head = fifo_head_name(fifo_name);
@@ -768,7 +785,8 @@ impl<'a> Emitter<'a> {
              tail(add({head}, UInt<{head_w}>(1)), 1))",
             depth - 1
         );
-        for (rule, enq, saw_deq) in touching {
+        for (rule, enq, deq) in touching {
+            let saw_deq = deq.is_some();
             self.enter_rule(*rule);
             let f = &fires_name[rule];
             let _ = writeln!(out, "    when {f} :");
@@ -799,7 +817,7 @@ impl<'a> Emitter<'a> {
                     );
                 }
             }
-            if *saw_deq {
+            if saw_deq {
                 let _ = writeln!(out, "      connect {head}, {head_p1}");
                 if enq.is_none() {
                     let _ = writeln!(

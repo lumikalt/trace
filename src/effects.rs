@@ -415,6 +415,35 @@ impl<'a> Checker<'a> {
                     self.infer_expr(*hi, sig);
                 }
             }
+            // `A or B or C` — unlike `logic(...)`, a selected alternative's
+            // fifo op is a REAL effect (mutates the fifo), so its
+            // reads/writes are NOT discharged. Only `fails` is special:
+            // each alternative failing individually doesn't fail the
+            // whole chain, only ALL of them failing does — and if the
+            // last alternative isn't itself a fifo op (a plain default
+            // value instead), the chain can never fail at all. v0 shape
+            // validation (every alt but possibly the last must be a fifo
+            // op) lives in firrtl/checks.rs; this stays permissive and
+            // conservative like the rest of `infer_expr`.
+            Expr::Or(alts) => {
+                let last = alts.len().saturating_sub(1);
+                for (i, alt) in alts.iter().enumerate() {
+                    if let Expr::Bracket { callee, args } = self.ast.expr(*alt)
+                        && let Some(fifo) = self.fifo_op_target(*callee)
+                    {
+                        sig.reads.insert(fifo);
+                        sig.writes.insert(fifo);
+                        for arg in args {
+                            self.infer_expr(*arg, sig);
+                        }
+                        if i == last {
+                            sig.fails = true;
+                        }
+                    } else {
+                        self.infer_expr(*alt, sig);
+                    }
+                }
+            }
         }
     }
 
@@ -642,6 +671,11 @@ impl<'a> Checker<'a> {
                 }
                 if let Some(hi) = hi {
                     self.check_expr(hi, item, sig, elab);
+                }
+            }
+            Expr::Or(alts) => {
+                for alt in alts {
+                    self.check_expr(alt, item, sig, elab);
                 }
             }
             Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}

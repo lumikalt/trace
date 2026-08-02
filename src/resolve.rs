@@ -689,6 +689,11 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(hi, in_type);
                 }
             }
+            Expr::Or(alts) => {
+                for alt in alts {
+                    self.resolve_expr(alt, in_type);
+                }
+            }
         }
     }
 }

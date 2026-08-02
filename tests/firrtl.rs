@@ -3429,3 +3429,229 @@ module M {
     ));
     run_firtool(&fir, &[]);
 }
+
+/// `A or B or C` with a real default tail: an infallible, unconditional
+/// priority pick — hand-lowered and Icarus-confirmed (fifo.rs's
+/// `or_chains` doc comment) before this compiler code was written. No
+/// guard term at all; `tick` advances even when neither fifo is ready.
+#[test]
+fn or_with_default_is_unconditional_and_prioritized() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    out result : bits[8] = 0
+    out counter : bits[8] = 0
+    rule r {
+        result := a.Deq[] or b.Deq[] or 0
+        counter := counter + 1
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains(
+        "connect __out_result, mux(__fifo_a_valid, __fifo_a_data, \
+         mux(and(__fifo_b_valid, not(__fifo_a_valid)), __fifo_b_data, UInt<8>(0)))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+/// `let`-bound `or`: DESIGN.md lists a `let` init among the three legal
+/// positions (matching `or_chains`, fifo.rs), but only `:=` gets
+/// exercised by every other test/example — pin that `let` genuinely
+/// works too, not just that `or_chains` happens to match its shape.
+#[test]
+fn or_bound_via_let_folds_the_same_guard_as_assign() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        let v = a.Deq[] or b.Deq[]
+        result := v
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = or(__fifo_a_valid, __fifo_b_valid)"));
+    run_firtool(&fir, &[]);
+}
+
+/// `A or B` with no default: stays fallible — the alternatives' combined
+/// occupancy (ORed, not ANDed) becomes the rule's own guard.
+#[test]
+fn or_without_default_folds_an_ored_guard() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        result := a.Deq[] or b.Deq[]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = or(__fifo_a_valid, __fifo_b_valid)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn or_rejects_a_non_fifo_op_alternative_in_a_middle_position() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    in x : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        result := a.Deq[] or x or 0
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("must be a fifo `Deq[]`"))
+    );
+}
+
+#[test]
+fn or_rejects_depth_greater_than_one() {
+    let src = "\
+module M {
+    fifo a : [4]bits[8]
+    fifo b : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        result := a.Deq[] or b.Deq[]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("depth > 1")));
+}
+
+#[test]
+fn or_rejects_a_fifo_also_touched_directly_elsewhere_in_the_rule() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    in x : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        a.Enq[x]
+        result := a.Deq[] or b.Deq[]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("also touched directly elsewhere"))
+    );
+}
+
+#[test]
+fn or_without_default_after_a_state_write_is_rejected() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    reg r0 : bits[8] = 0
+    out result : bits[8] = 0
+    rule r {
+        r0 := 1
+        result := a.Deq[] or b.Deq[]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("with no default, after a state write"))
+    );
+}
+
+/// `or` nested in `if`/`while` isn't wired into `or_chains`' (fifo.rs)
+/// intentionally non-recursive walk, so its alternatives stay
+/// unexempted and fall through to `check_fifo_op_positions`'s generic
+/// "fifo operation ... not in an allowed position" message — this pins
+/// WHICH check actually owns the rejection, rather than just reasoning
+/// it through (per-advisor: write the test).
+#[test]
+fn or_nested_in_if_is_rejected_by_the_generic_fifo_position_check() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    in cond : bit
+    out result : bits[8] = 0
+    rule r {
+        if cond {
+            result := a.Deq[] or b.Deq[]
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("not in an allowed position")
+                || e.message.contains("only appear as a whole statement"))
+    );
+}
+
+/// `or` inside a callee's own body — with a real default tail, so the
+/// callee's OWN `fails` is false and `check_fails_is_foldable_guard`
+/// (which only ever looks for a nested guard/fifo op, not an `Or` node)
+/// never gets a chance to reject it. Without `check_no_or_in_callee_
+/// body` (calls.rs's `validate_call`), this compiled clean: a priority
+/// mux reading `__fifo_a_data`/`__fifo_b_data` every cycle with NO
+/// `connect __fifo_a_valid, UInt<1>(0)` anywhere — a fifo read every
+/// cycle but never actually dequeued. Found by hand-testing, not by
+/// construction — pins the fix.
+#[test]
+fn or_inside_a_callees_own_body_with_a_default_is_rejected() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    out result : bits[8] = 0
+    Pick() : bits[8] <combines> {
+        return a.Deq[] or b.Deq[] or 0
+    }
+    rule r {
+        result := Pick()
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("callee's own body")));
+}
+
+/// The undefaulted form takes a DIFFERENT rejection path: the callee's
+/// own `fails` is true, so `check_fails_is_foldable_guard` rejects it
+/// first (it only recognizes bare guards/fifo ops, not `Or`) — before
+/// `check_no_or_in_callee_body` even matters. Both forms must be safe;
+/// this pins that the undefaulted one already was, independently.
+#[test]
+fn or_inside_a_callees_own_body_without_a_default_is_rejected() {
+    let src = "\
+module M {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    out result : bits[8] = 0
+    Pick() : bits[8] <combines, fails> {
+        return a.Deq[] or b.Deq[]
+    }
+    rule r {
+        result := Pick()
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(!err.is_empty());
+}

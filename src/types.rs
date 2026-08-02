@@ -890,6 +890,27 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ty::Unknown
             }
+            // `A or B or C` types like `ListLit`'s element unification:
+            // every alternative (a fifo op's element type, or a plain
+            // default value) must agree with the first's type. Shape
+            // rules (which alts must be fifo ops) are firrtl/checks.rs's
+            // job, same division as everywhere else in this module.
+            Expr::Or(alts) => {
+                let Some((&first, rest)) = alts.split_first() else {
+                    self.error(
+                        self.expr_span(id),
+                        "`or` needs at least two alternatives, e.g. `a.Deq[] or b.Deq[]`"
+                            .to_string(),
+                    );
+                    return Ty::Unknown;
+                };
+                let elem = self.type_expr(first, locals);
+                for &alt in rest {
+                    let t = self.type_expr(alt, locals);
+                    self.check_assignable(&t, &elem, self.expr_span(alt), "`or` alternative");
+                }
+                elem
+            }
         }
     }
 

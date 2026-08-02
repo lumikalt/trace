@@ -1,0 +1,32 @@
+-- `A or B or C`: try each fifo alternative in priority order (`a` before
+-- `b`), same first-match-wins convention `prio` already uses -- the
+-- winner's data is returned and dequeued; every loser is left untouched.
+-- `pick_default`'s chain ends in a plain value (`0`) -- an infallible
+-- default, so the whole rule fires every cycle regardless of whether
+-- either fifo has data (`tick_count` proves it: it advances even on a
+-- cycle where neither `a` nor `b` is ready). `pick_strict`'s chain has
+-- no default, so it stays fallible: the alternatives' combined occupancy
+-- becomes part of the rule's own guard (`fired` stays 0, and nothing
+-- advances, on a cycle where neither `c` nor `d` is ready).
+module OrFifos {
+    fifo a : bits[8]
+    fifo b : bits[8]
+    fifo c : bits[8]
+    fifo d : bits[8]
+
+    out result_default : bits[8] = 0
+    out tick_count : bits[8] = 0
+
+    out result_strict : bits[8] = 0
+    out fired_strict : bit = 0
+
+    rule pick_default {
+        result_default := a.Deq[] or b.Deq[] or 0
+        tick_count := tick_count + 1
+    }
+
+    rule pick_strict {
+        result_strict := c.Deq[] or d.Deq[]
+        fired_strict := 1
+    }
+}

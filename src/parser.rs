@@ -1003,6 +1003,32 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // `A or B or C` — Verse's failure-discharging fallback chain,
+            // looser-binding than every other operator (`0`, not in
+            // `infix_bp`'s table at all) so `a + 1 or b` parses as
+            // `(a + 1) or b`, matching every real example. Flattened
+            // into one `Expr::Or` at construction time rather than left-
+            // nested `Binary`s: `lhs` may already BE an `Or` from a
+            // previous iteration of this very loop (`a or b or c` visits
+            // this arm twice), in which case the new alternative is
+            // appended to its existing list instead of wrapping it in
+            // another layer — see ast.rs's `Expr::Or` doc comment for
+            // why every downstream consumer wants that flat shape.
+            if kind == Or {
+                if 0 < min_bp {
+                    break;
+                }
+                self.bump();
+                let rhs = self.parse_expr(1)?;
+                let mut alts = match self.ast.expr(lhs).clone() {
+                    Expr::Or(alts) => alts,
+                    _ => vec![lhs],
+                };
+                alts.push(rhs);
+                lhs = self.ast.push_expr(Expr::Or(alts), lo..self.prev_end);
+                continue;
+            }
+
             let Some((l_bp, r_bp)) = infix_bp(kind) else {
                 break;
             };

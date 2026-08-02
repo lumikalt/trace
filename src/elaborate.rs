@@ -615,7 +615,7 @@ impl<'a> Interp<'a> {
                 // reference, same as a plain `Ident` not bound in `env`.
                 Ok(ElabValue::Circuit(self.text_of(id)))
             }
-            Expr::Guard(_) | Expr::Spawn(_) | Expr::Range { .. } => {
+            Expr::Guard(_) | Expr::Spawn(_) | Expr::Range { .. } | Expr::Or(_) => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
                 self.error(
                     span,

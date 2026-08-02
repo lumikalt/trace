@@ -147,45 +147,17 @@ Worth building:
   "Builtins" section for the full write-up (semantics, the guard+write
   v0 restriction and why it mirrors Verse's own `<decides>`/`<transacts>`
   split, examples). Confirmed as a real Verse port (`02_primitives`'s
-  `logic{ exp }`), not just a plausible trace-only name. `or` below
-  still needs it as its per-alternative "did this succeed" primitive.
-- **`or` fallback operator** — Verse's `X? or Default` / `A or B or C`:
-  try the left fallible expression, and if it fails, use the right side
-  instead, DISCHARGING the failure rather than propagating it — this is
-  the actual "escape hatch" Lumi named when scoping the `fails` gate
-  ("the only way to escape needing a fallible context is... with the
-  `or` keyword"). Highest-value single item here: closes a real
-  expressiveness gap (today a failing sub-expression has no way to
-  supply a fallback value short of restructuring into `if`/`else`), and
-  gives fallible fifo reads/calls a priority-chain idiom
-  (`Deq[fifoA] or Deq[fifoB] or default`) that's a natural fit for
-  arbitration hardware. Open questions to settle before writing any
-  Rust, ideally by hand-lowering a `fifo_bridge`-style example to raw
-  FIRRTL first (this project's established playbook, paid off for
-  spawn/sync/race and fifo depth): whether `or` is spelled as the bare
-  word (matching Verse, and free of collision with the existing bitwise
-  `|`) or as symbolic sugar; whether the muxing reuses `prio`'s
-  first-match machinery or needs its own; and how a chain's fail
-  condition composes back into the enclosing rule's guard when NONE of
-  the alternatives succeed (an `or` chain ending in a non-fallible
-  default is always infallible, but `A or B` with no default stays
-  fallible — needs the same fold-through-the-chain treatment
-  `callee_fail_cond` already does for calls). `logic(...)` (ACHIEVED,
-  DESIGN.md's "Builtins" section) is this question's actual answer, not
-  just a related feature: `A or B or C` needs "did this alternative
-  succeed?" as a boolean before deciding whether to fall through, per
-  alternative — that's `logic(...)`'s exact job. `logic(...)` alone
-  doesn't finish `or`, though: `or` still needs its own priority-mux/
-  exclusivity machinery (which alternative's REAL, effectful op
-  actually executes) built on top, the same shape `prio`/`__race_value`
-  already establish. `and` isn't listed as a
-  companion gap: sequential bare guards already conjoin into one rule's
-  readiness for free, and bitwise `&` already covers AND in expression
-  position for `bits[1]` operands — there's no missing capability to
-  port, just `or`'s missing discharge behavior. The `or` semantics
-  above are paraphrased from a fetched summary, not the primary text —
-  re-read [08_failure](https://verselang.github.io/book/08_failure/)
-  itself before writing any Rust, same as the hand-lowering step.
+  `logic{ exp }`), not just a plausible trace-only name.
+- `or` fallback chain ACHIEVED (v0: `Deq[]`-only alternatives, depth-1
+  fifos, optional infallible default tail) — see DESIGN.md's "`or`:
+  fallback chains" section for the full write-up (semantics, v0
+  restrictions, examples). Confirmed against Verse's own primary source
+  (`08_failure`), not a paraphrase. Call alternatives, `Enq`
+  alternatives, depth>1 fifos, and `or` nested in `if`/`while` or a
+  callee's own body are all separate, larger gaps, not silently
+  accepted. `and` needed no dedicated syntax: sequential bare guards
+  already conjoin for free, and `logic(...)` combined with bitwise `&`
+  already covers it in expression position.
 - trace's `not` is confirmed to be a plain `bits[1]` boolean operator
   (`types.rs`'s operand-must-already-be-`bits[1]` rule), not Verse's
   "test success/failure without committing" operator — `17f21e9` was a
@@ -255,7 +227,15 @@ re-propose these from a fresh read of the same chapters:
   (Verse: `X > 0` yields `X` on success) — would blur trace's clean
   condition/value type split (a condition is always `bits[1]`, a
   compared operand can be any width) for a cosmetic win only; not worth
-  the type-system ambiguity.
+  the type-system ambiguity. Concrete consequence, surfaced while
+  building `or`: this is exactly why `a <> 0 or b` doesn't work today
+  (a comparison is a plain always-succeeding `bits[1]` value, with
+  nothing for `or` to discharge — `or`'s alternatives all need real
+  fallibility) — `if a <> 0 { a } else { b }` is the spelling instead.
+  Revisit only if this specific pattern shows up for real, not
+  speculatively; it'd be a much bigger, more disruptive change than
+  `logic`/`or` were (every existing bool-returning comparison use would
+  need rethinking), not just another operator.
 - **`first`/`for` runtime failure-filtering** — the synthesizable case
   (pick the first of several candidates that's actually valid) is
   already covered by the `prio` builtin; no new control-flow syntax
