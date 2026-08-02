@@ -198,6 +198,7 @@ pub(crate) fn collect_fifo_ops(ast: &Ast, res: &Resolution, id: ExprId, out: &mu
                 collect_fifo_ops(ast, res, *value, out);
             }
         }
+        Expr::OptionTy(_) | Expr::Absent => {}
     }
 }
 

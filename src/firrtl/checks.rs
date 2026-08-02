@@ -88,9 +88,11 @@ impl<'a> Emitter<'a> {
                     // validation-completeness gap, the same else-if-
                     // behind-`is_state_write` class the `or` case above
                     // was fixed for earlier this session.
+                    let rhs_is_guard = matches!(self.ast.expr(rhs), Expr::Guard(_));
                     let contributes_guard = fallible_or.contains(stmt)
                         || self.fifo_op(rhs).is_some()
-                        || self.is_failing_call(rhs);
+                        || self.is_failing_call(rhs)
+                        || rhs_is_guard;
                     if fallible_or.contains(stmt) && seen_write {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -112,6 +114,13 @@ impl<'a> Emitter<'a> {
                             "a call to a function that can fail, after a state write, \
                              is not yet supported (v0 restriction): its guard must \
                              gate the whole rule"
+                                .to_string(),
+                        );
+                    } else if rhs_is_guard && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a guard after a state write is not yet supported (v0 \
+                             restriction): a guard must gate the whole rule"
                                 .to_string(),
                         );
                     }
@@ -179,6 +188,13 @@ impl<'a> Emitter<'a> {
                             "a call to a function that can fail, after a state write, \
                              is not yet supported (v0 restriction): its guard must \
                              gate the whole rule"
+                                .to_string(),
+                        );
+                    } else if matches!(self.ast.expr(init), Expr::Guard(_)) && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a guard after a state write is not yet supported (v0 \
+                             restriction): a guard must gate the whole rule"
                                 .to_string(),
                         );
                     } else if fallible_or.contains(stmt) && seen_write {
@@ -712,6 +728,100 @@ impl<'a> Emitter<'a> {
                  be recognized there)"
                     .to_string(),
             );
+        }
+    }
+
+    /// A guard (`expr?`) may only appear as a whole bare statement, the
+    /// entire right-hand side of `:=`, or the entire init of a `let` —
+    /// the same three positions `compile_guard` (writes.rs) actually
+    /// folds a guard's failure condition from. Needed once `?` started
+    /// producing a VALUE (the unwrapped `T` of a `?T`) rather than just
+    /// a bare pass-through condition: before that, a misplaced guard
+    /// (nested in arithmetic, a call argument, an `if` condition) had no
+    /// value to read wrong, so nothing could silently miscompile. Now it
+    /// does — `compile_expr_hinted`'s `Expr::Guard` arm happily reads
+    /// `opt.data` from ANY position, so a nested-not-folded guard reads
+    /// an absent Option as if it were present, with no error. Mirrors
+    /// `check_failing_call_positions`/`check_fifo_op_positions` exactly.
+    pub(crate) fn check_guard_positions(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        let mut bad = Vec::new();
+        self.guards_outside_allowed_positions(&body, &mut bad);
+        let logic_args = self.logic_arg_exprs(&body);
+        bad.retain(|e| !logic_args.contains(e));
+        for guard in bad {
+            self.error(
+                self.ast.expr_spans[guard.0 as usize].clone(),
+                "a guard (`expr?`) may only appear as a whole statement, the \
+                 entire right-hand side of `:=`, or the entire init of a `let` \
+                 (v0 restriction: not nested inside a larger expression, a \
+                 condition, or as an argument to a call — its failure \
+                 condition would not be folded into the rule's guard there)"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// Every `Expr::Guard` reachable within `stmts` that isn't sitting at
+    /// one of the three positions `check_guard_positions` allows —
+    /// walked generically via `sub_exprs` (lower.rs) rather than a
+    /// hand-copied exhaustive match, since a guard's own inner expr can
+    /// itself be arbitrarily shaped.
+    fn guards_outside_allowed_positions(&self, stmts: &[StmtId], out: &mut Vec<ExprId>) {
+        fn collect_guards(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
+            if matches!(ast.expr(id), Expr::Guard(_)) {
+                out.push(id);
+            }
+            for child in crate::lower::sub_exprs(ast, id) {
+                collect_guards(ast, child, out);
+            }
+        }
+        for stmt in stmts {
+            let allowed = match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) if matches!(self.ast.expr(e), Expr::Guard(_)) => Some(e),
+                Stmt::Assign { rhs, .. } if matches!(self.ast.expr(rhs), Expr::Guard(_)) => {
+                    Some(rhs)
+                }
+                Stmt::Let { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
+                    Some(init)
+                }
+                _ => None,
+            };
+            let mut roots: Vec<ExprId> = Vec::new();
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) => roots.push(e),
+                Stmt::Assign { lhs, rhs } => {
+                    roots.push(lhs);
+                    roots.push(rhs);
+                }
+                Stmt::Let { init, .. } => roots.push(init),
+                Stmt::Return(Some(e)) => roots.push(e),
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    roots.push(cond);
+                    self.guards_outside_allowed_positions(&then_body, out);
+                    if let Some(b) = &else_body {
+                        self.guards_outside_allowed_positions(b, out);
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    roots.push(cond);
+                    self.guards_outside_allowed_positions(&body, out);
+                }
+                Stmt::Return(None) | Stmt::Tick => {}
+            }
+            for root in roots {
+                let mut guards = Vec::new();
+                collect_guards(self.ast, root, &mut guards);
+                for g in guards {
+                    if Some(g) != allowed {
+                        out.push(g);
+                    }
+                }
+            }
         }
     }
 

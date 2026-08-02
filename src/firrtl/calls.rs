@@ -171,6 +171,7 @@ pub(crate) fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
                 collect_calls(ast, *value, out);
             }
         }
+        Expr::OptionTy(_) | Expr::Absent => {}
     }
 }
 
@@ -748,10 +749,8 @@ impl<'a> Emitter<'a> {
         for stmt in &body {
             if let Stmt::Expr(e) = self.ast.stmt(*stmt).clone() {
                 if let Expr::Guard(inner) = self.ast.expr(e) {
-                    conds.push(
-                        self.compile_expr(*inner)
-                            .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
-                    );
+                    let inner = *inner;
+                    conds.push(self.compile_guard_unwrap_cond(inner));
                 } else if is_guard_like(self.ast, self.res, e) {
                     // An implicit guard: `e` itself IS the condition,
                     // no `Guard` wrapper to unwrap.

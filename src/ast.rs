@@ -176,6 +176,20 @@ pub enum Expr {
         name: ExprId,
         fields: Vec<(String, ExprId)>,
     },
+    /// `?T` in a type position — sugar for a compiler-synthesized struct
+    /// `{ valid: bit, data: T }` (`Ty::Option`, types.rs). `inner` is
+    /// `T`'s own type expression. A prefix form (`?` before its operand),
+    /// unlike the postfix guard `?` (`cond?`) — the two share a token but
+    /// occupy disjoint parser positions (type position vs. a completed
+    /// value expression), so there's no ambiguity to resolve.
+    OptionTy(ExprId),
+    /// `false` — the literal absent value for a `?T`-typed target. Types
+    /// as the sentinel `Ty::AbsentLit`, which only unifies against a
+    /// `Ty::Option` target (`check_assignable`); used anywhere else, it's
+    /// a clean type error rather than a general `bits[1]` zero (see
+    /// `TokenKind::False`'s own doc comment for why it stays this
+    /// narrow).
+    Absent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +423,8 @@ impl Ast {
                 out.push(')');
                 out
             }
+            Expr::OptionTy(inner) => format!("(option {})", self.expr_sexpr(*inner)),
+            Expr::Absent => "false".to_string(),
         }
     }
 

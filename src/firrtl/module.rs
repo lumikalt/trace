@@ -63,20 +63,23 @@ pub(crate) fn emit_module(
     // name (what rule bodies write) and `emit_name` is its internal
     // backing register (see the `Item::Output` arm below).
     let mut regs: Vec<(String, String, u64, u64)> = Vec::new();
-    // A struct-typed reg/output expands into N entries in `regs` above
-    // (one flat register per leaf field, `match_name` keyed) — this map
-    // records, for exactly those entries, which struct-local name and
-    // field PATH (nested-struct-aware — `["inner", "a"]`, not just
-    // `"a"`) they came from, so the write-threading loop below
-    // (Registers section) can route through `struct_field_value_in_stmts`
-    // instead of the ordinary `reg_value_in_stmts` (which looks for a
-    // `match_name := ...` statement that a struct field write, `p :=
-    // Pair{...}`, never produces). Keyed by `match_name` (the same
-    // string used as `regs`' first tuple element) rather than adding a
-    // 5th tuple field, so `module_block`'s own signature — which only
-    // ever needs name/width/init, never the write source — doesn't need
-    // to change.
-    let mut struct_reg_source: HashMap<String, (String, Vec<String>)> = HashMap::new();
+    // A struct- or Option-typed reg/output expands into N entries in
+    // `regs` above (one flat register per leaf field, `match_name`
+    // keyed) — this map records, for exactly those entries, which
+    // struct/Option-local name, field PATH (nested-aware — `["inner",
+    // "a"]`, not just `"a"`), and ROOT TYPE (`Ty::Struct`/`Ty::Option` —
+    // needed to decide HOW to decompose the write: a struct literal's
+    // own field list vs. `false`/a coerced value) they came from, so the
+    // write-threading loop below (Registers section) can route through
+    // `struct_field_value_in_stmts` instead of the ordinary `reg_value_
+    // in_stmts` (which looks for a `match_name := ...` statement that
+    // neither a struct field write, `p := Pair{...}`, nor an Option
+    // write, `opt := false`/`opt := x`, ever produces). Keyed by
+    // `match_name` (the same string used as `regs`' first tuple
+    // element) rather than adding a 5th tuple field, so `module_block`'s
+    // own signature — which only ever needs name/width/init, never the
+    // write source — doesn't need to change.
+    let mut struct_reg_source: HashMap<String, (String, Vec<String>, Ty)> = HashMap::new();
     let mut mems = Vec::new();
     // `(fifo_name, width, depth)`.
     let mut fifos: Vec<(String, u64, u64)> = Vec::new();
@@ -111,9 +114,11 @@ pub(crate) fn emit_module(
                     // itself port-facing, so there's no separate
                     // internal-vs-external name split the way `Output`
                     // needs.
-                    Some(Ty::Struct {
-                        def: struct_def, ..
-                    }) => {
+                    Some(
+                        ref ty @ Ty::Struct {
+                            def: struct_def, ..
+                        },
+                    ) => {
                         let Some(fields) = cx.struct_field_widths(struct_def) else {
                             cx.error(
                                 ast.item_spans[id.0 as usize].clone(),
@@ -128,9 +133,32 @@ pub(crate) fn emit_module(
                         for (path, w) in fields {
                             let flat = format!("{}_{}", name.text, path.join("_"));
                             let fv = init
-                                .and_then(|e| cx.struct_lit_field_const(e, &path))
+                                .and_then(|e| cx.struct_lit_field_const(e, &path, struct_def))
                                 .unwrap_or(0);
-                            struct_reg_source.insert(flat.clone(), (name.text.clone(), path));
+                            struct_reg_source
+                                .insert(flat.clone(), (name.text.clone(), path, ty.clone()));
+                            regs.push((flat.clone(), flat, w, fv));
+                        }
+                    }
+                    Some(ref ty @ Ty::Option(ref inner)) => {
+                        let Some(fields) = cx.option_field_widths(inner) else {
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!("`{}` has a field with no concrete bit width", name.text),
+                            );
+                            continue;
+                        };
+                        let init = match ast.item(*id) {
+                            Item::Reg { init: Some(e), .. } => Some(*e),
+                            _ => None,
+                        };
+                        for (path, w) in fields {
+                            let flat = format!("{}_{}", name.text, path.join("_"));
+                            let fv = init
+                                .and_then(|e| cx.option_lit_field_const(e, &path, inner))
+                                .unwrap_or(0);
+                            struct_reg_source
+                                .insert(flat.clone(), (name.text.clone(), path, ty.clone()));
                             regs.push((flat.clone(), flat, w, fv));
                         }
                     }
@@ -150,6 +178,18 @@ pub(crate) fn emit_module(
                         def: struct_def, ..
                     }) => {
                         let Some(fields) = cx.struct_field_widths(struct_def) else {
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!("`{}` has a field with no concrete bit width", name.text),
+                            );
+                            continue;
+                        };
+                        for (path, w) in fields {
+                            inputs.push((format!("{}_{}", name.text, path.join("_")), w));
+                        }
+                    }
+                    Some(Ty::Option(ref inner)) => {
+                        let Some(fields) = cx.option_field_widths(inner) else {
                             cx.error(
                                 ast.item_spans[id.0 as usize].clone(),
                                 format!("`{}` has a field with no concrete bit width", name.text),
@@ -188,9 +228,11 @@ pub(crate) fn emit_module(
                         outputs.push((name.text.clone(), internal.clone(), w));
                         cx.output_regs.insert(name.text.clone(), internal);
                     }
-                    Some(Ty::Struct {
-                        def: struct_def, ..
-                    }) => {
+                    Some(
+                        ref ty @ Ty::Struct {
+                            def: struct_def, ..
+                        },
+                    ) => {
                         let Some(fields) = cx.struct_field_widths(struct_def) else {
                             cx.error(
                                 ast.item_spans[id.0 as usize].clone(),
@@ -204,12 +246,38 @@ pub(crate) fn emit_module(
                         };
                         for (path, w) in fields {
                             let fv = init
-                                .and_then(|e| cx.struct_lit_field_const(e, &path))
+                                .and_then(|e| cx.struct_lit_field_const(e, &path, struct_def))
                                 .unwrap_or(0);
                             let suffix = path.join("_");
                             let port = format!("{}_{suffix}", name.text);
                             let internal = format!("__out_{}_{suffix}", name.text);
-                            struct_reg_source.insert(port.clone(), (name.text.clone(), path));
+                            struct_reg_source
+                                .insert(port.clone(), (name.text.clone(), path, ty.clone()));
+                            regs.push((port.clone(), internal.clone(), w, fv));
+                            outputs.push((port, internal, w));
+                        }
+                    }
+                    Some(ref ty @ Ty::Option(ref inner)) => {
+                        let Some(fields) = cx.option_field_widths(inner) else {
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!("`{}` has a field with no concrete bit width", name.text),
+                            );
+                            continue;
+                        };
+                        let init = match ast.item(*id) {
+                            Item::Output { init: Some(e), .. } => Some(*e),
+                            _ => None,
+                        };
+                        for (path, w) in fields {
+                            let fv = init
+                                .and_then(|e| cx.option_lit_field_const(e, &path, inner))
+                                .unwrap_or(0);
+                            let suffix = path.join("_");
+                            let port = format!("{}_{suffix}", name.text);
+                            let internal = format!("__out_{}_{suffix}", name.text);
+                            struct_reg_source
+                                .insert(port.clone(), (name.text.clone(), path, ty.clone()));
                             regs.push((port.clone(), internal.clone(), w, fv));
                             outputs.push((port, internal, w));
                         }
@@ -352,6 +420,22 @@ pub(crate) fn emit_module(
                                     name.text
                                 ),
                             );
+                        } else if matches!(ty, Ty::Option(_)) {
+                            // Same flattening hazard as a struct-typed
+                            // port -- `?T` also flattens to N `{name}_
+                            // {field}` ports (`{name}_valid`/`{name}_
+                            // data`, via `option_field_widths`), so
+                            // wiring it here by the bare name has the
+                            // identical failure mode.
+                            cx.error(
+                                ast.item_spans[id.0 as usize].clone(),
+                                format!(
+                                    "instance `{}` has a `?T`-typed port `{pname}` \
+                                     -- `?T`-typed ports on an instantiated submodule \
+                                     aren't supported yet (v0 restriction)",
+                                    name.text
+                                ),
+                            );
                         }
                     }
                 }
@@ -405,6 +489,7 @@ pub(crate) fn emit_module(
     // `inst_port_value_in_stmts`/`mem_write_in_stmts`).
     for rule in &rules {
         cx.check_guard_placement(*rule);
+        cx.check_guard_positions(*rule);
         cx.check_writing_call_positions(*rule);
         cx.check_failing_call_positions(*rule);
         cx.check_fifo_op_positions(*rule);
@@ -693,16 +778,25 @@ pub(crate) fn emit_module(
         for rule in &rules {
             cx.enter_rule(*rule);
             let body = rule_body(ast, *rule);
-            // A struct-typed reg/output's flat field entry has no
-            // `match_name := ...` statement to find directly (the user
-            // writes the WHOLE struct, `p := Pair{...}`) — route through
-            // `struct_field_value_in_stmts` instead, which looks for that
-            // whole-value assignment and pulls out just this field's own
-            // sub-expression.
+            // A struct- or Option-typed reg/output's flat field entry has
+            // no `match_name := ...` statement to find directly (the
+            // user writes the WHOLE value — `p := Pair{...}`, or `opt :=
+            // false`/`opt := x`) — route through `struct_field_value_in_
+            // stmts` instead, which looks for that whole-value
+            // assignment and pulls out just this field's own value
+            // (decomposing a struct literal's own fields, or — when
+            // `root_ty` is `Ty::Option` — synthesizing `valid`/`data`
+            // from `false`/a coerced value; see that fn's own doc
+            // comment).
             let found = match struct_reg_source.get(match_name) {
-                Some((struct_name, field_path)) => {
-                    cx.struct_field_value_in_stmts(&body, *rule, struct_name, field_path, *width)
-                }
+                Some((struct_name, field_path, root_ty)) => cx.struct_field_value_in_stmts(
+                    &body,
+                    *rule,
+                    struct_name,
+                    field_path,
+                    *width,
+                    root_ty,
+                ),
                 None => cx.reg_value_in_stmts(&body, *rule, match_name, *width),
             };
             if let Some(v) = found {

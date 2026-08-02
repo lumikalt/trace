@@ -1,0 +1,45 @@
+-- `?T` sugar for an optional value: `{valid: bit, data: T}` under the
+-- hood, reusing every bit of struct flattening/read/write machinery.
+-- Verse spells the absent case `false` (tying into its logic-
+-- programming failure model) rather than a dedicated `none` keyword —
+-- a bare value of `T` coerces implicitly to the present case wherever
+-- it's written. Unwrapping goes through the SAME `?` guard operator a
+-- fifo `Deq[]`/a failing call already uses: `opt?` fails the rule (and
+-- so never commits any of its writes) if `opt` is absent, or evaluates
+-- to the unwrapped `T` if present — see DESIGN.md's "Option types"
+-- section. `.valid`/`.data` stay directly readable too, for a
+-- non-failing presence check via plain `if`/`else`.
+module Option {
+    fifo input : bits[8]
+    reg opt : ?bits[8] = false
+    out result : bits[8] = 0
+    out was_present : bit = 0
+    out relayed : ?bits[8] = false
+
+    rule fill {
+        let d = input.Deq[]
+        opt := d
+    }
+
+    rule pass {
+        result := opt?
+    }
+
+    rule check {
+        if opt.valid {
+            was_present := 1
+        } else {
+            was_present := 0
+        }
+        -- An `?T`-typed OUTPUT port flattens/write-threads the same way
+        -- an `?T`-typed reg does, but through separate bookkeeping
+        -- (`__out_{port}_{field}` internal registers, `struct_reg_
+        -- source` keyed by the PORT name) -- exercised here directly,
+        -- not just inferred from the reg case.
+        if opt.valid {
+            relayed := opt.data
+        } else {
+            relayed := false
+        }
+    }
+}

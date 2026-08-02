@@ -671,8 +671,8 @@ caught before it ever reaches flattening (see "Struct emission" under Part
 2), not a stack overflow.
 
 v0 restrictions, all enforced as clean compile-time errors rather than left to
-miscompile: a field's type must be `bits[N]` or another struct (no `list`, no
-fifo/mem); a struct has no per-field write — `p.field := x` is rejected,
+miscompile: a field's type must be `bits[N]`, another struct, or `?T` (no
+`list`, no fifo/mem); a struct has no per-field write — `p.field := x` is rejected,
 assign the whole value instead (`p := Pair{...}`, same restriction a `spawn`
 handle's `.result`/`.done` fields already have); a struct-typed write's
 right-hand side must itself be a struct literal, not another struct-typed
@@ -686,6 +686,105 @@ way to reach those).
 Struct destructuring (binding several locals from one struct value in a
 single statement) is a natural follow-on but not yet implemented — see
 TODO.md.
+
+## Option types
+
+`?T` is sugar for a compiler-synthesized `{ valid: bit, data: T }` struct —
+it reuses every bit of struct flattening/read/write machinery, not a parallel
+mechanism of its own. Verse spells the absent case `false` rather than a
+dedicated `none` keyword, tying it into Verse's logic-programming failure
+model; a bare value of `T` coerces implicitly to the present case wherever
+it's *written* (a reg/output/local init, a state write, an ordinary
+assignable position):
+
+```trace
+reg opt : ?bits[8] = false   -- absent
+...
+opt := 8'd5                  -- present(5), no wrapper syntax needed
+opt := false                 -- absent again
+```
+
+`false` is a real lexer keyword, not a general boolean literal — there is no
+`true` counterpart. This is deliberate: if `false` doubled as a plain zero
+bit, `?bit` would be ambiguous between "absent" and "present, holding 0".
+`false` only type-checks against a `?T` target.
+
+Unwrapping goes through the *same* `?` guard operator a fifo `Deq[]` or a
+`<fails>` call already uses, generalized: when its operand types as `?T`
+instead of `bits[1]`, `opt?` fails the rule (discarding any writes it would
+have made) if `opt` is absent, or evaluates to the unwrapped `T` if present —
+the exact same `fails`-folding machinery a fifo occupancy check already
+threads into a rule's guard:
+
+```trace
+module M {
+    fifo input : bits[8]
+    reg opt : ?bits[8] = false
+    out result : bits[8] = 0
+
+    rule fill {
+        let d = input.Deq[]
+        opt := d
+    }
+
+    rule pass {
+        result := opt?   -- only fires (and only writes result) when opt is present
+    }
+}
+```
+
+A non-failing presence check needs no new syntax either — `.valid`/`.data`
+read back directly, same as any other struct field:
+
+```trace
+if opt.valid {
+    result := opt.data
+} else {
+    result := 0
+}
+```
+
+`?T`'s guard placement follows the identical "whole statement, entire `:=`
+right-hand side, or entire `let` init" restriction a fifo op/failing call
+already has — `let x = opt?` folds its failure condition into the rule's
+guard the same way `x := opt?` does; a guard nested any deeper (an
+arithmetic operand, a call argument, an `if` condition — including chaining
+straight into a field, `opt?.valid`) is a compile-time error rather than a
+silently-unfolded guard, since `compile_guard`'s fold only looks in those
+three positions. Unwrap-via-`?` and non-failing access via `.valid`/`.data`
+are two distinct idioms, not composable into one chain — pick one per read.
+
+v0 restrictions, matching structs': a `?T`-typed write's right-hand side must
+be `false` or a plain value of `T` — copying one `?T` value into another
+(`p := q`, both `?T`) isn't supported yet, and neither is a plain local
+merely aliasing another `?T`-typed value (`let o = opt; o.valid` — the exact
+restriction a struct-typed local has, `let p = q; p.field`, whether the
+alias is read via `.valid`/`.data` or through `?`'s guard fold); `.valid`/
+`.data` are read-only; a `?T`-typed fn/rule param or return type isn't
+supported yet (see TODO.md); a `?T`-typed port on an instantiated submodule
+is rejected, same reason and same fix a struct-typed port needs. `T` may
+itself be a struct (`reg o : ?Pair`), or a struct's own field may itself be
+`?T` — nested arbitrarily either way, reusing struct's own recursive
+flattening; both a `?T`-typed `reg` and a `?T`-typed `out` write-thread
+correctly (the two go through separate bookkeeping — `examples/option.tr`'s
+`relayed` output exercises the `out` side directly). A `?T` guard folds
+correctly from inside a callee body too (`callee_fail_cond`, calls.rs's own
+cross-file guard-fold site — the same "is it present" `valid`-field read
+`compile_guard`'s three in-rule fold sites use, not `opt`'s own nonexistent
+flat name) — for a `reg`/`output`/`input` root; a local/param root's `.valid`/
+`.data`/`?` all reduce to the aliasing restriction above instead.
+
+`??T` (`T` itself an `Option`) compiles and simulates correctly, but only
+for the two states reachable through today's syntax — fully absent
+(`false`) and fully present (a bare value of the innermost type, coerced
+through both layers by `check_assignable`'s recursive rule). It is not a
+general two-independent-layers nested Option: the outer and inner `valid`
+bits are provably always equal (no write path can ever separate them —
+`.data` is read-only, and a `?T`-typed expression can't be written into a
+`??T` target, a plain type mismatch, not a copy). `Some(None)` (outer
+present, inner absent) is genuinely inexpressible with current syntax, not
+merely untested; making the layers independent would need a construction
+syntax that doesn't exist yet.
 
 ## Locals
 
@@ -1376,16 +1475,20 @@ the user writes the *whole* struct (`p := Pair{...}`), one literal covering
 every field at once. `struct_field_value_in_stmts` mirrors that walk's
 if/else mux-threading structure but, on finding a matching whole-value
 assignment, pulls out just one LEAF field's own sub-expression per call —
-one call per flat register, walking a field PATH (`["header", "valid"]`,
-not just `"valid"`) into any nesting depth of struct literal via
-`find_struct_lit_field`, shared with the read side (`expr.rs`'s
-`compile_struct_field_read`, which peels a chased `.field.field` chain back
-down to its root value and the same path before dispatching). A struct-typed
-write whose right-hand side isn't literally a struct literal (`p := q`
-between two struct-typed regs) is rejected at type-check time rather than
-silently compiling to nothing here: the field-path walk can only decompose
-a literal, so a non-literal RHS would otherwise leave the register frozen
-at its reset value with no error at all.
+one call per flat register, walking a field PATH (`["header", "valid"]`, not
+just `"valid"`) into any nesting depth via `compile_field_path_value`,
+shared with the read side (`expr.rs`'s `compile_struct_field_read`, which
+peels a chased `.field.field` chain back down to its root value and the same
+path before dispatching). `compile_field_path_value` dispatches on the
+*current* type at each level it descends (`Ty::Struct` vs `Ty::Option`, see
+"Option emission" below) rather than assuming a struct literal all the way
+down — needed once a struct field could itself be `?T`, whose own literal
+form (`false`, or a bare coerced value) isn't another `Expr::StructLit` to
+keep walking structurally. A struct-typed write whose right-hand side isn't
+literally a struct literal (`p := q` between two struct-typed regs) is
+rejected at type-check time rather than silently compiling to nothing here:
+the field-path walk can only decompose a literal, so a non-literal RHS would
+otherwise leave the register frozen at its reset value with no error at all.
 
 A struct-typed port on an *instantiated* submodule is rejected outright
 (v0): the target module's own emission flattens its port to N real FIRRTL
@@ -1396,6 +1499,80 @@ declares `p_valid`/`p_data` would either reference a nonexistent port or
 silently default-wire a single bit (`port_bit_width`'s `unwrap_or(1)`
 fallback, built for scalar ports and never meant to see a struct). Caught
 explicitly at instance-collection time instead of surfacing as either.
+
+## Option emission
+
+`?T` never emits a real FIRRTL bundle either, for the identical reason a
+`struct` doesn't — it flattens to exactly two leaf entries, `valid` (1 bit)
+and `data` (`T`'s own flat shape: one register if `T` is `bits[N]`, or `T`'s
+own recursive field list, `data`-prefixed, if `T` is itself a struct or
+another `?T`). `option_field_widths` is `struct_field_widths`'s Option
+counterpart, sharing the exact same recursion/joining convention.
+
+`?T` has no literal AST form of its own the way a struct literal does —
+`opt := false` and `opt := 8'd5` are both just an ordinary expression, not a
+dedicated `OptionLit` node. `compile_field_path_value`'s `Ty::Option` arm
+(writes.rs) synthesizes `valid`/`data` directly instead of looking for a
+sub-expression that doesn't exist: `valid` is a constant `0`/`1` depending on
+whether the expression is literally `Expr::Absent`; `data` is the expression
+itself when present (there's no separate wrapper syntax to unwrap — the
+coerced expression *is* the `T` value) or a don't-care zero when absent.
+`data`'s own path continuation (when `T` is itself struct/Option-shaped)
+recurses into `compile_field_path_value` with the *same* expression,
+dispatched against `T`'s type — presence doesn't add a layer of the AST to
+peel off, only a layer of the flat-path naming. `option_lit_field_const`
+(mod.rs) is the identical shape one level earlier, computing a `?T`-typed
+reg/output's constant reset init instead of a live write's value.
+
+This arm's whole "is it literally `Expr::Absent`, else definitely present"
+logic depends on an invariant it doesn't itself enforce: the expression must
+be `false` or a plain value of `T` being coerced present, never *another*
+`?T`-typed expression. For a state WRITE that invariant comes from
+`type_write`'s Option-to-Option rejection (a separate, earlier check) — but
+a plain `let` has no target type to check against, so `let o = opt` (`opt`
+itself `?T`) types by ordinary inference and reaches this arm with the
+invariant already broken, `expr` itself `Ty::Option`. Self-caught while
+investigating `?T`-typed fn params (which bind an argument through this
+same path): without a guard, this silently concluded "definitely present"
+and hardcoded `UInt<1>(1)`/a zero-width constant, completely ignoring
+`opt_valid`'s actual runtime value — a real miscompile, not just a missing
+feature. Fixed by checking `expr`'s own type at the top of the arm and
+returning `None` (routed to a clean error by the caller) whenever it's
+itself `Ty::Option` — the same aliasing restriction a struct-typed local
+already has (`let p = q`, `p` merely aliasing another struct-typed value,
+rejected identically), now closed for Option too instead of silently
+"supported" through a bug.
+
+The `?` guard operator, generalized: `opt?` used as a *value*
+(`compile_expr_hinted`'s `Expr::Guard` arm, expr.rs) compiles to a read of
+`data` off `opt`'s own field path — reusing the identical peeling/dispatch
+`.field` access already has, so `opt?` and `opt.data` compile to the exact
+same FIRRTL text (the difference is entirely on the *guard* side). `opt?`'s
+contribution to a rule's *guard* (`compile_guard_unwrap_cond`, writes.rs) is
+computed separately: for a `?T`-typed operand it reads `valid` instead of
+compiling the operand as an ordinary `bits[1]` condition, then folds into
+the rule's guard through the same `fails`-folding machinery a fifo
+occupancy check or a `<fails>` callee's condition already uses. This fold
+only runs at the three positions `check_guard_positions` (checks.rs) allows
+a guard to sit at — a whole bare statement, the entire right-hand side of
+`:=`, or the entire init of a `let` — mirroring `check_failing_call_
+positions`/`check_fifo_op_positions` exactly; a guard nested any deeper (an
+arithmetic operand, a call argument, an `if` condition, or a field access
+chained straight off it, `opt?.valid`) is rejected outright rather than left
+to silently read `data` with no corresponding guard term.
+`compile_guard_unwrap_cond` is `pub(crate)` and has a fourth caller besides
+`compile_guard`'s own three: `callee_fail_cond` (calls.rs), which folds a
+bare-statement guard found inside a CALLEE's own body into the caller's
+rule guard. Advisor caught this cross-file site pre-commit compiling a
+`?T` guard's inner expression as an ordinary condition regardless of type —
+for a `?T` operand that emitted a reference to a register that was never
+declared (`opt`, not `opt_valid`), a real firtool-rejected miscompile, not
+merely a wrong value; routing it through the same helper closed it.
+
+A `?T`-typed port on an instantiated submodule is rejected the same way and
+for the same reason a struct-typed one is (see "Struct emission" above) —
+`?T` flattens to `{name}_valid`/`{name}_data` in the target module's own
+port list, unreachable by the bare, unflattened name instance-wiring uses.
 
 ## Calling a function: inlining
 
@@ -1619,6 +1796,11 @@ adder_tree.tr`, DESIGN.md's own `AdderTree`).
   may itself be a struct, cycle-rejected), flattened to N plain
   registers/ports per LEAF field with no real FIRRTL bundle ever emitted
   (`examples/struct_pair.tr`, `examples/struct_nested.tr`).
+- `?T` option types: `false` (absent)/implicit-coercion (present)
+  construction, unwrap via the generalized `?` guard operator (folds into a
+  rule's guard the same way a fifo `Deq[]` already does, including through a
+  `let` init), non-failing `.valid`/`.data` presence check, `T` itself a
+  struct or another `?T` (`examples/option.tr`).
 
 Not yet implemented:
 

@@ -4080,3 +4080,480 @@ module M {
     assert!(fir.contains("connect x, mux(cond, UInt<8>(1), x)"));
     run_firtool(&fir, &[]);
 }
+
+/// `?T` never emits a real FIRRTL bundle either, same as a plain
+/// `struct` -- a `?T`-typed REG flattens to two registers, `{name}_
+/// valid`/`{name}_data`; `false` writes `valid=0`, a bare value of `T`
+/// (auto-coerced present) writes `valid=1`. A `?T`-typed OUTPUT PORT
+/// flattens the same way but through separate bookkeeping (real
+/// `output {port}_valid`/`{port}_data` ports, backed by internal
+/// `__out_{port}_valid`/`{port}_data` registers) -- pinned here too,
+/// not just inferred from the reg case: advisor caught this test
+/// originally claimed to cover both while its source (`examples/
+/// option.tr`) had no `?T`-typed output at all.
+#[test]
+fn option_reg_and_output_flatten_to_valid_data_registers() {
+    let fir = emit_from_source(&read_example("option.tr")).expect("emission should succeed");
+    assert!(fir.contains("regreset opt_valid : UInt<1>"));
+    assert!(fir.contains("regreset opt_data : UInt<8>"));
+    assert!(fir.contains("connect opt_valid, UInt<1>(1)"));
+    assert!(fir.contains("connect opt_data, __fifo_input_data"));
+    assert!(fir.contains("output relayed_valid : UInt<1>"));
+    assert!(fir.contains("output relayed_data : UInt<8>"));
+    assert!(fir.contains("regreset __out_relayed_valid : UInt<1>"));
+    assert!(fir.contains("regreset __out_relayed_data : UInt<8>"));
+    assert!(fir.contains("connect __out_relayed_valid, mux(opt_valid, UInt<1>(1), UInt<1>(0))"));
+    assert!(fir.contains("connect relayed_valid, __out_relayed_valid"));
+    run_firtool(&fir, &[]);
+}
+
+/// A `?T`-typed port on an instantiated submodule hits the identical
+/// flattening hazard a struct-typed port does (`struct_typed_instance_
+/// port_is_rejected`) -- `?T` flattens to `{name}_valid`/`{name}_data`
+/// in the target module's own port list, so wiring it here by the bare
+/// name would reference a nonexistent port.
+#[test]
+fn option_typed_instance_port_is_rejected() {
+    let src = "\
+module Child {
+    out p : ?bits[8] = false
+    rule fill {
+        p := 8'd5
+    }
+}
+
+module Parent {
+    inst c : Child
+    out v : bit = 0
+    rule read {
+        v := c.p.valid
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter().any(|e| e.message.contains("`?T`-typed port")),
+        "expected a `?T`-typed-port rejection, got: {err:?}"
+    );
+}
+
+/// `?bit` is the discriminating case for spelling absent as `false`
+/// rather than a general boolean zero: `opt_valid`/`opt_data` are both
+/// `UInt<1>`, but they're two DISTINCT signals, not the same bit doing
+/// double duty -- `false` clears both, while a present `1` sets both
+/// independently. This pins the emitted shape; `sim/option_tb.v`'s
+/// `check`/`pass` rules exercise the general (wider-than-1-bit) case at
+/// runtime.
+#[test]
+fn option_of_bit_flattens_to_two_distinct_one_bit_registers() {
+    let src = "\
+module M {
+    reg opt : ?bit = false
+    in go : bit
+    in present : bit
+
+    rule fill {
+        go?
+        if present {
+            opt := 1
+        } else {
+            opt := false
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset opt_valid : UInt<1>"));
+    assert!(fir.contains("regreset opt_data : UInt<1>"));
+    assert!(fir.contains("connect opt_valid, mux(present, UInt<1>(1), UInt<1>(0))"));
+    assert!(fir.contains("connect opt_data, mux(present, UInt<1>(1), UInt<1>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct field may itself be `?T` -- flattens recursively the same
+/// way a nested struct field does (`{struct}_{field}_valid`/`_data`),
+/// and a struct literal's init const-evaluates correctly through the
+/// nested `?T` field too (this pins a real bug advisor caught: an
+/// earlier version of `struct_lit_field_const` assumed every
+/// intermediate struct field's value was itself another `Expr::
+/// StructLit`, which silently returned `None` -- falling back to a
+/// wrong `0` init -- the moment it reached a `?T` field instead).
+#[test]
+fn nested_option_struct_field_flattens_and_inits_correctly() {
+    let src = "\
+struct Frame {
+    id : bits[4]
+    maybe : ?bits[8]
+}
+
+module M {
+    reg fr : Frame = Frame{ id: 3, maybe: 8'd5 }
+    out ok : bit = 0
+    out val : bits[8] = 0
+
+    rule r {
+        if fr.maybe.valid {
+            ok := 1
+            val := fr.maybe.data
+        } else {
+            ok := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset fr_id : UInt<4>, clock, reset, UInt<4>(3)"));
+    assert!(fir.contains("regreset fr_maybe_valid : UInt<1>, clock, reset, UInt<1>(1)"));
+    assert!(fir.contains("regreset fr_maybe_data : UInt<8>, clock, reset, UInt<8>(5)"));
+    run_firtool(&fir, &[]);
+}
+
+/// `let x = opt?` folds its failure condition into the rule's own guard
+/// exactly like `x := opt?`/a bare `opt?` statement already do --
+/// advisor caught this as a real gap pre-commit: the position check
+/// (`check_guard_positions`) alone allowed a `let` init to be a whole
+/// guard, but `compile_guard`'s fold didn't look there, so the rule
+/// would have fired unconditionally, reading a stale/garbage unwrapped
+/// value on a cycle `opt` was actually absent.
+#[test]
+fn let_bound_option_unwrap_folds_its_guard() {
+    let src = "\
+module M {
+    reg opt : ?bits[8] = false
+    out val : bits[8] = 0
+    in go : bit
+
+    rule fill {
+        go?
+        opt := 8'd9
+    }
+
+    rule pass {
+        let x = opt?
+        val := x
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_pass = and(opt_valid, not(fires_fill))"));
+    run_firtool(&fir, &[]);
+}
+
+/// The `let`-bound case of `check_guard_placement`'s "guard after a
+/// state write" restriction -- mirrors `a_bare_condition_after_a_
+/// state_write_is_an_error` for the `Stmt::Let` position specifically.
+#[test]
+fn let_bound_option_unwrap_after_a_state_write_is_rejected() {
+    let src = "\
+module M {
+    reg opt : ?bits[8] = false
+    reg other : bits[8] = 0
+    rule r {
+        other := 1
+        let x = opt?
+        other := x
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("guard") && e.message.contains("state write"))
+    );
+}
+
+/// A guard nested inside a larger expression (here, an arithmetic
+/// operand) is rejected outright rather than silently never folded --
+/// `compile_guard`'s fold only looks at three exact positions (bare
+/// statement, whole `:=` RHS, whole `let` init); anywhere else, the
+/// value side (`compile_expr_hinted`'s `Expr::Guard` arm) would happily
+/// read `opt.data` with no corresponding guard term, reading an absent
+/// Option as if it were present. Advisor-caught: this is the general
+/// form of the same hole `let_bound_option_unwrap_folds_its_guard`
+/// closes for the `let`-init position specifically.
+#[test]
+fn a_guard_nested_in_arithmetic_is_rejected() {
+    let src = "\
+module M {
+    reg opt : ?bits[8] = false
+    out val : bits[8] = 0
+    in go : bit
+
+    rule fill {
+        go?
+        opt := 8'd9
+    }
+
+    rule bad {
+        val := opt? + 1
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("guard") && e.message.contains("nested")),
+        "expected a nested-guard rejection, got: {err:?}"
+    );
+}
+
+/// A `?T`-typed field access over a Guard base (`o?.valid`) is cleanly
+/// rejected by `check_guard_positions`, not silently miscompiled -- the
+/// `Expr::Guard` here isn't the WHOLE right-hand side of `:=` (a
+/// `.valid` field wraps around it), so it's "nested" the same as
+/// `a_guard_nested_in_arithmetic_is_rejected`'s case. Pins the answer
+/// to a question raised while designing `?T`: unwrap via `?` and
+/// non-failing access via `.valid`/`.data` are two DISTINCT idioms, not
+/// composable into one chain.
+#[test]
+fn a_guard_field_accessed_directly_is_rejected() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    reg o : ?Pair = Pair{ valid: 1, data: 8'd7 }
+    out ok : bit = 0
+    rule r {
+        ok := o?.valid
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("guard") && e.message.contains("nested")),
+        "expected a nested-guard rejection, got: {err:?}"
+    );
+}
+
+/// `?T` where `T` is itself a struct -- `option_field_widths`'s
+/// `Ty::Struct` recursion arm, `compile_field_path_value`'s Option-to-
+/// Struct handoff, and `option_lit_field_const`'s matching handoff all
+/// exercised together. `o`'s nonzero init (`valid: 1, data: 7`)
+/// discriminates the const-eval path from a `0`-fallback the same way
+/// `nested_option_struct_field_flattens_and_inits_correctly` does for
+/// the opposite nesting order.
+#[test]
+fn option_of_a_struct_flattens_and_inits_correctly() {
+    let src = "\
+struct Pair {
+    valid : bit
+    data : bits[8]
+}
+
+module M {
+    reg o : ?Pair = Pair{ valid: 1, data: 8'd7 }
+    out ok : bit = 0
+    rule r {
+        ok := o.data.valid
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset o_valid : UInt<1>, clock, reset, UInt<1>(1)"));
+    assert!(fir.contains("regreset o_data_valid : UInt<1>, clock, reset, UInt<1>(1)"));
+    assert!(fir.contains("regreset o_data_data : UInt<8>, clock, reset, UInt<8>(7)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A `?T` guard folded from INSIDE a callee body (`callee_fail_cond`,
+/// calls.rs) -- the fourth, cross-file guard-fold site, separate from
+/// `compile_guard`'s three (writes.rs). Advisor caught this one
+/// pre-commit: it originally compiled the guard's inner expression as
+/// an ordinary condition regardless of type, which for a `?T` operand
+/// emitted a reference to a register that was never declared (`opt`
+/// instead of `opt_valid`) -- a real firtool-rejected miscompile, not
+/// just a wrong value. `Consume`'s body is a bare-statement `opt?`
+/// (discarding the unwrapped value) followed by a separate `.data`
+/// read, the one shape `check_fails_is_foldable_guard` actually allows
+/// here (a `return opt?` with the guard AS the return value is
+/// rejected outright before this fold ever runs, a stricter but
+/// correct restriction, not this bug).
+#[test]
+fn a_callee_bodys_option_guard_folds_correctly() {
+    let src = "\
+module M {
+    reg opt : ?bits[8] = false
+    out result : bits[8] = 0
+
+    Consume() : bits[8] <combines, fails> {
+        opt?
+        return opt.data
+    }
+
+    rule r {
+        result := Consume()
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = opt_valid"));
+    run_firtool(&fir, &[]);
+}
+
+/// A `?T`-typed OUTPUT written nested in `if` with no `else` -- the
+/// hold-the-current-value fallback (`struct_field_value_in_stmts`'s
+/// hold name, built as `{name}_{path}`) resolves to the flat PORT name
+/// (`relayed_valid`), not the internal `__out_relayed_valid` backing
+/// register `reg_value_in_stmts` would use for a plain scalar output.
+/// Advisor flagged this as a possible bug pre-commit; confirmed
+/// harmless instead: firtool elaborates the port as a pure
+/// combinational alias of its backing register (`wire _relayed_valid_
+/// output = __out_relayed_valid`), so referencing it as the hold value
+/// is value-identical to referencing the register directly -- verified
+/// through a full Icarus run holding correctly across multiple `go=0`
+/// cycles, not just firtool acceptance. Pinned here as a real test
+/// rather than left as a hand probe.
+#[test]
+fn option_typed_output_written_nested_in_if_with_no_else_holds_correctly() {
+    let src = "\
+module M {
+    reg opt : ?bits[8] = false
+    out relayed : ?bits[8] = false
+    in go : bit
+    rule r {
+        if go {
+            relayed := opt.data
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_relayed_valid, mux(go, UInt<1>(1), relayed_valid)"));
+    assert!(fir.contains("connect __out_relayed_data, mux(go, opt_data, relayed_data)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A `?T`-typed INPUT flattens to two real input ports, `{name}_valid`/
+/// `{name}_data` -- the read side needs no `struct_reg_source` entry at
+/// all (an input has no write to thread), just the ordinary flat-name
+/// field read every other `.field` access already resolves.
+#[test]
+fn option_typed_input_flattens_to_two_ports() {
+    let src = "\
+module M {
+    in i : ?bits[8]
+    out ok : bit = 0
+    rule r {
+        ok := i.valid
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("input i_valid : UInt<1>"));
+    assert!(fir.contains("input i_data : UInt<8>"));
+    assert!(fir.contains("connect __out_ok, i_valid"));
+    run_firtool(&fir, &[]);
+}
+
+/// `??T` (`T` itself `?U`) compiles and simulates correctly for the two
+/// states actually reachable through today's syntax -- fully absent
+/// (`false`) and fully present (a bare `bits[8]` value, coerced through
+/// BOTH Option layers by `check_assignable`'s recursive coercion rule).
+/// It is NOT a general two-independent-layers nested Option, though:
+/// `oo_valid` and `oo_data_valid` get byte-identical mux expressions in
+/// every branch below, because there is no write path that can ever
+/// separate them -- `.data` is read-only, and a `?T`-typed expression
+/// can't be written into a `??T` target (a plain type mismatch, see
+/// `differently_shaped_option_write_is_one_plain_type_mismatch_not_
+/// two_errors` in tests/types.rs). `Some(None)` (outer present, inner
+/// absent) is genuinely inexpressible with current syntax, not merely
+/// untested -- see TODO.md.
+#[test]
+fn nested_option_reaches_only_fully_absent_or_fully_present() {
+    let src = "\
+module M {
+    reg oo : ??bits[8] = false
+    out outer_valid : bit = 0
+    out inner_valid : bit = 0
+    out val : bits[8] = 0
+    in go : bit
+    in present : bit
+
+    rule fill {
+        go?
+        if present {
+            oo := 8'd7
+        } else {
+            oo := false
+        }
+    }
+
+    rule check {
+        outer_valid := oo.valid
+        inner_valid := oo.data.valid
+        val := oo.data.data
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset oo_valid : UInt<1>"));
+    assert!(fir.contains("regreset oo_data_valid : UInt<1>"));
+    assert!(fir.contains("regreset oo_data_data : UInt<8>"));
+    assert!(fir.contains("connect oo_valid, mux(present, UInt<1>(1), UInt<1>(0))"));
+    assert!(fir.contains("connect oo_data_valid, mux(present, UInt<1>(1), UInt<1>(0))"));
+    assert!(fir.contains("connect oo_data_data, mux(present, UInt<8>(7), UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A local bound to ANOTHER `?T`-typed value (`let o = opt`, `opt`
+/// itself `?bits[8]`) is rejected, the identical restriction a
+/// struct-typed local has (`struct_typed_local_aliasing_another_local_
+/// is_rejected`) -- pins a real bug found while investigating `?T`-
+/// typed fn params (which bind an argument through this exact same
+/// `compile_field_path_value` path): `type_write`'s Option-to-Option
+/// rejection only runs for a state WRITE with a known target type, so
+/// a plain `let` (no target type, ordinary type inference) reached
+/// `compile_field_path_value`'s `Ty::Option` arm with `expr` itself
+/// Option-typed, which the arm silently treated as "definitely
+/// present" -- hardcoding `UInt<1>(1)` regardless of `opt_valid`'s
+/// actual runtime value. Now a clean compile-time error instead.
+#[test]
+fn option_typed_local_aliasing_another_option_value_is_rejected() {
+    let src = "\
+module M {
+    reg opt : ?bits[8] = false
+    out ok : bit = 0
+    rule r {
+        let o = opt
+        ok := o.valid
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("not aliased from another `?T` value")),
+        "expected an option-aliasing rejection, got: {err:?}"
+    );
+}
+
+/// The same aliasing rejection reached through the `?` unwrap's GUARD
+/// fold (`compile_guard_unwrap_cond`), not just a plain `.valid` value
+/// read -- `val := o?` folds a guard condition through the identical
+/// `compile_field_path_value` path before ever compiling `o?`'s VALUE,
+/// so both would have hit the same silent-hardcoded-`UInt<1>(1)` bug
+/// pre-fix (the rule firing unconditionally on an absent Option, worse
+/// than a wrong read since it's invisible without simulating).
+#[test]
+fn option_typed_local_aliasing_is_rejected_through_the_guard_fold_too() {
+    let src = "\
+module M {
+    reg opt : ?bits[8] = false
+    out val : bits[8] = 0
+    rule r {
+        let o = opt
+        val := o?
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("not aliased from another `?T` value")),
+        "expected an option-aliasing rejection, got: {err:?}"
+    );
+}

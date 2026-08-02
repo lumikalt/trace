@@ -1452,3 +1452,37 @@ fn struct_nested_runs_through_real_ports() {
         "f/result did not settle correctly:\n{output}"
     );
 }
+
+/// Proves `?T` option types end to end: `examples/option.tr`'s `opt`
+/// resets to absent (`false`), a fifo-fed value coerces implicitly to
+/// present, the `?` unwrap (`result := opt?`) only takes effect on a
+/// cycle `opt` is actually present (its guard folds into `pass`'s own
+/// rule guard), the non-failing `.valid`/`.data` if/else escape hatch
+/// (`check`) tracks presence independently, and an `?T`-typed OUTPUT
+/// port (`relayed`) write-threads correctly through its own separate
+/// bookkeeping. See sim/option_tb.v.
+#[test]
+fn option_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/option.tr"))
+        .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/option_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains(
+            "final: opt_valid=1 opt_data=2a result=2a was_present=1 relayed_valid=1 \
+             relayed_data=2a"
+        ),
+        "opt/result/was_present/relayed did not settle correctly:\n{output}"
+    );
+}

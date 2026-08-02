@@ -264,6 +264,31 @@ impl<'a> Emitter<'a> {
             .unwrap_or_else(|| self.locals_snapshots.len().saturating_sub(1));
     }
 
+    /// A `Guard(inner)`'s own contribution to the rule's fires
+    /// condition: for an ordinary bits[1] `(cond)?`, that's just
+    /// `inner`'s own compiled value (unchanged from before `?T` existed)
+    /// — for `opt?`, `opt : ?T`, it's `inner`'s `valid` field instead
+    /// (the guard-worthy question is "is it present", not `data`'s own
+    /// bit pattern), reusing the same peeling/dispatch `.field` access
+    /// and `compile_expr_hinted`'s own `Expr::Guard` VALUE-compilation
+    /// arm both already have. `pub(crate)`: also called from calls.rs's
+    /// `callee_fail_cond`, the fourth (and only cross-file) guard-fold
+    /// site — advisor caught that it originally compiled a `?T` guard's
+    /// inner expression as an ordinary condition, emitting a reference
+    /// to a register that was never declared (`opt` instead of `opt_
+    /// valid`), a real firtool-rejected miscompile this closes.
+    pub(crate) fn compile_guard_unwrap_cond(&mut self, inner: ExprId) -> String {
+        if matches!(self.types.expr_tys.get(&inner), Some(Ty::Option(_))) {
+            let (root, mut path) = self.struct_field_path(inner);
+            path.push("valid".to_string());
+            self.compile_struct_field_read(inner, root, &path, Some(1))
+                .unwrap_or_else(|_| "UInt<1>(1)".to_string())
+        } else {
+            self.compile_expr(inner)
+                .unwrap_or_else(|_| "UInt<1>(1)".to_string())
+        }
+    }
+
     pub(crate) fn compile_guard(&mut self, rule: ItemId) -> String {
         let body = rule_body(self.ast, rule);
         // `rule_fifo_ops` (fifo.rs) already finds every fifo op this
@@ -334,10 +359,8 @@ impl<'a> Emitter<'a> {
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Expr(e) => {
                     if let Expr::Guard(inner) = self.ast.expr(e) {
-                        conds.push(
-                            self.compile_expr(*inner)
-                                .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
-                        );
+                        let inner = *inner;
+                        conds.push(self.compile_guard_unwrap_cond(inner));
                     } else {
                         conds.extend(stmt_fifo_conds);
                         if let Expr::Call { callee, args } = self.ast.expr(e).clone()
@@ -360,14 +383,35 @@ impl<'a> Emitter<'a> {
                         && let Some(cond) = self.callee_fail_cond(rhs, callee, &args)
                     {
                         conds.push(cond);
+                    } else if let Expr::Guard(inner) = self.ast.expr(rhs) {
+                        // `x := opt?` (or `x := (cond)?`): the guard sits
+                        // as the WHOLE right-hand side, same "bare
+                        // statement or entire RHS of `:=`" position a
+                        // failing call/fifo op is already restricted to
+                        // (`check_guard_placement`) — folds here the same
+                        // way the bare-statement case above does.
+                        let inner = *inner;
+                        conds.push(self.compile_guard_unwrap_cond(inner));
                     }
                 }
                 // A `let`-bound failing call is deliberately out of
                 // scope for now (`check_failing_call_positions` rejects
-                // it before this ever runs) -- only fifo-op folding
-                // still applies here, matching existing precedent.
-                Stmt::Let { .. } => {
+                // it before this ever runs) -- fifo-op folding and
+                // guard-unwrap folding (`let x = opt?`) both still apply
+                // here: `check_guard_positions` allows a `let` init to
+                // be exactly a whole `Expr::Guard`, the same position
+                // `Stmt::Assign`'s own fold above already covers -- this
+                // is what actually threads that allowance's failure
+                // condition into the rule's guard (a hole advisor caught
+                // pre-commit: the position check alone would have let
+                // `let x = opt?` through while its guard silently never
+                // reached `fires_<rule>`, reading a stale/garbage `x`).
+                Stmt::Let { init, .. } => {
                     conds.extend(stmt_fifo_conds);
+                    if let Expr::Guard(inner) = self.ast.expr(init) {
+                        let inner = *inner;
+                        conds.push(self.compile_guard_unwrap_cond(inner));
+                    }
                 }
                 _ => {}
             }
@@ -567,30 +611,111 @@ impl<'a> Emitter<'a> {
     /// `pub(crate)`: also used by `expr.rs`'s `compile_struct_field_read`
     /// (a struct-typed local's field read walks the same literal shape a
     /// struct-typed reg/output's WRITE does here).
-    pub(crate) fn find_struct_lit_field(&self, expr: ExprId, path: &[String]) -> Option<ExprId> {
-        let Expr::StructLit { fields, .. } = self.ast.expr(expr) else {
-            return None;
-        };
-        let (head, rest) = path.split_first()?;
-        let value = fields.iter().find(|(f, _)| f == head)?.1;
-        if rest.is_empty() {
-            Some(value)
-        } else {
-            self.find_struct_lit_field(value, rest)
+    /// Compiles the value at `path` within `expr`, dispatching on
+    /// `root_ty`: for `Ty::Struct`, `expr` must literally be a struct
+    /// literal — one segment of `path` is peeled off per struct level,
+    /// looking up EACH intermediate field's own declared type from
+    /// `struct_fields` before recursing, since a struct field's literal
+    /// value isn't always another `Expr::StructLit` to keep walking
+    /// structurally (a nested STRUCT field's value is, but a nested
+    /// `?T` field's value is `Expr::Absent`/a bare coerced value — this
+    /// must hand off to the `Ty::Option` arm below at exactly that
+    /// point, not assume `StructLit` all the way down; self-caught via
+    /// advisor: an earlier version delegated the WHOLE path to a
+    /// structure-blind walker that silently returned `None` the moment
+    /// it hit a struct containing a `?T` field). For `Ty::Option`,
+    /// `expr` has no literal AST form of its own — it's `Expr::Absent`
+    /// (`false`) or any plain value of the wrapped type, auto-coerced
+    /// present — so this synthesizes `valid`/`data` directly instead of
+    /// looking for a sub-expression that doesn't exist: `valid` is a
+    /// constant `0`/`1` (no `ExprId` to compile at all), `data` is
+    /// `expr` itself when present (there's no separate wrapper syntax to
+    /// unwrap — the coerced expression IS the `T` value) or a
+    /// don't-care-zero constant when absent. `data`'s own `rest` (T
+    /// itself struct/Option-shaped) recurses with `expr` unchanged,
+    /// since presence doesn't add a layer to peel off.
+    pub(crate) fn compile_field_path_value(
+        &mut self,
+        expr: ExprId,
+        path: &[String],
+        root_ty: &Ty,
+        width: u64,
+    ) -> Option<String> {
+        match root_ty {
+            Ty::Struct { def, .. } => {
+                let Expr::StructLit { fields, .. } = self.ast.expr(expr) else {
+                    return None;
+                };
+                let (head, rest) = path.split_first()?;
+                let value = fields.iter().find(|(f, _)| f == head)?.1;
+                if rest.is_empty() {
+                    Some(
+                        self.compile_expr_hinted(value, Some(width))
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    let field_ty = self
+                        .types
+                        .struct_fields
+                        .get(def)
+                        .and_then(|fs| fs.iter().find(|(n, _)| n == head))
+                        .map(|(_, t)| t.clone())?;
+                    self.compile_field_path_value(value, rest, &field_ty, width)
+                }
+            }
+            Ty::Option(inner) => {
+                // `expr` must be `Expr::Absent` or a plain value of the
+                // wrapped type being coerced present -- NOT itself
+                // another `?T`-typed expression aliased in. That
+                // invariant is enforced by `type_write`'s Option-to-
+                // Option rejection for a state WRITE, but a plain `let`
+                // has no target type to check against, so `let o = opt`
+                // types fine and reaches here with `expr` itself typed
+                // `Ty::Option` -- without this guard, `is_absent` below
+                // reads false (expr isn't literally `Expr::Absent`) and
+                // this arm concluded "definitely present", hardcoding
+                // `UInt<1>(1)`/`UInt<width>(data)`-shaped constants that
+                // ignore `expr`'s ACTUAL runtime valid/data bits
+                // entirely -- a real silent miscompile, self-caught
+                // while investigating `?T`-typed fn params (which bind
+                // an argument through this exact same path). Struct
+                // already rejects the identical aliasing shape (`let p
+                // = q` fails cleanly, see `find_struct_lit_field`'s
+                // sibling case above); this closes the same gap for
+                // Option instead of accidentally "supporting" aliasing
+                // through a bug.
+                if matches!(self.types.expr_tys.get(&expr), Some(Ty::Option(_))) {
+                    return None;
+                }
+                let (head, rest) = path.split_first()?;
+                let is_absent = matches!(self.ast.expr(expr), Expr::Absent);
+                match (head.as_str(), is_absent) {
+                    ("valid", true) => Some("UInt<1>(0)".to_string()),
+                    ("valid", false) => Some("UInt<1>(1)".to_string()),
+                    ("data", true) => Some(format!("UInt<{width}>(0)")),
+                    ("data", false) if rest.is_empty() => Some(
+                        self.compile_expr_hinted(expr, Some(width))
+                            .unwrap_or_default(),
+                    ),
+                    ("data", false) => self.compile_field_path_value(expr, rest, inner, width),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
-    /// A struct-typed reg/output's PER-FIELD write-threading — the same
-    /// if/else-mux pattern `reg_value_in_stmts` uses, but keyed on
-    /// (struct-local name, field PATH) instead of a flat register name:
-    /// the user writes the WHOLE struct value (`p := Pair{...}`), so
-    /// this finds THAT assignment and pulls out just `field_path`'s own
-    /// sub-expression (walking into a nested struct literal one segment
-    /// at a time via `find_struct_lit_field`), compiling it in the leaf
-    /// field's place. No callee-indirection case (`call_writes_reg`'s
-    /// sibling) — v0 excludes struct-typed fn params/returns entirely,
-    /// so a struct value can only ever reach a reg/output via a direct
-    /// assignment here, never through a callee's own write.
+    /// A struct- or Option-typed reg/output's PER-FIELD write-threading
+    /// — the same if/else-mux pattern `reg_value_in_stmts` uses, but
+    /// keyed on (struct/Option-local name, field PATH) instead of a flat
+    /// register name: the user writes the WHOLE value (`p :=
+    /// Pair{...}`, or `opt := false`/`opt := x`), so this finds THAT
+    /// assignment and pulls out just `field_path`'s own value via
+    /// `compile_field_path_value`, compiling it in the leaf field's
+    /// place. No callee-indirection case (`call_writes_reg`'s sibling)
+    /// — v0 excludes struct/`?T` fn params/returns entirely, so a
+    /// struct or Option value can only ever reach a reg/output via a
+    /// direct assignment here, never through a callee's own write.
     pub(crate) fn struct_field_value_in_stmts(
         &mut self,
         stmts: &[StmtId],
@@ -598,6 +723,7 @@ impl<'a> Emitter<'a> {
         struct_name: &str,
         field_path: &[String],
         width: u64,
+        root_ty: &Ty,
     ) -> Option<String> {
         let mut current: Option<String> = None;
         for stmt in stmts {
@@ -605,12 +731,10 @@ impl<'a> Emitter<'a> {
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Assign { lhs, rhs } => {
                     if is_ident_named(self.ast, self.res, lhs, struct_name)
-                        && let Some(value) = self.find_struct_lit_field(rhs, field_path)
+                        && let Some(value) =
+                            self.compile_field_path_value(rhs, field_path, root_ty, width)
                     {
-                        current = Some(
-                            self.compile_expr_hinted(value, Some(width))
-                                .unwrap_or_default(),
-                        );
+                        current = Some(value);
                     }
                 }
                 Stmt::If {
@@ -624,9 +748,17 @@ impl<'a> Emitter<'a> {
                         struct_name,
                         field_path,
                         width,
+                        root_ty,
                     );
                     let else_val = else_body.as_ref().and_then(|b| {
-                        self.struct_field_value_in_stmts(b, rule, struct_name, field_path, width)
+                        self.struct_field_value_in_stmts(
+                            b,
+                            rule,
+                            struct_name,
+                            field_path,
+                            width,
+                            root_ty,
+                        )
                     });
                     if then_val.is_some() || else_val.is_some() {
                         let flat = format!("{struct_name}_{}", field_path.join("_"));

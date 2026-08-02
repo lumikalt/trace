@@ -79,6 +79,16 @@ pub enum TokenKind {
     /// from bitwise `~`) as before.
     #[token("not")]
     Not,
+    /// Verse spells an absent optional value `false` (tying into its
+    /// logic-programming failure model) rather than a dedicated `none`
+    /// keyword — trace follows that spelling. Deliberately NOT a general
+    /// `bits[1]` boolean literal (no `true` counterpart either): `?bit`
+    /// would make `opt := false` ambiguous between "absent" and
+    /// "present, holding 0" if `false` doubled as a plain zero. Only
+    /// valid where a `?T` value is expected (`types.rs`'s `Ty::AbsentLit`
+    /// sentinel enforces this contextually).
+    #[token("false")]
+    False,
 
     #[token("_", priority = 100)]
     Underscore,

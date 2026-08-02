@@ -64,6 +64,20 @@ pub enum Ty {
         def: DefId,
         name: String,
     },
+    /// `?T` — sugar for a compiler-synthesized `{ valid: bit, data: T }`
+    /// struct (see `firrtl`'s "Struct emission" for the flattening this
+    /// shares with an ordinary declared struct). Unlike `Ty::Struct`,
+    /// carries no `DefId`: there's no user declaration to key off of,
+    /// `T` alone is the identity.
+    Option(Box<Ty>),
+    /// The literal `false`'s own type — unifies ONLY against a
+    /// `Ty::Option` target (`check_assignable`), never a general
+    /// `bits[1]`. Kept as its own sentinel (mirroring `Ty::Int`, the
+    /// untyped-integer-literal placeholder) rather than reusing
+    /// `Ty::Unknown`, which unifies with anything and would let `false`
+    /// silently pass as a value of any type at all, not just an absent
+    /// `?T`.
+    AbsentLit,
     /// Recovery type: unifies with anything, silences cascades.
     Unknown,
 }
@@ -80,6 +94,8 @@ impl std::fmt::Display for Ty {
             Ty::List(elem) => write!(f, "list[{elem}]"),
             Ty::Unit => write!(f, "unit"),
             Ty::Struct { name, .. } => write!(f, "struct {name}"),
+            Ty::Option(inner) => write!(f, "?{inner}"),
+            Ty::AbsentLit => write!(f, "false"),
             Ty::Unknown => write!(f, "?"),
         }
     }
@@ -189,21 +205,34 @@ impl<'a> TypeChecker<'a> {
                 Item::Module { items, .. } => stack.extend(items),
                 Item::Reg { ty, init, .. } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
-                    if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
+                    if !matches!(
+                        ty,
+                        Ty::Bits(_) | Ty::Struct { .. } | Ty::Option(_) | Ty::Unknown
+                    ) {
                         let span = self.ast.item_spans[id.0 as usize].clone();
                         self.error(span, format!("a reg holds bits or a struct, not {ty}"));
                     }
                     if let Some(init) = init {
-                        // A struct-typed init is a real expression tree
-                        // (missing/extra/mistyped fields, not just a
+                        // A struct- or Option-typed init is a real
+                        // expression tree (missing/extra/mistyped
+                        // fields, `false`/coerced-present, not just a
                         // width-fit check) — `check_literal_fits` alone
                         // (which only ever looks at `Ty::Bits` targets)
                         // would silently skip all of that, since nothing
                         // else in `collect_state` ever runs `type_expr`
-                        // over a reg/output's own init. `Ty::Bits` inits
-                        // are untouched (still just `check_literal_fits`,
-                        // matching every existing example/test).
-                        if matches!(ty, Ty::Struct { .. }) {
+                        // over a reg/output's own init. Also routed
+                        // through here whenever the init is literally
+                        // `false`, regardless of `ty` — `false` isn't
+                        // const-evaluable as an integer, so `check_
+                        // literal_fits` would otherwise silently skip
+                        // validating it entirely (e.g. `reg x : bits[8]
+                        // = false` passing with no error at all). Every
+                        // other `Ty::Bits` init is untouched (still just
+                        // `check_literal_fits`, matching every existing
+                        // example/test).
+                        if matches!(ty, Ty::Struct { .. } | Ty::Option(_))
+                            || matches!(self.ast.expr(init), Expr::Absent)
+                        {
                             let mut locals = HashMap::new();
                             let init_ty = self.type_expr(init, &mut locals);
                             self.check_assignable(&init_ty, &ty, self.expr_span(init), "reg init");
@@ -238,7 +267,10 @@ impl<'a> TypeChecker<'a> {
                 }
                 Item::Input { ty, .. } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
-                    if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
+                    if !matches!(
+                        ty,
+                        Ty::Bits(_) | Ty::Struct { .. } | Ty::Option(_) | Ty::Unknown
+                    ) {
                         let span = self.ast.item_spans[id.0 as usize].clone();
                         self.error(span, format!("an input holds bits or a struct, not {ty}"));
                     }
@@ -246,12 +278,17 @@ impl<'a> TypeChecker<'a> {
                 }
                 Item::Output { ty, init, .. } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
-                    if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
+                    if !matches!(
+                        ty,
+                        Ty::Bits(_) | Ty::Struct { .. } | Ty::Option(_) | Ty::Unknown
+                    ) {
                         let span = self.ast.item_spans[id.0 as usize].clone();
                         self.error(span, format!("an output holds bits or a struct, not {ty}"));
                     }
                     if let Some(init) = init {
-                        if matches!(ty, Ty::Struct { .. }) {
+                        if matches!(ty, Ty::Struct { .. } | Ty::Option(_))
+                            || matches!(self.ast.expr(init), Expr::Absent)
+                        {
                             let mut locals = HashMap::new();
                             let init_ty = self.type_expr(init, &mut locals);
                             self.check_assignable(
@@ -301,11 +338,15 @@ impl<'a> TypeChecker<'a> {
             let mut field_tys = Vec::new();
             for field in &fields {
                 let ty = self.eval_ty(field.ty, &HashMap::new());
-                // A struct field may be `bits[N]` or another struct
-                // (flattened recursively at emission time, see
-                // `firrtl::struct_field_widths`) — anything else
-                // (fifo/mem/list/handle) has no flat register shape.
-                if !matches!(ty, Ty::Bits(_) | Ty::Struct { .. } | Ty::Unknown) {
+                // A struct field may be `bits[N]`, another struct, or a
+                // `?T` (all flattened recursively at emission time, see
+                // `firrtl::struct_field_widths`/`option_field_widths`) —
+                // anything else (fifo/mem/list/handle) has no flat
+                // register shape.
+                if !matches!(
+                    ty,
+                    Ty::Bits(_) | Ty::Struct { .. } | Ty::Option(_) | Ty::Unknown
+                ) {
                     self.error(
                         self.ast.expr_spans[field.ty.0 as usize].clone(),
                         format!("a struct field holds bits or a struct, not {ty}"),
@@ -509,6 +550,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Expr::Call { .. } => Ty::Unknown,
+            Expr::OptionTy(inner) => Ty::Option(Box::new(self.eval_ty(inner, env))),
             _ => {
                 self.error(self.expr_span(id), "expected a type here".to_string());
                 Ty::Unknown
@@ -590,6 +632,28 @@ impl<'a> TypeChecker<'a> {
                 // resolve.rs mapped every ident use. Bind by span match.
                 let _ = def;
             }
+            // A struct or `?T` (itself struct-shaped under the hood) fn
+            // param isn't wired up in `calls.rs`'s inlining machinery
+            // yet — reject explicitly rather than let it silently
+            // type-check (`check_assignable`'s own coercion rule for
+            // `Ty::Option` would otherwise happily accept an argument
+            // here) and fail confusingly downstream at FIRRTL emission.
+            // `self.emit` is false here (only set true inside `collect_
+            // structs`/`collect_state`'s own brackets and this fn's
+            // stable-pass block below) — bracket explicitly, or this
+            // silently discards like the struct feature's first cut did.
+            if matches!(ty, Ty::Struct { .. } | Ty::Option(_)) {
+                self.emit = true;
+                self.error(
+                    self.expr_span(param.ty),
+                    format!(
+                        "a struct or `?T` fn parameter isn't supported yet (v0 \
+                         restriction): `{}` is {ty}",
+                        param.name.text
+                    ),
+                );
+                self.emit = false;
+            }
             // Param defs: resolve declared them; find by name+span.
             for (i, d) in self.res.defs.iter().enumerate() {
                 if d.span == param.name.span {
@@ -599,6 +663,19 @@ impl<'a> TypeChecker<'a> {
             }
         }
         let ret_ty = ret.map(|r| self.eval_ty(r, &empty));
+        if let (Some(rt), Some(r)) = (&ret_ty, ret)
+            && matches!(rt, Ty::Struct { .. } | Ty::Option(_))
+        {
+            self.emit = true;
+            self.error(
+                self.expr_span(r),
+                format!(
+                    "a struct or `?T` fn return type isn't supported yet (v0 \
+                     restriction), got {rt}"
+                ),
+            );
+            self.emit = false;
+        }
 
         for _ in 0..WIDEN_CAP {
             let before = locals.clone();
@@ -686,6 +763,19 @@ impl<'a> TypeChecker<'a> {
 
     fn check_cond(&mut self, cond: ExprId, locals: &mut HashMap<DefId, Ty>) {
         let ty = self.type_expr(cond, locals);
+        // A bare `opt?` statement (`opt : ?T`) unwraps-or-fails,
+        // discarding the unwrapped value -- the same "gate the rule,
+        // ignore the value" position a bare fifo-op statement already
+        // occupies (`is_guard_like` excludes those from `check_cond`
+        // entirely; a Guard-wrapped Option can't be excluded the same
+        // way up front, since an ORDINARY `(cond)?` still needs this
+        // check) -- so `T`'s own width is irrelevant here, unlike a
+        // real condition.
+        if let Expr::Guard(inner) = self.ast.expr(cond)
+            && matches!(self.types.expr_tys.get(inner), Some(Ty::Option(_)))
+        {
+            return;
+        }
         match ty {
             Ty::Bits(Width::Known(1)) | Ty::Bits(Width::Unknown) | Ty::Unknown | Ty::Int => {}
             other => self.error(
@@ -720,6 +810,33 @@ impl<'a> TypeChecker<'a> {
                              literal (v0 restriction) -- copying one struct value into \
                              another isn't supported yet; construct a fresh literal \
                              instead"
+                                .to_string(),
+                        );
+                    }
+                    // Same restriction, `?T`'s own flavor: unlike a
+                    // struct, an Option has no literal AST form of its
+                    // own to require here (`false`, or any bare
+                    // present-coerced value, both compile directly) —
+                    // so this checks the RHS's TYPE instead of its AST
+                    // shape. The one shape emission genuinely can't
+                    // handle is another *same-shaped* `?T`-typed value
+                    // (`opt2 := opt1`, both `?bits[8]`): there's no
+                    // struct literal to decompose fields from, so it
+                    // would otherwise silently leave the register frozen
+                    // at its reset value. A DIFFERENTLY-shaped Option on
+                    // the right (`??bits[8]` state, `?bits[8]` rhs) is
+                    // already a plain type mismatch `check_assignable`
+                    // above reports on its own -- checking `state ==
+                    // rhs_ty` here (not just "both Option") avoids a
+                    // second, misleadingly-worded "copy" error on top of
+                    // that one (self-caught while probing `??T`: `oo :=
+                    // inner` used to emit both).
+                    if matches!(state, Ty::Option(_)) && state == rhs_ty {
+                        self.error(
+                            self.expr_span(rhs),
+                            "a `?T`-typed write's right-hand side must be `false` or a \
+                             plain value of the wrapped type (v0 restriction) -- copying \
+                             one `?T` value into another isn't supported yet"
                                 .to_string(),
                         );
                     }
@@ -803,6 +920,16 @@ impl<'a> TypeChecker<'a> {
                                 ),
                             );
                         }
+                        Some(Ty::Option(_)) => {
+                            self.error(
+                                self.expr_span(lhs),
+                                format!(
+                                    "cannot write `.{name}`: a `?T` value's fields are \
+                                     read-only — write the whole value instead (`false`, \
+                                     or a plain value of the wrapped type)"
+                                ),
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -867,6 +994,24 @@ impl<'a> TypeChecker<'a> {
                         ),
                     );
                 }
+            }
+            // `false` constructs the absent value of any `?T`.
+            (Ty::AbsentLit, Ty::Option(_)) => {}
+            // A bare `T`-shaped value implicitly wraps into `?T` present
+            // — reached anywhere `check_assignable` already runs (state
+            // writes/inits, return values, call arguments, memory/
+            // instance-port writes, struct-literal fields, ...), not
+            // hand-restricted to a narrower set of positions. Recurses
+            // rather than requiring exact equality, so a too-wide
+            // literal into `?bits[8]` still gets the ordinary `trunc`
+            // guidance instead of a generic mismatch. Guarded off
+            // `value` itself being `Ty::Option` so writing one Option
+            // value into another (`opt2 := opt1`) is NOT silently
+            // treated as "present, holding an Option" — it falls
+            // through to ordinary equality below instead, matching
+            // `Ty::Struct`'s own copy-between-two-values handling.
+            (_, Ty::Option(inner)) if !matches!(value, Ty::Option(_)) => {
+                self.check_assignable(value, inner, span, what);
             }
             _ if value == target => {}
             _ => self.error(span, format!("{what}: expected {target}, got {value}")),
@@ -977,7 +1122,18 @@ impl<'a> TypeChecker<'a> {
                 let r = self.type_expr(rhs, locals);
                 self.type_binop(op, l, r, id)
             }
-            Expr::Guard(inner) => self.type_expr(inner, locals),
+            // `(cond)?` ordinarily just passes `inner`'s own type
+            // through (its "must be bits[1]" side is `check_cond`'s
+            // job, not this fn's). `opt?`, `opt : ?T`, is different: the
+            // WHOLE point is unwrapping, so the guard's own type becomes
+            // `T`, not `?T` — generalizing `?` from "fails unless
+            // bits[1]-true" to "fails unless present, yielding T",
+            // reusing the exact same `fails`-folding machinery `f.Deq[]`
+            // already has (see `effects.rs`'s `Expr::Guard` handling).
+            Expr::Guard(inner) => match self.type_expr(inner, locals) {
+                Ty::Option(t) => *t,
+                other => other,
+            },
             Expr::Field { base, name } => {
                 if let Some(module_def) = self.instance_module_of(base) {
                     self.types.expr_tys.insert(base, Ty::Unknown);
@@ -1033,6 +1189,26 @@ impl<'a> TypeChecker<'a> {
                                 }
                             }
                         }
+                        // `?T`'s two synthetic fields, same escape hatch
+                        // a `spawn` handle's `.result`/`.done` already
+                        // has: `.valid`/`.data` read WITHOUT unwrap-or-
+                        // fail (`opt?`'s job) — the non-failing
+                        // alternative `if opt.valid { ...opt.data... }
+                        // else { ... }` gives.
+                        Ty::Option(inner) => match name.as_str() {
+                            "valid" => Ty::Bits(Width::Known(1)),
+                            "data" => *inner,
+                            _ => {
+                                self.error(
+                                    self.expr_span(id),
+                                    format!(
+                                        "a `?T` value only has `.valid`/`.data` fields, \
+                                         not `.{name}`"
+                                    ),
+                                );
+                                Ty::Unknown
+                            }
+                        },
                         Ty::Unknown => Ty::Unknown,
                         other => {
                             self.error(
@@ -1178,6 +1354,18 @@ impl<'a> TypeChecker<'a> {
                     name: struct_name,
                 }
             }
+            // `?T` has no meaning as a VALUE expression, only a type
+            // (`eval_ty`'s own `Expr::OptionTy` arm handles it there) —
+            // reachable here only if `?T` shows up somewhere that isn't
+            // actually a type position (e.g. `x := ?bits[8]`).
+            Expr::OptionTy(_) => {
+                self.error(
+                    self.expr_span(id),
+                    "`?T` is a type, not a value".to_string(),
+                );
+                Ty::Unknown
+            }
+            Expr::Absent => Ty::AbsentLit,
         }
     }
 

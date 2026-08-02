@@ -449,6 +449,10 @@ impl<'a> Checker<'a> {
                     self.infer_expr(*value, sig);
                 }
             }
+            // Type-position only (`?T`); never appears in a rule/fn
+            // body's own value expressions.
+            Expr::OptionTy(_) => {}
+            Expr::Absent => {}
         }
     }
 
@@ -688,7 +692,12 @@ impl<'a> Checker<'a> {
                     self.check_expr(value, item, sig, elab);
                 }
             }
-            Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
+            Expr::Ident(_)
+            | Expr::Int(_)
+            | Expr::SizedInt { .. }
+            | Expr::Wildcard
+            | Expr::OptionTy(_)
+            | Expr::Absent => {}
         }
     }
 

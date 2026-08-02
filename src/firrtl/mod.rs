@@ -392,16 +392,6 @@ impl<'a> Emitter<'a> {
         self.types.state_tys.get(&def).cloned()
     }
 
-    /// A struct's declared fields, each with its own concrete width —
-    /// `None` if any field's width isn't concrete (mirrors `state_width`'s
-    /// own "no concrete bit width" contract, generalized to N fields).
-    /// module.rs's Reg/Input/Output collection uses this to expand ONE
-    /// struct-typed declaration into N flat registers/ports, one per
-    /// field — the architecture confirmed by hand-lowering a real bundle
-    /// through firtool before this was written: firtool flattens a
-    /// bundle-typed reg/port to exactly this shape regardless, so trace's
-    /// own emitted FIRRTL skips real bundle syntax entirely and emits the
-    /// flat shape directly.
     /// A struct's flat field list: `(path, width)` per leaf `bits[N]`
     /// field — `path` is the field-name chain from the struct's own top
     /// level down to that leaf (`["inner", "a"]`, not just `"a"`) —
@@ -423,8 +413,42 @@ impl<'a> Emitter<'a> {
                         out.push((sub_path, w));
                     }
                 }
+                Ty::Option(inner) => {
+                    for (mut sub_path, w) in self.option_field_widths(inner)? {
+                        sub_path.insert(0, name.clone());
+                        out.push((sub_path, w));
+                    }
+                }
                 _ => return None,
             }
+        }
+        Some(out)
+    }
+
+    /// `?T`'s flat field list — the same `(path, width)` shape `struct_
+    /// field_widths` produces, over the compiler-synthesized `{ valid:
+    /// bit, data: T }` shape `Ty::Option` sugars over. `T` itself may be
+    /// another struct (or another `?T`, `??T` — untested but the same
+    /// recursion that already generalizes `struct_field_widths` applies
+    /// here too) via the `data` field's own recursion; a plain `bits[N]`
+    /// `T` is the common case (`?bits[8]`).
+    pub(crate) fn option_field_widths(&self, inner: &Ty) -> Option<Vec<(Vec<String>, u64)>> {
+        let mut out = vec![(vec!["valid".to_string()], 1)];
+        match inner {
+            Ty::Bits(Width::Known(w)) => out.push((vec!["data".to_string()], *w)),
+            Ty::Struct { def, .. } => {
+                for (mut sub_path, w) in self.struct_field_widths(*def)? {
+                    sub_path.insert(0, "data".to_string());
+                    out.push((sub_path, w));
+                }
+            }
+            Ty::Option(t) => {
+                for (mut sub_path, w) in self.option_field_widths(t)? {
+                    sub_path.insert(0, "data".to_string());
+                    out.push((sub_path, w));
+                }
+            }
+            _ => return None,
         }
         Some(out)
     }
@@ -445,10 +469,25 @@ impl<'a> Emitter<'a> {
     /// one flat field at a time — `init` must literally be a struct
     /// literal (types.rs already required this: a struct-typed reg/
     /// output's declared type only unifies against a `StructLit`'s own
-    /// inferred type). `path` walks into nested struct literals one
+    /// inferred type). `path` walks into nested struct/`?T` literals one
     /// segment at a time (`["inner", "a"]` for a nested field), same
-    /// join convention `struct_field_widths` uses for the flat name.
-    pub(crate) fn struct_lit_field_const(&self, init: ExprId, path: &[String]) -> Option<u64> {
+    /// join convention `struct_field_widths` uses for the flat name —
+    /// `def` is `head`'s OWN struct's `DefId`, needed to look up each
+    /// intermediate field's declared type before recursing: a nested
+    /// STRUCT field's value is another real `Expr::StructLit` to keep
+    /// walking structurally, but a nested `?T` field's value is
+    /// `Expr::Absent`/a bare coerced value, which must hand off to
+    /// `option_lit_field_const` instead of assuming `StructLit` all the
+    /// way down (mirrors `writes.rs`'s `compile_field_path_value`,
+    /// caught the same way — advisor flagged this fn's un-threaded
+    /// `def` as the const-eval-time twin of that value-compile-time
+    /// bug).
+    pub(crate) fn struct_lit_field_const(
+        &self,
+        init: ExprId,
+        path: &[String],
+        def: DefId,
+    ) -> Option<u64> {
         let Expr::StructLit { fields, .. } = self.ast.expr(init) else {
             return None;
         };
@@ -457,7 +496,50 @@ impl<'a> Emitter<'a> {
         if rest.is_empty() {
             self.const_eval(value)
         } else {
-            self.struct_lit_field_const(value, rest)
+            let field_ty = self
+                .types
+                .struct_fields
+                .get(&def)
+                .and_then(|fs| fs.iter().find(|(n, _)| n == head))
+                .map(|(_, t)| t.clone())?;
+            match field_ty {
+                Ty::Struct { def: sub_def, .. } => {
+                    self.struct_lit_field_const(value, rest, sub_def)
+                }
+                Ty::Option(inner) => self.option_lit_field_const(value, rest, &inner),
+                _ => None,
+            }
+        }
+    }
+
+    /// `?T`'s init, one flat field at a time — same role `struct_lit_
+    /// field_const` has, over `false`/a coerced-present value instead
+    /// of a real struct literal (`?T` has no literal AST form of its
+    /// own): `valid` is `0`/`1` depending on whether `init` is literally
+    /// `false`; `data` is `init` itself (there is no separate wrapper
+    /// syntax to peel off a present value — the coerced expression IS
+    /// the `T` value), or `0` when absent (a don't-care default). `data`'s
+    /// own `rest` dispatches on `inner` (T itself struct- or `?`-shaped)
+    /// rather than assuming struct, so a nested `??T` recurses correctly
+    /// too.
+    pub(crate) fn option_lit_field_const(
+        &self,
+        init: ExprId,
+        path: &[String],
+        inner: &Ty,
+    ) -> Option<u64> {
+        let (head, rest) = path.split_first()?;
+        let is_absent = matches!(self.ast.expr(init), Expr::Absent);
+        match (head.as_str(), is_absent) {
+            ("valid", absent) => Some(u64::from(!absent)),
+            ("data", true) => Some(0),
+            ("data", false) if rest.is_empty() => self.const_eval(init),
+            ("data", false) => match inner {
+                Ty::Struct { def, .. } => self.struct_lit_field_const(init, rest, *def),
+                Ty::Option(t) => self.option_lit_field_const(init, rest, t),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }

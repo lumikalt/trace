@@ -836,6 +836,173 @@ fn struct_to_struct_copy_is_rejected() {
 }
 
 #[test]
+fn option_construction_and_unwrap_type_check() {
+    // `false` constructs absent; a bare `bits[8]` value coerces
+    // implicitly to present; `opt?` unwraps to `bits[8]`; `.valid`/
+    // `.data` read back `bit`/`bits[8]` directly.
+    run_ok(
+        "module M {\n\
+             reg opt : ?bits[8] = false\n\
+             out result : bits[8] = 0\n\
+             out ok : bit = 0\n\
+             rule fill {\n\
+                 opt := 8'd5\n\
+             }\n\
+             rule clear {\n\
+                 opt := false\n\
+             }\n\
+             rule r {\n\
+                 result := opt?\n\
+                 ok := opt.valid\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn nested_option_in_struct_field_type_checks() {
+    run_ok(
+        "struct Frame {\n\
+             id : bits[4]\n\
+             maybe : ?bits[8]\n\
+         }\n\
+         module M {\n\
+             reg fr : Frame = Frame{ id: 0, maybe: false }\n\
+             out ok : bit = 0\n\
+             rule r {\n\
+                 ok := fr.maybe.valid\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn absent_literal_into_plain_bits_is_rejected() {
+    // `false` isn't const-evaluable as an integer -- without routing
+    // this through `check_assignable` too, `check_literal_fits` would
+    // silently skip validating it entirely (see types.rs's
+    // `collect_state` doc comment).
+    let src = "module M {\n\
+                   reg x : bits[8] = false\n\
+                   rule r {\n\
+                       x := 1\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("expected bits[8]") && e.message.contains("false")),
+        "expected a false-into-plain-bits rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn option_to_option_copy_is_rejected() {
+    let src = "module M {\n\
+                   reg p : ?bits[8] = false\n\
+                   reg q : ?bits[8] = false\n\
+                   rule r {\n\
+                       p := q\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("copying one `?T` value into another")),
+        "expected an option-copy rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn differently_shaped_option_write_is_one_plain_type_mismatch_not_two_errors() {
+    // `??bits[8]` (state) vs `?bits[8]` (rhs) are both `Ty::Option`, but
+    // NOT the same shape -- this must fall through to the ordinary
+    // `check_assignable` type-mismatch error alone, not ALSO trip the
+    // same-shape "copying one `?T` value into another" message (that
+    // message is specifically about `p := q`, both `?bits[8]` -- wrong
+    // and redundant here). Self-caught while probing `??T`: an earlier
+    // version of the check fired on "both Option" instead of "same
+    // Option", producing two errors for one mistake.
+    let src = "module M {\n\
+                   reg inner : ?bits[8] = false\n\
+                   reg oo : ??bits[8] = false\n\
+                   rule r {\n\
+                       oo := inner\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one error, got: {errors:?}"
+    );
+    assert!(
+        errors[0]
+            .message
+            .contains("expected ??bits[8], got ?bits[8]")
+    );
+}
+
+#[test]
+fn option_field_write_is_rejected() {
+    let src = "module M {\n\
+                   reg opt : ?bits[8] = false\n\
+                   rule r {\n\
+                       opt.valid := 1\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("read-only") && e.message.contains(".valid")),
+        "expected a read-only-field error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn option_fn_param_is_rejected() {
+    let src = "Consume(o : ?bits[8]) : bit <combines> {\n\
+                   return 1\n\
+               }\n\
+               module M {\n\
+                   out ok : bit = 0\n\
+                   rule r {\n\
+                       ok := Consume(8'd5)\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("fn parameter isn't supported yet")),
+        "expected an option-fn-param rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn option_fn_return_is_rejected() {
+    let src = "Wrap(x : bits[8]) : ?bits[8] <combines> {\n\
+                   return x\n\
+               }\n\
+               module M {\n\
+                   reg opt : ?bits[8] = false\n\
+                   rule r {\n\
+                       opt := Wrap(8'd5)\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("fn return type isn't supported yet")),
+        "expected an option-fn-return rejection, got: {errors:?}"
+    );
+}
+
+#[test]
 fn all_examples_type_check() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {

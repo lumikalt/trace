@@ -971,6 +971,20 @@ impl<'a> Parser<'a> {
             Some(Minus) => self.parse_prefix(UnOp::Neg)?,
             Some(Not) => self.parse_prefix(UnOp::Not)?,
             Some(Tilde) => self.parse_prefix(UnOp::BitNot)?,
+            // `?T` — a prefix use of `?`, unlike the postfix guard `?`
+            // (`cond?`, handled in the postfix loop below): the two never
+            // collide since a prefix `?` is only reached here, before any
+            // operand has been parsed. `types.rs` rejects `Expr::OptionTy`
+            // outside an actual type position.
+            Some(Question) => {
+                self.bump();
+                let inner = self.parse_expr(PREFIX_BP)?;
+                self.ast.push_expr(Expr::OptionTy(inner), lo..self.prev_end)
+            }
+            Some(False) => {
+                let span = self.bump().unwrap().span;
+                self.ast.push_expr(Expr::Absent, span)
+            }
             _ => {
                 self.error_here("expected an expression".to_string());
                 self.sync();

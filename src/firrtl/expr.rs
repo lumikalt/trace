@@ -63,11 +63,14 @@ impl<'a> Emitter<'a> {
         // `self.locals` `ExprId` map, exactly what per-field extraction
         // needs).
         if let Expr::Field { base, name } = self.ast.expr(id).clone()
-            && matches!(self.types.expr_tys.get(&base), Some(Ty::Struct { .. }))
+            && matches!(
+                self.types.expr_tys.get(&base),
+                Some(Ty::Struct { .. } | Ty::Option(_))
+            )
         {
             let (root, mut path) = self.struct_field_path(base);
             path.push(name);
-            return self.compile_struct_field_read(root, &path, hint);
+            return self.compile_struct_field_read(id, root, &path, hint);
         }
         match self.ast.expr(id).clone() {
             Expr::Ident(_) => {
@@ -165,6 +168,26 @@ impl<'a> Emitter<'a> {
                 }
             }
             Expr::Or(alts) => self.compile_or(id, &alts, hint),
+            // `opt?`, `opt : ?T`, used as a VALUE (not a bare-statement
+            // guard, which `compile_guard`/writes.rs folds separately):
+            // its compiled value is the unwrapped `T`, i.e. `inner`'s own
+            // `data` field — reusing the exact same peeling/dispatch
+            // `.field` access already has (`inner` may itself be a
+            // chained struct field, e.g. `frame.maybe_thing?`). An
+            // ordinary bits[1] guard (`(cond)?`) used as a value just
+            // passes `inner`'s own compiled value through unchanged —
+            // types.rs's `Expr::Guard` arm does the identical passthrough
+            // at the type level; the FAILURE side of either case is
+            // entirely `compile_guard`'s job, not this fn's.
+            Expr::Guard(inner) => {
+                if matches!(self.types.expr_tys.get(&inner), Some(Ty::Option(_))) {
+                    let (root, mut path) = self.struct_field_path(inner);
+                    path.push("data".to_string());
+                    self.compile_struct_field_read(id, root, &path, hint)
+                } else {
+                    self.compile_expr_hinted(inner, hint)
+                }
+            }
             _ => {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
@@ -236,9 +259,12 @@ impl<'a> Emitter<'a> {
     /// top). Only walks through a base that is ITSELF a struct-typed
     /// `Field` access; a plain struct-typed root value (an `Ident`)
     /// stops the walk, becoming `root` with an empty path so far.
-    fn struct_field_path(&self, id: ExprId) -> (ExprId, Vec<String>) {
+    pub(crate) fn struct_field_path(&self, id: ExprId) -> (ExprId, Vec<String>) {
         if let Expr::Field { base, name } = self.ast.expr(id).clone()
-            && matches!(self.types.expr_tys.get(&base), Some(Ty::Struct { .. }))
+            && matches!(
+                self.types.expr_tys.get(&base),
+                Some(Ty::Struct { .. } | Ty::Option(_))
+            )
         {
             let (root, mut path) = self.struct_field_path(base);
             path.push(name);
@@ -248,26 +274,41 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// `p.a.b. ...`'s value: `root` is the struct-typed value the WHOLE
-    /// chain starts from (already confirmed struct-typed by the
-    /// caller), `path` the field-name chain from `root`'s own top level
-    /// down to the leaf field actually being read (`["inner", "a"]` for
-    /// `p.inner.a`). Three cases, matching the plain-`Ident` dispatch's
-    /// own split (`Ident` arm, above) one level deeper:
+    /// `p.a.b. ...`'s value: `id` is the WHOLE field-access expression
+    /// (used only as a width fallback when `hint` is absent), `root` the
+    /// struct-/Option-typed value the chain starts from (already
+    /// confirmed by the caller), `path` the field-name chain from
+    /// `root`'s own top level down to the leaf field actually being read
+    /// (`["inner", "a"]` for `p.inner.a`). Three cases, matching the
+    /// plain-`Ident` dispatch's own split (`Ident` arm, above) one level
+    /// deeper:
     /// - `Output`: its field's backing register (`__out_{name}_{path
     ///   joined with _}`, module.rs's own naming).
     /// - `Reg`/`Input`: its field's flat register/port (`{name}_{path
     ///   joined with _}`).
-    /// - `Local`/`Param`: substitute the local's bound struct literal
-    ///   and walk `path` into it (`find_struct_lit_field`, shared with
-    ///   `writes.rs`'s per-field write-threading, since both need the
-    ///   same nested-literal walk), then compile just the leaf field's
-    ///   own sub-expression — a real, if narrow, v0 restriction: only a
-    ///   local bound DIRECTLY to a struct literal resolves (no aliasing
-    ///   chain, e.g. `let q = p`), a deliberate scope line, not an
-    ///   oversight.
-    fn compile_struct_field_read(
+    /// - `Local`/`Param`: substitute the local's bound value and walk
+    ///   `path` into it via `compile_field_path_value` (shared with
+    ///   `writes.rs`'s per-field write-threading — a struct-typed
+    ///   local's field read walks the same literal shape a struct-typed
+    ///   reg/output's WRITE does; an Option-typed local's synthesizes
+    ///   `valid`/`data` from `false`/a coerced value the same way). A
+    ///   struct-typed local carries a real, if narrow, v0 restriction:
+    ///   only a local bound DIRECTLY to a struct literal resolves (no
+    ///   aliasing chain, e.g. `let q = p`) — `compile_field_path_value`
+    ///   returns `None` for anything else, reported here. An Option-
+    ///   typed local carries the IDENTICAL restriction (`let o = opt`,
+    ///   `opt` itself `?T`, is rejected the same way) — a plain `let`
+    ///   has no target type, so `type_write`'s Option-to-Option
+    ///   rejection (the check that keeps `compile_field_path_value`'s
+    ///   Option arm's "not itself Option-typed" invariant true
+    ///   everywhere else) never runs for it, and without a matching
+    ///   guard INSIDE that arm this silently hardcoded a wrong constant
+    ///   instead of erroring — self-caught while investigating `?T`-
+    ///   typed fn params, which bind an argument through this exact
+    ///   path too.
+    pub(crate) fn compile_struct_field_read(
         &mut self,
+        id: ExprId,
         root: ExprId,
         path: &[String],
         hint: Option<u64>,
@@ -291,23 +332,34 @@ impl<'a> Emitter<'a> {
                     );
                     return Err(());
                 };
-                if !matches!(self.ast.expr(bound), Expr::StructLit { .. }) {
+                let Some(root_ty) = self.types.expr_tys.get(&root).cloned() else {
                     self.error(
                         self.ast.expr_spans[root.0 as usize].clone(),
-                        "cannot resolve this struct field (v0 restriction: a struct-typed \
-                         local must be bound directly to a struct literal, not aliased \
-                         from another local)"
+                        "unsupported struct reference in FIRRTL emission (v0 restriction)"
                             .to_string(),
                     );
                     return Err(());
-                }
-                match self.find_struct_lit_field(bound, path) {
-                    Some(value) => self.compile_expr_hinted(value, hint),
+                };
+                let width = hint.unwrap_or_else(|| self.width_of(id));
+                let bound_is_option_alias = matches!(root_ty, Ty::Option(_))
+                    && matches!(self.types.expr_tys.get(&bound), Some(Ty::Option(_)));
+                match self.compile_field_path_value(bound, path, &root_ty, width) {
+                    Some(value) => Ok(value),
                     None => {
-                        self.error(
-                            self.ast.expr_spans[root.0 as usize].clone(),
-                            format!("this struct literal has no field `{}`", path.join(".")),
-                        );
+                        let msg = if bound_is_option_alias {
+                            "cannot resolve this `?T` field (v0 restriction: a `?T`-typed \
+                             local must be bound directly to `false` or a plain value of \
+                             the wrapped type, not aliased from another `?T` value)"
+                                .to_string()
+                        } else if matches!(root_ty, Ty::Option(_)) {
+                            format!("this `?T` value has no field `{}`", path.join("."))
+                        } else {
+                            "cannot resolve this struct field (v0 restriction: a struct-typed \
+                             local must be bound directly to a struct literal, not aliased \
+                             from another local)"
+                                .to_string()
+                        };
+                        self.error(self.ast.expr_spans[root.0 as usize].clone(), msg);
                         Err(())
                     }
                 }

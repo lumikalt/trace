@@ -9,6 +9,7 @@
     { "include": "#sized-numbers" },
     { "include": "#numbers" },
     { "include": "#keywords" },
+    { "include": "#literals" },
     { "include": "#effect-words" },
     { "include": "#builtins" },
     { "include": "#calls" },
@@ -64,6 +65,11 @@
           "match": "\\bu[0-9]+\\b"
         }
       ]
+    },
+    "literals": {
+      "comment": "`false` spells the absent value of a `?T` (Verse's logic-programming-flavored `none`, see src/lexer.rs's TokenKind::False) — a real lexer keyword, not a general boolean (no `true` counterpart).",
+      "name": "constant.language.trace",
+      "match": "\\bfalse\\b"
     },
     "effect-words": {
       "comment": "Contextual identifiers, not lexer keywords (see src/lexer.rs) — only meaningful inside <...> effect lists and schedule{} blocks, but a plain word-match is close enough for a simple grammar.",

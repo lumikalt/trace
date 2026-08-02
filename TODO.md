@@ -209,27 +209,71 @@ Worth building:
 
 Speculative, bigger, not committed to:
 
-- **Option type** (`?T`, `option{...}` construction, `?.` safe access,
-  nested `??T`) — Verse's general mechanism for a value that may be
-  absent. General `struct` types are now ACHIEVED, including nesting
-  (see DESIGN.md's "Structs"/"Struct emission" sections,
-  `examples/struct_pair.tr`, `examples/struct_nested.tr`) — the
-  groundwork this bullet originally called for (a struct-shaped
-  `{valid: bit, data: T}` under the hood, with `T` itself possibly
-  another struct) is fully in place, chained field access included.
-  What's still open is `?T` itself as sugar over that shape: the
-  `option{...}`/`?.` surface syntax, "absence" still needing a
-  concrete bit pattern (no free representation the way a heap gives
-  a language), and safe-navigation semantics over a struct-typed value
-  (`?.`'s short-circuit-on-empty behavior has no existing analogue to
-  reuse — ordinary `.field` access requires the local to be bound
-  directly to a struct literal, no aliasing, which `?.` chaining would
-  need to relax). The real open design question, raised and deferred
-  when this groundwork landed: does reading a `?T` value fold a fail
-  condition into the rule's guard (Verse-aligned, reusing the `fails`
-  machinery `f.Deq[]` already has), or does it stay wrapped, requiring
-  explicit `.valid`/`.data`? Needs a decision, not just an
-  implementation pass.
+- **Option type core (`?T`) — ACHIEVED.** `?T` sugar over a compiler-
+  synthesized `{valid: bit, data: T}` struct, reusing struct's own
+  flattening/read/write machinery end to end (see DESIGN.md's "Option
+  types"/"Option emission" sections, `examples/option.tr`). Verse's own
+  answer settled the open design question this bullet used to raise:
+  absence is the literal `false` (tying into Verse's logic-programming
+  failure model), not a `none` keyword; unwrap reuses the *existing* `?`
+  guard operator, generalized to fold a `?T` value's absence into the
+  rule's guard the same way a fifo `Deq[]` already does (including
+  through a `let` init, not just a bare statement/`:=` RHS, and from
+  inside a callee body's own `callee_fail_cond` fold too); `.valid`/
+  `.data` stay directly readable for a non-failing presence check, but
+  don't compose with `?` in one chain (`opt?.valid` is rejected, same
+  as any other nested-guard position). `T` may itself be a struct
+  (`reg o : ?Pair`) or a struct's own field, both directions confirmed
+  through real firtool + one full Icarus simulation
+  (`examples/option.tr`'s `relayed` output exercises a `?T`-typed
+  OUTPUT port's own separate write-threading bookkeeping directly, not
+  just the reg case). What's left, not attempted this pass:
+  - **Struct- and `?T`-typed fn/rule params and returns.** One shared
+    feature, not two — `check_body`'s rejection is a single
+    `matches!(ty, Ty::Struct {..} | Ty::Option(_))`, so implementing
+    one without the other means deleting half a shared check and
+    leaving the other half, worse than either. Coercion today only
+    reaches direct writes and ordinary assignable positions
+    (`check_assignable`'s own broad reach); a call boundary needs its
+    own design pass, and the two directions aren't equally hard:
+    **params** are plausibly cheap (`compile_struct_field_read`'s
+    Local/Param case already dispatches on a `root_ty` via
+    `compile_field_path_value`, so a struct-literal/coerced-Option
+    argument may partly work already — though
+    `struct_typed_local_aliasing_another_local_is_rejected` suggests a
+    reg-typed argument's path is deliberately closed and would need
+    opening); **returns** need a real signature change —
+    `compile_callee_body` returns one FIRRTL expression
+    (`Result<String, ()>`), but a struct/Option return needs N values
+    (one per leaf field) threaded back to N flat register writes, all
+    the way through the inlining path. Scope (params-only first vs.
+    params+returns together) is Lumi's call, not self-executed — ask
+    before starting, the same way `conflict_free`/`race`'s scope
+    questions were settled via AskUserQuestion.
+  - **`??T` (nested Option) — verified, with a real limitation, not
+    just "untested."** Compiles and simulates correctly for the two
+    states reachable through today's syntax (fully absent via `false`,
+    fully present via a bare value coerced through both layers) — see
+    DESIGN.md's "Option types" section and
+    `nested_option_reaches_only_fully_absent_or_fully_present`
+    (tests/firrtl.rs). But the outer and inner `valid` bits are
+    provably always equal (no write path can separate them), so `??T`
+    is currently indistinguishable from `?T` — `Some(None)` (outer
+    present, inner absent) is genuinely inexpressible, not just
+    unexercised. Making the layers independent needs a construction
+    syntax that doesn't exist yet (there's no way to write "present,
+    holding an absent inner value" — `.data` is read-only and a `?T`
+    expression can't be written into a `??T` target). Not pursued
+    further without a concrete use case; no example added (an example
+    file advertises a pattern worth using, and this one currently
+    isn't one).
+  - **`option{...}` explicit-construction syntax, `?.` safe navigation.**
+    Not pursued: implicit coercion already covers construction (`opt :=
+    value`/`opt := false`, no wrapper syntax needed), and `?.`'s
+    short-circuit-on-empty chaining has no existing analogue to reuse
+    (ordinary `.field` access requires the local bound directly to a
+    literal, no aliasing) — would need its own design pass if ever
+    wanted, not assumed necessary.
 - **Struct destructuring** (`let Pair{valid, data} = p`, or a `let
   {valid, data} = p` field-shorthand form — binding several named
   locals from one struct value in a single statement, instead of one
@@ -243,7 +287,7 @@ Speculative, bigger, not committed to:
   explicitly in every literal, even when only one field of a large
   (possibly nested) struct actually changes. Emission-wise this looks
   straightforward on top of the flattening `struct_field_widths`/
-  `find_struct_lit_field` already do (a missing field falls back to
+  `compile_field_path_value` already do (a missing field falls back to
   `..old`'s own flat register/field instead of erroring "missing
   field"), but the parser/type-checker side needs its own design pass:
   where `..old` may appear in the field list (trailing only, like

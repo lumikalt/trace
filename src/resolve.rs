@@ -731,6 +731,10 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(value, in_type);
                 }
             }
+            // `?T`'s `T` is unconditionally a type position, regardless
+            // of the context `OptionTy` itself was reached from.
+            Expr::OptionTy(inner) => self.resolve_expr(inner, true),
+            Expr::Absent => {}
         }
     }
 }
