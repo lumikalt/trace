@@ -86,6 +86,14 @@ pub struct CapturedLocal {
     pub ty: Ty,
     pub assign_segment: usize,
     pub read_segments: Vec<usize>,
+    /// `Some(span)` if this capture's declaring statement was `let name =
+    /// init` — `span` covers exactly `let name = ` (this statement's own
+    /// start through `init`'s own start), the prefix a renderer must
+    /// replace with `{target_name} := ` before splicing the rest of the
+    /// statement verbatim. `None` for a `:=`-declared capture, whose
+    /// original text already parses as a register write once its own
+    /// backing `reg`/renamed register exists, needing no rewrite.
+    pub let_prefix_span: Option<Span>,
 }
 
 /// One `spawn`'s callee parameter: a save register written once, at
@@ -224,27 +232,6 @@ fn plan_rule(
                 .to_string(),
         }]);
     }
-    if let Some(span) = find_let_bound_spawn(ast, body) {
-        return Err(vec![LowerError {
-            span,
-            message: "a spawned handle's `.result`/`.done` are always read on a LATER \
-                      cycle, so `spawn` needs the same real register-backed binding a \
-                      value crossing a `tick` does — bind it with `h := spawn \
-                      Callee(args)`, not `let h = spawn Callee(args)`"
-                .to_string(),
-        }]);
-    }
-    if let Some(span) = find_let_bound_race(ast, res, body) {
-        return Err(vec![LowerError {
-            span,
-            message: "`race[...]`'s value and its own guard (whether this segment fires at \
-                      all) come from the same statement, making it a segment-gating \
-                      construct like `spawn`'s trigger or `sync` — this language always \
-                      binds those with `:=` (or leaves them bare), never `let`; bind it \
-                      with `value := race[...]`, not `let value = race[...]`"
-                .to_string(),
-        }]);
-    }
     if let Some(span) = find_unsupported_construct(ast, res, body, true) {
         return Err(vec![LowerError {
             span,
@@ -339,7 +326,19 @@ fn plan_rule(
         .iter()
         .map(|s| (s.handle_def, (s.result_name.clone(), s.done_name.clone())))
         .collect();
-    let handle_field_rewrites = collect_handle_field_rewrites(ast, res, body, &handle_names);
+    let mut handle_field_rewrites = collect_handle_field_rewrites(ast, res, body, &handle_names);
+    // A `let`-bound capture's own declaring statement needs rewriting to
+    // `{name} := ` before its (otherwise verbatim-spliced) text can be
+    // re-resolved as a write to the `reg {name}` this rule's own preamble
+    // declares for it (see `CapturedLocal::let_prefix_span`'s own doc
+    // comment). Folded into the SAME edits list `splice()` already
+    // applies to every ordinary statement below, rather than a second
+    // field/call site.
+    for cap in &captures {
+        if let Some(span) = &cap.let_prefix_span {
+            handle_field_rewrites.push((span.clone(), format!("{} := ", cap.name)));
+        }
+    }
 
     let cont_width = clog2(segments.len() as u64).max(1);
     Ok(LoweredRule {
@@ -406,28 +405,47 @@ fn split_into_segments(ast: &Ast, body: &[StmtId]) -> Vec<Segment> {
     segments
 }
 
-/// Recognizes `h := spawn Callee(args)`: a top-level assignment to a
-/// fresh ident whose RHS is directly a `spawn` of a call. Returns the
-/// handle's def, name, and the inner call expression.
+/// Recognizes `let h = spawn Callee(args)` (the ordinary form now that
+/// `let` is required for every fresh local) or `h := spawn Callee(args)`
+/// (still recognized too — an already-`let`-bound `h` reassigned to a
+/// second spawn is nonsensical given the one-spawn-per-handle rule
+/// below, but there's no reason to reject the shape itself here).
+/// Neither form needs `render_spawn_trigger` to splice this statement's
+/// own text at all — it synthesizes brand-new register-write lines from
+/// the extracted `(def, name, inner call)` alone, so unlike an ordinary
+/// captured local, a `let`-bound handle needs no prefix-span rewrite.
 fn spawn_trigger_shape(
     ast: &Ast,
     res: &Resolution,
     stmt: StmtId,
 ) -> Option<(DefId, String, ExprId)> {
-    let Stmt::Assign { lhs, rhs } = ast.stmt(stmt) else {
-        return None;
-    };
-    let Expr::Ident(_) = ast.expr(*lhs) else {
-        return None;
-    };
-    let Expr::Spawn(inner) = ast.expr(*rhs) else {
-        return None;
-    };
-    let def = *res.expr_defs.get(lhs)?;
-    if res.def(def).kind != DefKind::Local {
-        return None;
+    match ast.stmt(stmt) {
+        Stmt::Assign { lhs, rhs } => {
+            let Expr::Ident(_) = ast.expr(*lhs) else {
+                return None;
+            };
+            let Expr::Spawn(inner) = ast.expr(*rhs) else {
+                return None;
+            };
+            let def = *res.expr_defs.get(lhs)?;
+            if res.def(def).kind != DefKind::Local {
+                return None;
+            }
+            Some((def, res.def(def).name.clone(), *inner))
+        }
+        Stmt::Let { name, init } => {
+            let Expr::Spawn(inner) = ast.expr(*init) else {
+                return None;
+            };
+            let (idx, _) = res
+                .defs
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.span == name.span)?;
+            Some((DefId(idx as u32), name.text.clone(), *inner))
+        }
+        _ => None,
     }
-    Some((def, res.def(def).name.clone(), *inner))
 }
 
 /// Recognizes `sync[h1, h2, ...]` written as its own bare statement
@@ -448,25 +466,37 @@ fn race_call_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefI
     handle_bracket_call_shape(ast, res, stmt, "race")
 }
 
-/// Recognizes `value := race[h1, h2, ...]` — the value-producing form:
-/// `value` gets whichever named handle actually won, instead of `race`
-/// only gating the segment. Assign-only, the same restriction `spawn`'s
-/// own trigger has (`h := spawn ...`, never `let`) — see
-/// `find_let_bound_race`'s doc comment for why. Still gets the SAME
-/// cancellation as the guard-only form (`plan_rule` folds this into the
-/// same `races` list, since cancellation doesn't care which shape named
-/// the handles) — see `render_rule`'s own doc comment on both.
+/// Recognizes `let value = race[h1, h2, ...]` (or `value := race[...]`)
+/// — the value-producing form: `value` gets whichever named handle
+/// actually won, instead of `race` only gating the segment. Still gets
+/// the SAME cancellation as the guard-only form (`plan_rule` folds this
+/// into the same `races` list, since cancellation doesn't care which
+/// shape named the handles) — see `render_rule`'s own doc comment on
+/// both.
 fn race_value_shape(ast: &Ast, res: &Resolution, stmt: StmtId) -> Option<Vec<DefId>> {
-    let Stmt::Assign { lhs, rhs } = ast.stmt(stmt) else {
-        return None;
-    };
-    let Expr::Ident(_) = ast.expr(*lhs) else {
-        return None;
-    };
-    let Expr::Bracket { callee, args } = ast.expr(*rhs) else {
-        return None;
-    };
-    bracket_call_handles(ast, res, *callee, args, "race")
+    // `let value = race[...]` (now the ordinary form) or `value :=
+    // race[...]` (still recognized, same reasoning as `spawn_trigger_
+    // shape`'s own two-shape match). `render_rule`'s own race-value
+    // render site re-derives the destination name directly from `stmt`,
+    // so this fn only needs the racing HANDLES, not the destination.
+    match ast.stmt(stmt) {
+        Stmt::Assign { lhs, rhs } => {
+            let Expr::Ident(_) = ast.expr(*lhs) else {
+                return None;
+            };
+            let Expr::Bracket { callee, args } = ast.expr(*rhs) else {
+                return None;
+            };
+            bracket_call_handles(ast, res, *callee, args, "race")
+        }
+        Stmt::Let { init, .. } => {
+            let Expr::Bracket { callee, args } = ast.expr(*init) else {
+                return None;
+            };
+            bracket_call_handles(ast, res, *callee, args, "race")
+        }
+        _ => None,
+    }
 }
 
 fn handle_bracket_call_shape(
@@ -701,7 +731,22 @@ fn plan_spawn(
         return Err(errors);
     }
 
-    let rename_edits = collect_renames(ast, res, &callee_body, &renames);
+    let mut rename_edits = collect_renames(ast, res, &callee_body, &renames);
+    // `collect_renames`/`collect_renames_expr` only ever rewrite
+    // EXPRESSION positions (`stmt_exprs`), so a capture's OWN declaring
+    // `let name = init` never gets its `name` renamed to `__save_...` —
+    // `Stmt::Let`'s `name` field is a bare `Name`, not an `ExprId`, so
+    // there's nothing there for that walk to match against `renames` at
+    // all. Same fix as `render_rule`'s top-level captures (`let_prefix_
+    // span`), just targeting the RENAMED save-register name instead of
+    // the plain original one, since a spawn callee's captures always go
+    // through the rename scheme (never reuse their own source name).
+    for cap in &captures {
+        if let Some(span) = &cap.let_prefix_span {
+            let target = renames.get(&cap.def).cloned().unwrap_or(cap.name.clone());
+            rename_edits.push((span.clone(), format!("{target} := ")));
+        }
+    }
 
     // No sentinel/idle reset value: unlike a first glance suggests, a
     // plain 0 reset (matching every other continuation register in this
@@ -750,7 +795,7 @@ fn compute_captures(
 ) -> Result<Vec<CapturedLocal>, Vec<LowerError>> {
     let mut assigns: BTreeMap<DefId, BTreeSet<usize>> = Default::default();
     let mut reads: BTreeMap<DefId, BTreeSet<usize>> = Default::default();
-    let mut let_bound: HashSet<DefId> = Default::default();
+    let mut let_bound: HashMap<DefId, Span> = Default::default();
     for seg in segments {
         scan_stmts(
             ast,
@@ -767,6 +812,7 @@ fn compute_captures(
 
     let mut errors = Vec::new();
     let mut captures = Vec::new();
+    let mut capture_names: HashMap<String, DefId> = Default::default();
     for (def, assign_segs) in &assigns {
         let read_segs = reads.get(def).cloned().unwrap_or_default();
         let touched: BTreeSet<usize> = assign_segs.union(&read_segs).copied().collect();
@@ -774,17 +820,7 @@ fn compute_captures(
             continue; // stays a plain local within one generated segment
         }
         let name = res.def(*def).name.clone();
-        if let_bound.contains(def) {
-            errors.push(LowerError {
-                span: res.def(*def).span.clone(),
-                message: format!(
-                    "`{name}` is bound with `let`, but its value needs to survive past a \
-                     `tick` (sequences lowering does not yet support this — v0 \
-                     restriction); use `{name} := ...` instead of `let {name} = ...`"
-                ),
-            });
-            continue;
-        }
+        let let_prefix_span = let_bound.get(def).cloned();
         if assign_segs.len() != 1 {
             let segs: Vec<String> = assign_segs.iter().map(|s| s.to_string()).collect();
             errors.push(LowerError {
@@ -821,12 +857,25 @@ fn compute_captures(
             });
             continue;
         }
+        if let Some(_prev) = capture_names.get(&name) {
+            errors.push(LowerError {
+                span: res.def(*def).span.clone(),
+                message: format!(
+                    "`{name}` shadows another captured value of the same name across this \
+                     rule's segments; sequences lowering needs a distinct name per captured \
+                     save register (v0 restriction: rename one of the `let {name}`s)"
+                ),
+            });
+            continue;
+        }
+        capture_names.insert(name.clone(), *def);
         captures.push(CapturedLocal {
             def: *def,
             name,
             ty,
             assign_segment,
             read_segments: read_segs.into_iter().collect(),
+            let_prefix_span,
         });
     }
 
@@ -1032,54 +1081,13 @@ fn find_spawn_in_expr(ast: &Ast, id: ExprId) -> Option<Span> {
     None
 }
 
-/// Recognizes `let h = spawn Callee(args)` at a body's top level —
-/// `spawn_trigger_shape` only matches `Stmt::Assign`, so a `let`-bound
-/// spawn would otherwise fall through to `find_unsupported_construct`
-/// and get reported as if it were an unsupported `race`, rather than
-/// naming the real restriction (same root cause as a `let`-bound value
-/// crossing a `tick`: `let` always shadow-binds a fresh local instead of
-/// writing a register, which a spawn handle needs since it's read on a
-/// later cycle by definition). Checked before the generic scan, same as
-/// `find_nested_spawn` above.
-fn find_let_bound_spawn(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
-    for stmt in stmts {
-        if let Stmt::Let { init, .. } = ast.stmt(*stmt)
-            && let Expr::Spawn(_) = ast.expr(*init)
-        {
-            return Some(ast.expr_spans[init.0 as usize].clone());
-        }
-    }
-    None
-}
-
-/// Recognizes `let x = race[h1, h2, ...]` at a body's top level —
-/// `race[...]`'s value and its own guard come from the same statement,
-/// making it a segment-gating construct like `spawn`'s trigger or
-/// `sync`, always bound with `:=` (or left bare), never `let`, in this
-/// language. Without this check it falls through to the generic
-/// unsupported-construct scan below and gets reported as if `race[...]`
-/// itself were unsupported, rather than naming the real mistake (same
-/// shape as `find_let_bound_spawn` above, similar underlying reason).
-fn find_let_bound_race(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Option<Span> {
-    for stmt in stmts {
-        if let Stmt::Let { init, .. } = ast.stmt(*stmt)
-            && let Expr::Bracket { callee, .. } = ast.expr(*init)
-            && let Some(def) = res.expr_defs.get(callee)
-            && res.def(*def).kind == DefKind::Builtin
-            && res.def(*def).name == "race"
-        {
-            return Some(ast.expr_spans[init.0 as usize].clone());
-        }
-    }
-    None
-}
-
 /// Scans for anything this pass still can't handle: `spawn`/`sync`/
 /// `race` used in any shape other than the four legitimate ones
-/// (`h := spawn Callee(args)`, `sync[...]`/`race[...]` as their own
-/// statement — which also covers a `tick sync[...]`/`tick race[...]`'s
-/// desugared second statement — and `value := race[...]`) — those four
-/// are recognized and skipped by the caller before reaching here.
+/// (`let h = spawn Callee(args)` or `h := spawn Callee(args)`,
+/// `sync[...]`/`race[...]` as their own statement — which also covers a
+/// `tick sync[...]`/`tick race[...]`'s desugared second statement — and
+/// `let value = race[...]`/`value := race[...]`) — those four are
+/// recognized and skipped by the caller before reaching here.
 fn find_unsupported_construct(
     ast: &Ast,
     res: &Resolution,
@@ -1092,11 +1100,16 @@ fn find_unsupported_construct(
         let is_race_call = top_level && race_call_shape(ast, res, *stmt).is_some();
         let is_race_value = top_level && race_value_shape(ast, res, *stmt).is_some();
 
+        // `let x = expr` or `x := expr` both bind via their own second
+        // expr slot (`stmt_exprs` returns `[init]` for `Let`, `[lhs,
+        // rhs]` for `Assign`) — `.last()` picks the value side for
+        // either shape uniformly, since a spawn trigger/race value is
+        // never the `Assign` LHS case (`spawn_trigger_shape`/`race_
+        // value_shape` already confirmed this statement IS one of
+        // those, so the value expr is always present here).
         if is_spawn_trigger {
-            let Stmt::Assign { rhs, .. } = ast.stmt(*stmt) else {
-                unreachable!()
-            };
-            let Expr::Spawn(inner) = ast.expr(*rhs) else {
+            let value = *stmt_exprs(ast, *stmt).last().unwrap();
+            let Expr::Spawn(inner) = ast.expr(value) else {
                 unreachable!()
             };
             for child in sub_exprs(ast, *inner) {
@@ -1117,10 +1130,8 @@ fn find_unsupported_construct(
                 }
             }
         } else if is_race_value {
-            let Stmt::Assign { rhs, .. } = ast.stmt(*stmt) else {
-                unreachable!()
-            };
-            let Expr::Bracket { args, .. } = ast.expr(*rhs) else {
+            let value = *stmt_exprs(ast, *stmt).last().unwrap();
+            let Expr::Bracket { args, .. } = ast.expr(value) else {
                 unreachable!()
             };
             for arg in args {
@@ -1225,7 +1236,7 @@ fn scan_stmts(
     segment: usize,
     assigns: &mut BTreeMap<DefId, BTreeSet<usize>>,
     reads: &mut BTreeMap<DefId, BTreeSet<usize>>,
-    let_bound: &mut HashSet<DefId>,
+    let_bound: &mut HashMap<DefId, Span>,
 ) {
     for stmt in stmts {
         match ast.stmt(*stmt).clone() {
@@ -1252,17 +1263,28 @@ fn scan_stmts(
                 {
                     let def = DefId(idx as u32);
                     assigns.entry(def).or_default().insert(segment);
-                    // A `let`-bound value can't yet cross a tick: render's
-                    // splice-based lowering relies on the ORIGINAL binding
-                    // statement staying syntactically valid once the
-                    // captured local becomes a `reg` of the same name —
-                    // true by accident for `x := value` (still a plain
-                    // register write), never true for `let x = value`
+                    // A `let`-bound value CAN cross a tick, but its
+                    // declaring statement needs a render-time REWRITE
+                    // first: splice-based lowering makes a captured local
+                    // survive by declaring a `reg` of the same name (or,
+                    // for a spawn-callee capture, a renamed `__save_...`
+                    // one) and then splicing the ORIGINAL binding
+                    // statement's text verbatim — true by accident for
+                    // `x := value` (still parses as a register write once
+                    // that `reg` exists), never true for `let x = value`
                     // (always binds a FRESH local, shadowing the register
-                    // rather than writing it). Recorded here so
-                    // `compute_captures` can reject it once it knows this
-                    // def genuinely needs to survive past a tick.
-                    let_bound.insert(def);
+                    // rather than writing it, per resolve.rs's own
+                    // define-vs-mutate split). The PREFIX span recorded
+                    // here — from this statement's own start through to
+                    // `init`'s own start, i.e. exactly `let name = ` — is
+                    // what `render_rule`/`plan_spawn` replace with
+                    // `{target_name} := ` before splicing, turning `let x
+                    // = expr` into `x := expr` (or the renamed
+                    // equivalent) at render time without ever touching
+                    // the ORIGINAL source the user wrote.
+                    let stmt_span = ast.stmt_spans[stmt.0 as usize].clone();
+                    let init_span = ast.expr_spans[init.0 as usize].clone();
+                    let_bound.insert(def, stmt_span.start..init_span.start);
                 }
             }
             Stmt::Expr(e) => scan_expr(ast, res, e, segment, reads),
@@ -1580,22 +1602,44 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
                 if !dones.is_empty() {
                     out.push_str(&format!("    (({}) = 1)?\n", dones.join(" | ")));
                 }
-                // Value-producing form (`value := race[...]`) additionally
+                // Value-producing form (`let value = race[...]`, or the
+                // still-recognized `value := race[...]`) additionally
                 // assigns the winner's own result — `__race_value` is the
                 // internal builtin firrtl/expr.rs compiles straight to a
                 // priority mux (see its own doc comment for why trace-
                 // source `if`/`else` can't do this instead). Guard-only
                 // form (`race[...]` as its own statement) stops above.
-                if let Stmt::Assign { lhs, .. } = ast.stmt(*stmt)
-                    && let Expr::Ident(name) = ast.expr(*lhs)
-                {
+                // Synthesizes a brand-new declaration line rather than
+                // splicing the original statement, so — like a spawn
+                // trigger — needs no prefix-span rewrite; but UNLIKE a
+                // spawn trigger, the synthesized keyword itself must
+                // match the ORIGINAL shape: a `Stmt::Let` destination is
+                // a fresh local needing `let name = `, an `Assign` one is
+                // either an existing reg/output (needs `:=`) or an
+                // already-`let`-bound local being reassigned (also `:=`)
+                // — self-caught by trying `let winner = tick race[...]`
+                // followed by a same-segment use of `winner`: hardcoding
+                // `name := ...` here left `winner` undeclared in the
+                // rendered output (a real, caught-before-shipping bug,
+                // not a hypothetical).
+                let dest = match ast.stmt(*stmt) {
+                    Stmt::Assign { lhs, .. } => match ast.expr(*lhs) {
+                        Expr::Ident(name) => Some((name.clone(), false)),
+                        _ => None,
+                    },
+                    Stmt::Let { name, .. } => Some((name.text.clone(), true)),
+                    _ => None,
+                };
+                if let Some((name, is_let)) = dest {
                     let flat: Vec<&str> = handles
                         .iter()
                         .filter_map(|h| spawn_by_handle.get(h))
                         .flat_map(|plan| [plan.done_name.as_str(), plan.result_name.as_str()])
                         .collect();
+                    let keyword = if is_let { "let " } else { "" };
+                    let op = if is_let { "=" } else { ":=" };
                     out.push_str(&format!(
-                        "    {name} := __race_value({})\n",
+                        "    {keyword}{name} {op} __race_value({})\n",
                         flat.join(", ")
                     ));
                 }

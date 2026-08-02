@@ -6,10 +6,19 @@
 //! - Items are mutually recursive within a scope (a rule may call a
 //!   function declared after it), so each scope collects declarations
 //!   before resolving bodies.
-//! - `let` always binds a fresh local and may shadow.
-//! - `x := e` binds a fresh local only when `x` does not resolve;
-//!   otherwise it is a write to the existing definition. This is what
-//!   makes `pc := c` a register write but `a := m[pc]` a local binding.
+//! - `let` is the ONLY way to bind a fresh local, and may shadow. `x :=
+//!   e` never declares — it's always either a write to an EXISTING
+//!   definition (a reg/output/fifo/mem/inst port, or a `let`-bound
+//!   local being reassigned) or, if `x` doesn't resolve at all, a clean
+//!   "cannot find" error rather than silently declaring one. Splitting
+//!   "define" (`let`) from "mutate" (`:=`) this way, rather than
+//!   overloading `:=` for both like an earlier version of this language
+//!   did, is a deliberate Verse-alignment choice (Verse itself keeps
+//!   `x := e` a pure definition and requires `set x = e` for mutation) —
+//!   it's what makes `pc := c` unambiguously a register write and
+//!   `let a = m[pc]` unambiguously a local binding, instead of the two
+//!   being distinguished only by whichever name happened to already be
+//!   in scope.
 //! - Names free in a function signature type (`bits[N]`) become implicit
 //!   parameters of that function, per DESIGN.md's parameter inference.
 //! - `reads`/`writes` arguments must name state (reg/mem/fifo); schedule
@@ -17,7 +26,7 @@
 
 use crate::ast::{Ast, Effect, Expr, ExprId, FnKind, Item, ItemId, Name, Stmt, StmtId};
 use crate::lexer::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefId(pub u32);
@@ -226,6 +235,8 @@ pub fn resolve(ast: &Ast) -> (Resolution, Vec<ResolveError>) {
         scopes: vec![HashMap::new()],
         inst_ports: HashMap::new(),
         current_module: Vec::new(),
+        declared_locals: Vec::new(),
+        read_locals: HashSet::new(),
     };
     for name in BUILTINS {
         let id = resolver.new_def(name, DefKind::Builtin, 0..0);
@@ -249,6 +260,22 @@ struct Resolver<'a> {
     /// root. Only pushed/popped around a module's own body, not its own
     /// declaration site (see `resolve_item`'s `Item::Module` arm).
     current_module: Vec<ItemId>,
+    /// Every local declared via `let` or a fresh (unbound) `x := e`,
+    /// anywhere in the file, in declaration order, with its own name+span
+    /// for a good error message. Read unconditionally at every `declare`
+    /// site rather than only inside a fn/impl body — a RULE-scoped slice
+    /// of this is simply never checked (see `Item::Fn`'s own arm below),
+    /// so recording rule-local declarations here too is harmless, and
+    /// keeping ONE flat, unconditional list (no separate `current_fn`
+    /// stack to push/pop/get wrong) is simpler than gating collection
+    /// itself on where we are.
+    declared_locals: Vec<(DefId, Name)>,
+    /// Every local `DefId` ever READ (as an ordinary `Expr::Ident`, never
+    /// an `Assign`'s own LHS — resolve_stmt's `Assign` arm never routes an
+    /// `Expr::Ident` LHS through `resolve_expr`, so this can't double-count
+    /// a write as a read). Checked, not just recorded, only for locals
+    /// declared inside a fn/impl body (see `Item::Fn`'s own arm).
+    read_locals: HashSet<DefId>,
 }
 
 impl<'a> Resolver<'a> {
@@ -473,7 +500,40 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(ret, true);
                 }
                 self.check_effect_args(&effects);
+                let locals_before = self.declared_locals.len();
                 self.resolve_stmts(&body);
+                // A `let`-declared local ANYWHERE in this fn/impl body, at
+                // any nesting depth, and never read back is dead by
+                // construction: a fn's only observable outputs are its
+                // return value and its state writes, and a local (unlike
+                // state) is invisible outside this body, so nothing later
+                // can read it either. (This check no longer needs to worry
+                // about `log := d` on some unbound name meaning to reach a
+                // module's `log` reg — that's caught earlier, and more
+                // precisely, by `resolve_stmt`'s `Stmt::Assign` arm's own
+                // "cannot find" error, since `x := e` never declares a
+                // fresh local anymore; see this file's own module doc
+                // comment.) Rule bodies are deliberately NOT checked here
+                // (only inside this `Item::Fn` arm) — a rule-level scratch
+                // local via bare `let x = e` is a legitimate, load-bearing
+                // pattern (reassignment across statements via `x := e`),
+                // not a fn's-only-two-outputs invariant.
+                let newly_declared = self.declared_locals[locals_before..].to_vec();
+                for (def, name) in &newly_declared {
+                    if !self.read_locals.contains(def) {
+                        self.error(
+                            name.span.clone(),
+                            format!(
+                                "`{}` is assigned but never read in this fn/impl body \
+                                 (v0 restriction: a fn/impl's only outputs are its return \
+                                 value and its state writes, and a local is invisible \
+                                 outside its own body); use a fn/impl declared inside that \
+                                 module if this was meant to write its state",
+                                name.text
+                            ),
+                        );
+                    }
+                }
                 self.scopes.pop();
             }
             Item::Schedule { directives } => {
@@ -576,12 +636,13 @@ impl<'a> Resolver<'a> {
                                 self.res.expr_defs.insert(lhs, def);
                             }
                         } else {
-                            let name = Name {
-                                text: text.clone(),
-                                span: self.ast.expr_spans[lhs.0 as usize].clone(),
-                            };
-                            let def = self.declare(&name, DefKind::Local);
-                            self.res.expr_defs.insert(lhs, def);
+                            self.error(
+                                self.ast.expr_spans[lhs.0 as usize].clone(),
+                                format!(
+                                    "cannot find `{text}`; use `let {text} = ...` to declare \
+                                     a new local"
+                                ),
+                            );
                         }
                     }
                     _ => self.resolve_expr(lhs, false),
@@ -589,7 +650,8 @@ impl<'a> Resolver<'a> {
             }
             Stmt::Let { name, init } => {
                 self.resolve_expr(init, false);
-                self.declare(&name, DefKind::Local);
+                let def = self.declare(&name, DefKind::Local);
+                self.declared_locals.push((def, name));
             }
             Stmt::Tick => {}
             Stmt::Return(expr) => {
@@ -654,6 +716,7 @@ impl<'a> Resolver<'a> {
                         );
                     if ok {
                         self.res.expr_defs.insert(id, def);
+                        self.read_locals.insert(def);
                     }
                 } else if in_type {
                     let name = Name {

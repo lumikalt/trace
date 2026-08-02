@@ -14,7 +14,7 @@ module ReassignedLocal {
     out second_val : bits[8] = 0
 
     rule r {
-        x := a
+        let x = a
         first_val := x
         x := b
         second_val := x

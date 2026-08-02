@@ -113,7 +113,7 @@ module M {
     fifo wide : bits[16]
 
     rule r {
-        x := wide.Deq[]
+        let x = wide.Deq[]
         narrow.Enq[x]
     }
 }
@@ -123,7 +123,7 @@ module M {
     assert!(errors[0].message.contains("enqueue"));
 
     run_ok(
-        "module M {\n fifo a : bits[8]\n fifo b : bits[8]\n rule r {\n x := a.Deq[]\n b.Enq[x]\n }\n}\n",
+        "module M {\n fifo a : bits[8]\n fifo b : bits[8]\n rule r {\n let x = a.Deq[]\n b.Enq[x]\n }\n}\n",
     );
 }
 
@@ -298,7 +298,7 @@ F(x : bits[8]) : bits[8] <combines> {
 }
 
 rule r {
-    y := F(1, 2)
+    let y = F(1, 2)
 }
 ";
     let (_, _, errors) = run(src);
@@ -433,7 +433,7 @@ module M {
 #[test]
 fn shape_errors() {
     // Indexing a register.
-    let (_, _, errors) = run("module M {\n reg a : bits[8] = 0\n rule r {\n x := a(3)\n }\n}\n");
+    let (_, _, errors) = run("module M {\n reg a : bits[8] = 0\n rule r {\n let x = a(3)\n }\n}\n");
     assert!(!errors.is_empty());
 
     // Arithmetic on a fifo.
@@ -452,7 +452,7 @@ module M {
         a := a + 1
     }
     rule r {
-        x := t()
+        let x = t()
     }
 }
 ";
@@ -563,7 +563,7 @@ module M {
     out out : bits[8] = 0
 
     rule r <sequences> {
-        h := spawn Slow(1)
+        let h = spawn Slow(1)
         tick
         (h.done = 1)?
         out := h.result
@@ -583,7 +583,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 
 module M {
     rule r <sequences> {
-        h := spawn Slow(1)
+        let h = spawn Slow(1)
         tick
         h.result := 1
     }
@@ -605,7 +605,7 @@ module M {
     out out : bits[8] = 0
 
     rule r <sequences> {
-        h := spawn Slow(1)
+        let h = spawn Slow(1)
         tick
         out := h.nope
     }

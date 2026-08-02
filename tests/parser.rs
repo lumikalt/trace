@@ -42,7 +42,7 @@ module FifoBridge
   fifo input : (index bits 8)
   fifo output : (index bits 8)
   rule transfer
-    (:= x (index (. input Deq)))
+    (let x (index (. input Deq)))
     (index (. output Enq) x)
 ",
     );

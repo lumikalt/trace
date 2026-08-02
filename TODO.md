@@ -44,29 +44,44 @@
   `examples/call_trunc.tr`, `examples/call_pack.tr`,
   `examples/call_nested.tr`, `examples/call_nested_writes.tr`,
   `examples/call_guard.tr`, `examples/call_fifo.tr`.
-- **Newly-discovered gap, not yet investigated**: a state-writing `fn`
-  declared at FILE top level (outside any `module` block) that
-  references a register by NAME (`log := d`, no explicit qualification)
-  silently fails to write it — no error, no `connect` line, the write
-  just vanishes — when that name happens to match a register declared
-  inside some module. Found by advisor's third probe while verifying
-  struct-returning-callee-that-also-writes-state (this session's return
-  work): `MakeAndLog`/`Bump` declared OUTSIDE `module M { reg log :
-  bits[8] = 0 ... }` reproduces it even for a plain scalar-returning
-  callee with no struct/Option involved at all — confirmed via `git
-  stash` that it predates this session's changes entirely, so it's
-  unrelated to struct/Option returns specifically. Every EXISTING
-  passing test for a state-writing callee (`call_inlines_a_function_
-  that_writes_state_and_returns_a_value`, etc., tests/firrtl.rs)
-  declares the callee NESTED INSIDE the module instead, which is why
-  this never surfaced before. Root cause not yet identified — resolve.rs
-  apparently resolves the top-level fn's `log` reference to SOMETHING
-  (no "unresolved identifier" error), but neither `callee_reg_write`
-  nor `call_writes_reg` (writes.rs) end up emitting a `connect` for it.
-  Whether this should even be legal syntax (should a top-level fn be
-  allowed to write module-scoped state it has no lexical relationship
-  to at all?) is itself an open question — this needs a dedicated
-  investigation, not a quick patch.
+- **RESOLVED — was a fresh-local-declaration footgun, now closed
+  language-wide.** A state-"writing" `fn` declared at FILE top level,
+  referencing a register by NAME (`log := d`) that happens to match one
+  declared inside some module, was previously thought to silently drop
+  the write (found by advisor's third probe while verifying struct-
+  returning-callee-that-also-writes-state). Root cause, once actually
+  traced through resolve.rs: not a miscompile. `x := e` on a name that
+  didn't resolve used to declare a FRESH LOCAL, and a top-level fn
+  genuinely has no lexical access to a module's internal state (by
+  design — modules share no state with each other), so `log := d`
+  inside a top-level fn was just declaring an unused local named `log`,
+  never touching the module's real `log` reg — no wrong hardware ever
+  got built, the fn simply didn't do what its (invalid) source implied.
+  Confirmed the EXPLICIT form already caught the genuine mistake
+  cleanly (`<writes {log}>` on a top-level fn errors "cannot find state
+  `log`" via `check_effect_args`) — it was only the IMPLICIT
+  (inferred-signature) path that gave no diagnostic.
+  First fix (interim, superseded below): a narrow, fn/impl-scoped check
+  in resolve.rs — a local introduced via `let` or a fresh `x := e`
+  ANYWHERE in a fn/impl body, never read back anywhere in that same
+  body, became a compile error ("assigned but never read... if this was
+  meant to write module state, that state isn't in scope here").
+  Final fix (Verse-alignment pass, see the `let`-required entry below):
+  rather than keep patching narrowly around the ambiguity, `let` became
+  the ONLY way to declare a fresh local ANYWHERE in the language — a
+  rule body exactly as much as a fn/impl body. `x := e` on an unresolved
+  name is now always a clean "cannot find `x`; use `let x = ...` to
+  declare a new local" error, which catches `log := d` even earlier and
+  more precisely than the fn/impl-scoped unread-local check ever did.
+  That unread-local check still exists, scoped to `let`-bound locals in
+  fn/impl bodies only (never rule bodies, where a scratch local is a
+  legitimate, load-bearing pattern via `let x = ...` then reassignment
+  via `x := ...`) — a fn's only outputs are its return value and its
+  state writes, so a never-read local there is dead by construction, a
+  much tighter invariant than "unused anywhere," deliberately NOT a
+  general "unused local" lint. Zero false positives across the full
+  existing test suite (every example, every test fixture) — every real
+  fn/impl body's locals are already read at least once.
 - `<elaborates>` recursion/unrolling (`src/elaborate.rs`) is ACHIEVED —
   DESIGN.md's own `AdderTree` example (compile-time tree recursion over a
   `list[bits[N]]`, one-sided slices `xs[..mid]`/`xs[mid..]`). Separate
@@ -112,18 +127,91 @@
   the rule (e.g. used only as a mem-read index). See DESIGN.md's
   "Locals" section, `examples/reassigned_local.tr` +
   `sim/reassigned_local_tb.v`.
-- A `let`-bound value that needs to cross a `tick`, and a memory written
-  to more than once (unconditionally) in one rule, are both compile-time
-  errors now, closing two real silent-miscompile gaps the recent
-  fifo/spawn audit found. See DESIGN.md's "`sequences`: multi-cycle
-  code" and "Memory, fifo, and submodule declarations" sections.
+- A memory written to more than once (unconditionally) in one rule is a
+  compile-time error, closing a real silent-miscompile gap the recent
+  fifo/spawn audit found. See DESIGN.md's "Memory, fifo, and submodule
+  declarations" section. (Its erstwhile companion gap — a `let`-bound
+  value crossing a `tick` being rejected — is gone entirely now; see
+  below.)
 - The two message-quality gaps queued alongside the above are also
   closed: `let x = m[addr]` (a memory read bound with `let`) now emits a
   real read port and compiles, instead of erroring (`collect_read_sites`
   had no `Stmt::Let` arm, the same Assign-vs-Let parity gap as the
-  fifo-op bug); `let h = spawn Foo(args)` now names the real restriction
-  (bind with `:=`, since `.result`/`.done` are read on a later cycle)
-  instead of being blamed on `race`.
+  fifo-op bug); `let h = spawn Foo(args)` and `let value = race[...]`
+  are now both the ORDINARY forms (see below), no longer restricted to
+  `:=`.
+- **`let` required everywhere; `let` can now cross a `tick` (Verse-
+  alignment pass).** Closing the `x := e`/`let` fresh-local-declaration
+  ambiguity (see the RESOLVED entry above) surfaced a real architectural
+  conflict: `<sequences>`/`spawn`/`race` previously required a bare
+  `x := value` specifically for anything crossing a `tick`, because only
+  a `:=`-bound name could be promoted to a save register and still parse
+  correctly once spliced verbatim into the generated segment rule
+  (`x := value` stays an ordinary register write once `x` becomes a
+  `reg`; `let x = value` would always shadow-bind a fresh local
+  instead). Rather than carve out a `<sequences>`-scoped exception to
+  "`let` is required" (considered and explicitly rejected via
+  AskUserQuestion — the more invasive, more principled option was
+  chosen instead), `let` itself was taught to cross a `tick`:
+  `CapturedLocal` now records a `let_prefix_span` (the declaring
+  statement's own `let x = ` prefix, from the statement's start through
+  the init expression's own start) for a `let`-bound capture, and
+  `render_rule`/`render_spawn_segments` rewrite that prefix to `x := `
+  before splicing the rest of the statement verbatim — the same trick a
+  `:=`-bound capture already used, just with one rewritten prefix first.
+  A spawn handle (`let h = spawn Foo(args)`) and a race destination
+  (`let value = race[...]`) are a simpler case: `spawn_trigger_shape`/
+  `race_value_shape` now recognize `Stmt::Let` directly and synthesize
+  brand-new register-write lines from the extracted handle, no
+  splice/rewrite needed at all. Net effect: only "define vs. mutate"
+  distinguishes `let` from `:=` now, not "gets a capture register vs.
+  doesn't" — that second axis is gone.
+  One new restriction, not possible before this change (previously ANY
+  `let` crossing a tick was rejected outright, so it couldn't arise):
+  two textually-distinct `let x = ...` bindings that both cross a tick
+  within the same rule (shadowing — different `DefId`s, same name)
+  would otherwise both become captures sharing one save-register name;
+  `compute_captures` now rejects this directly ("shadows another
+  captured value of the same name") instead of emitting two colliding
+  `reg x` lines that would fail to re-resolve downstream. Found via
+  advisor review before commit, not by the test suite.
+  Two more bugs self-caught during implementation, both via dedicated
+  discriminating probes before the mechanical test migration ever ran:
+  an `unreachable!()` panic in `find_unsupported_construct` (assumed
+  spawn-trigger/race-value statements were always `Stmt::Assign`-shaped;
+  fixed by using `stmt_exprs(...).last()` instead, which already handles
+  both shapes uniformly), and `render_rule`'s race-value arm always
+  synthesizing `{name} := __race_value(...)` regardless of whether the
+  destination was `let`-declared (needing `let name = ...`) or
+  `:=`-declared (needing `name := ...`), producing lowered output with
+  an undeclared `winner` that failed to re-resolve at FIRRTL-emission
+  stage. See DESIGN.md's "Locals", "`sequences`: multi-cycle code",
+  "`spawn`, `sync`, and `race`", and "Sequences lowering" sections.
+- **NEW, REAL BUG — a callee-local reassigned via `:=` is silently
+  dropped at FIRRTL emission; found while fact-checking DESIGN.md's
+  "Calling a function from a rule" section during the pass above, not
+  by the test suite.** Confirmed pre-existing, not a regression from
+  this session's changes (`git stash -u` + rerun on the pre-session
+  baseline reproduces byte-for-byte identical output). Repro: a callee
+  with `let x = input.Deq[]` followed by `x := x + 1` later in the same
+  body — this compiles clean, no error, but the reassignment never
+  appears anywhere in the emitted FIRRTL; every read of `x` resolves to
+  its FIRST binding as if the `x := x + 1` line were never there. Root
+  cause: `enter_rule` (firrtl/writes.rs) is what builds
+  `locals_snapshots`, the position-indexed machinery that makes
+  rule-level `:=` reassignment resolve each read at its own textual
+  position — but it's built from `rule_body`, which returns an empty
+  `Vec` for anything that isn't a top-level `Item::Rule`, so a callee
+  body reached through inlining never populates it at all. Reads
+  instead fall back to the separate, single-binding `self.locals` map
+  (`expr.rs`'s Ident arm), which is what silently serves the stale
+  first value. NOT yet fixed — deliberately out of scope for the `let`
+  feature above (different bug class: silent wrong hardware, not a
+  message-quality or ambiguity gap; unrelated machinery). Needs either
+  extending `locals_snapshots`-style position tracking into callee
+  inlining, or a compile-time rejection of callee-local reassignment
+  until that exists (a `:=` reassignment of an already-`let`-bound
+  local, when the enclosing item isn't a `rule`).
 - Audited every `_ => {}` wildcard match over `Stmt`/`Expr`/`Item`/etc.
   across `src/` (30 sites) for more Assign-vs-Let-shaped silent gaps.
   29 are legitimately safe (most route the semantically-important part

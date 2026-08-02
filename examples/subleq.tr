@@ -8,15 +8,15 @@ module Subleq {
     mem m  : bits[16][4096]
 
     rule step <sequences> {
-        a := m[pc]
+        let a = m[pc]
         tick
-        b := m[pc + 1]
+        let b = m[pc + 1]
         tick
-        c := m[pc + 2]
+        let c = m[pc + 2]
         tick
-        va := m[a]
+        let va = m[a]
         tick
-        r := m[b] - va       -- second operand read; one array access per tick
+        let r = m[b] - va    -- second operand read; one array access per tick
         tick
         m[b] := r
         if r <= 0 { pc := c } else { pc := pc + 3 }

@@ -29,21 +29,31 @@ fn resolved_kinds(res: &Resolution) -> Vec<DefKind> {
 
 #[test]
 fn locals_vs_state_writes() {
-    // `x := ...` binds a local; `count := ...` writes the register.
+    // `let x = ...` binds a local; `count := ...` writes the register.
     let src = "\
 module M {
     reg count : bits[8] = 0
     fifo input : bits[8]
 
     rule drain {
-        x := input.Deq[]
+        let x = input.Deq[]
         count := count - 1
     }
 }
 ";
     let (_, res) = run_ok(src);
     let kinds = resolved_kinds(&res);
-    assert!(kinds.contains(&DefKind::Local), "x should be a local");
+    // `x` is declared but never READ, so it has no `expr_defs` entry to
+    // pick up via `resolved_kinds` (only `Stmt::Assign`'s LHS gets one
+    // at its own declaring site; `Stmt::Let`'s `name` has no `ExprId` at
+    // all) -- check `res.defs` directly instead, same style already
+    // used for `count`'s negative check below.
+    assert!(
+        res.defs
+            .iter()
+            .any(|d| d.name == "x" && d.kind == DefKind::Local),
+        "x should be a local"
+    );
     assert!(
         kinds.contains(&DefKind::Reg),
         "count should stay a register"
@@ -59,7 +69,7 @@ module M {
 
 #[test]
 fn unresolved_name_is_an_error() {
-    let (_, _, errors) = run("rule t {\n x := undeclared + 1\n}\n");
+    let (_, _, errors) = run("rule t {\n let x = undeclared + 1\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("undeclared"));
 }
@@ -285,14 +295,14 @@ fn duplicate_definition_is_an_error() {
 
 #[test]
 fn let_shadowing_is_allowed() {
-    run_ok("rule t {\n let x = 1\n let x = x + 1\n y := x\n}\n");
+    run_ok("rule t {\n let x = 1\n let x = x + 1\n let y = x\n}\n");
 }
 
 #[test]
 fn signature_types_bind_implicit_params() {
     let src = "\
 spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses> {
-    i := any(0..N-1)
+    let i = any(0..N-1)
     reqs[i]?
     return i
 }
@@ -388,7 +398,7 @@ fn rules_see_functions_declared_later() {
     let src = "\
 module M {
     rule r {
-        x := Helper(1)
+        let x = Helper(1)
     }
 }
 
@@ -398,6 +408,155 @@ Helper(v : bits[8]) : bits[8] <combines> {
 ";
     // Helper is top-level and declared after module M: still visible,
     // because scopes are two-phase.
+    run_ok(src);
+}
+
+/// `let` is now the ONLY way to declare a fresh local (`x := e` on an
+/// unbound name is a clean "cannot find" error instead, see the
+/// `feature/require-let-for-locals` migration) -- inside a fn/impl body
+/// specifically, a `let`-bound local that's never read back anywhere in
+/// that same body is STILL its own separate rejection, dead by
+/// construction since a fn's only outputs are its return value and its
+/// state writes. This used to be reachable through a top-level fn
+/// writing `log := d` meaning to reach a module's `log` reg it has no
+/// lexical access to (`log` never resolved, so the write silently
+/// became an unused local) -- that specific mistake is now caught
+/// EARLIER and more directly, by the plain "cannot find `log`" error
+/// (see `a_top_level_fn_writing_an_out_of_scope_name_is_a_clean_error`
+/// below) -- but a genuinely fresh, unread `let` local inside a fn/impl
+/// body (a typo'd return, forgotten field access, dead code) is a
+/// distinct, still-live case this check alone catches.
+#[test]
+fn unread_local_in_a_fn_body_is_rejected() {
+    let src = "\
+Bump(d : bits[8]) : bits[8] <combines> {
+    let doubled = d + d
+    return d
+}
+module M {
+    in x : bits[8]
+    rule r {
+        Bump(x)
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("assigned but never read")),
+        "expected an unread-local rejection, got: {errors:?}"
+    );
+}
+
+/// The scenario `unread_local_in_a_fn_body_is_rejected` used to pin
+/// (before `let` became required for every fresh local): a top-level fn
+/// writing `log := d` meaning to reach a module's `log` reg it has no
+/// lexical access to. Now caught immediately by the ordinary "cannot
+/// find" error -- `log` never resolves at all, so there's no unused
+/// local left to even diagnose as unread.
+#[test]
+fn a_top_level_fn_writing_an_out_of_scope_name_is_a_clean_error() {
+    let src = "\
+Bump(d : bits[8]) : bits[8] <combines> {
+    log := d
+    return d
+}
+module M {
+    in x : bits[8]
+    reg log : bits[8] = 0
+    rule r {
+        Bump(x)
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("cannot find `log`")),
+        "expected a cannot-find rejection, got: {errors:?}"
+    );
+}
+
+/// The explicit-signature form of the same mistake (`<writes {log}>` on
+/// a top-level fn that can't see any `log`) already had its own clean
+/// error before this session -- `check_effect_args` rejects it directly,
+/// unrelated to the new unread-local check. Pinned here alongside the
+/// implicit-form test above so the two don't drift apart.
+#[test]
+fn explicit_writes_effect_naming_out_of_scope_state_is_rejected() {
+    let src = "\
+Bump(d : bits[8]) : bits[8] <combines, writes {log}> {
+    log := d
+    return d
+}
+module M {
+    in x : bits[8]
+    reg log : bits[8] = 0
+    rule r {
+        Bump(x)
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("cannot find state")),
+        "expected a state-not-found rejection, got: {errors:?}"
+    );
+}
+
+/// A fn/impl-body local that's actually read back (the overwhelmingly
+/// common case -- every real example in the repo looks like this) type-
+/// checks fine; a nested `if`/`else` local, declared and read at a
+/// DEEPER scope than the fn's own top level, is also correctly seen (the
+/// check walks `declared_locals` by declaration order across the WHOLE
+/// body, not by scope-diffing the fn's own top-level scope object).
+#[test]
+fn read_locals_in_a_fn_body_are_unaffected_including_nested_in_if_else() {
+    let src = "\
+Classify(x : bits[8]) : bits[8] <combines> {
+    let doubled = x + x
+    if x > 10 {
+        let big = doubled + 1
+        return big
+    } else {
+        return doubled
+    }
+}
+module M {
+    in a : bits[8]
+    out result : bits[8] = 0
+    rule r {
+        result := Classify(a)
+    }
+}
+";
+    run_ok(src);
+}
+
+/// The rule-level twin of the fn-body check above: a RULE's own bare
+/// `x := e` scratch local is a legitimate, load-bearing pattern
+/// (reassignment across statements, DESIGN.md's "Locals" section) and
+/// must stay completely unaffected by the new fn/impl-only check --
+/// `locals_vs_state_writes` above already has an unread rule-level
+/// local (`x := input.Deq[]`, never read) passing `run_ok`, so this
+/// just makes the "deliberately not checked here" scoping explicit as
+/// its own named test.
+#[test]
+fn unread_local_in_a_rule_body_is_not_flagged() {
+    let src = "\
+module M {
+    reg count : bits[8] = 0
+    fifo input : bits[8]
+    rule drain {
+        let x = input.Deq[]
+        count := count - 1
+    }
+}
+";
     run_ok(src);
 }
 

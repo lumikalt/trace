@@ -12,21 +12,21 @@ module Fetch2Gated {
     out ir : bits[32] = 0
 
     ReadBank0(addr : bits[16]) : bits[16] <sequences> {
-        v := bank0[addr]
+        let v = bank0[addr]
         tick
         return v
     }
 
     ReadBank1(addr : bits[16]) : bits[16] <sequences> {
-        v := bank1[addr]
+        let v = bank1[addr]
         tick
         return v
     }
 
     rule fetch2 <sequences> {
         (go = 1)?
-        h1 := spawn ReadBank0(pc)
-        h2 := spawn ReadBank1(pc + 1)
+        let h1 = spawn ReadBank0(pc)
+        let h2 = spawn ReadBank1(pc + 1)
         tick sync[h1, h2]
         ir := pack(h1.result, h2.result)
     }

@@ -7,7 +7,7 @@
 -- sum through real hardware, not just that it compiles.
 AdderTree(xs : list[bits[32]]) : bits[32] <elaborates> {
     if len(xs) = 1 { return xs[0] }
-    mid := len(xs) / 2
+    let mid = len(xs) / 2
     return AdderTree(xs[..mid]) + AdderTree(xs[mid..])
 }
 

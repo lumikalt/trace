@@ -14,7 +14,7 @@ module Checksum {
     out result : bits[16] = 0
 
     rule sum {
-        s := 0
+        let s = 0
         s := s + m[0]
         s := s + m[1]
         s := s + m[2]

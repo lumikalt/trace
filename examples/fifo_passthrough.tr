@@ -21,7 +21,7 @@ module FifoPassthrough {
     }
 
     rule step {
-        x := f.Deq[]
+        let x = f.Deq[]
         f.Enq[x + 1]
         last_out := x
     }

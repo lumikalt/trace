@@ -120,7 +120,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 }
 
 rule r {
-    y := Slow(1)
+    let y = Slow(1)
 }
 ";
     let (_, _, errors) = run(src);
@@ -140,7 +140,7 @@ spec S(x : bits[1]) : bits[1] <combines, chooses> {
 }
 
 rule r {
-    y := S(1)
+    let y = S(1)
 }
 ";
     let (_, _, errors) = run(src);
@@ -223,7 +223,7 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
     // A rule needs no declaration at all -- always a failure context,
     // for any of the three constructs, including calling a `<fails>`
     // function directly.
-    run_ok("module M {\n fifo f : bits[8]\n rule r {\n x := f.Deq[]\n x <> 0\n }\n}\n");
+    run_ok("module M {\n fifo f : bits[8]\n rule r {\n let x = f.Deq[]\n x <> 0\n }\n}\n");
     run_ok(
         "Classify(x : bits[8]) : bits[8] <combines, fails> {\n (x <> 0)?\n return x\n}\n\
          module M {\n out result : bits[8] = 0\n rule r {\n result := Classify(1)\n }\n}\n",
@@ -275,7 +275,7 @@ module M {
     reg count : bits[8] = 0
 
     rule drain {
-        x := input.Deq[]
+        let x = input.Deq[]
         count := count - 1
     }
 }
@@ -295,7 +295,7 @@ module M {
     mem m : bits[8][256]
 
     rule r <reads {pc}> {
-        x := m[pc]
+        let x = m[pc]
     }
 }
 ";
@@ -366,7 +366,7 @@ Fast(x : bits[8]) : bits[8] <combines> {
 }
 
 rule r <sequences> {
-    h := spawn Fast(1)
+    let h = spawn Fast(1)
     tick
 }
 ";
@@ -377,7 +377,7 @@ rule r <sequences> {
     // A <sequences> callee is fine.
     run_ok(
         "Slow(x : bits[8]) : bits[8] <sequences> {\n tick\n return x\n}\n\n\
-         rule r <sequences> {\n h := spawn Slow(1)\n tick\n}\n",
+         rule r <sequences> {\n let h = spawn Slow(1)\n tick\n}\n",
     );
 }
 
@@ -385,7 +385,7 @@ rule r <sequences> {
 fn spawn_needs_a_direct_call() {
     let src = "\
 rule r <sequences> {
-    h := spawn 1
+    let h = spawn 1
     tick
 }
 ";
@@ -404,11 +404,13 @@ fn bracket_builtin_call_gets_the_same_checks_as_a_paren_call() {
     // the `<sequences>`-required check has to run for that shape too, not
     // just the paren-call one, or `sync[...]` in an ordinary `combines`
     // rule would silently pass.
-    let (_, _, errors) = run("module M {\n reg h : bits[1] = 0\n rule t {\n w := sync[h]\n }\n}\n");
+    let (_, _, errors) =
+        run("module M {\n reg h : bits[1] = 0\n rule t {\n let w = sync[h]\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`sync` requires `<sequences>`"));
 
-    let (_, _, errors) = run("module M {\n reg h : bits[1] = 0\n rule t {\n w := race[h]\n }\n}\n");
+    let (_, _, errors) =
+        run("module M {\n reg h : bits[1] = 0\n rule t {\n let w = race[h]\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`race` requires `<sequences>`"));
 }

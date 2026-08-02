@@ -7,7 +7,7 @@ module Rmw {
     reg addr : bits[8] = 0
 
     rule step <sequences> {
-        v := m[addr]
+        let v = m[addr]
         tick
         m[addr] := v + 1
     }

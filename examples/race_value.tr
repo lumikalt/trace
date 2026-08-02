@@ -18,8 +18,8 @@ module RaceValue {
 
     rule pick <sequences> {
         trigger?
-        ha := spawn A(1)
-        hb := spawn B(1)
+        let ha = spawn A(1)
+        let hb = spawn B(1)
         result := tick race[ha, hb]
     }
 }

@@ -28,7 +28,7 @@ module FifoBridge {
     fifo output : bits[8]
 
     rule transfer {
-        x := input.Deq[]      -- fails when input is empty
+        let x = input.Deq[]   -- fails when input is empty
         output.Enq[x]         -- fails when output is full
     }
 }
@@ -44,7 +44,7 @@ A bare `?` tests a condition. Failure of the test aborts the rule.
 ```trace
 rule drain {
     (mode = Draining)?       -- guard: rule only fires in Draining mode
-    x := input.Deq[]
+    let x = input.Deq[]
     count := count - 1
 }
 ```
@@ -123,7 +123,7 @@ and dynamic allocation are legal here and only here.
 ```trace
 AdderTree(xs : list[wire[bits[32]]]) : wire[bits[32]] <elaborates> {
     if len(xs) = 1 { return xs[0] }        -- `if` on an elab value: unrolls
-    mid := len(xs) / 2
+    let mid = len(xs) / 2
     return Add(AdderTree(xs[..mid]), AdderTree(xs[mid..]))   -- recursion: legal
 }
 ```
@@ -165,7 +165,7 @@ Classify(x : bits[8]) : bits[2] <combines, fails> {
 }
 
 rule step {
-    class := Classify(acc)    -- rule stalls until Classify succeeds
+    let class = Classify(acc) -- rule stalls until Classify succeeds
 }
 ```
 
@@ -252,7 +252,7 @@ The `tick` statement marks a cycle boundary.
 
 ```trace
 Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
-    v := mem[addr]
+    let v = mem[addr]
     tick
     mem[addr] := v + 1
 }
@@ -263,11 +263,18 @@ survive past the cycle where it was computed. `tick` must sit at the top level o
 a `sequences` body: it cannot nest inside `if`/`while`. A conditional cycle
 boundary has no defined meaning yet.
 
-A value that crosses a `tick` must be bound with `:=`, not `let`, until `let`
-gains the same support (v0 restriction, a compile-time error): `v := mem[addr]`
-above works because `v` still parses as an ordinary register write once it
-becomes one; `let v = mem[addr]` would not, since `let` always binds a fresh
-local rather than writing an existing register.
+A `let`-bound value crossing a `tick`, like `v` above, gets promoted to a real
+register the same as any other captured value — `render_rule` rewrites the
+declaring `let v = ...` statement into an ordinary register write (`v :=
+...`) at the point it splices that statement into the generated segment rule,
+since `let` itself always binds a fresh local and could never write a
+register directly. This rewrite is why `let` needs no special-casing here:
+whether a value was first bound with `let` or reassigned later with `:=`, it
+crosses a `tick` the same way. The one restriction that remains is on the
+*name*, not the binding form: two distinct `let`s of the same name that both
+need to cross a tick (for example, two arms of a sequence shadowing `x` in
+turn) collide on a single save register and are rejected — give the second
+one a different name.
 
 `tick` may name a trailing fallible expression: `tick <expr>`. The segment `tick`
 opens does not fire until `<expr>` succeeds; until then, the rule retries every
@@ -294,20 +301,20 @@ module Fetch2 {
     out ir : bits[32] = 0
 
     ReadBank0(addr : bits[16]) : bits[16] <sequences> {
-        v := bank0[addr]
+        let v = bank0[addr]
         tick
         return v
     }
 
     ReadBank1(addr : bits[16]) : bits[16] <sequences> {
-        v := bank1[addr]
+        let v = bank1[addr]
         tick
         return v
     }
 
     rule fetch2 <sequences> {
-        h1 := spawn ReadBank0(pc)
-        h2 := spawn ReadBank1(pc + 1)
+        let h1 = spawn ReadBank0(pc)
+        let h2 = spawn ReadBank1(pc + 1)
         tick sync[h1, h2]                   -- waits until both finish
         ir := pack(h1.result, h2.result)
     }
@@ -324,10 +331,10 @@ read-only.
 `tick` has. A loop can therefore never contain a `spawn`, so the number of spawns
 in a design is always static. Each spawn needs its own handle: reusing a handle
 name for a second `spawn` in the same rule is a compile-time error, since each
-occurrence gets its own private register set. A handle must be bound with `:=`,
-not `let` — `h.result`/`h.done` are always read on a later cycle, the same
-restriction as any other value crossing a `tick` (see "`sequences`: multi-cycle
-code" above).
+occurrence gets its own private register set. `let h = spawn ...` is the ordinary
+form, same as any other fresh local; the spawn machinery never splices the
+trigger statement's own text, so it needs no rewrite of the `let` — it always
+synthesizes brand-new register-write lines from the extracted handle instead.
 
 `sync[h1, h2, ...]` waits for every named handle to finish. Square brackets mark
 it as a fallible operation, the same convention `f.Deq[]`/`f.Enq[x]` use. It must
@@ -352,8 +359,8 @@ module FirstWins {
 
     rule pick <sequences> {
         trigger?
-        hf := spawn Fast(1)
-        hs := spawn Slow(1)
+        let hf = spawn Fast(1)
+        let hs = spawn Slow(1)
         tick
         race[hf, hs]                        -- waits until either finishes
         if hf.done = 1 {
@@ -377,9 +384,12 @@ as any other same-cycle conflict — exactly one handle ever actually completes,
 never both.
 
 Read as a bare statement (as above), `race` is a guard only — read whichever
-handle's `.done` came back 1 yourself. `value := race[h1, h2, ...]` is the
-value-producing form instead: `value` becomes whichever handle actually won,
-directly, with no `if`/`else` of your own needed:
+handle's `.done` came back 1 yourself. `value := race[h1, h2, ...]` (writing
+existing state directly) or `let value = race[h1, h2, ...]` (binding a fresh
+local) is the value-producing form instead: `value` becomes whichever handle
+actually won, directly, with no `if`/`else` of your own needed — the
+`RaceValue` example below uses the `:=` spelling, since `result` there is
+already the module's own output:
 
 ```trace
 module RaceValue {
@@ -397,20 +407,26 @@ module RaceValue {
 
     rule pick <sequences> {
         trigger?
-        ha := spawn A(1)
-        hb := spawn B(1)
+        let ha = spawn A(1)
+        let hb = spawn B(1)
         result := tick race[ha, hb]
     }
 }
 ```
 
-`race[...]`'s value, like a spawned handle's own `.result`/`.done`, is only
-meaningful once its own guard has succeeded — so its destination must be bound
-with `:=`, not `let`, the same restriction (and the same reason) `spawn`'s own
-handle has. `tick` optionally taking a trailing expression (`tick <expr>`)
-extends to this shape too: `value := tick race[...]` puts the tick right next
-to the expression it gates, folding `tick \n value := race[...]` onto one
-line — the idiomatic spelling, as `RaceValue` shows.
+`race[...]`'s value is only meaningful once its own guard has succeeded, but
+that is no obstacle here: `result` above already resolves to the module's own
+output, so `result := tick race[ha, hb]` is an ordinary write of already-
+existing state, the same as any other `:=`. Writing the race's value into a
+brand-new local instead (`let value = race[...]`) works too, and needs the
+same save-register treatment as any other fresh value crossing a `tick` — see
+"`sequences`: multi-cycle code" above. Either way, `race`'s value-producing
+form synthesizes a fresh `value := __race_value(...)` or `let value =
+__race_value(...)` line, matching whichever form the destination was written
+with. `tick` optionally taking a trailing expression (`tick <expr>`) extends
+to this shape too: `result := tick race[...]` puts the tick right next to the
+expression it gates, folding `tick \n result := race[...]` onto one line —
+the idiomatic spelling, as `RaceValue` shows.
 
 ### `chooses`: specification, not synthesis
 
@@ -421,7 +437,7 @@ refinements of specs that declare `chooses`.
 
 ```trace
 spec AnyGrant(reqs : bits[N]) : bits[clog2(N)] <combines, chooses, fails> {
-    i := any(0..N-1)          -- free variable: the checker picks
+    let i = any(0..N-1)       -- free variable: the checker picks
     reqs[i]?                  -- constrained: the pick must be a requester
     return i
 }
@@ -567,7 +583,7 @@ unconditional write becoming that `if`'s implicit fallback.
 A fifo has two operations, both fallible:
 
 ```trace
-x := f.Deq[]      -- fails when f is empty
+let x = f.Deq[]   -- fails when f is empty
 f.Enq[x]           -- fails when f is full
 ```
 
@@ -803,13 +819,24 @@ syntax that doesn't exist yet.
 
 ## Locals
 
-A local (`x := value`, or `let x = value`) may be reassigned within one rule. A
-later read sees whichever binding was active at that read's own position in the
-source, not the local's final value:
+`let` is the ONLY way to declare a fresh local. `x := value` never declares —
+it is always either a write to an EXISTING definition (a reg/output/fifo/mem/
+inst port, or a `let`-bound local being reassigned), or, if `x` doesn't
+resolve to anything at all, a compile-time "cannot find" error rather than a
+silent fresh declaration. Splitting "define" (`let`) from "mutate" (`:=`)
+this way is a deliberate Verse-alignment choice (Verse itself keeps `x := e`
+a pure definition and requires `set x = e` for mutation) — it's what makes
+`pc := c` unambiguously a register write and `let a = m[pc]` unambiguously a
+local binding, instead of the two being distinguished only by whichever name
+happened to already be in scope.
+
+A local may be reassigned (via `:=`, after its initial `let`) within one
+rule. A later read sees whichever binding was active at that read's own
+position in the source, not the local's final value:
 
 ```trace
 rule r {
-    x := a
+    let x = a
     first_val := x    -- sees a
     x := b
     second_val := x   -- sees b
@@ -819,8 +846,23 @@ rule r {
 A local whose width never resolves to a concrete `bits[w]` anywhere in the rule
 (for example, one used only as a memory-read index) still rejects reassignment.
 
-Inside a `sequences` body, only a `:=`-bound local can cross a `tick`; see
-"`sequences`: multi-cycle code" above.
+Inside a `sequences` body, a local can cross a `tick` regardless of whether it
+was first bound with `let` or later reassigned with `:=`; see "`sequences`:
+multi-cycle code" above.
+
+Inside a fn/impl body specifically (not a rule body), a `let`-bound local is a
+compile-time error if nothing ever reads it back anywhere in that same body:
+a fn/impl's only observable outputs are its return value and its state
+writes, and a local — unlike state — is invisible outside its own body, so a
+never-read one is dead by construction. The check is deliberately narrow, not
+a general "unused local" lint: a rule-level scratch local (the ordinary
+reassignment pattern above) is legitimate and stays completely unchecked, and
+so does any local that's read at least once. Since `x := value` can no
+longer declare a local at all, the classic mistake this check used to catch
+— `log := d` inside a fn meaning to reach some MODULE's `log` reg, when that
+fn has no lexical access to it at all (modules share no state with each
+other) — is now caught earlier and more precisely, as a plain "cannot find
+`log`" error at the `:=` itself, before this unread-local check ever runs.
 
 ## Calling a function from a rule
 
@@ -894,12 +936,19 @@ one combined `valid`-only guard, not the separately-computed (and always
 false) AND of each op's own individual guard. A `let`-bound callee-local
 feeding a `Deq` into a later `Enq` within the same callee (the
 `fifo_bridge.tr` pattern, wrapped in a callee — see `examples/call_fifo.tr`)
-works the same way a rule-level local does, with one sharp edge: it must be
-`let`-bound, not `:=`-reassigned — a callee's own locals don't have access to
-the position-snapshot machinery that makes rule-level `:=` reassignment work
-(see "Locals" below), so `x := input.Deq[]` inside a callee fails with a
-not-obviously-related "cannot find this local's binding" error; `let x =
-input.Deq[]` is required there.
+works the same way a rule-level local does. Declaring the local needs no
+special callee handling: `x := input.Deq[]` on a name that doesn't yet
+resolve is simply the ordinary "cannot find `x`; use `let x = ...`"
+resolve-time error every fresh-declaration site gets now (see "Locals"
+below), not a callee-specific case. REASSIGNING a callee-local afterward
+(`let x = ...` followed later by `x := ...` in the same callee body) is a
+real, KNOWN GAP, not yet a clean error: it currently compiles and emits
+without complaint, but the reassignment is silently dropped — every read
+resolves to the local's FIRST binding, since a callee's own locals never
+reach the position-snapshot machinery that makes rule-level `:=`
+reassignment sound (see "Locals" below); that machinery is rebuilt only
+per top-level `rule` item (`enter_rule`, firrtl/writes.rs), never for a
+callee body reached through inlining. See TODO.md.
 
 The fold only understands one shape: the callee's _entire_ fail condition must
 reduce to bare guards and fifo ops sitting directly at its own top level —
@@ -1229,7 +1278,7 @@ lowers to an ordinary single-cycle rule, guarded on a continuation register.
 
 ```trace
 Rmw(addr : bits[8]) <sequences, reads {mem}, writes {mem}> {
-    v := mem[addr]
+    let v = mem[addr]
     tick
     mem[addr] := v + 1
 }
@@ -1270,12 +1319,30 @@ register would change its semantics from "sees the new value" to "sees the old
 value" (a register is speculative until the clock edge). A local reassigned
 across segments, or read in its own assignment segment, is a compile error
 rather than a silent miscompile. A captured local's type must be a concrete
-`bits[w]`. A captured local must be bound with `:=`: the lowering splices the
-original binding statement verbatim, relying on it staying a valid register
-write once promoted, which only holds for `:=` — `let` always binds a fresh
-local, so it would silently shadow the register instead of writing it. A
-`let`-bound value that needs to cross a `tick` is a compile error, not a
-silent miscompile, until `let` gains the same support.
+`bits[w]`.
+
+The lowering splices the original binding statement verbatim into the
+generated segment rule, relying on it staying a valid register write once
+promoted. That holds immediately for `x := value`, since `x` still parses as
+an ordinary write once it becomes a `reg`. It does NOT hold for `let x =
+value` as written, since `let` always binds a fresh local rather than writing
+an existing one — spliced verbatim it would silently shadow the register
+instead of writing it. `CapturedLocal` closes this gap with a targeted
+rewrite instead: for a `let`-bound capture, it records the prefix span
+covering exactly `let x = ` (from the declaring statement's own start through
+the init expression's own start), and `render_rule`/`render_spawn_segments`
+replace that prefix with `x := ` before splicing the rest of the statement
+verbatim — the same trick as `:=`, just needing one rewritten prefix to reach
+it. A `:=`-declared capture has no such prefix span and needs no rewrite.
+
+Because `let` may shadow, two textually-distinct `let x = ...` bindings
+(different `DefId`s) can both need to cross a `tick` within the same rule —
+one arm of a sequence, then a later arm shadowing the same name. Both would
+otherwise become captures sharing the name `x`, and thus the same save
+register (`reg x : bits[8] = 0` emitted twice), which fails to re-resolve
+downstream rather than erroring cleanly at lowering time. `compute_captures`
+rejects this directly once two captures resolve to the same name, before any
+text is generated.
 
 A `sequences` rule reports its own cost: segment count and saved-register bits.
 
@@ -1366,7 +1433,10 @@ spawn reading another's).
 
 `value := race[h1, h2, ...]` (the value-producing form) lowers to the same
 guard PLUS one more line: `value := __race_value(h1.done, h1.result, h2.done,
-h2.result, ...)`, a compiler-internal builtin (never written by a user; it
+h2.result, ...)` — or `let value = __race_value(...)`, matching whichever form
+the destination was originally written with (`plan_rule`/`plan_spawn` detect
+both `Stmt::Assign` and `Stmt::Let` shapes at the trigger site). Either way
+`__race_value` is a compiler-internal builtin (never written by a user; it
 never survives a real `race[h1, h2]` reaching emission, same as `sync`) that
 `compile_race_value` (firrtl/calls.rs) compiles straight to a right-nested
 priority `mux` — `h1`'s pair outermost, so it wins a tie against a later pair,
@@ -1441,7 +1511,7 @@ module FifoPassthrough {
     }
 
     rule step {
-        x := f.Deq[]
+        let x = f.Deq[]
         f.Enq[x + 1]
         last_out := x
     }
@@ -1452,7 +1522,7 @@ module FifoPassthrough {
 }
 ```
 
-A local's value, referenced after being bound (`x := input.Deq[]`, then `x`
+A local's value, referenced after being bound (`let x = input.Deq[]`, then `x`
 used later), is inlined by recompiling whatever it was bound to — FIRRTL has no
 `let`-bound name of its own, only wires and declarations.
 

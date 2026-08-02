@@ -252,7 +252,7 @@ module M {
     fifo f : [4]bits[8]
     rule r {
         (want = 1)?
-        x := f.Deq[]
+        let x = f.Deq[]
         f.Enq[x + 1]
     }
     in want : bits[1]
@@ -332,7 +332,7 @@ module M {
 #[test]
 fn fifo_enq_and_deq_same_cycle_is_a_passthrough() {
     // Enqueueing AND dequeueing the SAME fifo in one rule is a
-    // pass-through, not an error: `x := f.Deq[]` reads the fifo's
+    // pass-through, not an error: `let x = f.Deq[]` reads the fifo's
     // current (pre-edge) data, `f.Enq[x + 1]` writes a NEW value for
     // next cycle -- the combined guard is just `valid` (there must be
     // something to dequeue), not the always-false AND of each op's own
@@ -341,7 +341,7 @@ fn fifo_enq_and_deq_same_cycle_is_a_passthrough() {
 module M {
     fifo f : bits[8]
     rule r {
-        x := f.Deq[]
+        let x = f.Deq[]
         f.Enq[x + 1]
     }
 }
@@ -378,8 +378,8 @@ fn fifo_dequeued_twice_in_one_rule_is_an_error() {
 module M {
     fifo f : bits[8]
     rule r {
-        x := f.Deq[]
-        y := f.Deq[]
+        let x = f.Deq[]
+        let y = f.Deq[]
     }
 }
 ";
@@ -651,8 +651,8 @@ module M {
     fifo f : bits[8]
     reg r : bits[8] = 0
     rule test {
-        x := r
-        y := x
+        let x = r
+        let y = x
         x := r + 1
         f.Enq[y]
     }
@@ -679,7 +679,7 @@ module M {
     reg before : bits[8] = 0
     reg after : bits[8] = 0
     rule r {
-        x := a
+        let x = a
         before := x
         x := b
         after := x
@@ -704,8 +704,8 @@ module M {
     mem m : bits[16][4]
     out result : bits[16] = 0
     rule r {
-        z := m[0]
-        y := z + m[1]
+        let z = m[0]
+        let y = z + m[1]
         z := m[2]
         result := y + z
     }
@@ -730,7 +730,7 @@ module M {
     mem m : bits[16][256]
     reg out : bits[16] = 0
     rule r {
-        x := 5
+        let x = 5
         out := m[x]
         x := 6
         out := m[x]
@@ -3152,7 +3152,7 @@ module M {
     reg counter : bits[8] = 0
 
     rule read_at_five {
-        x := 5
+        let x = 5
         out := m[x]
     }
 
@@ -3180,7 +3180,7 @@ module M {
     in addr : bits[8]
     reg out : bits[16] = 0
     rule r {
-        x := addr
+        let x = addr
         out := m[x]
     }
 }

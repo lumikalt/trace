@@ -5,7 +5,7 @@ module FifoBridge {
     fifo output : bits[8]
 
     rule transfer {
-        x := input.Deq[]      -- fails when input is empty
+        let x = input.Deq[]   -- fails when input is empty
         output.Enq[x]      -- fails when output is full
     }
 }

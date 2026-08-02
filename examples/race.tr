@@ -17,8 +17,8 @@ module Race {
 
     rule pick <sequences> {
         trigger?
-        hf := spawn Fast(1)
-        hs := spawn Slow(1)
+        let hf = spawn Fast(1)
+        let hs = spawn Slow(1)
         tick
         race[hf, hs]
         if hf.done = 1 {

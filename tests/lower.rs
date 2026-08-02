@@ -231,7 +231,7 @@ fn rejects_reassignment_across_segments() {
 module M {
     reg x : bits[8] = 0
     rule r <sequences> {
-        v := 1
+        let v = 1
         tick
         v := 2
         tick
@@ -253,7 +253,7 @@ module M {
     reg x : bits[8] = 0
     reg y : bits[8] = 0
     rule r <sequences> {
-        v := 1
+        let v = 1
         y := v + 1
         tick
         x := v
@@ -272,7 +272,7 @@ fn uncaptured_locals_are_left_alone() {
 module M {
     reg x : bits[8] = 0
     rule r <sequences> {
-        w := 1 + 1
+        let w = 1 + 1
         x := w
         tick
         x := x + 1
@@ -287,14 +287,17 @@ module M {
 }
 
 #[test]
-fn rejects_let_bound_value_crossing_a_tick() {
-    // `let v = value` relies on `render`'s splice-verbatim trick to turn
-    // into a register write once `v` becomes a captured local -- that
-    // trick only works for `x := value` (still a plain register write
-    // once `x` is a `reg`), never for `let x = value` (always binds a
-    // FRESH local, shadowing the register instead of writing it). Left
-    // unrejected this used to silently compile with the captured value
-    // permanently stuck at its reset value -- see TODO.md.
+fn let_bound_value_crossing_a_tick_now_works() {
+    // `let v = value` used to rely on `render`'s splice-verbatim trick,
+    // which only worked for `x := value` (still a plain register write
+    // once `x` becomes a `reg`) -- `let x = value` always bound a FRESH
+    // local instead, shadowing the register rather than writing it, so
+    // this was rejected outright (see git history). Once `let` became
+    // the ONLY way to declare a fresh local (resolve.rs, see TODO.md),
+    // `render_rule` learned to rewrite a `let`-bound capture's own
+    // declaring statement into `{name} := ` before splicing
+    // (`CapturedLocal::let_prefix_span`), so this now works correctly
+    // instead of needing a dedicated rejection.
     let src = "\
 module M {
     out out : bits[8] = 0
@@ -306,15 +309,22 @@ module M {
 }
 ";
     let c = run(src);
-    assert_eq!(c.errors.len(), 1);
-    assert!(c.errors[0].message.contains("bound with `let`"));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered[0].captures.len(), 1);
+    let rendered = render(&c.ast, src, &c.lowered);
+    assert!(rendered.contains("reg v : bits[8] = 0"));
+    assert!(rendered.contains("v := 8'd5"));
+    assert_round_trips(&rendered);
 }
 
 #[test]
-fn rejects_let_bound_value_crossing_a_tick_in_a_spawn_callee() {
-    // Same restriction applies inside a spawned <sequences> fn's own
-    // body, since `plan_spawn` reuses the identical `compute_captures`
-    // machinery as a top-level rule.
+fn let_bound_value_crossing_a_tick_in_a_spawn_callee_now_works() {
+    // Same fix applies inside a spawned <sequences> fn's own body,
+    // since `plan_spawn` reuses the identical `compute_captures`
+    // machinery as a top-level rule -- the rewrite there targets the
+    // RENAMED `__save_...` register instead of the plain original name,
+    // since a spawn callee's captures always go through the rename
+    // scheme.
     let src = "\
 Foo() : bits[8] <sequences> {
     let v = 8'd5
@@ -325,15 +335,17 @@ Foo() : bits[8] <sequences> {
 module M {
     out out : bits[8] = 0
     rule r <sequences> {
-        h := spawn Foo()
+        let h = spawn Foo()
         tick sync[h]
         out := h.result
     }
 }
 ";
     let c = run(src);
-    assert_eq!(c.errors.len(), 1);
-    assert!(c.errors[0].message.contains("bound with `let`"));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let rendered = render(&c.ast, src, &c.lowered);
+    assert!(rendered.contains(" := 8'd5"));
+    assert_round_trips(&rendered);
 }
 
 #[test]
@@ -356,11 +368,43 @@ module M {
 }
 
 #[test]
-fn rejects_a_spawn_bound_with_let() {
-    // `spawn_trigger_shape` only recognizes `Stmt::Assign` (`h := spawn
-    // ...`); a `let`-bound spawn used to fall through to the generic
-    // unsupported-construct scan and get blamed on `race`. It should get
-    // its own message naming the real restriction instead.
+fn shadowed_let_captures_of_the_same_name_are_rejected() {
+    // Two DISTINCT `let x` bindings (different DefIds, one shadowing the
+    // other) that both cross a tick would otherwise both become captures
+    // named "x" -- `render_rule` would emit two `reg x : bits[8] = 0`
+    // lines, producing lowered output that fails to re-resolve rather
+    // than a clean error at plan time.
+    let src = "\
+module M {
+    in a : bits[8]
+    in b : bits[8]
+    out out1 : bits[8] = 0
+    out out2 : bits[8] = 0
+    rule r <sequences> {
+        let x = a
+        tick
+        out1 := x
+        let x = b
+        tick
+        out2 := x
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("shadows"));
+}
+
+#[test]
+fn spawn_bound_with_let_now_works() {
+    // `spawn_trigger_shape` used to recognize only `Stmt::Assign` (`h :=
+    // spawn ...`); a `let`-bound spawn fell through to the generic
+    // unsupported-construct scan and got blamed on `race`. Now that
+    // `let` is the ONLY way to declare a fresh local, `spawn_trigger_
+    // shape` recognizes `Stmt::Let` directly -- and needs no render-side
+    // rewrite at all, since `render_spawn_trigger` always synthesizes
+    // brand-new register-write lines from the extracted handle rather
+    // than splicing the trigger statement's own text.
     let src = "\
 Foo() : bits[8] <sequences> {
     tick
@@ -377,14 +421,14 @@ module M {
 }
 ";
     let c = run(src);
-    assert_eq!(c.errors.len(), 1);
-    assert!(c.errors[0].message.contains("bind it with `h := spawn"));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered[0].spawns.len(), 1);
 }
 
 #[test]
 fn no_tick_no_lowering() {
     // <sequences> with zero ticks: nothing to cut, plan skips it.
-    let c = run("rule r <sequences> {\n x := 1\n}\n");
+    let c = run("rule r <sequences> {\n let x = 1\n}\n");
     assert!(c.lowered.is_empty());
     assert!(c.errors.is_empty());
 }
@@ -397,20 +441,20 @@ module Fetch2 {
     out ir : bits[32] = 0
 
     ReadBank0(addr : bits[16]) : bits[16] <sequences> {
-        v := bank0[addr]
+        let v = bank0[addr]
         tick
         return v
     }
 
     ReadBank1(addr : bits[16]) : bits[16] <sequences> {
-        v := bank1[addr]
+        let v = bank1[addr]
         tick
         return v
     }
 
     rule fetch2 <sequences> {
-        h1 := spawn ReadBank0(pc)
-        h2 := spawn ReadBank1(pc + 1)
+        let h1 = spawn ReadBank0(pc)
+        let h2 = spawn ReadBank1(pc + 1)
         tick sync[h1, h2]
         ir := pack(h1.result, h2.result)
     }
@@ -470,7 +514,7 @@ module M {
     rule r <sequences> {
         (1 = 1)?
         if 1 = 1 {
-            h := spawn Slow(1)
+            let h = spawn Slow(1)
         }
         tick
     }
@@ -491,7 +535,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 
 module M {
     rule r <sequences> {
-        h := spawn Slow(1)
+        let h = spawn Slow(1)
         tick
         if 1 = 1 {
             sync[h]
@@ -506,10 +550,13 @@ module M {
 
 #[test]
 fn race_value_form_lowers() {
-    // `w := race[...]` (assign-shaped) IS the value-producing form --
-    // no leading `tick` is structurally required (it's the segment's
-    // own guard, same as a bare `race[...]` statement never needed one
-    // either), though `tick w := race[...]` is the idiomatic spelling.
+    // `out := race[...]` (assign-shaped, into an EXISTING output rather
+    // than a fresh local -- the still-recognized backward-compat shape,
+    // see `race_value_bound_with_let_now_works` for the ordinary `let`
+    // form into a fresh local) IS the value-producing form -- no
+    // leading `tick` is structurally required (it's the segment's own
+    // guard, same as a bare `race[...]` statement never needed one
+    // either), though `tick out := race[...]` is the idiomatic spelling.
     let src = "\
 Slow(x : bits[8]) : bits[8] <sequences> {
     tick
@@ -519,11 +566,10 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 module M {
     out out : bits[8] = 0
     rule r <sequences> {
-        h1 := spawn Slow(1)
-        h2 := spawn Slow(2)
+        let h1 = spawn Slow(1)
+        let h2 = spawn Slow(2)
         tick
-        w := race[h1, h2]
-        out := w
+        out := race[h1, h2]
     }
 }
 ";
@@ -545,10 +591,10 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 
 module M {
     rule r <sequences> {
-        h1 := spawn Slow(1)
-        h2 := spawn Slow(2)
+        let h1 = spawn Slow(1)
+        let h2 = spawn Slow(2)
         tick
-        w := race[h1, h2] + 1
+        let w = race[h1, h2] + 1
     }
 }
 ";
@@ -558,7 +604,7 @@ module M {
 }
 
 #[test]
-fn race_let_bound_is_rejected_with_a_dedicated_message() {
+fn race_value_bound_with_let_now_works() {
     let src = "\
 Slow(x : bits[8]) : bits[8] <sequences> {
     tick
@@ -566,17 +612,21 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 }
 
 module M {
+    out out : bits[8] = 0
     rule r <sequences> {
-        h1 := spawn Slow(1)
-        h2 := spawn Slow(2)
+        let h1 = spawn Slow(1)
+        let h2 = spawn Slow(2)
         tick
         let w = race[h1, h2]
+        out := w
     }
 }
 ";
     let c = run(src);
-    assert_eq!(c.errors.len(), 1);
-    assert!(c.errors[0].message.contains("bind it with `value := race"));
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let rendered = render(&c.ast, src, &c.lowered);
+    assert!(rendered.contains("let w = __race_value("));
+    assert_round_trips(&rendered);
 }
 
 #[test]
@@ -589,8 +639,8 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 
 module M {
     rule r <sequences> {
-        h1 := spawn Slow(1)
-        h2 := spawn Slow(2)
+        let h1 = spawn Slow(1)
+        let h2 = spawn Slow(2)
         tick
         if 1 = 1 {
             race[h1, h2]
@@ -619,8 +669,8 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 module M {
     out out : bits[8] = 0
     rule pick <sequences> {
-        hf := spawn Fast(1)
-        hs := spawn Slow(1)
+        let hf = spawn Fast(1)
+        let hs = spawn Slow(1)
         tick
         race[hf, hs]
         if hf.done = 1 {
@@ -658,12 +708,14 @@ module M {
 
 #[test]
 fn spawning_the_same_handle_twice_is_rejected() {
-    // `:=` binds a local only when unresolved, so the second `h :=
-    // spawn ...` reuses the SAME handle_def as the first rather than
-    // shadowing it -- each spawn occurrence needs its own private
-    // register set, so this must be caught directly here, not left to
-    // surface as a confusing "already defined" resolve error several
-    // passes later on an auto-generated register name.
+    // `let h = spawn Slow(1)` declares the handle; a SECOND `h := spawn
+    // ...` (now a plain reassignment of that already-`let`-bound `h`,
+    // per `spawn_trigger_shape`'s `Stmt::Assign` arm) reuses the SAME
+    // handle_def rather than getting its own -- each spawn occurrence
+    // needs its own private register set, so this must be caught
+    // directly here, not left to surface as a confusing "already
+    // defined" resolve error several passes later on an auto-generated
+    // register name.
     let src = "\
 Slow(x : bits[8]) : bits[8] <sequences> {
     tick
@@ -672,7 +724,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 
 module M {
     rule r <sequences> {
-        h := spawn Slow(1)
+        let h = spawn Slow(1)
         h := spawn Slow(2)
         tick
     }
@@ -707,7 +759,7 @@ Slow(x : bits[8]) : bits[8] <sequences> {
 
 module M {
     rule r <sequences> {
-        h := spawn Slow(1)
+        let h = spawn Slow(1)
         tick
     }
 }

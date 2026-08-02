@@ -20,7 +20,7 @@ module FifoDepth {
     rule pushpop {
         (want_push = 1)?
         (want_pop = 1)?
-        x := f.Deq[]
+        let x = f.Deq[]
         f.Enq[push_data]
         last_deq := x
     }
@@ -32,7 +32,7 @@ module FifoDepth {
 
     rule pop_only {
         (want_pop = 1)?
-        x := f.Deq[]
+        let x = f.Deq[]
         last_deq := x
     }
 
