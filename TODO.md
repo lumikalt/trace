@@ -605,6 +605,87 @@ Worth building:
   accepted. `and` needed no dedicated syntax: sequential bare guards
   already conjoin for free, and `logic(...)` combined with bitwise `&`
   already covers it in expression position.
+- **Comparisons returning their left operand in a failure context**
+  (Verse: `X > 0` yields `X` on success, fails otherwise) — design
+  decided (Lumi's call, made alongside the if-guard decision above,
+  which this one depends on). Not built; this is the semantics +
+  scope writeup, mirroring the if-guard entry's shape.
+
+  **Reframe from "rework the type system" to "add a fourth fallible
+  shape."** trace already has a closed family of fallible expressions
+  — fifo `Deq[]`, `opt?` (Option unwrap), a call to a `<fails>`
+  fn/impl — each reusing the same `Expr::Guard`/`is_guard_like`/
+  placement-restriction (`check_guard_placement`)/mandatory-`<fails>`-
+  declaration (`check_fails_declared`) machinery. A comparison becomes
+  a FOURTH member of that family rather than a wholesale rework: `a >
+  b` stops being `Ty::Bits(Width::Known(1))` (`type_binop`'s
+  `Eq|Ne|Lt|Le|Gt|Ge` arm, currently a flat `return Ty::Bits(Width::
+  Known(1))`) and instead succeeds with `a`'s own type/width, or fails
+  — the exact "unwrap-or-fail" shape `opt?`/`f.Deq[]` already have.
+  `x := (a > b)?` would bind `x` to `a`'s value AND gate the rule on
+  the comparison holding, the same way `x := opt?`/`x := f.Deq[]`
+  already do today — no new binding form, just a new source feeding
+  the existing one. `logic(a > b)` (discharge to a definite `0`/`1`
+  without gating) generalizes cleanly too: `check_logic_args_in`
+  (firrtl/checks.rs) is a hard two-way allowlist (`is_fifo_op` / a
+  call to a guard-only `<fails>` callee), straightforward to extend
+  with a third arm — and a comparison is ALREADY side-effect-free, so
+  the "don't silently discard a write" concern that arm's other two
+  cases both have doesn't even apply here; simpler than what `logic`
+  already handles, not harder.
+
+  **The real cost is `if`/`while`, and it's why this depends on the
+  if-guard decision above.** `if`/`while` conditions go through
+  `check_cond` (types.rs), which demands exactly `[1]` — they are NOT
+  reached via `is_guard_like`/the guard-placement machinery at all
+  today. Once a comparison stops being `[1]`, every existing `if`/
+  `while` whose condition is a bare comparison breaks unless something
+  discharges it back to a plain boolean. Measured, not guessed: 7
+  examples (`adder_tree.tr`, `call_branch.tr`, `mem_write_branch.tr`,
+  `race.tr`, `subleq.tr`, `subleq_boot.tr`, `submodule_cond.tr`) and
+  roughly 50 test snippets across `tests/*.rs` condition an `if`/
+  `while` on a bare comparison today. That is the actual migration
+  cost this decision carries, and it's the SAME machinery the if-guard
+  design above already targets: an `if` with a fallible condition and
+  no `else` is that design's already-supported case (comparison
+  failure just gates the rule, matching every one of the 7 examples
+  above); an `if`-WITH-`else` is that design's new, not-yet-built,
+  branch-scoped case. Comparisons-as-fallible cannot ship as an
+  independent feature ahead of if-guard's build — virtually every
+  existing `if` in the codebase needs if-guard's discharge path to
+  keep compiling at all.
+
+  **`while` is forced back into scope, not optional.** The if-guard
+  writeup marked `while` "out of scope unless a concrete need shows
+  up." `while x <> 0 { x := x >> 1 }` is that need: it's a real, tested
+  pattern (`tests/effects.rs`), including one `<sequences>`-lowered
+  case that's genuinely synthesizable, not just an elaboration-time
+  `<combines>` unroll. A `while`'s "condition became false" is
+  semantically its ordinary loop-exit, not a rule-wide failure the way
+  an `if`-with-no-else's condition failing is — confirm this is how
+  `<sequences>`'s existing while-lowering already treats a plain `[1]`
+  condition today, and design the comparison case to match that
+  (looping stops; the REST of the rule after the loop is unaffected),
+  not to gate the whole rule on the final failing comparison.
+
+  Two scope questions still open, recommendation given for each rather
+  than left blank:
+  - **All six comparison operators, or just the four orderings (`<`,
+    `<=`, `>`, `>=`)?** Verse's own example is `X > 0`; equality's
+    "return the left operand on success" is a much less useful value
+    (a caller already knows what `a` equals if `a = b` held). Leaning
+    toward all six anyway, for the same reason `17f21e9` ported `=`/
+    `<>` alongside the rest — a comparison-shaped carve-out (some
+    comparisons fallible, some not) is a worse asymmetry than a
+    rarely-useful value on two of the six.
+  - **Nesting.** Should a fallible comparison get the SAME "whole
+    statement / entire RHS of `:=` / let init only" restriction
+    `opt?`/`f.Deq[]` already have (rejecting `(a > b) & (c < d)`,
+    arithmetic, or a call argument outright), or something looser?
+    Recommend the same restriction — consistency with the rest of the
+    fallible family, and `logic(a > b) & logic(c < d)` is the existing
+    escape hatch for the bitwise-combine case, same as `or`'s own doc
+    comment already points to for `and` in expression position.
 - trace's `not` is confirmed to be a plain `[1]` boolean operator
   (`types.rs`'s operand-must-already-be-`[1]` rule), not Verse's
   "test success/failure without committing" operator — `17f21e9` was a
@@ -768,13 +849,99 @@ Speculative, bigger, not committed to:
     its own design pass if ever wanted.
 - **Fallible bindings scoped to a single `if`** (Verse's
   `if (X := Expr, Y > 0):`, where `X` only exists in the `then` branch
-  and a failure skips straight past it) — uncertain fit. trace's guard
-  model is per-RULE (one composed readiness condition for the whole
-  body), not per-statement with real sequential abort/rollback the way
-  Verse's `if` is; grafting Verse's fine-grained scoping onto that
-  without just reinventing `if`/`else` restructuring needs a real
-  design discussion, not an implementation attempt, before committing
-  to anything.
+  and a failure skips straight past it, running the `else` instead
+  rather than aborting the surrounding scope). Design decided (Lumi's
+  call, picking the full version over closing this or building `?T`-
+  only sugar) — not built; this is the semantics + open-questions
+  writeup the decision needs before an implementation attempt.
+
+  **The no-else/with-else split is what makes this tractable at all.**
+  An `if` whose fallible condition has NO `else` is already exactly
+  today's supported top-level guard: failure means the rule doesn't
+  fire this cycle, full stop — no new semantics needed, it's just
+  `if cond? { body }` instead of `cond?` followed by `body` unnested.
+  The genuinely new half is `if`-WITH-`else`: failure must take the
+  `else` branch (or fall through, with no `else`) while the REST of the
+  rule still runs and still commits — trace has never had a construct
+  where one part of a rule can fail without the whole rule failing.
+
+  **The value side is already solved; only side-effecting ops are the
+  gap.** Probed directly: `if opt.valid { result := opt.data } else
+  { result := 2 }` already compiles today, unconditionally (no rule-
+  level guard at all), to a plain `mux(opt_valid, opt_data, 2)` —
+  ordinary conditional-write muxing, which `writes.rs` already does
+  correctly for any `if`/`else`-nested write. An Option's presence check
+  is a pure combinational predicate with nothing to make atomic, so
+  `opt?` as an if-condition is arguably just SCOPING sugar over this
+  (binding `opt.data` to a name visible only in `then`) — trace has no
+  branch-scoped bindings anywhere else (`let` is body-scoped,
+  shadowing is legal, see `let_shadowing_is_allowed`), so even the
+  Option-only case would be a new scoping rule, not free.
+  The real gap is a FIFO op / failing call as an if's condition: a
+  `Deq[]` is a genuine side effect (the fifo's occupancy register
+  actually decrements this cycle), and `compile_guard` (writes.rs) is
+  structurally top-level-only — `for stmt in &body`, no recursion into
+  `if`/`while` at all. Today EVERY guard/fifo-op/failing-call in a rule
+  is assumed unconditional, folding straight into one whole-rule `AND`
+  (`check_guard_placement`'s "nested in if/while is not yet supported"
+  restriction is this assumption enforced, not an arbitrary limitation).
+  Branch-scoping a fifo op means its dequeue-enable signal has to
+  become `<AND of every enclosing branch's take-condition> AND
+  fires_rule` instead of `fires_rule` alone — likely an extension of
+  the per-branch conditional-write machinery `writes.rs` already has
+  for ordinary state writes, not a wholly separate mechanism, but this
+  hasn't been confirmed against the actual fifo emission code in
+  `firrtl/fifo.rs`/`module.rs`.
+
+  **`or`-with-default is the existence proof, not a desugaring
+  target.** `x := f1.Deq[] or f2.Deq[] or 0` already has EXACTLY this
+  shape today: a fallible op tries an alternative, falls back on
+  failure, and contributes NOTHING to the rule's guard when a default
+  is present — "fallible thing whose failure takes an alternate path
+  without failing the rule" already exists and is hand-lowered +
+  Icarus-confirmed. That's precedent that the semantics are soundly
+  buildable in this execution model, not a claim that `if` should
+  desugar to `or`: `or`'s alternatives are `Deq[]`-only on depth-1
+  fifos with no writes of their own, while an `if`'s `then`/`else` need
+  to be arbitrary statement blocks with real writes in both branches —
+  a materially bigger surface than `or` covers.
+
+  Four open questions this design still owes before implementation:
+  - **Two `Deq[]`s on the same fifo, one in `then` and one in `else`.**
+    `check_fifo_op_counts` rejects a second `Deq[]` on the same fifo
+    per rule TODAY, unconditionally — but two `Deq[]`s in mutually
+    exclusive branches are provably not a double-dequeue. Does this
+    check become branch-aware (track mutual exclusion through the
+    if/else tree), or does the blanket restriction stay and this
+    pattern remains rejected even once branch-scoping otherwise works?
+    This is the sharpest concrete sub-question of the four.
+  - **Interaction with "a guard must appear before any state write."**
+    That restriction (`check_guard_placement`) is rule-wide today. Does
+    it become per-branch (a state write before the branch's OWN
+    fallible condition is still restricted, but a write in a SIBLING
+    branch or after the whole `if` is fine), or does introducing any
+    fallible condition inside an `if` still close the guard window for
+    the rest of the rule the same way a top-level one does?
+  - **`while` with a fallible condition** — out of scope unless named
+    in. Verse's own construct is `if`-shaped only; nothing here argues
+    for extending to `while`, so treat this as staying restricted
+    (today's "guard nested in if/while" error) unless a concrete need
+    for a fallible loop condition shows up.
+  - **What `fires_rule` becomes for an `if`-WITH-else fallible
+    condition.** Per the no-else/with-else split above, the with-else
+    case should contribute NOTHING to the whole-rule guard (matching
+    `or`-with-default) — confirm this is actually achievable for a
+    fifo-occupancy-gated branch, not just an Option-presence one, once
+    the dequeue-enable question above is answered.
+
+  One dead-code note this decision revives rather than resolves:
+  `check_cond`'s early-return for `Expr::Guard` over a `Ty::Option`
+  (types.rs:896) is unreachable today — the guard-position check in
+  `firrtl/checks.rs` rejects a guard in an if-condition before
+  `check_cond` ever gets a chance to allow it. Under the closed
+  alternative this would have been dead code to delete; under this
+  decision it becomes the live path once building starts, not a
+  leftover to clean up.
 
 Explicitly considered and NOT being ported, so a future session doesn't
 re-propose these from a fresh read of the same chapters:
@@ -783,19 +950,6 @@ re-propose these from a fresh read of the same chapters:
   hardware has no runtime to propagate an error into; the closest
   analogue, an elaboration-TIME fatal check, is a different feature
   already reachable via a plain compile error, not a gap.
-- **Comparisons returning their left operand in a failure context**
-  (Verse: `X > 0` yields `X` on success) — would blur trace's clean
-  condition/value type split (a condition is always `[1]`, a
-  compared operand can be any width) for a cosmetic win only; not worth
-  the type-system ambiguity. Concrete consequence, surfaced while
-  building `or`: this is exactly why `a <> 0 or b` doesn't work today
-  (a comparison is a plain always-succeeding `[1]` value, with
-  nothing for `or` to discharge — `or`'s alternatives all need real
-  fallibility) — `if a <> 0 { a } else { b }` is the spelling instead.
-  Revisit only if this specific pattern shows up for real, not
-  speculatively; it'd be a much bigger, more disruptive change than
-  `logic`/`or` were (every existing bool-returning comparison use would
-  need rethinking), not just another operator.
 - **`first`/`for` runtime failure-filtering** — the synthesizable case
   (pick the first of several candidates that's actually valid) is
   already covered by the `prio` builtin; no new control-flow syntax
