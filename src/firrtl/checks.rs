@@ -283,6 +283,94 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// A fifo op (`Enq`/`Deq`) is recognized ONLY in the exact positions
+    /// `fifo_op_stmt` (fifo.rs) matches structurally — a bare statement,
+    /// the entire right-hand side of `:=`, or a `let` init — since
+    /// `rule_fifo_ops`, module.rs's per-fifo state-transition emission,
+    /// and `compile_guard`'s pass-through precondition all route through
+    /// it. Anywhere else (an arithmetic/comparison operand, wrapped in
+    /// `not`, an `if`/`while` condition, a call argument) the op is
+    /// invisible to all three: no occupancy guard, no enqueue/dequeue
+    /// state transition, and the fifo's raw data register is read as if
+    /// it were valid — a silent miscompile, not a caught error, until
+    /// this check (found via the "Verse `not`-discharge" audit: `not
+    /// (fifo.Deq[])` was the entry point, but the same gap is reachable
+    /// with plain arithmetic and no `not` involved at all — confirmed
+    /// against real firtool-format FIRRTL output before this was
+    /// written). Mirrors `check_failing_call_positions` exactly: same
+    /// shared-traversal shape, `collect_fifo_ops` (fifo.rs) standing in
+    /// for `collect_calls`.
+    pub(crate) fn check_fifo_op_positions(&mut self, rule: ItemId) {
+        let body = rule_body(self.ast, rule);
+        let mut bad = Vec::new();
+        self.fifo_ops_outside_allowed_positions(&body, &mut bad);
+        for op in bad {
+            self.error(
+                self.ast.expr_spans[op.0 as usize].clone(),
+                "a fifo operation may only appear as a whole statement, or as \
+                 the entire right-hand side of `:=`/`let` (v0 restriction: not \
+                 nested inside a larger expression, a condition, or as an \
+                 argument to a call — its guard and state transition would not \
+                 be recognized there)"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// Every fifo op reachable within `stmts` that ISN'T sitting as a
+    /// whole bare statement, the entire right-hand side of `:=`, or a
+    /// `let` init — the fifo-op sibling of `calls_outside_allowed_
+    /// positions`, kept as its own copy (rather than parameterizing that
+    /// one over a collector function) since the two checks' allowed-
+    /// position sets already independently differ (`let` counts here
+    /// unconditionally; `calls_outside_allowed_positions` only counts it
+    /// when its caller opts in).
+    fn fifo_ops_outside_allowed_positions(&self, stmts: &[StmtId], out: &mut Vec<ExprId>) {
+        for stmt in stmts {
+            let allowed = match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) if is_fifo_op(self.ast, self.res, e) => Some(e),
+                Stmt::Assign { rhs, .. } if is_fifo_op(self.ast, self.res, rhs) => Some(rhs),
+                Stmt::Let { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
+                _ => None,
+            };
+            let mut roots: Vec<ExprId> = Vec::new();
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) => roots.push(e),
+                Stmt::Assign { lhs, rhs } => {
+                    roots.push(lhs);
+                    roots.push(rhs);
+                }
+                Stmt::Let { init, .. } => roots.push(init),
+                Stmt::Return(Some(e)) => roots.push(e),
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    roots.push(cond);
+                    self.fifo_ops_outside_allowed_positions(&then_body, out);
+                    if let Some(b) = &else_body {
+                        self.fifo_ops_outside_allowed_positions(b, out);
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    roots.push(cond);
+                    self.fifo_ops_outside_allowed_positions(&body, out);
+                }
+                Stmt::Return(None) | Stmt::Tick => {}
+            }
+            for root in roots {
+                let mut ops = Vec::new();
+                collect_fifo_ops(self.ast, self.res, root, &mut ops);
+                for op in ops {
+                    if Some(op) != allowed {
+                        out.push(op);
+                    }
+                }
+            }
+        }
+    }
+
     /// Every `Expr::Call` reachable within `stmts` that ISN'T sitting as
     /// a whole bare statement or the entire right-hand side of `:=`
     /// (the two positions a nested write or a nested fail condition can

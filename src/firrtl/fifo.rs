@@ -132,6 +132,57 @@ pub(crate) fn is_fifo_op(ast: &Ast, res: &Resolution, expr: ExprId) -> bool {
             .is_some_and(|d| res.def(*d).kind == DefKind::Fifo)
 }
 
+/// Every fifo op (`Enq`/`Deq`) reachable anywhere within `id`, recursing
+/// through arbitrary subexpressions — the fifo-op sibling of calls.rs's
+/// `collect_calls`, used the identical way by `check_fifo_op_positions`
+/// (checks.rs) to reject a fifo op that isn't sitting in one of the
+/// three positions `fifo_op`/`fifo_op_stmt` actually recognize (a bare
+/// statement, the whole RHS of `:=`, or a `let` init). Same shape as
+/// `collect_calls`: a found op is recorded, then its own `callee`/`args`
+/// are still walked too (an `Enq`'s value argument can't itself contain
+/// another fifo op in practice, but walking it anyway costs nothing and
+/// stays consistent with `collect_calls`'s own arg traversal).
+pub(crate) fn collect_fifo_ops(ast: &Ast, res: &Resolution, id: ExprId, out: &mut Vec<ExprId>) {
+    match ast.expr(id) {
+        Expr::Ident(_) | Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
+        Expr::Unary { operand, .. } => collect_fifo_ops(ast, res, *operand, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_fifo_ops(ast, res, *lhs, out);
+            collect_fifo_ops(ast, res, *rhs, out);
+        }
+        Expr::Guard(inner) | Expr::Spawn(inner) => collect_fifo_ops(ast, res, *inner, out),
+        Expr::Field { base, .. } => collect_fifo_ops(ast, res, *base, out),
+        Expr::Call { callee, args } => {
+            collect_fifo_ops(ast, res, *callee, out);
+            for a in args {
+                collect_fifo_ops(ast, res, *a, out);
+            }
+        }
+        Expr::Bracket { callee, args } => {
+            if is_fifo_op(ast, res, id) {
+                out.push(id);
+            }
+            collect_fifo_ops(ast, res, *callee, out);
+            for a in args {
+                collect_fifo_ops(ast, res, *a, out);
+            }
+        }
+        Expr::ListLit(items) => {
+            for item in items {
+                collect_fifo_ops(ast, res, *item, out);
+            }
+        }
+        Expr::Range { lo, hi } => {
+            if let Some(lo) = lo {
+                collect_fifo_ops(ast, res, *lo, out);
+            }
+            if let Some(hi) = hi {
+                collect_fifo_ops(ast, res, *hi, out);
+            }
+        }
+    }
+}
+
 pub(crate) fn contains_fifo_op(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool {
     match ast.stmt(stmt) {
         Stmt::Expr(e) => is_fifo_op(ast, res, *e),

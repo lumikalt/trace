@@ -509,6 +509,83 @@ module M {
 }
 
 #[test]
+fn a_fifo_op_nested_in_a_larger_expression_is_an_error_not_a_dropped_dequeue() {
+    // Mirrors `a_failing_call_nested_in_a_larger_expression_is_an_error_
+    // not_a_dropped_guard`: `fifo_op_stmt` only recognizes a fifo op
+    // sitting as a whole bare statement, the entire RHS of `:=`, or a
+    // `let` init -- one nested inside `+ 1` used to be entirely
+    // invisible to `rule_fifo_ops`, so the rule fired unconditionally
+    // (no occupancy guard) and the fifo never actually dequeued, all
+    // with no error. Found via an audit of whether `not` discharges a
+    // fifo op's fail condition -- the same gap turned out reachable
+    // with plain arithmetic, no `not` involved.
+    let src = "\
+module M {
+    fifo input : bits[8]
+    out result : bits[8] = 0
+    rule compute {
+        result := input.Deq[] + 1
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("may only appear as a whole statement"))
+    );
+}
+
+#[test]
+fn a_fifo_op_in_an_if_condition_is_an_error_not_a_dropped_dequeue() {
+    // `contains_fifo_op` (the existing if/while nesting check) only
+    // walks a branch's own STATEMENTS, never the `if`/`while`'s own
+    // condition expression -- so a fifo op sitting directly in the
+    // condition used to slip past both that check and `fifo_op_stmt`'s
+    // exact-shape match entirely.
+    let src = "\
+module M {
+    fifo input : bits[8]
+    out result : bits[8] = 0
+    rule compute {
+        if input.Deq[] = 1 {
+            result := 5
+        } else {
+            result := 6
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("may only appear as a whole statement"))
+    );
+}
+
+#[test]
+fn a_fifo_op_wrapped_in_not_is_an_error_not_a_dropped_dequeue() {
+    // The original entry point into this bug class: `not` needs a
+    // `bits[1]` operand, so only a `bit`-payload fifo type-checks here,
+    // but the underlying gap (`fifo_op_stmt`'s exact-shape match) is the
+    // same one the two tests above hit without `not` at all.
+    let src = "\
+module M {
+    fifo input : bit
+    out result : bit = 0
+    rule compute {
+        not (input.Deq[])
+        result := 1
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("may only appear as a whole statement"))
+    );
+}
+
+#[test]
 fn reassigned_local_read_between_two_bindings_sees_the_first() {
     // `y` must resolve against `x`'s FIRST binding (`r`), not the later
     // one (`r + 1`) that hasn't happened yet from `y`'s own position --

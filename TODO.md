@@ -172,29 +172,23 @@ Worth building:
   above are paraphrased from a fetched summary, not the primary text —
   re-read [08_failure](https://verselang.github.io/book/08_failure/)
   itself before writing any Rust, same as the hand-lowering step.
-- **Audit: does trace's `not` actually discharge a guard/fifo-op the way
-  Verse's `not` does?** (trace's own unary logical negation is now
-  spelled `not` too, since the operator-spelling pass below aligned it
-  with Verse's word — this is a real semantics question independent of
-  that spelling match.) Verse states plainly that "effects are not
-  committed under `not`" — a fallible expression wrapped in `not` tests
-  success/failure as a plain boolean without contributing to the
-  enclosing failure context. Unverified in trace: `is_guard_like`,
-  `callee_fail_cond`, and the guard-folding walk in `firrtl/checks.rs`/
-  `calls.rs`/`writes.rs` all recurse into arbitrary subexpressions to
-  find `Expr::Guard`/fifo-op nodes — it's not yet confirmed whether one
-  of those wrapped in `not (...)` still gets folded into the rule's AND
-  guard (matching trace's current, simpler "any fail site anywhere
-  gates the rule" model, which predates and is unrelated to `not`'s
-  respelling) or whether that's actually a latent Verse-semantics
-  mismatch worth closing. This is a real trace question worth answering
-  on its own regardless of the exact Verse wording above (also a
-  fetched paraphrase, not the primary text) — re-read
-  [08_failure](https://verselang.github.io/book/08_failure/) to confirm
-  the `not` claim precisely, but check trace's own behavior either way.
-  Check before building anything else in this section — it may already
-  be fine as-is, in which case this is a one-line confirmation, not a
-  change.
+- trace's `not` is confirmed to be a plain `bits[1]` boolean operator
+  (`types.rs`'s operand-must-already-be-`bits[1]` rule), not Verse's
+  "test success/failure without committing" operator — `17f21e9` was a
+  respelling, not a semantics port, and that's fine as-is: the two
+  positions where Verse's discharge semantics would matter (`not`
+  wrapping a failing call or a bare `expr?` guard) are already
+  hard-rejected with a clean compile error. A fifo op (`Enq`/`Deq`) is
+  only recognized in the exact structural positions `fifo_op_stmt`
+  matches (a bare statement, the whole RHS of `:=`, a `let` init) —
+  anywhere else (arithmetic, an `if`/`while` condition, wrapped in
+  `not`, a call argument) it's now a clean "not yet supported" error
+  (`check_fifo_op_positions`/`collect_fifo_ops`, mirroring calls' own
+  `check_failing_call_positions`/`collect_calls`) instead of the silent
+  miscompile it used to be (no occupancy guard, no state transition, the
+  fifo's raw register read as if valid). Rule bodies only — a callee's
+  own body already independently rejects any shape this permissive
+  (`check_fails_is_foldable_guard`), confirmed separately.
 - **Cross-tick fails/rollback safety in `sequences`** — ties directly
   into the existing "Cost model and formal verification" section below:
   Verse's `<transacts>` explicitly notes state changes are provisional
