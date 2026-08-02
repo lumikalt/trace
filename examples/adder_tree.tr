@@ -5,7 +5,7 @@
 -- d))` before this file's own type-checking/scheduling/emission ever
 -- runs -- see sim/adder_tree_tb.v for the proof it computes the right
 -- sum through real hardware, not just that it compiles.
-AdderTree(xs : list[[32]]) : [32] <elaborates> {
+AdderTree(xs : list[32]) : [32] <elaborates> {
     if len(xs) = 1 { return xs[0] }
     let mid = len(xs) / 2
     return AdderTree(xs[..mid]) + AdderTree(xs[mid..])

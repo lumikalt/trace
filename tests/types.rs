@@ -614,7 +614,7 @@ module M {
 #[test]
 fn list_literal_types_as_list_of_its_element_type() {
     run_ok(
-        "Sum(xs : list[[8]]) : [8] <elaborates> {\n\
+        "Sum(xs : list[8]) : [8] <elaborates> {\n\
              return xs[0]\n\
          }\n\
          module M {\n\
@@ -629,7 +629,7 @@ fn list_literal_types_as_list_of_its_element_type() {
 
 #[test]
 fn list_literal_element_type_mismatch_is_an_error() {
-    let src = "Sum(xs : list[[8]]) : [8] <elaborates> {\n\
+    let src = "Sum(xs : list[8]) : [8] <elaborates> {\n\
                    return xs[0]\n\
                }\n\
                module M {\n\
@@ -644,6 +644,27 @@ fn list_literal_element_type_mismatch_is_an_error() {
     assert!(
         !errors.is_empty(),
         "expected a type error for mismatched list elements"
+    );
+}
+
+#[test]
+fn list_of_a_named_struct_type_still_spells_the_element_type_out() {
+    // `list[T]`'s bare-width sugar (`list[8]`, above) only kicks in when
+    // the argument ISN'T already type-shaped (`eval_elem_ty`, types.rs) —
+    // a struct name like `Pair` is, so `list[Pair]` keeps meaning a list
+    // of that struct, not a list of `bits[Pair]` (which would be nonsense
+    // anyway, since `Pair` doesn't resolve to a constant width).
+    run_ok(
+        "struct Pair {\n\
+             valid : [1]\n\
+             data : [8]\n\
+         }\n\
+         First(xs : list[Pair]) : Pair <elaborates> {\n\
+             return xs[0]\n\
+         }\n\
+         module M {\n\
+             reg p : Pair\n\
+         }\n",
     );
 }
 

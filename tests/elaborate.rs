@@ -23,7 +23,7 @@ fn run(src: &str) -> (Vec<(trace::lexer::Span, String)>, Vec<ElabError>) {
 
 #[test]
 fn adder_tree_reduces_to_a_left_associated_sum_at_each_call_site() {
-    let src = "AdderTree(xs: list[[32]]) : [32] <elaborates> {\n\
+    let src = "AdderTree(xs: list[32]) : [32] <elaborates> {\n\
                    if len(xs) = 1 { return xs[0] }\n\
                    let mid = len(xs) / 2\n\
                    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])\n\
@@ -49,10 +49,45 @@ fn adder_tree_reduces_to_a_left_associated_sum_at_each_call_site() {
 }
 
 #[test]
+fn list_bare_width_sugar_also_covers_an_implicit_generic_param() {
+    // `list[N]` where `N` is free (an implicit width param, same as a
+    // bare `[N]` type would infer one) resolves through the identical
+    // `eval_elem_ty` path (types.rs) as a literal `list[32]` above --
+    // `const_eval` just resolves `N` from `env` instead of reading an
+    // `Expr::Int` directly. Deliberately NOT a types.rs-level test:
+    // `types::check` alone (no elaboration) can't validate a call against
+    // an unresolved generic list param -- by the time real `--firrtl`
+    // ever reaches ordinary type-checking, elaborate.rs has already
+    // reduced every such call away, so this is the representative venue.
+    let src = "Sum(xs: list[N]) : [N] <elaborates> {\n\
+                   if len(xs) = 1 { return xs[0] }\n\
+                   let mid = len(xs) / 2\n\
+                   return Sum(xs[..mid]) + Sum(xs[mid..])\n\
+               }\n\
+               module M {\n\
+                   in a : [16]\n\
+                   in b : [16]\n\
+                   out total : [16] = 0\n\
+                   rule go {\n\
+                       total := Sum([a, b])\n\
+                   }\n\
+               }\n";
+    let (edits, errors) = run(src);
+    assert!(errors.is_empty(), "elab errors: {errors:?}");
+    let rendered = render(src, &edits);
+    assert!(
+        rendered.contains("total := (a + b)"),
+        "unexpected rendering:\n{rendered}"
+    );
+}
+
+#[test]
 fn an_odd_length_list_exercises_the_asymmetric_split() {
     // The 4-element case (4->2->1) never exercises `let mid = len(xs) / 2`
     // truncating on an odd length -- 3 elements split [a] + [b, c], a
-    // genuinely different shape than the power-of-two case.
+    // genuinely different shape than the power-of-two case. Deliberately
+    // keeps the long-form `list[[32]]` spelling (rather than the `list[32]`
+    // sugar the sibling test above uses) to pin that both remain equivalent.
     let src = "AdderTree(xs: list[[32]]) : [32] <elaborates> {\n\
                    if len(xs) = 1 { return xs[0] }\n\
                    let mid = len(xs) / 2\n\
@@ -82,7 +117,7 @@ fn a_single_element_list_reduces_to_that_element_with_no_addition() {
     // alone is the `[N]` type shorthand instead (see parser.rs's
     // `Some(LBracket)` primary arm) — the same escape hatch Rust's own
     // one-element tuple syntax uses, for the identical reason.
-    let src = "One(xs: list[[8]]) : [8] <elaborates> {\n\
+    let src = "One(xs: list[8]) : [8] <elaborates> {\n\
                    return xs[0]\n\
                }\n\
                module M {\n\
@@ -104,7 +139,7 @@ fn a_single_element_list_reduces_to_that_element_with_no_addition() {
 #[test]
 fn an_out_of_bounds_list_slice_is_a_compile_error_not_a_panic() {
     // See the sibling test above for why this is `[a,]` rather than `[a]`.
-    let src = "Bad(xs: list[[8]]) : [8] <elaborates> {\n\
+    let src = "Bad(xs: list[8]) : [8] <elaborates> {\n\
                    return xs[5]\n\
                }\n\
                module M {\n\

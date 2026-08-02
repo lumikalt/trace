@@ -508,11 +508,12 @@ impl<'a> TypeChecker<'a> {
                     if args.len() != 1 {
                         self.error(
                             self.expr_span(id),
-                            "`list` takes one element type, e.g. `list[[8]]`".to_string(),
+                            "`list` takes one element type, e.g. `list[8]` or `list[Pair]`"
+                                .to_string(),
                         );
                         return Ty::Unknown;
                     }
-                    return Ty::List(Box::new(self.eval_ty(args[0], env)));
+                    return Ty::List(Box::new(self.eval_elem_ty(args[0], env)));
                 }
                 let elem = self.eval_ty(callee, env);
                 if matches!(elem, Ty::Unknown) {
@@ -553,6 +554,40 @@ impl<'a> TypeChecker<'a> {
                 self.error(self.expr_span(id), "expected a type here".to_string());
                 Ty::Unknown
             }
+        }
+    }
+
+    /// `list[T]`'s own single argument, with one extra sugar `eval_ty`
+    /// itself doesn't have: a bare width expression (`list[8]`,
+    /// `list[N]`, `list[clog2(N)]`) is shorthand for `list[[N]]` (that
+    /// is, `list[bits[N]]`) — sidesteps the double-bracket `list[[N]]`
+    /// for the overwhelmingly common case, a list of plain bit-vectors,
+    /// while `list[Pair]` (a list of some OTHER type, e.g. a struct)
+    /// still spells its element type out in full, since only a
+    /// `[N]`-shaped element has anything to abbreviate in the first
+    /// place. Told apart the same way `parse_expr`'s own `[N]`-vs-list-
+    /// literal split is: by shape, not position — an expression that's
+    /// ALREADY type-shaped (a `Bracket`, an `OptionTy`, or an `Ident`
+    /// naming a declared struct) evaluates as a type normally; anything
+    /// else is treated as the width argument an implicit `[...]` would
+    /// have wrapped, mirroring the `bits` arm's own Known/Unknown
+    /// `const_eval` fallback above.
+    fn eval_elem_ty(&mut self, id: ExprId, env: &HashMap<DefId, u64>) -> Ty {
+        let already_a_type = match self.ast.expr(id) {
+            Expr::Bracket { .. } | Expr::OptionTy(_) => true,
+            Expr::Ident(_) => self
+                .res
+                .expr_defs
+                .get(&id)
+                .is_some_and(|d| self.res.def(*d).kind == DefKind::Struct),
+            _ => false,
+        };
+        if already_a_type {
+            return self.eval_ty(id, env);
+        }
+        match self.const_eval(id, env) {
+            Some(w) => Ty::Bits(Width::Known(w)),
+            None => Ty::Bits(Width::Unknown),
         }
     }
 

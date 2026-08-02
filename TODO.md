@@ -270,6 +270,57 @@
   real firtool + Icarus sim on a representative spread (`fifo_depth`,
   `adder_tree`, `subleq`, `race_value`, `option`, `call_fifo`,
   `struct_pair`, `fetch2`), not just the unit-test suite.
+- **`list[T]`/`wire[T]`'s own single argument sugars a bare width
+  (Lumi's follow-up call after the `[N]` respelling above: even the new
+  `[N]` shorthand still doubled up inside `list[[N]]`).** `list[8]`,
+  `list[N]`, `list[clog2(N)]` are all now shorthand for `list[[N]]`
+  (that is, `list[bits[N]]`); `list[Pair]` (a list of some OTHER type,
+  e.g. a declared struct) is unaffected, since only a `[N]`-shaped
+  element had anything left to abbreviate. New `eval_elem_ty` helper
+  (types.rs), used by the `list` arm of `eval_ty`: an argument that's
+  ALREADY type-shaped (a `Bracket`, an `OptionTy`, or an `Ident` naming
+  a declared struct) evaluates as a type normally; anything else is
+  treated as the width `[...]` would have wrapped, mirroring the `bits`
+  arm's own Known/Unknown `const_eval` fallback. Needed zero parser or
+  resolve.rs changes: resolve.rs's free-identifier-as-implicit-param
+  collection (`resolve_expr`'s `in_type` recursion) already walks every
+  sub-expression of a signature type uniformly, regardless of bracket
+  nesting depth, so a bare `list[N]`'s `N` was already becoming an
+  implicit param correctly before this change — only its TYPE
+  evaluation needed to stop erroring ("expected a type here").
+  `wire[T]` was never actually touched by this change, but was already
+  accepting a bare width for a different reason: `wire[N]` is a `Bracket`
+  whose callee (`wire`) itself evaluates to `Ty::Unknown` (the
+  `DefKind::Builtin` arm), and `eval_ty`'s generic-memory-type fallthrough
+  short-circuits to `Ty::Unknown` the moment its callee is `Unknown` —
+  before ever looking at `args`, let alone calling `eval_elem_ty`. So
+  `wire[N]` and `wire[[N]]` were already indistinguishable before this
+  commit, confirmed by probing both spellings through `--elaborate` and
+  seeing identical reduced output; `list`'s new sugar doesn't extend to
+  `wire`, it just happened to already not need it.
+  Confirmed a sharper edge, too: `eval_elem_ty`'s "already type-shaped"
+  check only special-cases an `Ident` that resolves to a declared
+  `Struct`; a misspelled struct name (or any other free identifier,
+  e.g. `list[SomeModule]`) is indistinguishable from a genuine implicit
+  width param, so it's silently accepted as `list[bits[Unknown]]` rather
+  than erroring "expected a type here" the way it did before this change.
+  Documented as a known sharp edge in DESIGN.md rather than fixed — a
+  bare identifier is a genuine ambiguity the sugar can't resolve without
+  losing the implicit-param case it exists to support.
+  One real methodology trap, caught before commit: a first attempt at
+  testing the implicit-param case (`list[N]`) directly against
+  `types::check` failed ("expected `list[[?]]`, got `list[[16]]`") —
+  not a real bug, but a test written against an unrealistic pipeline
+  ordering. `types::check` alone can't validate a call against an
+  unresolved generic list param; in the REAL `--firrtl`/`--lower`
+  pipeline, `elaborate.rs` always reduces every such call away FIRST
+  (`--elaborate` returns before `types::check` ever runs — see
+  `main.rs`), so ordinary type-checking never actually sees an
+  unreduced generic-list call. Moved to a `tests/elaborate.rs`-level
+  test (the representative venue, matching how every other `<elaborates>`
+  test in that file already validates through `plan`/`render`, not
+  `types::check` directly) instead of chasing a type-checker fix for a
+  scenario that can't arise for real.
 - Audited every `_ => {}` wildcard match over `Stmt`/`Expr`/`Item`/etc.
   across `src/` (30 sites) for more Assign-vs-Let-shaped silent gaps.
   29 are legitimately safe (most route the semantically-important part

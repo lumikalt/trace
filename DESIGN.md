@@ -121,7 +121,7 @@ Bad(x : [8]) : [8] <combines> {
 and dynamic allocation are legal here and only here.
 
 ```trace
-AdderTree(xs : list[wire[[32]]]) : wire[[32]] <elaborates> {
+AdderTree(xs : list[wire[32]]) : wire[32] <elaborates> {
     if len(xs) = 1 { return xs[0] }        -- `if` on an elab value: unrolls
     let mid = len(xs) / 2
     return Add(AdderTree(xs[..mid]), AdderTree(xs[mid..]))   -- recursion: legal
@@ -476,7 +476,7 @@ else (empty, or 2+ comma-separated items) is a list value. Nothing about a
 type expression is otherwise special — arithmetic (`[N+1]`), a call
 (`[clog2(N)]`), or bracket application (a memory's `elem_ty[depth]`, a fifo's
 own `{depth}elem_ty`) all parse the same as any other expression in that
-position. `[N]` is unambiguous everywhere it nests too — inside `list[[8]]`,
+position. `[N]` is unambiguous everywhere it nests too — inside `list[8]`,
 a call argument, a struct field type — since every bracket parses through
 this same primary rule regardless of depth. A genuine one-element list VALUE
 (as opposed to a type) needs a trailing comma to tell it apart — `[x]` is
@@ -485,6 +485,22 @@ Rust-style escape hatch a one-element tuple literal uses for an identical
 reason. Omitting the comma (`Foo([x])`) fails with a clear type error (a
 `[N]` type appearing where a value was expected) rather than silently doing
 the wrong thing.
+
+`list[T]`'s own single argument gets one more sugar on top: a bare width
+expression (`list[8]`, `list[N]`, `list[clog2(N)]`) is shorthand for
+`list[[N]]` — the overwhelmingly common case (a list of plain bit-vectors)
+never needs the double bracket. `list[Pair]` (a list of some OTHER type,
+e.g. a declared struct) still spells its element type out directly, since
+only a `[N]`-shaped element has anything left to abbreviate — `list[[N]]`
+remains valid too, exactly equivalent to `list[N]`, just longer to write.
+One sharp edge: a bare identifier is ambiguous between "width parameter"
+and "type name", and it's resolved in favor of the former. `list[Pair]`
+with `Pair` misspelled (or naming a module, register, anything but a
+declared struct) is not rejected as an unknown type — it's silently taken
+as an implicit width parameter instead, producing a list of unconstrained-
+width bit-vectors rather than a clear error. Spelling the element type out
+in full sidesteps this; there's no sugar-free way to get the old "expected
+a type here" diagnostic back for a bare name.
 
 Arithmetic and bitwise operators follow Chisel-style modular width rules:
 
