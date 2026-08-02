@@ -915,6 +915,114 @@ fn absent_literal_into_plain_bits_is_rejected() {
 }
 
 #[test]
+fn optional_false_constructs_some_none_on_a_double_option() {
+    // Bare coercion (`false`, a plain value) fills EVERY remaining `?`
+    // layer at once, so `??[8]` can only reach fully-absent/fully-
+    // present that way. `optional false` forces just the OUTER layer
+    // present while the inner one stays absent -- `Some(None)`,
+    // otherwise inexpressible (see DESIGN.md's "Option types" section).
+    run_ok(
+        "module M {\n\
+             reg oo : ??[8] = optional false\n\
+             out outer_valid : [1] = 0\n\
+             out inner_valid : [1] = 0\n\
+             rule r {\n\
+                 outer_valid := oo.valid\n\
+                 inner_valid := oo.data.valid\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn optional_into_a_single_option_layer_has_no_inner_for_false_to_mean_anything() {
+    // `optional`'s ONE layer and `?[8]`'s ONE layer already line up, so
+    // there's no remaining Option layer left for `false` (which only
+    // unifies against a `Ty::Option` target) to construct absence in --
+    // a genuine type mismatch, not the `??T` case above.
+    let src = "module M {\n\
+                   reg opt : ?[8] = optional false\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("expected [8]") && e.message.contains("false")),
+        "expected a mismatch inside `optional`'s single layer, got: {errors:?}"
+    );
+}
+
+#[test]
+fn optional_wrapping_an_existing_option_alias_is_rejected() {
+    // `optional p`, `p` an EXISTING `?T`-typed reg (not a fresh literal
+    // or computed value), would need emission to thread `p`'s own live
+    // valid/data pair into another Option's flat fields -- unsupported,
+    // the same "copying one `?T` value into another" v0 restriction
+    // `option_to_option_copy_is_rejected` pins for a direct write, one
+    // layer up. Caught here rather than left to silently miscompile at
+    // emission (`compile_field_path_value`'s aliasing guard returns
+    // `None` for this shape, but nothing on the WRITE side escalates a
+    // `None` to a diagnostic -- self-caught by hand-probing before
+    // considering the feature done).
+    let src = "module M {\n\
+                   reg p : ?[8] = false\n\
+                   reg oo : ??[8] = false\n\
+                   rule r {\n\
+                       oo := optional p\n\
+                   }\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors.iter().any(|e| e
+            .message
+            .contains("cannot wrap an existing `?T` value directly")),
+        "expected an `optional`-alias rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn optional_wrapping_a_call_returning_option_is_allowed() {
+    // The one exception to the alias rejection above: a CALL returning
+    // `?T` decomposes per-leaf (`compile_call_field_value`) rather than
+    // aliasing a flat register, the same exemption `type_write`'s own
+    // sibling Option-to-Option check already carves out for calls.
+    run_ok(
+        "Id(x : ?[8]) : ?[8] {\n\
+             return x\n\
+         }\n\
+         module M {\n\
+             reg oo : ??[8] = false\n\
+             rule r {\n\
+                 oo := optional Id(8'd5)\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn optional_into_a_non_option_target_is_rejected() {
+    // `optional e` has no standalone type of its own (mirrors `false`'s
+    // `Ty::AbsentLit` sentinel) -- it only type-checks against a
+    // `Ty::Option` target, which supplies the layer it doesn't know.
+    // Also pins the reg-init routing fix: without diverting an
+    // `Expr::Optional` init through `check_assignable` the same way a
+    // literal `Expr::Absent` init already is, `check_literal_fits`
+    // silently no-ops (its `const_eval` doesn't recognize `Expr::
+    // Optional` either) and this passed with no error at all --
+    // self-caught the same way the ORIGINAL `false`-into-`[8]` gap was.
+    let src = "module M {\n\
+                   reg x : [8] = optional 5\n\
+               }\n";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("expected [8]") && e.message.contains("optional")),
+        "expected an `optional`-outside-`?T` rejection, got: {errors:?}"
+    );
+}
+
+#[test]
 fn option_to_option_copy_is_rejected() {
     let src = "module M {\n\
                    reg p : ?[8] = false\n\

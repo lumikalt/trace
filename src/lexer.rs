@@ -82,6 +82,12 @@ pub enum TokenKind {
     /// sentinel enforces this contextually).
     #[token("false")]
     False,
+    /// Explicit one-layer "present" constructor for `?T` (`Expr::Optional`,
+    /// ast.rs) — the way to build a `??T` whose two `valid` bits differ
+    /// (`Some(None)`), which a bare value or `false` can't do (both
+    /// coerce through every remaining `?` layer at once).
+    #[token("optional")]
+    Optional,
 
     #[token("_", priority = 100)]
     Underscore,

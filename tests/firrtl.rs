@@ -4435,19 +4435,19 @@ module M {
     run_firtool(&fir, &[]);
 }
 
-/// `??T` (`T` itself `?U`) compiles and simulates correctly for the two
-/// states actually reachable through today's syntax -- fully absent
+/// `??T` (`T` itself `?U`) via BARE coercion only (no `optional`) still
+/// only ever reaches the two fully-agreeing states -- fully absent
 /// (`false`) and fully present (a bare `[8]` value, coerced through
-/// BOTH Option layers by `check_assignable`'s recursive coercion rule).
-/// It is NOT a general two-independent-layers nested Option, though:
+/// BOTH Option layers by `check_assignable`'s recursive coercion rule):
 /// `oo_valid` and `oo_data_valid` get byte-identical mux expressions in
-/// every branch below, because there is no write path that can ever
-/// separate them -- `.data` is read-only, and a `?T`-typed expression
-/// can't be written into a `??T` target (a plain type mismatch, see
-/// `differently_shaped_option_write_is_one_plain_type_mismatch_not_
-/// two_errors` in tests/types.rs). `Some(None)` (outer present, inner
-/// absent) is genuinely inexpressible with current syntax, not merely
-/// untested -- see TODO.md.
+/// every branch below, because neither `false` nor a bare value ever
+/// separates them, and `.data` stays read-only throughout. This is NOT
+/// a general limitation of `??T` itself -- `optional false`/`optional
+/// (optional e)` DO reach the third state, `Some(None)` included (see
+/// DESIGN.md's "Option types" section, `examples/option.tr`'s `nested`
+/// reg); this test only pins that the OLD, bare-coercion-only paths
+/// below are unaffected by that addition, not that `Some(None)` is
+/// unreachable some other way.
 #[test]
 fn nested_option_reaches_only_fully_absent_or_fully_present() {
     let src = "\

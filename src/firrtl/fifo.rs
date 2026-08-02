@@ -150,7 +150,9 @@ pub(crate) fn collect_fifo_ops(ast: &Ast, res: &Resolution, id: ExprId, out: &mu
             collect_fifo_ops(ast, res, *lhs, out);
             collect_fifo_ops(ast, res, *rhs, out);
         }
-        Expr::Guard(inner) | Expr::Spawn(inner) => collect_fifo_ops(ast, res, *inner, out),
+        Expr::Guard(inner) | Expr::Spawn(inner) | Expr::Optional(inner) => {
+            collect_fifo_ops(ast, res, *inner, out);
+        }
         Expr::Field { base, .. } => collect_fifo_ops(ast, res, *base, out),
         Expr::Call { callee, args } => {
             collect_fifo_ops(ast, res, *callee, out);

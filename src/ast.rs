@@ -190,6 +190,16 @@ pub enum Expr {
     /// `TokenKind::False`'s own doc comment for why it stays this
     /// narrow).
     Absent,
+    /// `optional <expr>` — an explicit one-layer "present" constructor,
+    /// the way to build a `??T` whose two `valid` bits differ (`Some(None)`,
+    /// outer present/inner absent — otherwise inexpressible, since a bare
+    /// value or `false` coerces through EVERY remaining `?` layer at once).
+    /// Like `Absent`, has no standalone type of its own — types as the
+    /// sentinel `Ty::Optional(inner)`, which only unifies against a
+    /// `Ty::Option` target, recursing on `inner` against the target's own
+    /// inner rather than a type it precomputed, so nesting (`optional
+    /// (optional e)`) peels one target layer per `optional`.
+    Optional(ExprId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,6 +435,7 @@ impl Ast {
             }
             Expr::OptionTy(inner) => format!("(option {})", self.expr_sexpr(*inner)),
             Expr::Absent => "false".to_string(),
+            Expr::Optional(inner) => format!("(optional {})", self.expr_sexpr(*inner)),
         }
     }
 

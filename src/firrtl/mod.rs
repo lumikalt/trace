@@ -529,6 +529,27 @@ impl<'a> Emitter<'a> {
         inner: &Ty,
     ) -> Option<u64> {
         let (head, rest) = path.split_first()?;
+        // `optional <sub>` forces THIS layer's `valid` to 1 regardless of
+        // `sub`'s own shape, then peels to `sub` for `data` — unlike the
+        // coerced-present case below, where presence never adds a layer
+        // to peel off, `optional` is the one construction that DOES: it
+        // is a real recursive-descent step, letting `sub` be itself
+        // absent/another `optional`/a plain value, i.e. exactly the
+        // `??T`/`Some(None)` construction the coerced-present case can't
+        // express (both its layers are always equal).
+        if let Expr::Optional(sub) = self.ast.expr(init) {
+            let sub = *sub;
+            return match head.as_str() {
+                "valid" => Some(1),
+                "data" if rest.is_empty() => self.const_eval(sub),
+                "data" => match inner {
+                    Ty::Struct { def, .. } => self.struct_lit_field_const(sub, rest, *def),
+                    Ty::Option(t) => self.option_lit_field_const(sub, rest, t),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
         let is_absent = matches!(self.ast.expr(init), Expr::Absent);
         match (head.as_str(), is_absent) {
             ("valid", absent) => Some(u64::from(!absent)),

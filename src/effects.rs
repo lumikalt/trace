@@ -453,6 +453,7 @@ impl<'a> Checker<'a> {
             // body's own value expressions.
             Expr::OptionTy(_) => {}
             Expr::Absent => {}
+            Expr::Optional(inner) => self.infer_expr(*inner, sig),
         }
     }
 
@@ -664,6 +665,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Unary { operand, .. } => self.check_expr(operand, item, sig, elab),
+            Expr::Optional(inner) => self.check_expr(inner, item, sig, elab),
             Expr::Binary { lhs, rhs, .. } => {
                 self.check_expr(lhs, item, sig, elab);
                 self.check_expr(rhs, item, sig, elab);

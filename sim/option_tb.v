@@ -44,6 +44,26 @@ module option_tb;
                       dut.opt_valid, dut.opt_data);
             failed = 1;
         end
+        // `flag : ?[1] = optional 1'd0` -- `?[1]`'s "present, holding 0"
+        // state, told apart from absent (`flag_valid == 0`) only by the
+        // valid bit, never written after reset.
+        if (dut.flag_valid !== 1'b1 || dut.flag_data !== 1'b0) begin
+            $display("FAIL: flag should reset to present(0) via `optional 1'd0`, got valid=%b data=%b",
+                      dut.flag_valid, dut.flag_data);
+            failed = 1;
+        end
+        // `nested : ??[8] = optional false` -- `Some(None)`: the OUTER
+        // layer forced present by `optional`, the INNER layer left
+        // absent by `false`. Bare coercion alone can never produce this
+        // (it fills every layer at once), so this is the actual load-
+        // bearing case `optional` exists for -- confirming the two
+        // `valid` bits genuinely DIFFER, not just that `nested` resets
+        // to something.
+        if (dut.nested_valid !== 1'b1 || dut.nested_data_valid !== 1'b0) begin
+            $display("FAIL: nested should reset to Some(None) via `optional false`, got outer_valid=%b inner_valid=%b",
+                      dut.nested_valid, dut.nested_data_valid);
+            failed = 1;
+        end
 
         // `check` has no guard, so it fires every cycle `fill` doesn't
         // -- with `input` still empty, that's every cycle so far, and
@@ -61,6 +81,11 @@ module option_tb;
         if (dut.relayed_valid !== 1'b0) begin
             $display("FAIL: expected relayed absent while opt is absent, got valid=%b data=%h",
                       dut.relayed_valid, dut.relayed_data);
+            failed = 1;
+        end
+        if (dut.flag_present !== 1'b1 || dut.flag_value !== 1'b0) begin
+            $display("FAIL: expected flag_present=1 flag_value=0 (present, holding 0), got present=%b value=%b",
+                      dut.flag_present, dut.flag_value);
             failed = 1;
         end
 
@@ -104,9 +129,20 @@ module option_tb;
                       dut.relayed_valid, dut.relayed_data);
             failed = 1;
         end
+        // `fill` wrote `nested := optional d` alongside `opt := d` --
+        // `Some(Some(0x2A))`, the fully-present state, through the same
+        // runtime WRITE path (`compile_field_path_value`, not the
+        // reset-const path `option_lit_field_const` the earlier
+        // Some(None) assertion exercised).
+        if (dut.nested_valid !== 1'b1 || dut.nested_data_valid !== 1'b1 || dut.nested_data_data !== 8'h2A) begin
+            $display("FAIL: expected nested = Some(Some(0x2A)), got outer_valid=%b inner_valid=%b inner_data=%h",
+                      dut.nested_valid, dut.nested_data_valid, dut.nested_data_data);
+            failed = 1;
+        end
 
-        $display("final: opt_valid=%b opt_data=%h result=%h was_present=%b relayed_valid=%b relayed_data=%h",
-                  dut.opt_valid, dut.opt_data, dut.result, dut.was_present, dut.relayed_valid, dut.relayed_data);
+        $display("final: opt_valid=%b opt_data=%h result=%h was_present=%b relayed_valid=%b relayed_data=%h flag_present=%b flag_value=%b nested_valid=%b nested_data_valid=%b nested_data_data=%h",
+                  dut.opt_valid, dut.opt_data, dut.result, dut.was_present, dut.relayed_valid, dut.relayed_data,
+                  dut.flag_present, dut.flag_value, dut.nested_valid, dut.nested_data_valid, dut.nested_data_data);
 
         if (failed) begin
             $display("SIMULATION FAILED");

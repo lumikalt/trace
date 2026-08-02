@@ -1197,7 +1197,7 @@ pub(crate) fn sub_exprs(ast: &Ast, id: ExprId) -> Vec<ExprId> {
         Expr::OptionTy(inner) => vec![inner],
         Expr::Unary { operand, .. } => vec![operand],
         Expr::Binary { lhs, rhs, .. } => vec![lhs, rhs],
-        Expr::Guard(inner) | Expr::Spawn(inner) => vec![inner],
+        Expr::Guard(inner) | Expr::Spawn(inner) | Expr::Optional(inner) => vec![inner],
         Expr::Field { base, .. } => vec![base],
         Expr::Call { callee, args } | Expr::Bracket { callee, args } => {
             let mut v = vec![callee];

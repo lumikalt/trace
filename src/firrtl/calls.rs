@@ -140,7 +140,9 @@ pub(crate) fn collect_calls(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
             collect_calls(ast, *lhs, out);
             collect_calls(ast, *rhs, out);
         }
-        Expr::Guard(inner) | Expr::Spawn(inner) => collect_calls(ast, *inner, out),
+        Expr::Guard(inner) | Expr::Spawn(inner) | Expr::Optional(inner) => {
+            collect_calls(ast, *inner, out);
+        }
         Expr::Field { base, .. } => collect_calls(ast, *base, out),
         Expr::Bracket { callee, args } => {
             collect_calls(ast, *callee, out);

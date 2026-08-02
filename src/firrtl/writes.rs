@@ -703,6 +703,33 @@ impl<'a> Emitter<'a> {
                 }
             }
             Ty::Option(inner) => {
+                // `optional <sub>` forces THIS layer's `valid` to 1 and
+                // peels to `sub` for `data`, recursing with `sub` (not
+                // `expr`) so a nested `??T`'s own presence is
+                // independently controlled -- exactly the `Some(None)`
+                // construction the coercion case below can't express
+                // (its "presence doesn't add a layer to peel off"
+                // invariant is deliberately different: `optional` DOES
+                // add one). Checked ahead of the aliasing guard below,
+                // which an `Expr::Optional` node never trips anyway
+                // (its own type is the `Ty::Optional` sentinel, not
+                // `Ty::Option`) but would otherwise fall through to
+                // `is_absent`'s `Expr::Absent` test misreading the whole
+                // wrapper node as "definitely present, `data` = expr
+                // itself" instead of unwrapping to `sub`.
+                if let Expr::Optional(sub) = self.ast.expr(expr) {
+                    let sub = *sub;
+                    let (head, rest) = path.split_first()?;
+                    return match head.as_str() {
+                        "valid" => Some("UInt<1>(1)".to_string()),
+                        "data" if rest.is_empty() => Some(
+                            self.compile_expr_hinted(sub, Some(width))
+                                .unwrap_or_default(),
+                        ),
+                        "data" => self.compile_field_path_value(sub, rest, inner, width),
+                        _ => None,
+                    };
+                }
                 // `expr` must be `Expr::Absent` or a plain value of the
                 // wrapped type being coerced present -- NOT itself
                 // another `?T`-typed expression aliased in. That

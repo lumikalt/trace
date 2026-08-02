@@ -78,6 +78,15 @@ pub enum Ty {
     /// silently pass as a value of any type at all, not just an absent
     /// `?T`.
     AbsentLit,
+    /// `optional <expr>`'s own type — mirrors `AbsentLit`: no standalone
+    /// shape of its own, unifies ONLY against a `Ty::Option` target
+    /// (`check_assignable`), which supplies the layer `optional` itself
+    /// doesn't know. Carries the wrapped expression's `ExprId` (not a
+    /// precomputed `Ty`) so unification recurses through `check_
+    /// assignable` again on demand, against the TARGET's own inner —
+    /// letting `optional (optional e)` peel one target layer per
+    /// `optional` regardless of how many the target actually has.
+    Optional(ExprId),
     /// Recovery type: unifies with anything, silences cascades.
     Unknown,
 }
@@ -96,6 +105,7 @@ impl std::fmt::Display for Ty {
             Ty::Struct { name, .. } => write!(f, "struct {name}"),
             Ty::Option(inner) => write!(f, "?{inner}"),
             Ty::AbsentLit => write!(f, "false"),
+            Ty::Optional(_) => write!(f, "optional"),
             Ty::Unknown => write!(f, "?"),
         }
     }
@@ -222,16 +232,18 @@ impl<'a> TypeChecker<'a> {
                         // else in `collect_state` ever runs `type_expr`
                         // over a reg/output's own init. Also routed
                         // through here whenever the init is literally
-                        // `false`, regardless of `ty` — `false` isn't
-                        // const-evaluable as an integer, so `check_
-                        // literal_fits` would otherwise silently skip
-                        // validating it entirely (e.g. `reg x : bits[8]
-                        // = false` passing with no error at all). Every
-                        // other `Ty::Bits` init is untouched (still just
-                        // `check_literal_fits`, matching every existing
-                        // example/test).
+                        // `false` or `optional <e>`, regardless of `ty`
+                        // — neither is const-evaluable as an integer
+                        // (`Ty::AbsentLit`/`Ty::Optional` are sentinels,
+                        // not `Ty::Bits`), so `check_literal_fits` would
+                        // otherwise silently skip validating either one
+                        // entirely (e.g. `reg x : [8] = optional false`
+                        // passing with no error at all — self-caught by
+                        // probing exactly that). Every other `Ty::Bits`
+                        // init is untouched (still just `check_literal_
+                        // fits`, matching every existing example/test).
                         if matches!(ty, Ty::Struct { .. } | Ty::Option(_))
-                            || matches!(self.ast.expr(init), Expr::Absent)
+                            || matches!(self.ast.expr(init), Expr::Absent | Expr::Optional(_))
                         {
                             let mut locals = HashMap::new();
                             let init_ty = self.type_expr(init, &mut locals);
@@ -285,7 +297,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     if let Some(init) = init {
                         if matches!(ty, Ty::Struct { .. } | Ty::Option(_))
-                            || matches!(self.ast.expr(init), Expr::Absent)
+                            || matches!(self.ast.expr(init), Expr::Absent | Expr::Optional(_))
                         {
                             let mut locals = HashMap::new();
                             let init_ty = self.type_expr(init, &mut locals);
@@ -1011,6 +1023,55 @@ impl<'a> TypeChecker<'a> {
             }
             // `false` constructs the absent value of any `?T`.
             (Ty::AbsentLit, Ty::Option(_)) => {}
+            // `optional e` forces exactly the NEXT layer's `valid` to
+            // true, then recurses on `e`'s own type (looked up now that
+            // it's needed, not precomputed — see `Ty::Optional`'s doc
+            // comment) against the TARGET's inner. Checked ahead of the
+            // generic bare-value-coercion arm below, whose guard would
+            // otherwise accept a `Ty::Optional` value too (it isn't a
+            // `Ty::Option`) and keep re-checking the SAME sentinel
+            // against successively peeled targets instead of ever
+            // unwrapping to `e`.
+            (Ty::Optional(inner), Ty::Option(t_inner)) => {
+                let inner_ty = self
+                    .types
+                    .expr_tys
+                    .get(inner)
+                    .cloned()
+                    .unwrap_or(Ty::Unknown);
+                // `optional <alias>`, `<alias>` a plain reference already
+                // typed `?T` (a reg/param/local/field, not a fresh
+                // literal/computed value) — the exact "copy one `?T`
+                // value into another" v0 restriction below, one layer up.
+                // Emission (`compile_field_path_value`, writes.rs) has no
+                // way to thread an ALIASED `?T`'s own live valid/data
+                // pair into another Option's flat fields; without this
+                // check it silently falls through to that fn's existing
+                // aliasing guard, which returns `None` for a value that
+                // nothing escalates to a diagnostic on the WRITE side
+                // (unlike the read side's `compile_struct_field_read`) —
+                // the register would silently hold its previous value
+                // instead of tracking `alias`. A CALL returning `?T` is
+                // exempt: its return decomposes per-leaf
+                // (`compile_call_field_value`) rather than aliasing a
+                // flat register, the same exemption `type_write`'s own
+                // Option-to-Option rejection already carves out.
+                if matches!(inner_ty, Ty::Option(_))
+                    && !matches!(self.ast.expr(*inner), Expr::Call { .. })
+                {
+                    self.error(
+                        span,
+                        format!(
+                            "{what}: `optional` cannot wrap an existing `?T` value directly \
+                             (v0 restriction) -- copying one `?T` value into another isn't \
+                             supported yet; use a fresh value, `false`, or a nested `optional` \
+                             instead"
+                        ),
+                    );
+                    return;
+                }
+                self.check_assignable(&inner_ty, t_inner, span, what);
+            }
             // A bare `T`-shaped value implicitly wraps into `?T` present
             // — reached anywhere `check_assignable` already runs (state
             // writes/inits, return values, call arguments, memory/
@@ -1380,6 +1441,17 @@ impl<'a> TypeChecker<'a> {
                 Ty::Unknown
             }
             Expr::Absent => Ty::AbsentLit,
+            // Type-checks `inner` for its own sake (effects, diagnostics,
+            // populating `expr_tys` for `check_assignable`'s later
+            // lookup) but deliberately does NOT wrap `inner`'s `Ty` here
+            // — see `Ty::Optional`'s own doc comment for why unification
+            // needs to stay lazy, recursing through `check_assignable`
+            // against the eventual TARGET's inner instead of a type this
+            // arm precomputed.
+            Expr::Optional(inner) => {
+                self.type_expr(inner, locals);
+                Ty::Optional(inner)
+            }
         }
     }
 

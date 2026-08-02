@@ -1030,6 +1030,16 @@ impl<'a> Parser<'a> {
                 let span = self.bump().unwrap().span;
                 self.ast.push_expr(Expr::Absent, span)
             }
+            // `optional <expr>` — an explicit one-layer "present"
+            // constructor (see `Expr::Optional`'s own doc comment,
+            // ast.rs). A real AST node, unlike `?T`'s type-position
+            // prefix `?` above: it needs to survive into typing/emission
+            // so `??T`'s two `valid` bits can be driven independently.
+            Some(Optional) => {
+                self.bump();
+                let inner = self.parse_expr(PREFIX_BP)?;
+                self.ast.push_expr(Expr::Optional(inner), lo..self.prev_end)
+            }
             _ => {
                 self.error_here("expected an expression".to_string());
                 self.sync();

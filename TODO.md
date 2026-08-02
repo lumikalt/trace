@@ -321,6 +321,73 @@
   test in that file already validates through `plan`/`render`, not
   `types::check` directly) instead of chasing a type-checker fix for a
   scenario that can't arise for real.
+- **`optional <expr>`: an explicit one-layer "present" constructor, making
+  `??T`'s `Some(None)` (outer present, inner absent) expressible for the
+  first time (Lumi's actual goal — a follow-up correction after an initial
+  implementation missed it, see below).** Bare-value coercion (`opt := 5`,
+  `opt := false`) fills EVERY remaining `?` layer at once, so it can only
+  ever reach `??T`'s two fully-agreeing states; `optional false`/`optional
+  (optional 5'd3)` force exactly one layer present per keyword, reaching
+  the third, previously-inexpressible state too. DESIGN.md's "Option
+  types"/`??T` sections have the full read/write semantics and worked
+  examples.
+  Went through two implementations in one session. The FIRST (since
+  reverted) took `reg opt : ?[5] = optional 5'3` reading clearly as the
+  whole goal, and — since that already worked via plain bare-value
+  coercion before `optional` existed at all (confirmed via `--firrtl`:
+  `reg flag : ?[1] = 1'd0` already reset to `flag_valid=1, flag_data=0`)
+  — implemented `optional` as pure notation, elided entirely at parse
+  time (no new AST node). Lumi then clarified the actual goal was `??T`
+  construction, which a transparent/elided `optional` cannot do BY
+  DESIGN: eliding it means nothing downstream can ever tell `optional e`
+  apart from bare `e`, so there is no way to independently drive two
+  Option layers. Reverted the elision, added a real `Expr::Optional`
+  node (ast.rs) instead, forced through by the compiler at every
+  exhaustive `Expr` match — resolve.rs, effects.rs (x2), elaborate.rs,
+  lower.rs's `sub_exprs`, firrtl/calls.rs's `collect_calls`, firrtl/
+  fifo.rs's `collect_fifo_ops` — each just recurses into the wrapped
+  expression like `Guard`/`Spawn` already do, except `elaborate.rs`
+  (`optional` has no elaboration-time meaning, same treatment `Absent`/
+  `OptionTy` get: a clean "no meaning in `<elaborates>` code" error).
+  Typing (types.rs) mirrors `false`'s own `Ty::AbsentLit` sentinel rather
+  than eagerly computing `Ty::Option(inner_ty)`: `optional e` has no
+  standalone type, only `Ty::Optional(ExprId)`, which carries `e`'s id
+  and recurses through `check_assignable` again on demand, against the
+  TARGET's own inner — this was a correction mid-implementation too (the
+  advisor's first pass suggested eager `Ty::Option(inner_ty)`, which
+  turned out to require loosening `check_assignable`'s existing
+  Option-into-Option aliasing guard, itself a real correctness invariant
+  protecting params/returns/struct-fields/list-elements everywhere else;
+  the lazy sentinel needs no such loosening, `check_assignable`'s
+  existing arms are untouched). One genuine silent-miscompile caught by
+  hand-probing before considering this done: `oo := optional opt1`
+  (`opt1` an EXISTING `?T`-typed reg, not a fresh value) type-checked
+  clean and compiled with `oo_valid` driven but `oo_data_valid`/
+  `oo_data_data` silently undriven (holding stale/reset values) —
+  `compile_field_path_value`'s pre-existing aliasing guard caught it and
+  returned `None`, but nothing on the WRITE side escalates a `None` to a
+  diagnostic (only the READ side, `compile_struct_field_read`, does).
+  Fixed at the type-checking level instead of chasing the emission gap:
+  `check_assignable`'s new `Ty::Optional`/`Ty::Option` arm now rejects
+  `optional <alias>` outright when `<alias>`'s own type is already
+  `Ty::Option` and it isn't a `Expr::Call` (calls decompose per-leaf via
+  `compile_call_field_value`, not aliasing, so stay exempt — the same
+  carve-out `type_write`'s sibling check already has). Also caught:
+  `reg x : [8] = optional false` (a non-Option target) silently passed
+  with no error, since `x`'s reg-init routing condition only diverted a
+  literal `Expr::Absent` init through the `check_assignable` path, not
+  `Expr::Optional` — `check_literal_fits`'s `const_eval` silently returns
+  `None` for anything it doesn't recognize (a no-op, not a check),
+  identical to the ORIGINAL gap `false` itself needed the same routing
+  fix for. Emission side: `option_lit_field_const` (mod.rs, reg/output
+  reset consts) and `compile_field_path_value`'s `Ty::Option` arm
+  (writes.rs, runtime rule-body writes) both got a matching `Expr::
+  Optional` branch, checked ahead of their existing "is it literally
+  `Expr::Absent`" logic — forces `valid=1` at that layer, then recurses
+  on the WRAPPED sub-expression (not `expr` itself) for `data`, which is
+  the one place presence genuinely DOES add a layer to peel off (every
+  other case in both functions deliberately does NOT, since bare-value
+  coercion has no wrapper to peel).
 - Audited every `_ => {}` wildcard match over `Stmt`/`Expr`/`Item`/etc.
   across `src/` (30 sites) for more Assign-vs-Let-shaped silent gaps.
   29 are legitimately safe (most route the semantically-important part
@@ -512,30 +579,31 @@ Speculative, bigger, not committed to:
     misfiring on an ordinary `T`-into-`?T` present-coercion return — a
     dedicated guard-fold-intersection probe (per advisor's flagged
     priority) caught this one before it shipped, not after.
-  - **`??T` (nested Option) — verified, with a real limitation, not
-    just "untested."** Compiles and simulates correctly for the two
-    states reachable through today's syntax (fully absent via `false`,
-    fully present via a bare value coerced through both layers) — see
-    DESIGN.md's "Option types" section and
-    `nested_option_reaches_only_fully_absent_or_fully_present`
-    (tests/firrtl.rs). But the outer and inner `valid` bits are
-    provably always equal (no write path can separate them), so `??T`
-    is currently indistinguishable from `?T` — `Some(None)` (outer
-    present, inner absent) is genuinely inexpressible, not just
-    unexercised. Making the layers independent needs a construction
-    syntax that doesn't exist yet (there's no way to write "present,
-    holding an absent inner value" — `.data` is read-only and a `?T`
-    expression can't be written into a `??T` target). Not pursued
-    further without a concrete use case; no example added (an example
-    file advertises a pattern worth using, and this one currently
-    isn't one).
-  - **`option{...}` explicit-construction syntax, `?.` safe navigation.**
-    Not pursued: implicit coercion already covers construction (`opt :=
-    value`/`opt := false`, no wrapper syntax needed), and `?.`'s
-    short-circuit-on-empty chaining has no existing analogue to reuse
-    (ordinary `.field` access requires the local bound directly to a
-    literal, no aliasing) — would need its own design pass if ever
-    wanted, not assumed necessary.
+  - **`??T` (nested Option), independent layers — ACHIEVED.** The
+    concrete use case this bullet used to wait on turned out to be
+    Lumi asking for it directly: `optional <expr>` (below) is exactly
+    the "construction syntax that doesn't exist yet" this bullet named
+    as the blocker. `Some(None)` (outer present, inner absent) is now
+    expressible and simulated (`examples/option.tr`'s `nested` reg,
+    `sim/option_tb.v`) — see the `optional` bullet in "Emission" above
+    for the full write-up. `nested_option_reaches_only_fully_absent_or_
+    fully_present` (tests/firrtl.rs) still correctly pins that BARE
+    coercion alone (no `optional`) only ever reaches the two
+    fully-agreeing states — that restriction didn't change, `optional`
+    is a strictly new capability layered on top of it, not a
+    loosening.
+  - **`option{...}` explicit-construction syntax — partially covered by
+    `optional`, not fully.** Implicit coercion still handles ordinary
+    construction (`opt := value`/`opt := false`) with no wrapper syntax
+    needed; `optional <expr>` (above) additionally covers the ONE case
+    coercion can't — forcing a specific `?` layer present independently
+    of the value beneath it. Neither is a general struct-literal-style
+    `option{ valid: ..., data: ... }` constructor; not pursued, no
+    concrete use case for one beyond what `optional` already closes.
+    `?.` safe navigation: still not pursued, no existing analogue to
+    reuse (ordinary `.field` access requires the local bound directly
+    to a literal, no aliasing) — unrelated to `optional`, would need
+    its own design pass if ever wanted.
 - **Struct destructuring** (`let Pair{valid, data} = p`, or a `let
   {valid, data} = p` field-shorthand form — binding several named
   locals from one struct value in a single statement, instead of one

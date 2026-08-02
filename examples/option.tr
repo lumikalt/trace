@@ -16,9 +16,31 @@ module Option {
     out was_present : [1] = 0
     out relayed : ?[8] = false
 
+    -- `optional <expr>` is an explicit one-layer "present" constructor --
+    -- at a plain `?[1]` it's stylistic (`optional 1'd0` reads more
+    -- clearly than the bare `1'd0` a plain write already accepts:
+    -- `flag_present`/`flag_value` below read 1/0, not 0/0 absent).
+    reg flag : ?[1] = optional 1'd0
+    out flag_present : [1] = 0
+    out flag_value : [1] = 0
+
+    -- At `??[8]` it's load-bearing, not stylistic: bare coercion
+    -- (`false`, a plain `[8]` value) fills BOTH layers at once, so it
+    -- can only ever reach fully-absent or fully-present. `optional
+    -- false` forces just the OUTER layer present while the inner one
+    -- stays `false` (absent) -- `Some(None)`, otherwise inexpressible.
+    -- `fill` below writes `optional d` on top of that reset value,
+    -- reaching the fully-present state (`Some(Some(d))`) through the
+    -- SAME write path.
+    reg nested : ??[8] = optional false
+    out nested_outer_valid : [1] = 0
+    out nested_inner_valid : [1] = 0
+    out nested_inner_data : [8] = 0
+
     rule fill {
         let d = input.Deq[]
         opt := d
+        nested := optional d
     }
 
     rule pass {
@@ -41,5 +63,15 @@ module Option {
         } else {
             relayed := false
         }
+        if flag.valid {
+            flag_present := 1
+            flag_value := flag.data
+        } else {
+            flag_present := 0
+            flag_value := 0
+        }
+        nested_outer_valid := nested.valid
+        nested_inner_valid := nested.data.valid
+        nested_inner_data := nested.data.data
     }
 }

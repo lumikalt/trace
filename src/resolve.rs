@@ -798,6 +798,10 @@ impl<'a> Resolver<'a> {
             // of the context `OptionTy` itself was reached from.
             Expr::OptionTy(inner) => self.resolve_expr(inner, true),
             Expr::Absent => {}
+            // `optional <expr>`'s `<expr>` is a value, not a type —
+            // resolves in whatever context `Optional` itself was reached
+            // from, like `Unary`/`Guard`/`Spawn` above, unlike `OptionTy`.
+            Expr::Optional(inner) => self.resolve_expr(inner, in_type),
         }
     }
 }

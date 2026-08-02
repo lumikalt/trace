@@ -763,6 +763,48 @@ opt := false                 -- absent again
 bit, `?[1]` would be ambiguous between "absent" and "present, holding 0".
 `false` only type-checks against a `?T` target.
 
+`optional <expr>` is an explicit ONE-LAYER "present" constructor — unlike
+the bare-value coercion above (which fills EVERY remaining `?` layer at
+once, present all the way down), `optional` forces exactly the next
+layer's `valid` to true and hands `expr` to that layer's `data`, leaving
+`expr`'s own shape to determine what happens at any layer beneath. This
+matters once `T` is itself an `Option`: bare coercion can only reach
+`??T`'s two fully-agreeing states (fully absent, fully present), but
+`optional false` on a `??T` target builds the third — outer present,
+inner absent (`Some(None)`) — by forcing presence at the OUTER layer
+while `false` constructs absence at the inner one:
+
+```trace
+reg oo : ??[8] = optional false   -- Some(None): oo.valid=1, oo.data.valid=0
+oo := 8'd5                        -- fully present: oo.valid=1, oo.data.valid=1, oo.data.data=5
+oo := false                       -- fully absent: oo.valid=0, oo.data.valid=0
+```
+
+`optional` nests one layer per keyword (`optional (optional 5'd3)` forces
+both of a `??[5]`'s layers present explicitly, equivalent to the bare
+`5'd3` coercion above it since neither leaves an inner layer for `false`
+to make interesting) and works at plain `?T` too, where it's stylistic
+rather than load-bearing (`reg opt : ?[5] = optional 5'3` reads more
+clearly than the bare `5'3`, especially at `?[1]`, where the reader can't
+tell "present, holding 0" apart from "absent" without already knowing a
+bare value coerces) — `optional`'s single layer and `?T`'s single layer
+line up exactly, so there's no room for an inner `false` to add anything
+`optional 5'3` alone doesn't already say.
+
+`optional e` has no standalone type of its own (mirroring `false`'s own
+`Ty::AbsentLit` sentinel): it only type-checks against a `Ty::Option`
+target, which supplies the layer it doesn't know — used anywhere else
+(`x := optional 5` where `x : [8]`) it's a clean type error, not a
+silent no-op. `optional <alias>`, where `<alias>` is a plain reference
+already typed `?T` (a reg, param, local, or field — not a fresh literal
+or computed value), is also rejected: this is the same "copying one `?T`
+value into another isn't supported yet" v0 restriction below, one layer
+up — emission has no way to thread an aliased `?T`'s own live valid/data
+pair into another Option's flat fields. `optional Foo(x)`, `Foo` returning
+`?T`, is exempt from that restriction the same way a bare `Foo(x)` call
+already is (`callee_fail_cond`/`compile_call_field_value` decompose a
+call's return per-leaf rather than aliasing a flat register).
+
 Unwrapping goes through the *same* `?` guard operator a fifo `Deq[]` or a
 `<fails>` call already uses, generalized: when its operand types as `?T`
 instead of `[1]`, `opt?` fails the rule (discarding any writes it would
@@ -809,9 +851,10 @@ three positions. Unwrap-via-`?` and non-failing access via `.valid`/`.data`
 are two distinct idioms, not composable into one chain — pick one per read.
 
 v0 restrictions, matching structs': a `?T`-typed write's right-hand side must
-be `false` or a plain value of `T` — copying one `?T` value into another
-(`p := q`, both `?T`) isn't supported yet, and neither is a plain LOCAL
-merely aliasing another `?T`-typed value (`let o = opt; o.valid` — the exact
+be `false`, `optional <e>`, or a plain value of `T` — copying one `?T` value
+into another (`p := q`, both `?T`, whether written directly or through
+`optional q`) isn't supported yet, and neither is a plain LOCAL merely
+aliasing another `?T`-typed value (`let o = opt; o.valid` — the exact
 restriction a struct-typed local has, `let p = q; p.field`, whether the
 alias is read via `.valid`/`.data` or through `?`'s guard fold); `.valid`/
 `.data` are read-only; a `?T`-typed fn/rule PARAM is supported (an argument
@@ -835,17 +878,19 @@ cross-file guard-fold site — the same "is it present" `valid`-field read
 flat name) — for a `reg`/`output`/`input` root; a local/param root's `.valid`/
 `.data`/`?` all reduce to the aliasing restriction above instead.
 
-`??T` (`T` itself an `Option`) compiles and simulates correctly, but only
-for the two states reachable through today's syntax — fully absent
-(`false`) and fully present (a bare value of the innermost type, coerced
-through both layers by `check_assignable`'s recursive rule). It is not a
-general two-independent-layers nested Option: the outer and inner `valid`
-bits are provably always equal (no write path can ever separate them —
-`.data` is read-only, and a `?T`-typed expression can't be written into a
-`??T` target, a plain type mismatch, not a copy). `Some(None)` (outer
-present, inner absent) is genuinely inexpressible with current syntax, not
-merely untested; making the layers independent would need a construction
-syntax that doesn't exist yet.
+`??T` (`T` itself an `Option`) compiles and simulates correctly, with its
+outer and inner `valid` bits independently controllable via `optional`
+(above): bare coercion (`8'd5`, `false`) still only ever reaches the two
+fully-agreeing states, but `optional false`/`optional (optional 5'd3)`
+reach all three well-formed ones, `Some(None)` included. `Ty::Optional`
+(types.rs) is what makes this sound rather than a second `check_
+assignable`-level copy path: `optional e`'s own type carries `e`'s
+`ExprId`, not a precomputed `Ty`, so unification recurses through `check_
+assignable` again against the TARGET's own inner on demand — the peel
+happens exactly once per `optional`, however many layers the target
+actually has, and `.data` stays read-only throughout (nothing new writes
+through a `.data` path — `oo.data`'s own presence is set by a SEPARATE
+`optional` one level up, not by writing `oo.data` directly).
 
 ## Locals
 

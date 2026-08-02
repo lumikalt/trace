@@ -634,3 +634,17 @@ fn while_with_a_bare_ident_condition_still_parses_its_body_as_a_block_not_a_stru
         trace::ast::Stmt::Assign { .. }
     ));
 }
+
+#[test]
+fn optional_is_a_real_prefix_node_distinct_from_its_wrapped_expression() {
+    // Unlike `?T`'s type-position prefix `?`, `optional` is a real AST
+    // node (not elided): it needs to survive into typing/emission so a
+    // `??T`'s two `valid` bits can be driven independently (`Some(None)`).
+    assert_eq!(stmt_sexpr("x := optional 5'd3"), "(:= x (optional 5'd3))");
+    // Nests -- `optional (optional false)` is `Some(Some(absent))` on a
+    // `???T`, one `optional` per layer of forced presence.
+    assert_eq!(
+        stmt_sexpr("x := optional optional false"),
+        "(:= x (optional (optional false)))"
+    );
+}
