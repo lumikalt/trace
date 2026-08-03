@@ -665,20 +665,28 @@ Worth building:
   `if logic a > b { ... }` reads cleanly BECAUSE of that precedence
   change, which is why Lumi asked for it right before this decision,
   not a coincidence. If-guard's branch-scoped `if`-with-`else` design
-  remains a separate, larger, still-unbuilt feature — it would let a
-  BARE comparison (no `logic`) sit directly in an `if`-with-`else`
-  condition; that's a real ergonomic gap this migration left open, not
-  something this work quietly solved.
+  remained a separate, larger, still-unbuilt feature at the time —
+  it would let a BARE comparison (no `logic`) sit directly in an
+  `if`-with-`else` condition; that was a real ergonomic gap this
+  migration left open, not something this work quietly solved.
+  **Update: built in a later session — see "`if`: branch-scoped
+  fallible conditions ACHIEVED" below.**
 
   **Migration measured and completed, not just predicted.** 7 examples
   and the ~50 test snippets both bullets estimated needed `logic`-
   wrapping their `if`/`while` conditions; all migrated, full suite
   green, firtool + Icarus reconfirmed on every touched example.
-  `adder_tree.tr` — DESIGN.md's own `<elaborates>` showcase — is the
+  `adder_tree.tr` — DESIGN.md's own `<elaborates>` showcase — was the
   one real readability cost: `if logic len(xs) = 1 { ... }`, not the
   original bare `if len(xs) = 1 { ... }`, because Lumi chose uniform
   application over carving `<elaborates>` bodies out (see below), and
   `logic` was the only working discharge path available even there.
+  **Update: reverted to the bare form once the if-guard feature below
+  shipped — `<elaborates>` code needed no changes of its own to accept
+  it (elaborate.rs's interpreter already evaluated a bare comparison
+  correctly; only `check_cond`'s `[1]`-requirement, shared by every
+  `if`, was ever in the way), so this readability cost is fully closed,
+  not just reduced.**
 
   **`<elaborates>` decision: uniform, not carved out (Lumi's call,
   against the recommendation).** Offered a carve-out (comparisons stay
@@ -980,6 +988,73 @@ Speculative, bigger, not committed to:
     reuse (ordinary `.field` access requires the local bound directly
     to a literal, no aliasing) — unrelated to `optional`, would need
     its own design pass if ever wanted.
+- **`if`: branch-scoped fallible conditions ACHIEVED** — a BARE
+  comparison (no `logic`) directly as an `if`'s own condition, Verse-
+  faithful branch-scoping applied uniformly to the with-else and
+  no-else shapes alike (Lumi's call via `AskUserQuestion`, resolving
+  the one open question below that had no argued default: failure
+  skips only the `then` branch and the REST of the rule still commits,
+  even with no `else` — a real behavior change from today's top-level
+  bare comparison/`(cond)?`, which would abort the whole cycle instead).
+  See DESIGN.md's "`if`: branch-scoped fallible conditions" for the
+  full write-up (semantics, examples, why the value side needed almost
+  no new code). `while`'s own condition stays out of scope, unaffected
+  — resolves the "while with a fallible condition" open question below
+  by taking its already-argued default. A fifo op or failing call as an
+  `if`'s condition remains a type error, same as ever — this ships only
+  the comparison case; the harder branch-scoped-fifo/failing-call
+  question the open-questions list below still owes stays fully open,
+  not narrowed by this work.
+
+  **Two more pre-existing silent-miscompile bugs, found the same way
+  the comparisons-as-fallible bugs were (direct probing before
+  considering this done), neither specific to `if`.** A comparison's
+  own TYPE is its left operand's type (`type_binop`), so whenever that
+  operand is exactly 1 bit wide, combining it with `&`/`|`/`^` produces
+  an entirely ordinary `[1]` type — indistinguishable from a genuine
+  boolean by width alone, and reachable at `a01683f` already, before
+  this feature touched anything. `if (a > b) & c` (`a`/`b`/`c` all
+  1-bit) compiled clean to `mux(and(a, c), ...)`, silently using `a`'s
+  own passthrough value instead of `gt(a, b)`; the identical shape hit
+  a bare rule-body guard STATEMENT too (`((a > b) & c)?` folding to
+  `fires_r = and(a, c)`, dropping `a > b`'s guard entirely); and
+  `while x <> 0` with a 1-bit `x` slipped straight past `check_cond`'s
+  width check, silently accepting a bare comparison `while` was never
+  supposed to allow. `compile_guard_unwrap_cond` (writes.rs) itself is
+  UNCHANGED — still exactly as shallow as before, checking only whether
+  a condition's own IMMEDIATE shape is a comparison — fixed instead at
+  the one gate all three shapes must pass through first: `check_cond`
+  (types.rs)'s new `expr_has_undischarged_comparison` walks a
+  condition's full subexpression tree (`sub_exprs`, lower.rs) and
+  rejects outright, before emission ever runs, when an undischarged
+  comparison is reachable anywhere that isn't either the whole
+  condition (this feature's new `if`-only exemption) or already
+  `logic`-wrapped — closing all three call sites (`if`, `while`, and
+  the bare-statement guard fold) at once, since all three route through
+  `check_cond` before anything reaches `compile_guard_unwrap_cond`. A
+  future guard-fold call site that reached `compile_guard_unwrap_cond`
+  WITHOUT going through `check_cond` first would reintroduce this exact
+  gap with no test catching it.
+
+  **Verified the way this session's other features were: direct `.tr`
+  probes through `--firrtl` for every distinct write-threading walk
+  before considering this done**, not just the register case — a
+  memory write's explicit write-enable (`mem_write_in_stmts`), a
+  submodule instance port (`inst_port_value_in_stmts`), a callee
+  writing a caller's register as a bare statement
+  (`callee_reg_write` — a different code path from a callee's own
+  RETURN value), and a reassigned local referenced inside an
+  if-condition comparison (resolves at its own textual position,
+  `set_pos`/`enter_rule`, not a later reassignment) — all confirmed
+  correct and pinned with regression tests (tests/firrtl.rs), alongside
+  the type-level rejections (tests/types.rs) and the fn-boundary
+  `<fails>`-discharge behavior (tests/effects.rs). `examples/
+  adder_tree.tr` reverted to its original bare `if len(xs) = 1 { ... }`
+  now that `logic` is no longer needed there either (elaborate.rs's
+  interpreter already evaluated the bare form correctly all along —
+  only `check_cond` was ever in the way), closing the one readability
+  cost the earlier comparisons-as-fallible migration left behind.
+
 - **Fallible bindings scoped to a single `if`** (Verse's
   `if (X := Expr, Y > 0):`, where `X` only exists in the `then` branch
   and a failure skips straight past it, running the `else` instead
@@ -987,12 +1062,18 @@ Speculative, bigger, not committed to:
   call, picking the full version over closing this or building `?T`-
   only sugar) — not built; this is the semantics + open-questions
   writeup the decision needs before an implementation attempt.
-  **Update:** comparisons-as-fallible (below) shipped WITHOUT this —
+  **Update:** comparisons-as-fallible (earlier) shipped WITHOUT this —
   `logic <expr>` turned out to be a complete discharge path for
-  `if`/`while` on its own, so this is no longer a blocker for anything
-  that's actually built. What THIS would still add on top: a BARE
-  comparison directly in an `if`-with-`else` condition, no `logic`
-  needed. Still just a design, not an implementation attempt.
+  `if`/`while` on its own, so this was no longer a blocker for anything
+  actually built at the time. **Second update: the BARE-comparison half
+  of what this would add is now its own ACHIEVED bullet above** (a
+  comparison directly in an `if`-with-`else` — or no-`else` — condition,
+  no `logic` needed); what's STILL missing here is specifically the
+  Option-presence BINDING sugar (`X := Expr` introducing a THEN-branch-
+  scoped name), which is a new scoping rule trace has no precedent for
+  (`let` is body-scoped, shadowing is legal), plus the still-fully-open
+  branch-scoped fifo-op/failing-call-as-condition question below. Still
+  just a design, not an implementation attempt, for both.
 
   **The no-else/with-else split is what makes this tractable at all.**
   An `if` whose fallible condition has NO `else` is already exactly
@@ -1065,13 +1146,23 @@ Speculative, bigger, not committed to:
     in. Verse's own construct is `if`-shaped only; nothing here argues
     for extending to `while`, so treat this as staying restricted
     (today's "guard nested in if/while" error) unless a concrete need
-    for a fallible loop condition shows up.
+    for a fallible loop condition shows up. **Resolved for the
+    comparison case (see the ACHIEVED bullet above): took exactly this
+    already-argued default, `while` stays restricted, `logic` still the
+    discharge.** Still open for fifo ops/failing calls, same as ever.
   - **What `fires_rule` becomes for an `if`-WITH-else fallible
     condition.** Per the no-else/with-else split above, the with-else
     case should contribute NOTHING to the whole-rule guard (matching
     `or`-with-default) — confirm this is actually achievable for a
     fifo-occupancy-gated branch, not just an Option-presence one, once
-    the dequeue-enable question above is answered.
+    the dequeue-enable question above is answered. **Confirmed for the
+    comparison case (ACHIEVED bullet above), WITH one addition beyond
+    what this question originally asked: the same "contributes
+    nothing" answer was extended to the NO-else shape too, not just
+    with-else — `compile_guard`'s statement loop never looked inside
+    `Stmt::If` at all, with or without an `else`, so this fell out for
+    free once `check_cond` accepted the shape. Still unconfirmed for a
+    fifo-occupancy-gated branch.**
 
   One dead-code note this decision revives rather than resolves:
   `check_cond`'s early-return for `Expr::Guard` over a `Ty::Option`

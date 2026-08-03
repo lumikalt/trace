@@ -274,7 +274,23 @@ impl<'a> Checker<'a> {
                 then_body,
                 else_body,
             } => {
-                self.infer_expr(*cond, sig);
+                // A BARE comparison directly as an `if`'s own condition is
+                // branch-scoped and discharged right here (types.rs's
+                // `check_cond` is what actually allows this shape) --
+                // mirrors `Expr::Logic`'s arm below: merge the operands'
+                // `reads`, but not the ordinary `Expr::Binary` comparison
+                // arm's `fails = true`, or every such `if` would need
+                // `<fails>` declared for a condition that never gates
+                // anything (see DESIGN.md's "`if`: branch-scoped fallible
+                // conditions").
+                if let Expr::Binary { op, lhs, rhs } = self.ast.expr(*cond)
+                    && op.is_comparison()
+                {
+                    self.infer_expr(*lhs, sig);
+                    self.infer_expr(*rhs, sig);
+                } else {
+                    self.infer_expr(*cond, sig);
+                }
                 for s in then_body {
                     self.infer_stmt(*s, sig);
                 }

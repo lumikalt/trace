@@ -456,3 +456,40 @@ fn all_examples_pass_effect_check() {
         }
     }
 }
+
+/// A BARE comparison directly as an `if`'s own condition is branch-
+/// scoped and discharged (`infer_stmt`'s `Stmt::If` arm, effects.rs) --
+/// mirrors `logic <comparison>`'s existing discharge, but needs no
+/// `logic` at all here. Exercised at a FN BOUNDARY specifically (not
+/// just a rule) since that's where an incorrectly-propagated `fails`
+/// would force a spurious `<fails>` declaration: a `<combines>` callee
+/// whose ONLY comparison sits in an if-condition must NOT need `<fails>`
+/// at all.
+#[test]
+fn a_bare_comparison_ifs_condition_does_not_require_fails_declared() {
+    run_ok(
+        "Classify(a : [8], b : [8]) : [8] <combines> {\n if a > b {\n return 1\n } else {\n \
+         return 2\n }\n}\n",
+    );
+    // No-else shape too -- the discharge doesn't depend on whether an
+    // `else` is present, matching this feature's uniform branch-scoping.
+    run_ok(
+        "Bump(x : [8], y : [8]) : [8] <combines> {\n if x > y {\n return x\n }\n \
+         return y\n}\n",
+    );
+}
+
+/// Contrast: a REAL guard elsewhere in the same body (unrelated to the
+/// if-condition comparison) still needs `<fails>` declared -- the
+/// if-condition discharge is scoped to exactly that one comparison, not
+/// a blanket exemption that could hide an unrelated undeclared failure.
+#[test]
+fn a_bare_comparison_if_condition_does_not_mask_an_unrelated_guard_needing_fails() {
+    let (_, _, errors) = run(
+        "Check(a : [8], b : [8], c : [8]) : [8] <combines> {\n if a > b {\n return 1\n \
+         }\n (c <> 0)?\n return 2\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`Check`"));
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+}

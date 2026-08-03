@@ -5409,3 +5409,251 @@ module M {
     assert!(fir.contains("connect p_data, x"));
     run_firtool(&fir, &[]);
 }
+
+/// `if`: branch-scoped fallible conditions (DESIGN.md, TODO.md's
+/// if-guard item). A BARE comparison, no `logic` needed, directly as an
+/// `if`'s own condition — Lumi's call: Verse-faithful branch-scoping
+/// applied uniformly, so the rule's own guard (`fires_r`) never depends
+/// on it, with-else or not; only the mux select does. `mux(gt(a, b), 1,
+/// 2)` proves the SELECT compiles the comparison's TEST, not its "yields
+/// the left operand" VALUE (`type_binop`'s comparisons-as-fallible rule)
+/// — `compile_expr`'s ordinary dispatch would give `a` itself there,
+/// wrong for a mux selector; `compile_guard_unwrap_cond` (already built
+/// for the guard-fold, reused here) is what the 8 mux-threading call
+/// sites across writes.rs/calls.rs now route through instead.
+#[test]
+fn if_with_a_bare_comparison_condition_and_else_compiles_to_a_predicate_mux_and_never_gates_the_rule()
+ {
+    let src = "\
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    rule r {
+        if a > b {
+            v := 1
+        } else {
+            v := 2
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(gt(a, b), UInt<8>(1), UInt<8>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// The genuinely new half of this feature (DESIGN.md/TODO.md's own
+/// framing): a fallible `if` with NO `else`. Verse-faithful branch-
+/// scoping, applied uniformly (Lumi's call, `AskUserQuestion`): failure
+/// only skips the `then` branch — `v` holds its own current value, same
+/// "hold" fallback an ordinary unwritten register path already has — the
+/// REST of the rule still runs and the rule still fires unconditionally,
+/// unlike today's top-level bare-comparison guard (`a > b` alone, or
+/// `(a > b)?`), which would abort the whole cycle instead. `w := 2`
+/// running regardless is the one observable difference a probe can pin.
+#[test]
+fn if_with_a_bare_comparison_condition_and_no_else_holds_on_failure_and_the_rest_of_the_rule_still_commits()
+ {
+    let src = "\
+module M {
+    reg v : [8] = 0
+    reg w : [8] = 0
+    in a : [8]
+    in b : [8]
+    rule r {
+        if a > b {
+            v := 1
+        }
+        w := 2
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(gt(a, b), UInt<8>(1), v)"));
+    assert!(fir.contains("connect w, UInt<8>(2)"));
+    run_firtool(&fir, &[]);
+}
+
+/// `logic`-wrapping an if-condition comparison still works exactly as it
+/// did before this feature (compiles to the identical FIRRTL) — a bare
+/// comparison is a newly ADDED shape, not a replacement, so the existing
+/// `logic a > b` spelling stays valid.
+#[test]
+fn logic_wrapped_if_condition_comparison_is_unaffected_by_the_bare_comparison_addition() {
+    let src = "\
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    rule r {
+        if logic a > b {
+            v := 1
+        } else {
+            v := 2
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(gt(a, b), UInt<8>(1), UInt<8>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A fifo op as a bare if-condition stays a v0 restriction, completely
+/// unaffected by this feature — only a comparison gets the new bare
+/// discharge; `check_cond`'s `allow_bare_comparison` exemption only ever
+/// matches `Expr::Binary` with `is_comparison()`, never a fifo op's own
+/// `Ty::Bits(width)` (the fifo element's type, not `[1]`).
+#[test]
+fn a_fifo_op_as_a_bare_if_condition_is_still_a_type_error() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg v : [8] = 0
+    rule r {
+        if f.Deq[] {
+            v := 1
+        }
+    }
+}
+";
+    let (tokens, _) = lexer::lex(src);
+    let (ast, _) = parser::parse(src, &tokens);
+    let (res, _) = resolve::resolve(&ast);
+    let (_, type_errors) = types::check(&ast, &res);
+    assert_eq!(type_errors.len(), 1);
+    assert!(type_errors[0].message.contains("condition must be [1]"));
+}
+
+/// The write-threading walk this feature's mux-select fix touches isn't
+/// just `reg_value_in_stmts` — a memory write threads an explicit
+/// write-enable boolean alongside the muxed addr/data
+/// (`mem_write_in_stmts`, writes.rs), a structurally different function
+/// from the register case with its own independent `compile_expr(cond)`
+/// call site. Pins that all three (enable, addr, data) use the
+/// comparison's TEST (`gt(a, b)`), not its left-operand passthrough.
+#[test]
+fn if_with_a_bare_comparison_condition_gates_a_memory_write_enable_and_addr_data_correctly() {
+    let src = "\
+module M {
+    mem m : [8][16]
+    in a : [4]
+    in b : [4]
+    in data : [8]
+    in read_addr : [4]
+    out read_data : [8] = 0
+    rule step {
+        if a > b {
+            m[a] := data
+        }
+        read_data := m[read_addr]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(
+        fir.contains("connect m.w_m.en, and(fires_step, mux(gt(a, b), UInt<1>(1), UInt<1>(0)))")
+    );
+    assert!(fir.contains("connect m.w_m.addr, mux(gt(a, b), a, UInt<4>(0))"));
+    assert!(fir.contains("connect m.w_m.data, mux(gt(a, b), data, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// Same mux-select fix, exercised through a THIRD independent
+/// write-threading walk: an instance port
+/// (`inst_port_value_in_stmts`, writes.rs) has no "hold" fallback of its
+/// own (unlike a register) — its unwritten path falls back to a literal
+/// `UInt(0)` instead, but the SELECT itself must still be the
+/// comparison's predicate, not `x`'s own passthrough value.
+#[test]
+fn if_with_a_bare_comparison_condition_gates_a_submodule_instance_port() {
+    let src = "\
+module Child {
+    in a : [8]
+    out b : [8] = 0
+    rule pass {
+        b := a
+    }
+}
+module Top {
+    inst c : Child
+    in x : [8]
+    in y : [8]
+    out result : [8] = 0
+    rule wire {
+        if x > y {
+            c.a := x
+        } else {
+            c.a := 0
+        }
+        result := c.b
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect c.a, mux(gt(x, y), x, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A FOURTH independent write-threading walk: a callee (not a rule)
+/// writing a caller's register through its own `if`/`else`, called as a
+/// bare statement (`callee_reg_write`, writes.rs) — a completely
+/// different code path from a callee's RETURN value (`compile_callee_
+/// body`, calls.rs, already covered by `if_condition...gates_a_
+/// submodule_instance_port` and this file's other callee tests), since
+/// nothing here ever reaches a `return`.
+#[test]
+fn if_with_a_bare_comparison_condition_gates_a_callee_writing_a_register_as_a_bare_statement() {
+    let src = "\
+module Top {
+    in a : [8]
+    in b : [8]
+    out v_out : [8] = 0
+    Bump(x : [8], y : [8]) : [8] <combines> {
+        if x > y {
+            v_out := x
+        } else {
+            v_out := y
+        }
+        return x
+    }
+    rule compute {
+        Bump(a, b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_v_out, mux(gt(a, b), a, b)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A reassigned local used inside an if-condition comparison resolves at
+/// its OWN textual position (`set_pos`/`enter_rule`, DESIGN.md's
+/// "Reassigned locals"), same as every other cond value — the mux select
+/// must use `t`'s FIRST binding (`a`), not a later reassignment
+/// (`c`) that textually follows the `if`.
+#[test]
+fn a_reassigned_local_in_an_if_condition_comparison_resolves_at_its_own_position() {
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    reg v : [8] = 0
+    rule r {
+        let t = a
+        if t > b {
+            v := 1
+        }
+        t := c
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, mux(gt(a, b), UInt<8>(1), v)"));
+    run_firtool(&fir, &[]);
+}

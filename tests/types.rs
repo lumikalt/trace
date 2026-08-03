@@ -1438,3 +1438,94 @@ fn all_examples_type_check() {
         }
     }
 }
+
+/// `if`'s new `allow_bare_comparison` exemption (`check_cond`) is
+/// deliberately `if`-only: Verse's own construct is `if`-shaped, and
+/// TODO.md explicitly keeps `while`'s own fallible condition out of
+/// scope. A bare comparison directly as `while`'s condition must stay a
+/// type error, `logic` still the discharge, completely unaffected by
+/// this feature.
+#[test]
+fn if_condition_accepts_a_bare_comparison_but_while_still_rejects_it() {
+    run_ok(
+        "module M {\n reg v : [8] = 0\n in a : [8]\n in b : [8]\n \
+         rule r {\n if a > b {\n v := 1\n } else {\n v := 2\n }\n }\n}\n",
+    );
+    run_ok(
+        "Sum(x : [8]) : [8] <sequences, fails> {\n while logic x <> 0 {\n x := x >> 1\n }\n \
+         return x\n}\n",
+    );
+    let (_, _, errors) = run(
+        "Sum(x : [8]) : [8] <sequences, fails> {\n while x <> 0 {\n x := x >> 1\n }\n \
+         return x\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("wrap it with `logic`"));
+}
+
+/// Advisor-caught while reviewing the `if`-only exemption above: a
+/// comparison's own TYPE is its left operand's type (`type_binop`), so
+/// once that operand happens to be exactly 1 bit wide, a comparison
+/// COMBINED with `&`/`|`/`^` types as an ordinary `[1]` — indistinguish-
+/// able from a genuine boolean by width alone. Pre-existing this
+/// session's `if`-condition work entirely (reachable at `a01683f`
+/// already, unrelated to `allow_bare_comparison`): `if (a > b) & c`
+/// silently compiled to `mux(and(a, c), ...)`, using `a`'s own
+/// passthrough value instead of `gt(a, b)` as the mux selector. Fixed by
+/// `expr_has_undischarged_comparison` rejecting ANY undischarged
+/// comparison reachable inside a condition that ISN'T exactly the whole
+/// condition itself (or explicitly `logic`-discharged) — checked here at
+/// the type level so it can never reach a compile-time mux-select bug.
+#[test]
+fn a_comparison_nested_inside_a_larger_if_or_while_condition_is_rejected_not_silently_miscompiled()
+{
+    let (_, _, errors) = run(
+        "module M {\n reg v : [8] = 0\n in a : [1]\n in b : [1]\n in c : [1]\n \
+         rule r {\n if (a > b) & c {\n v := 1\n }\n }\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("wrap it with `logic`"));
+
+    // `logic`-discharging the comparison FIRST is the escape hatch, same
+    // idiom `logic A & logic B` already documents.
+    run_ok(
+        "module M {\n reg v : [8] = 0\n in a : [1]\n in b : [1]\n in c : [1]\n \
+         rule r {\n if (logic a > b) & c {\n v := 1\n }\n }\n}\n",
+    );
+
+    // `while` had the identical gap, with no `allow_bare_comparison`
+    // needed to trigger it: `while x <> 0` with a 1-bit `x` used to pass
+    // `check_cond`'s width check silently (a comparison's own type IS
+    // [1] whenever its LHS is), never even reaching the "must be [1]"
+    // error `while`'s own restriction is supposed to enforce.
+    let (_, _, errors) = run(
+        "Sum(x : [1]) : [1] <sequences, fails> {\n while x <> 0 {\n x := 0\n }\n \
+         return x\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("wrap it with `logic`"));
+}
+
+/// The identical nested-comparison gap, one call site over: a bare
+/// rule-body guard STATEMENT (`(complex)?`), which folds through
+/// `compile_guard_unwrap_cond` (writes.rs) exactly like an if-condition
+/// does, and has the same "only checks whether its own operand IS
+/// directly a comparison" blind spot. `((a > b) & c)?` used to compile
+/// clean with `fires_r = and(a, c)`, silently dropping `a > b`'s own
+/// guard — the SAME `expr_has_undischarged_comparison` check in
+/// `check_cond` closes this too, since this bare-statement position also
+/// routes through `check_cond` (`type_stmt`'s `Stmt::Expr` arm).
+#[test]
+fn a_comparison_nested_inside_a_bare_guard_statement_is_rejected_not_silently_dropped() {
+    let (_, _, errors) = run(
+        "module M {\n reg v : [8] = 0\n in a : [1]\n in b : [1]\n in c : [1]\n \
+         rule r {\n ((a > b) & c)?\n v := 1\n }\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("wrap it with `logic`"));
+
+    run_ok(
+        "module M {\n reg v : [8] = 0\n in a : [1]\n in b : [1]\n in c : [1]\n \
+         rule r {\n ((logic a > b) & c)?\n v := 1\n }\n}\n",
+    );
+}

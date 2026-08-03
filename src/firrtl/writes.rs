@@ -277,6 +277,16 @@ impl<'a> Emitter<'a> {
     /// inner expression as an ordinary condition, emitting a reference
     /// to a register that was never declared (`opt` instead of `opt_
     /// valid`), a real firtool-rejected miscompile this closes.
+    ///
+    /// A second job, added for `if`'s branch-scoped fallible conditions
+    /// (DESIGN.md): every `Stmt::If`'s own `cond` mux-select, across
+    /// writes.rs and calls.rs, compiles through here too (called directly
+    /// on `cond`, no `Guard` wrapper needed) — a BARE comparison used as
+    /// an if's condition needs this same "test, not the left-operand
+    /// passthrough value" treatment for exactly the reason its guard-fold
+    /// use does, and every other condition shape (a plain bits[1] value,
+    /// a `logic`-wrapped one) already falls through to the ordinary
+    /// `compile_expr` arm unchanged.
     pub(crate) fn compile_guard_unwrap_cond(&mut self, inner: ExprId) -> String {
         if matches!(self.types.expr_tys.get(&inner), Some(Ty::Option(_))) {
             let (root, mut path) = self.struct_field_path(inner);
@@ -586,9 +596,7 @@ impl<'a> Emitter<'a> {
                         // it to THIS (enclosing) statement before
                         // compiling the if's own condition.
                         self.set_pos(rule, *stmt);
-                        let cond_str = self
-                            .compile_expr(cond)
-                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        let cond_str = self.compile_guard_unwrap_cond(cond);
                         current = Some((
                             format!("mux({cond_str}, {te}, {ee})"),
                             format!("mux({cond_str}, {ta}, {ea})"),
@@ -657,9 +665,7 @@ impl<'a> Emitter<'a> {
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
                         self.set_pos(rule, *stmt);
-                        let cond_str = self
-                            .compile_expr(cond)
-                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        let cond_str = self.compile_guard_unwrap_cond(cond);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
@@ -918,9 +924,7 @@ impl<'a> Emitter<'a> {
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
                         self.set_pos(rule, *stmt);
-                        let cond_str = self
-                            .compile_expr(cond)
-                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        let cond_str = self.compile_guard_unwrap_cond(cond);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
@@ -1072,9 +1076,7 @@ impl<'a> Emitter<'a> {
                         let hold = current.clone().unwrap_or_else(|| reg_name.to_string());
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
-                        let cond_str = self
-                            .compile_expr(cond)
-                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        let cond_str = self.compile_guard_unwrap_cond(cond);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
@@ -1147,9 +1149,7 @@ impl<'a> Emitter<'a> {
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
                         self.set_pos(rule, *stmt);
-                        let cond_str = self
-                            .compile_expr(cond)
-                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        let cond_str = self.compile_guard_unwrap_cond(cond);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
@@ -1292,9 +1292,7 @@ impl<'a> Emitter<'a> {
                             .unwrap_or_else(|| format!("UInt<{width}>(0)"));
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
-                        let cond_str = self
-                            .compile_expr(cond)
-                            .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                        let cond_str = self.compile_guard_unwrap_cond(cond);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }

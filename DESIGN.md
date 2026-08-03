@@ -243,6 +243,85 @@ only checking a statement's top-level shape); `v := a + (a > b)` inside an
 `if` had the identical silent gap one level deeper (fixed by rejecting it,
 matching the fifo-op precedent, rather than folding it unconditionally).
 
+### `if`: branch-scoped fallible conditions
+
+A BARE comparison — no `logic` — may sit directly as an `if`'s own
+condition, the ergonomic gap the previous section's migration deliberately
+left open. Verse-faithful branch-scoping, applied uniformly regardless of
+whether an `else` is present (Lumi's call): failure only skips the `then`
+branch; it never gates the whole rule the way a top-level bare comparison
+(or an explicit `?`) does. `while`'s own condition stays out of scope —
+Verse's own construct is `if`-shaped only — so a bare comparison there is
+still a type error, `logic` still the discharge.
+
+```trace
+rule r {
+    if a > b {
+        v := 1              -- v becomes 1 when a > b holds
+    } else {
+        v := 2               -- v becomes 2 otherwise
+    }
+}
+
+rule r2 {
+    if a > b {
+        v := 1               -- v holds its own value when a <= b, same as
+    }                        -- an unwritten register path always would
+    w := 2                   -- runs EVERY cycle, regardless of a > b
+}
+```
+
+The value side was already solved before this feature existed: `if opt.valid
+{ result := opt.data } else { result := 2 }` already compiled to a plain
+`mux(opt_valid, opt_data, 2)`, ordinary conditional-write muxing
+(`writes.rs`) with no rule-level guard at all. A bare comparison's own
+condition-position compilation reuses this unchanged — only the SELECT
+itself needed to change, from `a`'s own passthrough value (`type_binop`'s
+"yields the left operand" rule) to the comparison's actual boolean test
+(`gt`/`lt`/...), the same `compile_guard_unwrap_cond` already built for the
+guard-fold. No-else naturally falls out of the SAME mux-threading with no
+special-casing: a branch that doesn't write a register already holds its
+prior value (`reg_value_in_stmts`'s existing "hold" fallback); the whole-
+rule guard already never looked inside `Stmt::If` at all (`compile_guard`'s
+statement loop only matches `Stmt::Expr`/`Stmt::Assign`/`Stmt::Let`), so an
+if-condition contributing nothing to `fires_rule` needed no new code, only
+the type checker (`check_cond`, types.rs) accepting the shape.
+
+v0 restrictions: only a comparison discharges this way — a fifo op or a
+failing call as an if's condition remains a type error (unchanged, no new
+exemption for either); and only when the comparison is the WHOLE condition,
+not nested inside a larger expression (`if (a > b) & c` is rejected, not
+silently folded) — combine with `logic` first instead, the same
+`(logic A) & (logic B)` idiom `logic`'s own entry above already documents
+(`(logic a > b) & c`).
+
+That last restriction closes a real, pre-existing silent-miscompile gap,
+not a hypothetical one: a comparison's own TYPE is its left operand's type
+(`type_binop`), so whenever that operand happens to be exactly 1 bit wide,
+`(a > b) & c` types as an entirely ordinary `[1]` — indistinguishable from
+a genuine boolean by width alone. Before this was caught, `if (a > b) & c`
+compiled clean to `mux(and(a, c), ...)`, using `a`'s own passthrough value
+in place of `gt(a, b)`; the identical shape reached a bare rule-body guard
+statement too (`((a > b) & c)?` folding to `fires_r = and(a, c)`, dropping
+`a > b`'s guard entirely), and `while x <> 0` with a 1-bit `x` slipped past
+`check_cond`'s width check the same way, silently accepting a bare
+comparison `while` was never supposed to allow at all. All three routed
+through the same underlying blind spot: `check_cond`'s width check, and
+`compile_guard_unwrap_cond`'s own comparison special-case, both only ever
+checked whether a condition's own IMMEDIATE shape was a comparison, never
+whether one was reachable somewhere inside a larger expression.
+`compile_guard_unwrap_cond` itself is UNCHANGED — still exactly as shallow
+as before — fixed instead at the one gate every one of these three shapes
+must pass through first: `expr_has_undischarged_comparison` (types.rs,
+called from `check_cond`) walks a condition's full subexpression tree via
+`sub_exprs` (lower.rs) and rejects outright, before emission ever runs,
+when an undischarged comparison is reachable anywhere that isn't either
+the WHOLE condition (the new `if`-only exemption above) or already
+wrapped in `logic`. A future guard-fold call site that reaches
+`compile_guard_unwrap_cond` WITHOUT going through `check_cond` first would
+reintroduce this exact gap with no test catching it — the fix is a
+front-gate, not a fix to the shallow check itself.
+
 ### `or`: fallback chains
 
 `A or B or C` tries each fallible alternative in priority order (`A` first) and

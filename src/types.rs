@@ -837,16 +837,17 @@ impl<'a> TypeChecker<'a> {
                 // A bare COMPARISON is the one exception: like a fifo
                 // op, it now has its OWN independent gating mechanism
                 // (`compile_guard_unwrap_cond`, firrtl/writes.rs) that
-                // doesn't route through this [1] requirement at all --
-                // unlike an if/while condition (`check_cond` below,
-                // unchanged), where a bare comparison must still be
-                // REJECTED (not silently exempted) so it doesn't reach
-                // `compile_expr`'s "yields lhs's value" path as a mux
-                // selector; `logic` is the discharge for that position.
+                // doesn't route through this [1] requirement at all.
+                // This is a RULE-BODY bare statement, not an if/while
+                // condition -- `check_cond` below still rejects a bare
+                // comparison for `while`, and for an `if` it's handled by
+                // its own dedicated `Stmt::If` arm (which never reaches
+                // this `Stmt::Expr` arm at all), not this path; `logic`
+                // remains a valid, unaffected discharge everywhere.
                 if matches!(self.ast.expr(e), Expr::Binary { op, .. } if op.is_comparison()) {
                     self.type_expr(e, locals);
                 } else if is_guard_like(self.ast, self.res, e) {
-                    self.check_cond(e, locals);
+                    self.check_cond(e, locals, false);
                 } else {
                     self.type_expr(e, locals);
                 }
@@ -877,7 +878,14 @@ impl<'a> TypeChecker<'a> {
                 then_body,
                 else_body,
             } => {
-                self.check_cond(cond, locals);
+                // `if`, unlike `while`, allows a BARE comparison directly
+                // as its condition (Lumi's call: branch-scoped, Verse-
+                // faithful semantics chosen uniformly for both the
+                // with-else and no-else shapes -- see DESIGN.md's "`if`:
+                // branch-scoped fallible conditions"). `logic` is no
+                // longer required here, though it still works (`logic`'s
+                // own type is plain `[1]`, unaffected by this exemption).
+                self.check_cond(cond, locals, true);
                 for s in then_body {
                     self.type_stmt(s, locals, ret);
                 }
@@ -886,7 +894,11 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::While { cond, body } => {
-                self.check_cond(cond, locals);
+                // `while`'s fallible condition stays out of scope (TODO.md
+                // -- Verse's own construct is `if`-shaped only): a bare
+                // comparison here is still a type error, `logic` still the
+                // discharge.
+                self.check_cond(cond, locals, false);
                 for s in body {
                     self.type_stmt(s, locals, ret);
                 }
@@ -894,7 +906,12 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_cond(&mut self, cond: ExprId, locals: &mut HashMap<DefId, Ty>) {
+    fn check_cond(
+        &mut self,
+        cond: ExprId,
+        locals: &mut HashMap<DefId, Ty>,
+        allow_bare_comparison: bool,
+    ) {
         let ty = self.type_expr(cond, locals);
         // A bare `opt?` statement (`opt : ?T`) unwraps-or-fails,
         // discarding the unwrapped value -- the same "gate the rule,
@@ -912,17 +929,64 @@ impl<'a> TypeChecker<'a> {
         // `(a > b)?`: same idea, a comparison's own "value" (per
         // `type_binop`) is `a`'s type, not [1] -- explicitly gating on
         // it with `?` doesn't need it to ALSO be a real boolean here.
-        // Unlike a BARE comparison (which this fn still rejects, so it
-        // doesn't reach `compile_expr`'s "yields lhs's value" path as a
-        // mux selector — see `type_stmt`'s own bare-comparison
-        // exemption, which routes around this fn entirely instead), an
-        // EXPLICIT `?` reaching an if/while condition is already
-        // rejected by `check_guard_placement`'s position restriction
-        // regardless of this exemption, so there's no silent-miscompile
-        // risk in exempting it here too.
+        // Unlike a BARE comparison (handled by the `allow_bare_comparison`
+        // exemption just below, `if`-only), an EXPLICIT `?` reaching an
+        // if/while condition is already rejected by `check_guard_
+        // placement`'s position restriction regardless of this exemption,
+        // so there's no silent-miscompile risk in exempting it here too.
         if let Expr::Guard(inner) = self.ast.expr(cond)
             && matches!(self.ast.expr(*inner), Expr::Binary { op, .. } if op.is_comparison())
         {
+            return;
+        }
+        // A BARE comparison directly as an `if`'s own condition (no `?`,
+        // no `logic`): the branch-scoped discharge this feature adds.
+        // `while` never sets `allow_bare_comparison`, so its bare
+        // comparison stays a type error same as before. Deliberately
+        // narrow: only the WHOLE condition being a comparison qualifies,
+        // not one nested inside a larger condition expression (`if (a >
+        // b) & c`) -- see `expr_has_undischarged_comparison` just below
+        // for why nesting is rejected outright rather than silently
+        // accepted.
+        if allow_bare_comparison
+            && matches!(self.ast.expr(cond), Expr::Binary { op, .. } if op.is_comparison())
+        {
+            return;
+        }
+        // Advisor-caught, twice, while building the exemption just above:
+        // a comparison's own type is its LHS's type (`type_binop`), so
+        // once that LHS happens to be exactly 1 bit wide, a comparison
+        // COMBINED with `&`/`|`/`^` (`(a > b) & c`, `a, b, c : [1]`) types
+        // as a perfectly ordinary ty::Bits(1) -- indistinguishable from a
+        // genuine boolean by the width check below alone. That's not
+        // hypothetical: `if (a > b) & c` compiled clean pre-existing this
+        // feature (`a01683f`, unrelated to the `allow_bare_comparison`
+        // exemption above) to `mux(and(a, c), ...)`, silently using `a`'s
+        // own passthrough value instead of `gt(a, b)` -- and the exact
+        // same shape reaches a bare rule-body guard statement too
+        // (`((a > b) & c)?` folded to `fires_r = and(a, c)`, dropping the
+        // comparison's guard entirely), since `compile_guard_unwrap_cond`
+        // (firrtl/writes.rs) only special-cases a comparison sitting
+        // DIRECTLY as its own operand, the same shape this fn's own
+        // exemptions above check for. `while x <> 0` with a 1-bit `x` had
+        // the identical gap (no `allow_bare_comparison` needed to trigger
+        // it at all). Reject outright, mirroring `contains_comparison`'s
+        // (firrtl/checks.rs) body-nesting restriction and the "wrap it
+        // with `logic`" precedent `logic A & logic B` already set --
+        // don't silently fold, since finding-and-correctly-compiling a
+        // comparison nested arbitrarily deep in a boolean combination
+        // (unlike the guard-FOLD's own `comparison_conds`, which has no
+        // VALUE to get wrong) would still leave the wrong VALUE reaching
+        // this mux selector.
+        if self.expr_has_undischarged_comparison(cond) {
+            self.error(
+                self.expr_span(cond),
+                "a comparison combined with another condition (`&`/`|`/`^`, or nested \
+                 inside a larger expression) is not yet supported here (v0 restriction): \
+                 wrap it with `logic` first -- `(logic a > b) & c` -- or, for an `if`, \
+                 use it as the WHOLE condition on its own"
+                    .to_string(),
+            );
             return;
         }
         match ty {
@@ -932,6 +996,31 @@ impl<'a> TypeChecker<'a> {
                 format!("condition must be [1], got {other} (compare explicitly)"),
             ),
         }
+    }
+
+    /// Whether `id` IS an undischarged comparison, or has one reachable
+    /// anywhere in its own subexpression tree -- `logic <comparison>`
+    /// exempted (already discharged, see `logic`'s own entry in TODO.md),
+    /// everything else walked generically via `sub_exprs` (lower.rs).
+    /// `check_cond`'s own two exemptions above (an explicit `(a > b)?`,
+    /// and -- `if`-only -- a bare comparison as the WHOLE condition) both
+    /// `return` before reaching this check, so by the time this runs
+    /// `cond` itself may still legitimately BE a bare comparison (a
+    /// `while`'s, always rejected) or may legitimately CONTAIN a
+    /// `logic`-discharged one (`(logic a > b) & c`, correctly exempted
+    /// here) -- only a comparison neither wrapper has touched counts.
+    fn expr_has_undischarged_comparison(&self, id: ExprId) -> bool {
+        if let Expr::Logic(inner) = self.ast.expr(id)
+            && matches!(self.ast.expr(*inner), Expr::Binary { op, .. } if op.is_comparison())
+        {
+            return false;
+        }
+        if matches!(self.ast.expr(id), Expr::Binary { op, .. } if op.is_comparison()) {
+            return true;
+        }
+        crate::lower::sub_exprs(self.ast, id)
+            .into_iter()
+            .any(|child| self.expr_has_undischarged_comparison(child))
     }
 
     /// `lhs := rhs`: state writes check width; local (re)binds widen.

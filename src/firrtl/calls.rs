@@ -875,9 +875,7 @@ impl<'a> Emitter<'a> {
                 self.compile_callee_body(&else_body, hint, span),
             ) {
                 (Ok(t), Ok(e)) => {
-                    let cond_str = self
-                        .compile_expr(cond)
-                        .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                    let cond_str = self.compile_guard_unwrap_cond(cond);
                     Ok(format!("mux({cond_str}, {t}, {e})"))
                 }
                 _ => Err(()),
@@ -1015,9 +1013,7 @@ impl<'a> Emitter<'a> {
                 self.compile_callee_body_field(&else_body, path, root_ty, width),
             ) {
                 (Some(t), Some(e)) => {
-                    let cond_str = self
-                        .compile_expr(cond)
-                        .unwrap_or_else(|_| "UInt<1>(0)".to_string());
+                    let cond_str = self.compile_guard_unwrap_cond(cond);
                     Some(format!("mux({cond_str}, {t}, {e})"))
                 }
                 _ => None,
