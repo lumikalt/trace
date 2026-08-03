@@ -1,0 +1,35 @@
+-- A deliberately-FAILING twin of tb_accumulator.tr, used only to prove
+-- that a checkpoint's failure is actually observable from outside: the
+-- checkpoint below (`dut.sum = 99`) can never hold (four `inc = 5`
+-- cycles plus two `inc = 3` cycles give 26, not 99), so `drive`'s
+-- `<sequences>` continuation register should stick at its last segment
+-- forever instead of wrapping back to 0. See
+-- tests/sim.rs's `tb_accumulator_checkpoint_failure_stalls_and_is_observable`.
+module Accumulator {
+    in inc : [8]
+    out sum : [8] = 0
+
+    rule accumulate {
+        sum := sum + inc
+    }
+}
+
+module Top {
+    inst dut : Accumulator
+
+    rule drive <sequences> {
+        dut.inc := 5
+        tick
+        dut.inc := 5
+        tick
+        dut.inc := 5
+        tick
+        dut.inc := 5
+        tick
+        dut.inc := 3
+        tick
+        dut.inc := 3
+        tick
+        dut.sum = 99
+    }
+}

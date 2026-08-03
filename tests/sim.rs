@@ -2017,3 +2017,108 @@ fn extmodule_tribuf_runs_a_real_bidirectional_bus_under_verilator() {
         "simulation did not report PASSED:\n{output}"
     );
 }
+
+// --- Testbenches written in trace ---------------------------------------
+//
+// examples/tb_accumulator.tr's `Top` is not a feature demo the way every
+// other example is -- it's a testbench: it `inst`s `Accumulator` (the
+// same DUT examples/accumulator.tr uses), drives it across real clock
+// cycles via a `<sequences>` rule, and checks the result with a bare
+// comparison (`dut.sum = 26`) -- needing no new language surface at all,
+// stimulus OR check. sim/tb_accumulator_tb.v's own job shrinks
+// accordingly: just clock/reset generation and a look at whether the
+// `<sequences>` continuation register wrapped back to 0 (checkpoint
+// held) or stuck at a nonzero segment (checkpoint failed) -- see both
+// files' own comments for the full story.
+
+/// Proves a trace-authored testbench drives a real DUT correctly under
+/// iverilog: `Top`'s `drive` rule should run its full `<sequences>`
+/// cycle (4 cycles of `inc = 5` plus 2 of `inc = 3`) and its final
+/// checkpoint (`dut.sum = 26`) should hold, letting `__cont_drive` wrap
+/// back to 0 -- the same expected total
+/// `accumulator_runs_through_real_ports` checks via a hand-written
+/// stimulus sequence instead.
+#[test]
+fn tb_accumulator_drives_a_dut_through_real_cycles() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/tb_accumulator.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/tb_accumulator_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: __cont_drive=0"),
+        "drive did not run to completion:\n{output}"
+    );
+}
+
+/// The negative case: examples/tb_accumulator_failing.tr's checkpoint
+/// (`dut.sum = 99`) can never hold, so `drive`'s `<sequences>`
+/// continuation register should stick at its last segment (6) forever
+/// instead of wrapping back to 0 -- proving a failing checkpoint is
+/// actually observable from outside, not just a claim about how
+/// `comparison_conds`/guard-folding ought to behave.
+#[test]
+fn tb_accumulator_checkpoint_failure_stalls_and_is_observable() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/tb_accumulator_failing.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sim/tb_accumulator_failing_tb.v"
+    );
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION FAILED: stalled at segment 6"),
+        "failing checkpoint should have stalled drive at segment 6:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of `tb_accumulator_drives_a_dut_through_
+/// real_cycles`.
+#[test]
+fn tb_accumulator_drives_a_dut_through_real_cycles_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/tb_accumulator.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/tb_accumulator_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: __cont_drive=0"),
+        "drive did not run to completion:\n{output}"
+    );
+}

@@ -166,3 +166,45 @@ correctness of every individual example is already fully proven by the
 not testing anything new, at the cost of roughly doubling this test
 binary's runtime (each Verilator run pays a real C++ compile, ~15s,
 vs. iverilog's near-instant interpretation).
+
+## Testbenches written in trace
+
+`tb_accumulator_tb.v` is a different SHAPE of testbench from every other
+file here: it drives no stimulus AND makes no result check of its own.
+`examples/tb_accumulator.tr`'s own `Top` module does both instead — it
+`inst`s `Accumulator`, drives `inc` across real clock cycles through a
+`<sequences>` rule (ordinary instance-port writes), and ends with a
+checkpoint (`dut.sum = 26`, an ordinary bare comparison — fallible by
+default, same as everywhere else in the language). This harness's job
+shrinks to what's left: generate clock/reset, wait the right number of
+cycles, then look at whether `drive`'s `<sequences>` continuation
+register (`dut.__cont_drive`) wrapped back to 0 (checkpoint held) or
+stuck at a nonzero segment (checkpoint failed) — no `@(posedge clock)`
+stimulus sequencing and no numeric result check of its own at all,
+unlike every sibling file in this directory. `Top` has no output ports,
+so this is a hierarchical peek like `fifo_bridge_tb.v`'s, not a
+port-based read.
+
+`tb_accumulator_failing_tb.v` drives the same DUT through
+`examples/tb_accumulator_failing.tr`'s `Top`, whose checkpoint
+(`dut.sum = 99`) can never hold — it exists purely to prove the failure
+path is real: `__cont_drive` actually sticks at segment 6 and stays
+observable from outside, not just a claim about how guard-folding ought
+to behave (`tests/sim.rs`'s
+`tb_accumulator_checkpoint_failure_stalls_and_is_observable`).
+
+See DESIGN.md's "Testbenches written in trace" section for why this
+needed no new language construct: a `<sequences>` rule's own guard-fold
+(`writes.rs`'s `comparison_conds`, the same machinery `?`/fifo ops/
+failing calls already use) turns a bare comparison in a segment into a
+checkpoint for free.
+
+One thing worth calling out explicitly, since it's the one real gap
+between writing a testbench in trace vs. Verilog: `dut.inc := 5` inside
+a rule is a plain combinational connect, not a latch — it holds ONLY on
+the cycle that write actually fires. `tb_accumulator.tr`'s own `drive`
+rule re-asserts `dut.inc := 5` on every one of the 4 cycles it needs to
+hold, not once — a hand-written `reg inc = 5;` in Verilog would have
+held it automatically, so this is the one place porting a testbench's
+intent from Verilog to trace needs a genuine mental-model shift, not
+just a syntax translation.

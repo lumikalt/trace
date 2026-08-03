@@ -1837,6 +1837,41 @@ manually in the meantime.
   submodule's own memory array, `extmodule_tribuf` for a blackbox `.v`
   source compiled alongside the design). See sim/README.md's new
   "Verilator" section for the full mechanism and the exact correction.
+- **RESOLVED — no way to write testbenches in trace itself.**
+  `examples/tb_accumulator.tr` proves BOTH halves need no new language
+  surface. Stimulus: its `Top` `inst`s `Accumulator` and drives it across
+  real cycles via a `<sequences>` rule, ordinary instance-port writes,
+  `tick`-separated segments — the same machinery `sequences`/`tick`
+  already exist for. Checking the result: the rule's own last statement
+  is a bare comparison (`dut.sum = 26`) — fallible by default, the same
+  mechanism `?`/fifo ops/failing calls already fold into a rule's guard
+  via `writes.rs`'s `comparison_conds`. Folded into a lowered
+  `<sequences>` rule's LAST segment, that comparison becomes a checkpoint
+  for free: holds → the segment fires and `__cont_drive` wraps back to
+  0; fails → the segment never fires and `__cont_drive` sticks there
+  forever, a directly-observable stall rather than a silent wrong answer.
+  Initially assumed this needed a new `assert` construct (a statement-
+  position version needing enable-gating derived from `writes.rs`'s
+  guard-folding machinery PLUS a new `Stmt` variant threaded through
+  ~30 exhaustive match sites — this codebase's own known silent-
+  miscompile shape, see this doc's `Stmt::Return` entry) — turned out to
+  be unnecessary: the guard-fold ALREADY does exactly this for a bare
+  comparison in any rule, `<sequences>`-lowered or not, so a checkpoint
+  is just a comparison in the right position, zero new syntax. Verified
+  both directions empirically before committing to the design: a
+  deliberately-wrong checkpoint (`examples/tb_accumulator_failing.tr`,
+  `dut.sum = 99`) sticks at segment 6 under both firtool+iverilog and
+  firtool+Verilator (`tests/sim.rs`'s
+  `tb_accumulator_checkpoint_failure_stalls_and_is_observable`), and the
+  real one runs to completion (`tb_accumulator_drives_a_dut_through_
+  real_cycles`, plus its Verilator twin). `Top` now has no output ports
+  at all — `sim/tb_accumulator_tb.v`'s job is clock/reset generation and
+  a hierarchical peek at `dut.__cont_drive` (the same access pattern
+  `fifo_bridge_tb.v` already uses for a port-less DUT), reporting which
+  segment a stall happened at. `devenv.nix`'s `simulate` script needed
+  ZERO changes to run either example under either backend — both plug
+  into the exact same infrastructure any other example does. See
+  DESIGN.md's "Testbenches written in trace" section for the full story.
 - **RESOLVED — `firtool`/`iverilog` version pin.** `devenv.nix`'s
   `simulate` script now asserts the exact versions this project's
   scripts/tests are written against (`firtool-1.147.0`, iverilog `13.0`)

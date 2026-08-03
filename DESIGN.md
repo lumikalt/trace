@@ -3278,6 +3278,48 @@ read-modify-write-branch step is one natural multi-cycle transaction.
 of a testbench poking memory directly, with a `boot_done` handshake gating the
 CPU's own rules until loading finishes.
 
+## Testbenches written in trace
+
+`examples/tb_accumulator.tr` proves a testbench can be written IN trace,
+not just hand-written Verilog: its `Top` module `inst`s `Accumulator`
+(the same DUT `examples/accumulator.tr` uses) and drives it across real
+clock cycles via a `<sequences>` rule — ordinary instance-port writes,
+`tick`-separated segments, no new language surface needed at all. The
+DUT and its testbench have to live in the SAME file (no cross-file
+imports exist yet, see "Language features with no synthesis path yet"),
+matching `examples/submodule.tr`'s own existing `inst`-two-modules-in-
+one-file shape.
+
+The one real difference from writing a testbench directly in Verilog:
+`dut.inc := 5` inside a rule is a plain combinational connect, not a
+latch — it holds ONLY on the cycle that write actually fires. A value
+meant to hold across several cycles has to be re-asserted every one of
+those cycles (or stashed in a register and read back), not written once
+and left alone the way a hand-written `reg inc = 5;` would be.
+
+Checking the result needs no new construct either: `dut.sum = 26`, the
+final statement of `drive`'s `<sequences>` body, is an ordinary bare
+comparison — fallible by default (see "Comparisons: fallible by
+default"), the SAME mechanism `?`/fifo ops/failing calls already fold
+into a rule's guard via `comparison_conds`. Folded into the LAST segment
+of a lowered `<sequences>` rule, that comparison becomes a checkpoint for
+free: if it holds, the segment fires and the continuation register
+(`__cont_drive`) wraps back to 0; if it doesn't, the segment never
+fires and `__cont_drive` sticks at that segment forever instead —
+verified directly (not just argued): a deliberately-wrong checkpoint
+(`examples/tb_accumulator_failing.tr`, `dut.sum = 99`) sticks at segment
+6 under both firtool+iverilog and firtool+Verilator, proven by
+`tests/sim.rs`'s `tb_accumulator_checkpoint_failure_stalls_and_is_
+observable`. `Top` therefore has no output ports at all —
+`sim/tb_accumulator_tb.v`'s job shrinks to clock/reset generation and a
+hierarchical peek at `dut.__cont_drive` (the same access pattern
+`fifo_bridge_tb.v` already uses for a port-less DUT), reporting which
+segment a stall happened at if the checkpoint failed. No `assert`
+keyword, no new `Stmt` variant, no enable-gating work beyond what
+`writes.rs`'s existing guard-folding already does for every other
+fallible construct — a checkpoint in a `<sequences>` testbench is just a
+comparison in the right position.
+
 ## Implementation status
 
 Implemented and proven through real `firtool` + Icarus simulation, one example
