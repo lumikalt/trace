@@ -893,6 +893,61 @@ impl<'a> TypeChecker<'a> {
                     self.type_stmt(s, locals, ret);
                 }
             }
+            Stmt::IfLet {
+                name,
+                init,
+                then_body,
+                else_body,
+            } => {
+                // `init` must be `inner?`, `inner : ?T` -- the v0-only
+                // shape this feature discharges (a fifo op/failing call/
+                // comparison as `init` is a clean, explicit rejection,
+                // not a silent fallback to some other meaning). `type_
+                // expr`'s own `Expr::Guard` arm already peels `?T` to `T`
+                // (or passes through unchanged for any OTHER guard shape)
+                // -- checking `inner`'s OWN type afterward, not just
+                // matching the `Expr::Guard` AST shape, is what actually
+                // distinguishes "was an Option" from "was a fifo op/
+                // comparison/failing call that also happens to parse as
+                // `Guard`".
+                let bound_ty = if let Expr::Guard(inner) = self.ast.expr(init) {
+                    let inner = *inner;
+                    let ty = self.type_expr(init, locals);
+                    if matches!(self.types.expr_tys.get(&inner), Some(Ty::Option(_))) {
+                        ty
+                    } else {
+                        self.error(
+                            self.expr_span(init),
+                            "`if let`'s right-hand side must be an Option's own unwrap \
+                             (`opt?`, `opt : ?T`) (v0 restriction: a fifo op, failing \
+                             call, or comparison isn't supported here yet)"
+                                .to_string(),
+                        );
+                        Ty::Unknown
+                    }
+                } else {
+                    self.type_expr(init, locals);
+                    self.error(
+                        self.expr_span(init),
+                        "`if let`'s right-hand side must be an Option's own unwrap \
+                         (`opt?`, `opt : ?T`) -- missing the `?`?"
+                            .to_string(),
+                    );
+                    Ty::Unknown
+                };
+                for (i, d) in self.res.defs.iter().enumerate() {
+                    if d.span == name.span {
+                        locals.insert(DefId(i as u32), bound_ty);
+                        break;
+                    }
+                }
+                for s in then_body {
+                    self.type_stmt(s, locals, ret);
+                }
+                for s in else_body.unwrap_or_default() {
+                    self.type_stmt(s, locals, ret);
+                }
+            }
             Stmt::While { cond, body } => {
                 // `while`'s fallible condition stays out of scope (TODO.md
                 // -- Verse's own construct is `if`-shaped only): a bare

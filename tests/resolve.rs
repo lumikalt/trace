@@ -557,6 +557,72 @@ module M {
     run_ok(src);
 }
 
+/// `if let x = opt? { ... } else { ... }`'s own `x` is branch-scoped to
+/// `then_body` only -- a genuinely new scoping rule, unlike `Stmt::Let`'s
+/// body-wide visibility. Reuses `Stmt::If`'s existing scope push/pop for
+/// then/else (already isolates a plain `let` declared in one branch from
+/// the other); `x` is just declared one level deeper, inside that same
+/// pushed then-scope.
+#[test]
+fn if_let_bound_name_is_not_visible_in_the_else_branch() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    out result : [8] = 0
+    rule r {
+        if let x = opt? {
+            result := x
+        } else {
+            result := x
+        }
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot find `x`"));
+}
+
+#[test]
+fn if_let_bound_name_is_not_visible_after_the_whole_statement() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    out result : [8] = 0
+    rule r {
+        if let x = opt? {
+            result := x
+        }
+        result := x
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot find `x`"));
+}
+
+#[test]
+fn if_let_bound_name_shadows_silently_like_a_plain_let() {
+    // `declare`'s existing shadow-allowance for `DefKind::Local` covers
+    // `if let` too -- no special-casing needed, it's the same DefKind.
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    out result : [8] = 0
+    rule r {
+        let x = 8'd1
+        if let x = opt? {
+            result := x
+        } else {
+            result := x
+        }
+    }
+}
+";
+    run_ok(src);
+}
+
 #[test]
 fn all_examples_resolve() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");

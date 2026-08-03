@@ -50,6 +50,23 @@ pub(crate) fn rule_body(ast: &Ast, id: ItemId) -> Vec<StmtId> {
     }
 }
 
+/// A binding `Name`'s own `DefId` — `resolve.rs` records defs in a flat
+/// `Vec` with no back-reference from the `Name` that declared one, so
+/// every site that needs a `let`/`if let`-bound name's `DefId` re-finds
+/// it by matching spans (the same inline pattern `enter_rule` and
+/// several `calls.rs`/`writes.rs` sites already used before this helper
+/// existed — pulled out here specifically because `if let`'s mux-
+/// threading arms need it identically at SIX call sites, unlike those
+/// scattered single uses).
+pub(crate) fn def_of_name(res: &Resolution, name: &crate::ast::Name) -> DefId {
+    res.defs
+        .iter()
+        .enumerate()
+        .find(|(_, d)| d.span == name.span)
+        .map(|(i, _)| DefId(i as u32))
+        .expect("a resolved binding name always has a matching def")
+}
+
 /// Is `target` `s` itself, or nested inside `s`'s if/else branches? Used
 /// by `set_pos` to find which top-level statement a (possibly nested)
 /// statement logically belongs to for local-snapshot purposes.
@@ -59,6 +76,11 @@ pub(crate) fn stmt_contains(ast: &Ast, s: StmtId, target: StmtId) -> bool {
     }
     match ast.stmt(s) {
         Stmt::If {
+            then_body,
+            else_body,
+            ..
+        }
+        | Stmt::IfLet {
             then_body,
             else_body,
             ..
@@ -104,6 +126,11 @@ pub(crate) fn find_mem_write(
         }
         let nested = match ast.stmt(*stmt) {
             Stmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | Stmt::IfLet {
                 then_body,
                 else_body,
                 ..
@@ -604,6 +631,42 @@ impl<'a> Emitter<'a> {
                         ));
                     }
                 }
+                Stmt::IfLet {
+                    name,
+                    init,
+                    then_body,
+                    else_body,
+                } => {
+                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    };
+                    let def = def_of_name(self.res, &name);
+                    self.if_let_binds.insert(def, opt);
+                    let then_val =
+                        self.mem_write_in_stmts(&then_body, rule, mem_name, elem_width, addr_width);
+                    self.if_let_binds.remove(&def);
+                    let else_val = else_body.as_ref().and_then(|b| {
+                        self.mem_write_in_stmts(b, rule, mem_name, elem_width, addr_width)
+                    });
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current.clone().unwrap_or_else(|| {
+                            (
+                                "UInt<1>(0)".to_string(),
+                                format!("UInt<{addr_width}>(0)"),
+                                format!("UInt<{elem_width}>(0)"),
+                            )
+                        });
+                        let (te, ta, td) = then_val.unwrap_or_else(|| hold.clone());
+                        let (ee, ea, ed) = else_val.unwrap_or(hold);
+                        self.set_pos(rule, *stmt);
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
+                        current = Some((
+                            format!("mux({cond_str}, {te}, {ee})"),
+                            format!("mux({cond_str}, {ta}, {ea})"),
+                            format!("mux({cond_str}, {td}, {ed})"),
+                        ));
+                    }
+                }
                 Stmt::While { .. } => {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -666,6 +729,31 @@ impl<'a> Emitter<'a> {
                         let e = else_val.unwrap_or(hold);
                         self.set_pos(rule, *stmt);
                         let cond_str = self.compile_guard_unwrap_cond(cond);
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
+                Stmt::IfLet {
+                    name,
+                    init,
+                    then_body,
+                    else_body,
+                } => {
+                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    };
+                    let def = def_of_name(self.res, &name);
+                    self.if_let_binds.insert(def, opt);
+                    let then_val = self.reg_value_in_stmts(&then_body, rule, reg_name, width);
+                    self.if_let_binds.remove(&def);
+                    let else_val = else_body
+                        .as_ref()
+                        .and_then(|b| self.reg_value_in_stmts(b, rule, reg_name, width));
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current.clone().unwrap_or_else(|| reg_name.to_string());
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        self.set_pos(rule, *stmt);
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
@@ -928,6 +1016,46 @@ impl<'a> Emitter<'a> {
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
+                Stmt::IfLet {
+                    name,
+                    init,
+                    then_body,
+                    else_body,
+                } => {
+                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    };
+                    let def = def_of_name(self.res, &name);
+                    self.if_let_binds.insert(def, opt);
+                    let then_val = self.struct_field_value_in_stmts(
+                        &then_body,
+                        rule,
+                        struct_name,
+                        field_path,
+                        width,
+                        root_ty,
+                    );
+                    self.if_let_binds.remove(&def);
+                    let else_val = else_body.as_ref().and_then(|b| {
+                        self.struct_field_value_in_stmts(
+                            b,
+                            rule,
+                            struct_name,
+                            field_path,
+                            width,
+                            root_ty,
+                        )
+                    });
+                    if then_val.is_some() || else_val.is_some() {
+                        let flat = format!("{struct_name}_{}", field_path.join("_"));
+                        let hold = current.clone().unwrap_or(flat);
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        self.set_pos(rule, *stmt);
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
                 Stmt::While { .. } => {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -1080,6 +1208,43 @@ impl<'a> Emitter<'a> {
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
+                Stmt::IfLet {
+                    name,
+                    init,
+                    then_body,
+                    else_body,
+                } => {
+                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    };
+                    let def = def_of_name(self.res, &name);
+                    // Save/restore (not a plain insert-then-remove, unlike
+                    // this same arm's rule-level siblings): a CALLEE body
+                    // can be inlined reentrantly (`Avg(Avg(x, y), z)`,
+                    // this file's own precedent for exactly this hazard),
+                    // so the same `def` could already be bound from an
+                    // OUTER inlining of the same callee.
+                    let prev = self.if_let_binds.insert(def, opt);
+                    let then_val = self.callee_reg_write(&then_body, reg_name, width);
+                    match prev {
+                        Some(p) => {
+                            self.if_let_binds.insert(def, p);
+                        }
+                        None => {
+                            self.if_let_binds.remove(&def);
+                        }
+                    }
+                    let else_val = else_body
+                        .as_ref()
+                        .and_then(|b| self.callee_reg_write(b, reg_name, width));
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current.clone().unwrap_or_else(|| reg_name.to_string());
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1150,6 +1315,34 @@ impl<'a> Emitter<'a> {
                         let e = else_val.unwrap_or(hold);
                         self.set_pos(rule, *stmt);
                         let cond_str = self.compile_guard_unwrap_cond(cond);
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
+                Stmt::IfLet {
+                    name,
+                    init,
+                    then_body,
+                    else_body,
+                } => {
+                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    };
+                    let def = def_of_name(self.res, &name);
+                    self.if_let_binds.insert(def, opt);
+                    let then_val = self
+                        .inst_port_value_in_stmts(&then_body, rule, inst_name, port_name, width);
+                    self.if_let_binds.remove(&def);
+                    let else_val = else_body.as_ref().and_then(|b| {
+                        self.inst_port_value_in_stmts(b, rule, inst_name, port_name, width)
+                    });
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current
+                            .clone()
+                            .unwrap_or_else(|| format!("UInt<{width}>(0)"));
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        self.set_pos(rule, *stmt);
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
@@ -1293,6 +1486,39 @@ impl<'a> Emitter<'a> {
                         let t = then_val.unwrap_or_else(|| hold.clone());
                         let e = else_val.unwrap_or(hold);
                         let cond_str = self.compile_guard_unwrap_cond(cond);
+                        current = Some(format!("mux({cond_str}, {t}, {e})"));
+                    }
+                }
+                Stmt::IfLet {
+                    name,
+                    init,
+                    then_body,
+                    else_body,
+                } => {
+                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    };
+                    let def = def_of_name(self.res, &name);
+                    let prev = self.if_let_binds.insert(def, opt);
+                    let then_val = self.callee_port_write(&then_body, inst_name, port_name, width);
+                    match prev {
+                        Some(p) => {
+                            self.if_let_binds.insert(def, p);
+                        }
+                        None => {
+                            self.if_let_binds.remove(&def);
+                        }
+                    }
+                    let else_val = else_body
+                        .as_ref()
+                        .and_then(|b| self.callee_port_write(b, inst_name, port_name, width));
+                    if then_val.is_some() || else_val.is_some() {
+                        let hold = current
+                            .clone()
+                            .unwrap_or_else(|| format!("UInt<{width}>(0)"));
+                        let t = then_val.unwrap_or_else(|| hold.clone());
+                        let e = else_val.unwrap_or(hold);
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }

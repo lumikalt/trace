@@ -226,7 +226,7 @@ impl<'a> Emitter<'a> {
                         );
                     }
                 }
-                Stmt::If { .. } | Stmt::While { .. } => {
+                Stmt::If { .. } | Stmt::While { .. } | Stmt::IfLet { .. } => {
                     if contains_guard(self.ast, self.res, *stmt) {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -448,6 +448,18 @@ impl<'a> Emitter<'a> {
                             roots_of(ast, b, out);
                         }
                     }
+                    Stmt::IfLet {
+                        init,
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        out.push(init);
+                        roots_of(ast, &then_body, out);
+                        if let Some(b) = &else_body {
+                            roots_of(ast, b, out);
+                        }
+                    }
                     Stmt::While { cond, body } => {
                         out.push(cond);
                         roots_of(ast, &body, out);
@@ -585,6 +597,18 @@ impl<'a> Emitter<'a> {
                         else_body,
                     } => {
                         out.push(cond);
+                        roots_of(ast, &then_body, out);
+                        if let Some(b) = &else_body {
+                            roots_of(ast, b, out);
+                        }
+                    }
+                    Stmt::IfLet {
+                        init,
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        out.push(init);
                         roots_of(ast, &then_body, out);
                         if let Some(b) = &else_body {
                             roots_of(ast, b, out);
@@ -822,6 +846,16 @@ impl<'a> Emitter<'a> {
                 Stmt::Let { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
                     Some(init)
                 }
+                // `if let x = opt?`'s own `init` IS `Expr::Guard(opt)` by
+                // construction (types.rs requires this shape) -- the
+                // WHOLE POINT of the syntax, not a misplaced guard the
+                // way an explicit `(a > b)?` if-CONDITION still is (see
+                // `Stmt::If`'s own comment above: that stays unlisted
+                // here on purpose). Allowed here mirrors `Stmt::Let`'s
+                // own `init` treatment exactly.
+                Stmt::IfLet { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
+                    Some(init)
+                }
                 _ => None,
             };
             let mut roots: Vec<ExprId> = Vec::new();
@@ -839,6 +873,18 @@ impl<'a> Emitter<'a> {
                     else_body,
                 } => {
                     roots.push(cond);
+                    self.guards_outside_allowed_positions(&then_body, out);
+                    if let Some(b) = &else_body {
+                        self.guards_outside_allowed_positions(b, out);
+                    }
+                }
+                Stmt::IfLet {
+                    init,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    roots.push(init);
                     self.guards_outside_allowed_positions(&then_body, out);
                     if let Some(b) = &else_body {
                         self.guards_outside_allowed_positions(b, out);
@@ -876,6 +922,7 @@ impl<'a> Emitter<'a> {
                 Stmt::Expr(e) if is_fifo_op(self.ast, self.res, e) => Some(e),
                 Stmt::Assign { rhs, .. } if is_fifo_op(self.ast, self.res, rhs) => Some(rhs),
                 Stmt::Let { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
+                Stmt::IfLet { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
                 _ => None,
             };
             let mut roots: Vec<ExprId> = Vec::new();
@@ -893,6 +940,18 @@ impl<'a> Emitter<'a> {
                     else_body,
                 } => {
                     roots.push(cond);
+                    self.fifo_ops_outside_allowed_positions(&then_body, out);
+                    if let Some(b) = &else_body {
+                        self.fifo_ops_outside_allowed_positions(b, out);
+                    }
+                }
+                Stmt::IfLet {
+                    init,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    roots.push(init);
                     self.fifo_ops_outside_allowed_positions(&then_body, out);
                     if let Some(b) = &else_body {
                         self.fifo_ops_outside_allowed_positions(b, out);
@@ -949,6 +1008,11 @@ impl<'a> Emitter<'a> {
                 {
                     Some(init)
                 }
+                Stmt::IfLet { init, .. }
+                    if allow_let && matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                {
+                    Some(init)
+                }
                 _ => None,
             };
             let mut roots: Vec<ExprId> = Vec::new();
@@ -966,6 +1030,18 @@ impl<'a> Emitter<'a> {
                     else_body,
                 } => {
                     roots.push(cond);
+                    self.calls_outside_allowed_positions(&then_body, allow_let, out);
+                    if let Some(b) = &else_body {
+                        self.calls_outside_allowed_positions(b, allow_let, out);
+                    }
+                }
+                Stmt::IfLet {
+                    init,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    roots.push(init);
                     self.calls_outside_allowed_positions(&then_body, allow_let, out);
                     if let Some(b) = &else_body {
                         self.calls_outside_allowed_positions(b, allow_let, out);
@@ -1130,6 +1206,18 @@ pub(crate) fn collect_all_calls_in(ast: &Ast, stmts: &[StmtId], out: &mut Vec<Ex
                     collect_all_calls_in(ast, b, out);
                 }
             }
+            Stmt::IfLet {
+                init,
+                then_body,
+                else_body,
+                ..
+            } => {
+                roots.push(init);
+                collect_all_calls_in(ast, &then_body, out);
+                if let Some(b) = &else_body {
+                    collect_all_calls_in(ast, b, out);
+                }
+            }
             Stmt::While { cond, body } => {
                 roots.push(cond);
                 collect_all_calls_in(ast, &body, out);
@@ -1164,6 +1252,16 @@ pub(crate) fn contains_guard(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool 
     match ast.stmt(stmt) {
         Stmt::Expr(e) => is_guard_like(ast, res, *e),
         Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            then_body.iter().any(|s| contains_guard(ast, res, *s))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| contains_guard(ast, res, *s)))
+        }
+        Stmt::IfLet {
             then_body,
             else_body,
             ..
@@ -1225,6 +1323,18 @@ pub(crate) fn contains_comparison(ast: &Ast, stmt: StmtId) -> bool {
             ..
         } => {
             then_body.iter().any(|s| contains_comparison(ast, *s))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| contains_comparison(ast, *s)))
+        }
+        Stmt::IfLet {
+            init,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr_has_comparison(ast, *init)
+                || then_body.iter().any(|s| contains_comparison(ast, *s))
                 || else_body
                     .as_ref()
                     .is_some_and(|b| b.iter().any(|s| contains_comparison(ast, *s)))

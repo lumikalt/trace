@@ -1529,3 +1529,77 @@ fn a_comparison_nested_inside_a_bare_guard_statement_is_rejected_not_silently_dr
          rule r {\n ((logic a > b) & c)?\n v := 1\n }\n}\n",
     );
 }
+
+/// `if let x = opt? { ... }`'s own `x` binds to `opt`'s UNWRAPPED type
+/// (`type_expr`'s existing `Expr::Guard` arm, unchanged) -- checked here
+/// by writing `x` into a target the WRONG width would reject.
+#[test]
+fn if_let_binds_the_unwrapped_option_type() {
+    run_ok(
+        "module M {\n reg opt : ?[8] = false\n reg v : [8] = 0\n \
+         rule r {\n if let x = opt? {\n v := x\n }\n }\n}\n",
+    );
+    let (_, _, errors) = run("module M {\n reg opt : ?[8] = false\n reg v : [4] = 0\n \
+         rule r {\n if let x = opt? {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+}
+
+/// `if let`'s right-hand side must be an Option's own `?`-unwrap (v0
+/// restriction: not a fifo op, failing call, or comparison, even though
+/// each of those is ALSO `Expr::Guard`-compatible or otherwise fallible
+/// in other positions) -- the scope this session's `AskUserQuestion`
+/// picked (binding sugar only, no general fallible-binding chain).
+#[test]
+fn if_let_rhs_must_be_an_option_unwrap_not_another_fallible_shape() {
+    // Missing `?` entirely.
+    let (_, _, errors) = run("module M {\n reg opt : ?[8] = false\n reg v : [8] = 0\n \
+         rule r {\n if let x = opt {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+
+    // A fifo op -- not itself `Expr::Guard`, so it hits the same message.
+    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [8] = 0\n \
+         rule r {\n if let x = f.Deq[] {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+
+    // A bare comparison, explicitly `?`-guarded (`Expr::Guard`, but its
+    // own inner isn't `Ty::Option`) -- exercises the "IS `Expr::Guard`
+    // but isn't an Option" branch specifically, not just "isn't `Expr::
+    // Guard` at all".
+    let (_, _, errors) = run("module M {\n reg v : [8] = 0\n in a : [8]\n in b : [8]\n \
+         rule r {\n if let x = (a > b)? {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+}
+
+/// A struct-typed `if let` binding used as a WHOLE value (not `.field`
+/// chase-through, which is out of scope entirely -- see the sibling
+/// firrtl.rs test for that) already hits a DIFFERENT, pre-existing
+/// restriction: a struct-typed write's right-hand side must be a fresh
+/// literal, not a copied value (`type_write`'s existing check) --
+/// confirms this is an inherited restriction `if let` gets for free, not
+/// a gap it introduces.
+#[test]
+fn if_let_bound_struct_used_as_a_whole_value_hits_the_ordinary_struct_copy_restriction() {
+    let src = "\
+struct Pair {
+    x : [8]
+    y : [8]
+}
+module M {
+    reg opt : ?Pair = false
+    reg p : Pair = Pair{ x: 0, y: 0 }
+    rule r {
+        if let v = opt? {
+            p := v
+        } else {
+            p := Pair{ x: 0, y: 0 }
+        }
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("must be a struct literal"));
+}

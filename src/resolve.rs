@@ -663,6 +663,34 @@ impl<'a> Resolver<'a> {
                     self.scopes.pop();
                 }
             }
+            Stmt::IfLet {
+                name,
+                init,
+                then_body,
+                else_body,
+            } => {
+                // `init` resolves in the OUTER scope (same as `If`'s
+                // `cond`) -- `name` isn't in scope for its own
+                // initializer. `name` is then declared INSIDE the
+                // then_body's own pushed scope, so it's invisible to
+                // `else_body` and to anything after the whole statement
+                // for free, the same way `If`'s existing then/else scope
+                // push/pop already isolates a plain `let` declared inside
+                // one branch from the other -- no new scoping mechanism
+                // needed, just declaring `name` one level deeper than
+                // `If`'s `cond` does.
+                self.resolve_expr(init, false);
+                self.scopes.push(HashMap::new());
+                let def = self.declare(&name, DefKind::Local);
+                self.declared_locals.push((def, name));
+                self.resolve_stmts(&then_body);
+                self.scopes.pop();
+                if let Some(else_body) = else_body {
+                    self.scopes.push(HashMap::new());
+                    self.resolve_stmts(&else_body);
+                    self.scopes.pop();
+                }
+            }
             Stmt::While { cond, body } => {
                 self.resolve_expr(cond, false);
                 self.scopes.push(HashMap::new());

@@ -56,6 +56,7 @@ pub(crate) fn emit_module(
         locals: HashMap::new(),
         locals_snapshots: Vec::new(),
         current_pos: 0,
+        if_let_binds: HashMap::new(),
     };
 
     // `(match_name, emit_name, width, init)`. For a plain `reg`, both
@@ -1078,6 +1079,18 @@ impl<'a> Emitter<'a> {
                     else_body,
                 } => {
                     self.collect_read_sites_expr(cond, rule, *stmt);
+                    self.collect_read_sites(&then_body, rule);
+                    if let Some(e) = else_body {
+                        self.collect_read_sites(&e, rule);
+                    }
+                }
+                Stmt::IfLet {
+                    init,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.collect_read_sites_expr(init, rule, *stmt);
                     self.collect_read_sites(&then_body, rule);
                     if let Some(e) = else_body {
                         self.collect_read_sites(&e, rule);

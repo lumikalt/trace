@@ -182,6 +182,16 @@ fn scan_body(
                     scan_body(ast, res, fx, src, b, edits, errors);
                 }
             }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                scan_body(ast, res, fx, src, then_body, edits, errors);
+                if let Some(b) = else_body {
+                    scan_body(ast, res, fx, src, b, edits, errors);
+                }
+            }
             Stmt::While { body, .. } => scan_body(ast, res, fx, src, body, edits, errors),
             _ => {}
         }
@@ -200,6 +210,7 @@ fn stmt_exprs(ast: &Ast, id: StmtId) -> Vec<ExprId> {
         Stmt::Tick => vec![],
         Stmt::Return(e) => e.into_iter().collect(),
         Stmt::If { cond, .. } => vec![cond],
+        Stmt::IfLet { init, .. } => vec![init],
         Stmt::While { cond, .. } => vec![cond],
     }
 }
@@ -461,6 +472,23 @@ impl<'a> Interp<'a> {
                         span,
                         "a loop in `<elaborates>` code is not yet supported (v0 \
                          restriction: use recursion, DESIGN.md's `AdderTree` style)"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                // Defensive: `effects::check`'s own `Expr::Guard` rejection
+                // ("guards cannot fail at elaboration time") already
+                // catches `if let`'s `init` before this interpreter ever
+                // runs (main.rs's pipeline stops on any effect error), so
+                // this arm should be unreachable in practice -- kept
+                // explicit rather than falling through to a generic
+                // catch-all, matching every other construct's own clear
+                // rejection in this match.
+                Stmt::IfLet { .. } => {
+                    self.error(
+                        span,
+                        "`if let` (Option-presence binding) is not supported in \
+                         `<elaborates>` code"
                             .to_string(),
                     );
                     return Err(());

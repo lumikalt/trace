@@ -79,6 +79,25 @@ impl<'a> Emitter<'a> {
                     Some(d) if d.kind == DefKind::Output => Ok(self.output_regs[&d.name].clone()),
                     Some(d) if matches!(d.kind, DefKind::Local | DefKind::Param) => {
                         let def = def.unwrap();
+                        // `if let x = opt? { ... }`'s own `x`: resolves
+                        // to `opt.data` -- reuses the exact same struct-
+                        // field chase-through a plain `opt.data` field
+                        // read already goes through (`struct_field_path`
+                        // handles `opt` itself being a chained field,
+                        // e.g. `frame.maybe?`), just reached from a bare
+                        // Ident instead of an explicit `Expr::Field`.
+                        // Checked BEFORE `locals_snapshots`/`locals`
+                        // below: the two are mutually exclusive by
+                        // construction (see `if_let_binds`'s own doc
+                        // comment, mod.rs), so order between them and
+                        // this check doesn't matter for correctness, but
+                        // checking here first avoids a wasted snapshot
+                        // lookup for every if-let-bound reference.
+                        if let Some(opt) = self.if_let_binds.get(&def).copied() {
+                            let (root, mut path) = self.struct_field_path(opt);
+                            path.push("data".to_string());
+                            return self.compile_struct_field_read(id, root, &path, hint);
+                        }
                         if let Some(text) = self
                             .locals_snapshots
                             .get(self.current_pos)
@@ -378,6 +397,29 @@ impl<'a> Emitter<'a> {
                     && matches!(self.ast.expr(bound), Expr::Ident(_))
                     && self.types.expr_tys.get(&bound) == Some(&root_ty)
                 {
+                    // `bound` chases to an `if let NAME = opt?`-bound
+                    // name, passed WHOLE as this call's argument
+                    // (`Get(v)`) rather than field-accessed directly
+                    // (`v.x`, which never reaches here: that has `root`
+                    // = `v` itself, a Local, so `is_param` above is
+                    // false and it falls to the "cannot find this
+                    // local's binding" rejection below instead, exactly
+                    // as the deferred `.field` chase-through restriction
+                    // requires). Recursing with `bound` as the new root
+                    // would re-enter this match on `v`'s OWN DefId and
+                    // hit that same rejection -- so jump straight to
+                    // `opt`'s own root with `"data"` and the remaining
+                    // `path` spliced on, the same rewrite `compile_expr_
+                    // hinted`'s `if_let_binds` check performs for a
+                    // whole-value (empty-path) read.
+                    if let Some(bound_def) = self.res.expr_defs.get(&bound).copied()
+                        && let Some(&opt) = self.if_let_binds.get(&bound_def)
+                    {
+                        let (opt_root, mut opt_path) = self.struct_field_path(opt);
+                        opt_path.push("data".to_string());
+                        opt_path.extend_from_slice(path);
+                        return self.compile_struct_field_read(id, opt_root, &opt_path, hint);
+                    }
                     return self.compile_struct_field_read(id, bound, path, hint);
                 }
                 let width = hint.unwrap_or_else(|| self.width_of(id));

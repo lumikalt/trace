@@ -988,6 +988,9 @@ impl<'a> Parser<'a> {
 
     fn parse_if(&mut self) -> Option<Stmt> {
         self.bump(); // if
+        if self.at(TokenKind::Let) {
+            return self.parse_if_let();
+        }
         let cond = self.parse_expr(0)?;
         let then_body = self.parse_block()?;
         let else_body = if self.eat(TokenKind::Else) {
@@ -1008,6 +1011,48 @@ impl<'a> Parser<'a> {
         };
         Some(Stmt::If {
             cond,
+            then_body,
+            else_body,
+        })
+    }
+
+    /// `if let NAME = EXPR { ... } [else { ... }]` — Option-presence
+    /// binding sugar (DESIGN.md's "`if let`: branch-scoped Option-
+    /// presence binding"). `if` has already been consumed; `self` is
+    /// sitting on `let`. Mirrors `parse_if`'s own block/else/else-if
+    /// handling exactly — the only difference is the `let NAME =` prefix,
+    /// reusing `Stmt::Let`'s own name/`=` parsing shape. `EXPR` is parsed
+    /// as an ordinary expression, no shape restriction here — types.rs is
+    /// what requires it be `Expr::Guard(inner)` over `Ty::Option`.
+    fn parse_if_let(&mut self) -> Option<Stmt> {
+        self.bump(); // let
+        let name = self.expect_ident("binding name")?;
+        self.expect(TokenKind::Eq, "`=` after `let` name")
+            .ok()
+            .or_else(|| {
+                self.sync();
+                None
+            })?;
+        let init = self.parse_expr(0)?;
+        let then_body = self.parse_block()?;
+        let else_body = if self.eat(TokenKind::Else) {
+            if self.at(TokenKind::If) {
+                let lo = self.cur_span().start;
+                let nested = self.parse_if()?;
+                let id = self.ast.push_stmt(nested, lo..self.prev_end);
+                Some(vec![id])
+            } else {
+                let block = self.parse_block()?;
+                self.expect_terminator();
+                Some(block)
+            }
+        } else {
+            self.expect_terminator();
+            None
+        };
+        Some(Stmt::IfLet {
+            name,
+            init,
             then_body,
             else_body,
         })

@@ -300,6 +300,35 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            Stmt::IfLet {
+                init,
+                then_body,
+                else_body,
+                ..
+            } => {
+                // `if let x = opt?`'s own unwrap is branch-scoped and
+                // discharged right here -- mirrors `Stmt::If`'s
+                // comparison-discharge arm above: `init` is `Expr::Guard
+                // (inner)` (types.rs's own arm requires this shape), so
+                // merge `inner`'s reads directly rather than routing
+                // through `Expr::Guard`'s ordinary arm below, which would
+                // set `sig.fails = true` -- wrong here, since this
+                // presence check never gates the enclosing item the way
+                // an explicit top-level `opt?` does.
+                if let Expr::Guard(inner) = self.ast.expr(*init) {
+                    self.infer_expr(*inner, sig);
+                } else {
+                    self.infer_expr(*init, sig);
+                }
+                for s in then_body {
+                    self.infer_stmt(*s, sig);
+                }
+                if let Some(else_body) = else_body {
+                    for s in else_body {
+                        self.infer_stmt(*s, sig);
+                    }
+                }
+            }
             Stmt::While { cond, body } => {
                 self.infer_expr(*cond, sig);
                 for s in body {
@@ -634,6 +663,27 @@ impl<'a> Checker<'a> {
                 else_body,
             } => {
                 self.check_expr(cond, item, sig, elab);
+                for s in then_body {
+                    self.check_stmt(s, item, sig, elab);
+                }
+                for s in else_body.unwrap_or_default() {
+                    self.check_stmt(s, item, sig, elab);
+                }
+            }
+            Stmt::IfLet {
+                init,
+                then_body,
+                else_body,
+                ..
+            } => {
+                // `init` is `Expr::Guard(inner)` (types.rs requires this
+                // shape) -- `check_expr`'s own `Expr::Guard` arm already
+                // errors "guards cannot fail at elaboration time" when
+                // `elab` is true, the identical rejection an ordinary
+                // `opt?` gets there; no separate elaborates-specific
+                // check needed here, this falls out of the existing
+                // recursive call for free.
+                self.check_expr(init, item, sig, elab);
                 for s in then_body {
                     self.check_stmt(s, item, sig, elab);
                 }

@@ -610,6 +610,50 @@ fn if_with_a_bare_ident_condition_still_parses_its_body_as_a_block_not_a_struct_
 }
 
 #[test]
+fn if_let_parses_name_init_and_both_branches() {
+    // `if let NAME = EXPR { ... } else { ... }` -- Option-presence binding
+    // sugar (DESIGN.md's "`if let`: branch-scoped Option-presence
+    // binding"). `EXPR` parses as an ordinary expression (no shape
+    // restriction here -- types.rs is what requires `Expr::Guard`).
+    let src = "rule t {\n if let x = opt? {\n v := x\n } else {\n v := 0\n }\n}\n";
+    let ast = parse_ok(src);
+    let trace::ast::Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 1, "expected one statement: {body:?}");
+    let trace::ast::Stmt::IfLet {
+        name,
+        init,
+        then_body,
+        else_body,
+    } = ast.stmt(body[0])
+    else {
+        panic!("expected an if-let statement, got: {:?}", ast.stmt(body[0]));
+    };
+    assert_eq!(name.text, "x");
+    assert!(matches!(ast.expr(*init), trace::ast::Expr::Guard(_)));
+    assert_eq!(then_body.len(), 1);
+    assert_eq!(
+        else_body.as_ref().map(|b| b.len()),
+        Some(1),
+        "expected an else body"
+    );
+}
+
+#[test]
+fn if_let_without_an_else_parses_with_none() {
+    let src = "rule t {\n if let x = opt? {\n v := x\n }\n}\n";
+    let ast = parse_ok(src);
+    let trace::ast::Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::IfLet { else_body, .. } = ast.stmt(body[0]) else {
+        panic!("expected an if-let statement, got: {:?}", ast.stmt(body[0]));
+    };
+    assert!(else_body.is_none());
+}
+
+#[test]
 fn while_with_a_bare_ident_condition_still_parses_its_body_as_a_block_not_a_struct_literal() {
     // `while`'s condition is parsed by the exact same `parse_expr(0)`
     // call `if`'s condition is (see `parse_stmt`), so it shares the

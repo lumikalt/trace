@@ -1,0 +1,26 @@
+-- `if let NAME = opt? { ... }` binds `opt`'s unwrapped value to `NAME`,
+-- scoped to `then_body` ONLY (never `else_body`, never after the whole
+-- statement) -- unlike a bare `opt?`, presence never gates the rest of
+-- the enclosing rule. See DESIGN.md's "`if let`: branch-scoped
+-- Option-presence binding" section.
+module IfLet {
+    fifo input : [8]
+    reg opt : ?[8] = false
+    out result : [8] = 0
+    out other : [8] = 0
+
+    rule fill {
+        opt := input.Deq[]
+    }
+
+    rule read {
+        if let x = opt? {
+            result := x
+        } else {
+            result := 0
+        }
+        -- `other` still commits every cycle, whether or not `opt` was
+        -- present -- an `if let` branch never gates the rest of the rule.
+        other := other + 1
+    }
+}

@@ -493,3 +493,35 @@ fn a_bare_comparison_if_condition_does_not_mask_an_unrelated_guard_needing_fails
     assert!(errors[0].message.contains("`Check`"));
     assert!(errors[0].message.contains("does not declare `<fails>`"));
 }
+
+/// `if let x = opt? { ... }` is branch-scoped and discharged right at
+/// the `Stmt::IfLet` -- mirrors the bare-comparison-if discharge above,
+/// but for an Option's own unwrap instead of a comparison. A `<combines>`
+/// fn whose ONLY fallible thing is the if-let's own presence check needs
+/// no `<fails>` declared, with or without an `else`.
+#[test]
+fn if_let_does_not_require_fails_declared() {
+    run_ok(
+        "Unwrap(o : ?[8]) : [8] <combines> {\n if let x = o? {\n return x\n } else {\n \
+         return 0\n }\n}\n",
+    );
+    // No-else shape too, same uniform branch-scoping the bare-comparison
+    // if already established.
+    run_ok(
+        "Unwrap(o : ?[8], y : [8]) : [8] <combines> {\n if let x = o? {\n return x\n }\n \
+         return y\n}\n",
+    );
+}
+
+/// Contrast: a real guard elsewhere in the body still needs `<fails>` --
+/// the if-let discharge is scoped to exactly that one Option unwrap.
+#[test]
+fn if_let_does_not_mask_an_unrelated_guard_needing_fails() {
+    let (_, _, errors) = run(
+        "Check(o : ?[8], c : [8]) : [8] <combines> {\n if let x = o? {\n return x\n \
+         }\n (c <> 0)?\n return 0\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`Check`"));
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+}

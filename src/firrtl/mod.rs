@@ -369,6 +369,26 @@ struct Emitter<'a> {
     /// referencing a rule-local resolve correctly: the call's own
     /// compile happens "at" whatever position the caller set.
     current_pos: usize,
+    /// `if let NAME = opt? { ... }`'s own bound `NAME` -> `opt`'s ExprId
+    /// (the Guard's own inner, NOT yet chased down to `.data` — each
+    /// reader does that itself via `struct_field_path`, since `opt` may
+    /// itself be a chained field, e.g. `frame.maybe?`). Active only
+    /// while compiling that one `then_body`: every write-threading walk
+    /// that recurses into a `Stmt::IfLet`'s `then_body` inserts before
+    /// and removes right after (a fresh `DefId` per binder, so a plain
+    /// insert/remove is sound even for nested `if let`s — no prior value
+    /// to save/restore the way `calls.rs`'s param save/restore needs).
+    /// `compile_expr_hinted`'s `Ident` case checks this before falling
+    /// back to `locals_snapshots`/`locals` — deliberately a THIRD,
+    /// separate map rather than reusing `locals` (which holds an
+    /// ExprId whose compiled value the reader wants directly; this one
+    /// instead needs `.data` appended via `struct_field_path`, a
+    /// different shape) or `locals_snapshots` (which never even sees
+    /// this def — `enter_rule` only scans the RULE's own top-level
+    /// statements, and an `if let` is always nested inside SOME then/
+    /// else body, so its own binding statement is never a top-level
+    /// entry `enter_rule`'s loop would visit).
+    if_let_binds: HashMap<DefId, ExprId>,
 }
 
 impl<'a> Emitter<'a> {

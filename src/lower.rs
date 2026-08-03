@@ -1228,6 +1228,7 @@ fn stmt_exprs(ast: &Ast, id: StmtId) -> Vec<ExprId> {
         Stmt::Tick => vec![],
         Stmt::Return(e) => e.into_iter().collect(),
         Stmt::If { cond, .. } => vec![cond],
+        Stmt::IfLet { init, .. } => vec![init],
         Stmt::While { cond, .. } => vec![cond],
     }
 }
@@ -1300,6 +1301,29 @@ fn scan_stmts(
                 else_body,
             } => {
                 scan_expr(ast, res, cond, segment, reads);
+                scan_stmts(ast, res, &then_body, segment, assigns, reads, let_bound);
+                if let Some(else_body) = else_body {
+                    scan_stmts(ast, res, &else_body, segment, assigns, reads, let_bound);
+                }
+            }
+            // `name` is deliberately NOT registered in `assigns`/
+            // `let_bound` the way `Stmt::Let`'s own arm above does: that
+            // machinery exists to let a render-time REWRITE turn `let
+            // name = init` into `name := init` verbatim when a local
+            // needs to survive a `tick` as a synthesized register --
+            // `if let name = init { ... }` has no such rewrite (the
+            // surrounding `if`/branch structure can't just disappear the
+            // way a bare `let` statement can), so `name` crossing a
+            // `tick` inside its own `then_body` isn't supported by this
+            // pass. `init` itself is scanned for reads only, same
+            // treatment `Stmt::If`'s `cond` already gets.
+            Stmt::IfLet {
+                init,
+                then_body,
+                else_body,
+                ..
+            } => {
+                scan_expr(ast, res, init, segment, reads);
                 scan_stmts(ast, res, &then_body, segment, assigns, reads, let_bound);
                 if let Some(else_body) = else_body {
                     scan_stmts(ast, res, &else_body, segment, assigns, reads, let_bound);

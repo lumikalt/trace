@@ -262,6 +262,22 @@ pub enum Stmt {
         then_body: Vec<StmtId>,
         else_body: Option<Vec<StmtId>>,
     },
+    /// `if let NAME = EXPR { then_body } [else { else_body }]` — Option-
+    /// presence binding sugar (DESIGN.md's "`if let`: branch-scoped
+    /// Option-presence binding"). `init` (`EXPR`) is parsed as an
+    /// ordinary expression, not restricted by the parser to any
+    /// particular shape — types.rs requires it be `Expr::Guard(inner)`
+    /// with `inner : Ty::Option(T)` (v0: Option only, not a fifo op/
+    /// failing call/comparison). `name` is bound to the unwrapped `T`
+    /// value, visible ONLY within `then_body` (never `else_body`, never
+    /// after the whole statement) — a genuinely new scoping rule, unlike
+    /// `Stmt::Let`'s body-wide visibility.
+    IfLet {
+        name: Name,
+        init: ExprId,
+        then_body: Vec<StmtId>,
+        else_body: Option<Vec<StmtId>>,
+    },
     While {
         cond: ExprId,
         body: Vec<StmtId>,
@@ -668,6 +684,26 @@ impl Ast {
                 else_body,
             } => {
                 out.push_str(&format!("{pad}if {}\n", self.expr_sexpr(*cond)));
+                for stmt in then_body {
+                    self.dump_stmt(*stmt, depth + 1, out);
+                }
+                if let Some(else_body) = else_body {
+                    out.push_str(&format!("{pad}else\n"));
+                    for stmt in else_body {
+                        self.dump_stmt(*stmt, depth + 1, out);
+                    }
+                }
+            }
+            Stmt::IfLet {
+                name,
+                init,
+                then_body,
+                else_body,
+            } => {
+                out.push_str(&format!(
+                    "{pad}(if let {name} {})\n",
+                    self.expr_sexpr(*init)
+                ));
                 for stmt in then_body {
                     self.dump_stmt(*stmt, depth + 1, out);
                 }

@@ -5657,3 +5657,324 @@ module M {
     assert!(fir.contains("connect v, mux(gt(a, b), UInt<8>(1), v)"));
     run_firtool(&fir, &[]);
 }
+
+/// `if let`: Option-presence binding sugar (DESIGN.md's "`if let`:
+/// branch-scoped Option-presence binding"). The mux select is `opt`'s
+/// own presence (`.valid`), and `x` inside `then_body` resolves to
+/// `opt`'s own `.data` -- reusing `compile_guard_unwrap_cond` (for the
+/// select) and `struct_field_path`/`compile_struct_field_read` (for `x`)
+/// exactly as they already work for an ordinary `.data` field read, just
+/// reached from a bare Ident this time. `fires_r` stays unconditional:
+/// this is branch-scoped, not a rule-level guard, same as the bare-
+/// comparison `if` feature it's built alongside.
+#[test]
+fn if_let_with_else_compiles_to_a_presence_mux_and_never_gates_the_rule() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    reg v : [8] = 0
+    rule r {
+        if let x = opt? {
+            v := x
+        } else {
+            v := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(opt_valid, opt_data, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// No-else: `v` holds its own value on absence (same "hold" fallback an
+/// unwritten register path always has), and the REST of the rule still
+/// commits -- the identical uniform branch-scoping this session's
+/// bare-comparison `if` established, now shared by `if let` too.
+#[test]
+fn if_let_with_no_else_holds_on_absence_and_the_rest_of_the_rule_still_commits() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    reg v : [8] = 0
+    reg w : [8] = 0
+    rule r {
+        if let x = opt? {
+            v := x
+        }
+        w := w + 1
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(opt_valid, opt_data, v)"));
+    assert!(fir.contains("connect w, tail(add(w, UInt<8>(1)), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+/// `x`'s scope is deliberately narrow (Lumi's call, `AskUserQuestion`:
+/// binding sugar only, no field chase-through this pass): `x` may be
+/// used as a whole value, but `x.field` (T a struct) is cleanly rejected
+/// -- the SAME pre-existing "a struct-typed local must be bound directly
+/// to a struct literal, not aliased" restriction a plain `let p = opt?;
+/// p.field` already hits, not a new error path built for this feature.
+#[test]
+fn if_let_bound_structs_own_fields_are_not_chased_through() {
+    let src = "\
+struct Pair {
+    x : [8]
+    y : [8]
+}
+module M {
+    reg opt : ?Pair = false
+    reg p : Pair = Pair{ x: 0, y: 0 }
+    rule r {
+        if let v = opt? {
+            p := Pair{ x: v.x, y: v.y }
+        } else {
+            p := Pair{ x: 0, y: 0 }
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert_eq!(err.len(), 2, "{err:?}");
+    assert!(
+        err.iter()
+            .all(|e| e.message.contains("cannot find this local's binding"))
+    );
+}
+
+/// The same body-nesting restriction a bare-comparison `if` already has
+/// (`contains_comparison`) applies identically inside `if let`'s own
+/// then/else bodies -- confirms `check_guard_placement`'s top-level loop
+/// (and `contains_comparison`'s own recursive walk) both learned about
+/// `Stmt::IfLet`, not just `Stmt::If`.
+#[test]
+fn a_comparison_nested_inside_if_lets_body_is_still_rejected() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    rule r {
+        if let x = opt? {
+            v := a + (a > b)
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("comparison nested in if/while"))
+    );
+}
+
+/// A memory write inside `if let`'s body: `find_mem_write` (writes.rs)
+/// is the "does this rule write this mem at all" gate that decides
+/// whether the mem even gets a writer port declared -- self-caught by
+/// direct probe before this feature was considered done: `find_mem_
+/// write`'s own recursive walk had no `Stmt::IfLet` arm, so a write
+/// buried inside one was invisible to it, and the whole write (guard,
+/// address, data — all of it) silently vanished with no writer port at
+/// all, despite `mem_write_in_stmts` itself (the function that actually
+/// EMITS the write) being correctly wired already. Pins both: the
+/// writer port exists, AND its enable/addr/data all gate on `opt_valid`.
+#[test]
+fn if_let_gates_a_memory_write_enable_and_addr_data_correctly() {
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg opt : ?[4] = false
+    in data : [8]
+    in read_addr : [4]
+    out read_data : [8] = 0
+    rule step {
+        if let a = opt? {
+            m[a] := data
+        }
+        read_data := m[read_addr]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("writer => w_m"));
+    assert!(
+        fir.contains("connect m.w_m.en, and(fires_step, mux(opt_valid, UInt<1>(1), UInt<1>(0)))")
+    );
+    assert!(fir.contains("connect m.w_m.addr, mux(opt_valid, opt_data, UInt<4>(0))"));
+    assert!(fir.contains("connect m.w_m.data, mux(opt_valid, data, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// `if let` gating a submodule instance port -- a third independent
+/// write-threading walk (`inst_port_value_in_stmts`), structurally
+/// different from both the register and memory cases.
+#[test]
+fn if_let_gates_a_submodule_instance_port() {
+    let src = "\
+module Child {
+    in a : [8]
+    out b : [8] = 0
+    rule pass {
+        b := a
+    }
+}
+module Top {
+    inst c : Child
+    reg opt : ?[8] = false
+    out result : [8] = 0
+    rule wire {
+        if let x = opt? {
+            c.a := x
+        } else {
+            c.a := 0
+        }
+        result := c.b
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect c.a, mux(opt_valid, opt_data, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A callee writing a caller's register through its own `if let`, called
+/// as a bare statement (`callee_reg_write`, a fourth independent write-
+/// threading walk, this one over a CALLEE body rather than a rule's own
+/// — and one of the two paths needing save/restore, not plain insert/
+/// remove, for reentrancy safety against `Avg(Avg(x, y), z)`-style
+/// nested inlining).
+#[test]
+fn if_let_gates_a_callee_writing_a_register_as_a_bare_statement() {
+    let src = "\
+module Top {
+    reg opt : ?[8] = false
+    out v_out : [8] = 0
+    Bump(o : ?[8]) : [8] <combines> {
+        if let x = o? {
+            v_out := x
+        } else {
+            v_out := 0
+        }
+        return 0
+    }
+    rule compute {
+        Bump(opt)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_v_out, mux(opt_valid, opt_data, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A reassigned local referenced INSIDE `if let`'s own body resolves at
+/// its own textual position (`stmt_contains`/`set_pos`) -- self-caught
+/// by direct probe: `stmt_contains` (used by `set_pos` to find which
+/// top-level statement a nested one belongs to) had no `Stmt::IfLet` arm
+/// either, so a statement nested inside one would silently fail to
+/// resolve to its enclosing top-level position and fall back to the
+/// rule's FINAL locals snapshot instead — reading `t`'s LAST binding
+/// (`c`) rather than the one in scope at the `if let`'s own position
+/// (`a`), a real reassigned-locals miscompile class this repo has hit
+/// before (`examples/reassigned_local.tr`).
+#[test]
+fn a_reassigned_local_referenced_inside_if_lets_body_resolves_at_its_own_position() {
+    let src = "\
+module M {
+    in a : [8]
+    in c : [8]
+    reg opt : ?[8] = false
+    reg v : [8] = 0
+    rule r {
+        let t = a
+        if let x = opt? {
+            v := t
+        }
+        t := c
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect v, mux(opt_valid, a, v)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A struct/`?T`-typed `if let`-bound name, passed WHOLE as another
+/// function's argument, initially failed with "cannot find this local's
+/// binding": `compile_struct_field_read`'s existing PARAM chase-through
+/// recurses with the chased-to value as the new root, and once that root
+/// was the `if let` name itself, `if_let_binds` was never consulted along
+/// that path (only `compile_expr_hinted`'s own `Ident` case did). Fixed by
+/// splicing `"data"` onto `opt`'s own root when the chased-to value is an
+/// `if_let_binds` entry, gated inside the chase-through's existing
+/// `is_param` branch so a DIRECT `x.field` access (which has the `if let`
+/// name as `root` itself, a Local, so `is_param` is false) still falls
+/// through to the same rejection `if_let_bound_structs_own_fields_are_not_
+/// chased_through` pins.
+#[test]
+fn if_let_bound_struct_passed_whole_as_a_call_argument_resolves_through_the_callee() {
+    let src = "\
+struct Pair {
+    x : [8]
+    y : [8]
+}
+Get(p : Pair) : [8] <combines> {
+    return p.x
+}
+module M {
+    reg opt : ?Pair = false
+    out result : [8] = 0
+    rule r {
+        if let v = opt? {
+            result := Get(v)
+        } else {
+            result := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, mux(opt_valid, opt_data_x, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// Same as above but through a NESTED struct field, to pin the path-splice
+/// direction: `"data"` must be PREPENDED ahead of the remaining path
+/// (`["data", "inner", "z"]`), not substituted for it, else a nested
+/// field's flat register name collapses to the wrong one
+/// (`opt_data_z` instead of `opt_data_inner_z`).
+#[test]
+fn if_let_bound_struct_passed_whole_as_a_call_argument_resolves_a_nested_field() {
+    let src = "\
+struct Inner {
+    z : [8]
+}
+struct Outer {
+    inner : Inner
+    w : [8]
+}
+Get(o : Outer) : [8] <combines> {
+    return o.inner.z
+}
+module M {
+    reg opt : ?Outer = false
+    out result : [8] = 0
+    rule r {
+        if let v = opt? {
+            result := Get(v)
+        } else {
+            result := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, mux(opt_valid, opt_data_inner_z, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}

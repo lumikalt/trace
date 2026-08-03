@@ -15,7 +15,7 @@
 
 use super::Emitter;
 use super::fifo::fifo_guard_cond;
-use super::writes::item_name;
+use super::writes::{def_of_name, item_name};
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
@@ -56,6 +56,18 @@ fn direct_callees(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Vec<(ItemId,
                     else_body,
                 } => {
                     collect_calls(ast, *cond, out);
+                    body_call_exprs(ast, then_body, out);
+                    if let Some(b) = else_body {
+                        body_call_exprs(ast, b, out);
+                    }
+                }
+                Stmt::IfLet {
+                    init,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect_calls(ast, *init, out);
                     body_call_exprs(ast, then_body, out);
                     if let Some(b) = else_body {
                         body_call_exprs(ast, b, out);
@@ -893,6 +905,50 @@ impl<'a> Emitter<'a> {
                 );
                 Err(())
             }
+            Stmt::IfLet {
+                name,
+                init,
+                then_body,
+                else_body: Some(else_body),
+            } => {
+                let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                    unreachable!("types.rs requires an `if let` init to be `opt?`")
+                };
+                let def = def_of_name(self.res, &name);
+                let prev = self.if_let_binds.insert(def, opt);
+                let then_result = self.compile_callee_body(&then_body, hint, span);
+                match prev {
+                    Some(p) => {
+                        self.if_let_binds.insert(def, p);
+                    }
+                    None => {
+                        self.if_let_binds.remove(&def);
+                    }
+                }
+                match (
+                    then_result,
+                    self.compile_callee_body(&else_body, hint, span),
+                ) {
+                    (Ok(t), Ok(e)) => {
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
+                        Ok(format!("mux({cond_str}, {t}, {e})"))
+                    }
+                    _ => Err(()),
+                }
+            }
+            Stmt::IfLet {
+                else_body: None, ..
+            } => {
+                self.error(
+                    span.clone(),
+                    "an `if let` inside an inlined function's body must have an \
+                     `else` (v0 restriction: every reachable path must produce a \
+                     value, there is no way to \"hold\" a return the way an \
+                     unwritten register path holds its own feedback)"
+                        .to_string(),
+                );
+                Err(())
+            }
             _ => {
                 self.error(
                     span.clone(),
@@ -1018,6 +1074,37 @@ impl<'a> Emitter<'a> {
                 }
                 _ => None,
             },
+            Stmt::IfLet {
+                name,
+                init,
+                then_body,
+                else_body: Some(else_body),
+            } => {
+                let Expr::Guard(opt) = self.ast.expr(init).clone() else {
+                    unreachable!("types.rs requires an `if let` init to be `opt?`")
+                };
+                let def = def_of_name(self.res, &name);
+                let prev = self.if_let_binds.insert(def, opt);
+                let then_result = self.compile_callee_body_field(&then_body, path, root_ty, width);
+                match prev {
+                    Some(p) => {
+                        self.if_let_binds.insert(def, p);
+                    }
+                    None => {
+                        self.if_let_binds.remove(&def);
+                    }
+                }
+                match (
+                    then_result,
+                    self.compile_callee_body_field(&else_body, path, root_ty, width),
+                ) {
+                    (Some(t), Some(e)) => {
+                        let cond_str = self.compile_guard_unwrap_cond(opt);
+                        Some(format!("mux({cond_str}, {t}, {e})"))
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         };
 

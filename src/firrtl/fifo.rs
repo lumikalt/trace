@@ -289,6 +289,16 @@ pub(crate) fn contains_fifo_op(ast: &Ast, res: &Resolution, stmt: StmtId) -> boo
                     .as_ref()
                     .is_some_and(|b| b.iter().any(|s| contains_fifo_op(ast, res, *s)))
         }
+        Stmt::IfLet {
+            then_body,
+            else_body,
+            ..
+        } => {
+            then_body.iter().any(|s| contains_fifo_op(ast, res, *s))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| contains_fifo_op(ast, res, *s)))
+        }
         Stmt::While { body, .. } => body.iter().any(|s| contains_fifo_op(ast, res, *s)),
         _ => false,
     }

@@ -1049,6 +1049,138 @@ actually has, and `.data` stays read-only throughout (nothing new writes
 through a `.data` path — `oo.data`'s own presence is set by a SEPARATE
 `optional` one level up, not by writing `oo.data` directly).
 
+### `if let`: branch-scoped Option-presence binding
+
+`if let NAME = EXPR { then_body } [else { else_body }]` binds `NAME` to the
+UNWRAPPED value of `EXPR` (which must itself be an Option's own `?`-unwrap,
+`opt?`), visible ONLY within `then_body` — never `else_body`, never after the
+whole statement. Verse's own inspiration is the general failure-context
+binding form, `if (X := Expr, Y > 0):` (`08_failure`); this is the narrower
+Option-only slice of it (Lumi's call, `AskUserQuestion`): a bare `opt?`
+already reads cleanly as the right-hand side, and the general multi-clause
+comma-chain form isn't needed for that.
+
+```trace
+rule r {
+    if let x = opt? {
+        result := x        -- x is opt's own unwrapped value here
+    } else {
+        result := 0
+    }
+}
+```
+
+Branch-scoped, same as the bare-comparison `if` feature above (Lumi's call,
+applied uniformly again): `NAME`'s presence never gates the enclosing rule
+the way a top-level `opt?` does — `then_body` runs when `opt` is present,
+`else_body` (or nothing, with the ordinary "hold" fallback an unwritten
+register path already has) otherwise, and the REST of the rule commits
+either way. `while` isn't given an equivalent form; Verse's own construct is
+`if`-shaped only.
+
+v0 scope, narrower than the general binding form and deliberately so: `NAME`
+may be used as a WHOLE value inside `then_body`, but not chased through a
+further `.field` access (`x.field` when the unwrapped type is a struct) —
+that would need new local-to-root chase-through machinery (`compile_struct_
+field_read`'s existing chase-through is PARAM-only, see "Structs" above);
+this cleanly rejects instead, the same "cannot find this local's binding"
+message an ordinary `let p = opt?; p.field` already gets, not a new error
+path. A struct-typed `NAME` used as a whole value (`p := x`) still hits the
+separate, pre-existing "struct-typed write's RHS must be a literal"
+restriction regardless — inherited for free, not a new gap.
+
+Passing a struct/`?T`-typed `NAME` WHOLE as another function's argument
+(`Get(x)`) is the one genuinely useful whole-value case for that type
+family, and initially didn't work: `compile_struct_field_read`'s existing
+PARAM chase-through (a callee param bound to another struct/Option value
+via a plain `Ident`, "Structs" above) recurses with the chased-to value as
+the new root, and once that root is `NAME` itself, resolution hit the exact
+same "cannot find this local's binding" rejection a direct `x.field` gets —
+`if_let_binds` was never consulted along that path, only by `compile_expr_
+hinted`'s own `Ident` case. Fixed narrowly, inside the PARAM chase-through's
+existing `is_param`-gated branch (`compile_struct_field_read`, expr.rs):
+when the chased-to value is itself an `if_let_binds` entry, splice `"data"`
+plus the remaining field path onto `opt`'s own root and resolve from there,
+instead of recursing with `NAME` as root. Gating this inside the `is_param`
+branch (rather than at the top of the function, which was the first attempt
+and over-broadened — it made `if_let_bound_structs_own_fields_are_not_
+chased_through` start passing where it should fail) is what keeps a direct
+`x.field` access rejected: that has `NAME` as `root` itself, a Local rather
+than a Param, so `is_param` is false and the branch never runs. Confirmed
+both directions by direct probe through real FIRRTL (firtool-checked): a
+single-hop struct argument, and a two-level nested-field one (`?Outer`
+containing an `Inner` struct field) to pin the path-splice direction —
+prepend `"data"` ahead of the remaining path, not replace it, else nested
+fields collapse to the wrong flat register name. `a_callee_local_aliasing_
+a_struct_typed_param_is_rejected` and `option_typed_local_aliasing_another_
+option_value_is_rejected` (the two pre-existing regression tests guarding
+against over-broadening this exact chase-through) still pass unchanged.
+`?.` safe
+navigation (Verse's own multi-hop `opt?.field?.next`, each hop independently
+unwrap-or-fail) is a related but separate, larger feature, not attempted
+this pass — see TODO.md. `if let` inside a `<sequences>`/spawn-callee body
+(crossing a `tick`) isn't supported either: `NAME` deliberately isn't
+registered in `lower.rs`'s local-crosses-a-tick capture machinery (that
+machinery rewrites `let NAME = init` into `NAME := init` verbatim for a
+synthesized register, and there's no equivalent rewrite for the surrounding
+`if`/branch structure an `if let` needs to keep), and the existing "a spawned
+fn's last segment must end with `return`" check doesn't recognize `Stmt::
+IfLet` as a valid segment-ending shape — cleanly rejected, not silently
+miscompiled, confirmed by direct probe.
+
+Implementation-wise, `if let` reuses almost every mechanism the earlier
+features on this page already built rather than adding new ones: the mux
+select is `opt`'s own `.valid`, computed via `compile_guard_unwrap_cond`
+(the same function the bare-comparison `if` predicate and the ordinary
+guard-fold both already call); the whole-rule guard fold
+(`compile_guard`) never looks inside `Stmt::If`/`Stmt::IfLet` at all, so
+branch-scoping needed no new code there either. The one genuinely new piece
+is resolving `NAME` itself to `opt.data`: a dedicated `if_let_binds:
+HashMap<DefId, ExprId>` on the emitter (mod.rs), populated with `opt`'s own
+`ExprId` right before compiling `then_body` and removed right after (or, in
+a CALLEE body — reentrant via nested inlining, `Avg(Avg(x, y), z)`-style —
+saved and restored instead of a plain remove), consulted by `compile_expr_
+hinted`'s `Ident` case before it falls back to `locals_snapshots`/`locals`.
+Reading `NAME` then routes through `struct_field_path`/`compile_struct_
+field_read` with `"data"` appended to `opt`'s own path — the exact same
+per-field resolution an explicit `.data` read already uses, including
+`opt` itself being a chained field (`frame.maybe?`) or a callee PARAM
+(chasing through to the caller's own argument, confirmed working through a
+real `<combines>` callee taking a `?T` param).
+
+Every write-threading walk that can reach a branch needed its own `Stmt::
+IfLet` arm — mirroring its existing `Stmt::If` arm exactly, with `if_let_
+binds` inserted/removed around the `then_body` recursion: `reg_value_in_
+stmts`, `mem_write_in_stmts`, `struct_field_value_in_stmts`, `inst_port_
+value_in_stmts` (writes.rs), `callee_reg_write`/`callee_port_write`
+(writes.rs, save/restore), and `compile_callee_body`/`compile_callee_body_
+field` (calls.rs, save/restore). Confirmed correct by direct probe through
+real FIRRTL (firtool-checked): `reg_value_in_stmts`, `mem_write_in_stmts`,
+`inst_port_value_in_stmts`, `struct_field_value_in_stmts`,
+`callee_reg_write`, `callee_port_write`, and `compile_callee_body`.
+`compile_callee_body_field`'s arm is verified only by mirroring its `Stmt::
+If` sibling exactly — every body shape tried for it either bottoms out at
+the same "no `.field` chase-through"/"local, not param, so no passthrough"
+restrictions the paragraph below covers (correctly rejected, not a gap) or
+requires the whole-value call-argument path below, which doesn't happen to
+route through this particular function in the shapes tried. Three more
+non-exhaustive
+helpers were self-caught missing a `Stmt::IfLet` arm the same way (silent,
+not a compile error, since Rust's exhaustiveness checking only catches a
+missing arm in an EXHAUSTIVE match, and these three use a `_ => None`/`_ =>
+{}` fallback instead): `find_mem_write` (writes.rs) — a memory write buried
+inside an `if let` was invisible to the "does this rule write this mem at
+all" gate, so the mem never even got a writer port declared, silently
+dropping the write entirely, guard and all; `collect_read_sites`
+(module.rs) — the analogous gap for a mem READ address referencing an
+`if let`; and `stmt_contains` (writes.rs, used by `set_pos`) — a
+REASSIGNED local referenced inside an `if let`'s own body would have
+silently resolved to the rule's FINAL snapshot instead of the one in scope
+at its actual position, the identical reassigned-locals miscompile class
+`examples/reassigned_local.tr` exists to guard against. All three fixed and
+pinned with regression tests (tests/firrtl.rs) before this was considered
+done.
+
 ## Locals
 
 `let` is the ONLY way to declare a fresh local. `x := value` never declares —

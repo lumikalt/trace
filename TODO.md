@@ -984,10 +984,11 @@ Speculative, bigger, not committed to:
     of the value beneath it. Neither is a general struct-literal-style
     `option{ valid: ..., data: ... }` constructor; not pursued, no
     concrete use case for one beyond what `optional` already closes.
-    `?.` safe navigation: still not pursued, no existing analogue to
-    reuse (ordinary `.field` access requires the local bound directly
-    to a literal, no aliasing) — unrelated to `optional`, would need
-    its own design pass if ever wanted.
+    `?.` safe navigation: now designed against Verse's actual primary
+    source (`08_failure`, fetched directly, not paraphrased) rather
+    than a guess — see its own bullet below, split out of this one
+    once `if let` made clear the two are related but separately
+    scoped features, not one.
 - **`if`: branch-scoped fallible conditions ACHIEVED** — a BARE
   comparison (no `logic`) directly as an `if`'s own condition, Verse-
   faithful branch-scoping applied uniformly to the with-else and
@@ -1055,25 +1056,82 @@ Speculative, bigger, not committed to:
   only `check_cond` was ever in the way), closing the one readability
   cost the earlier comparisons-as-fallible migration left behind.
 
-- **Fallible bindings scoped to a single `if`** (Verse's
-  `if (X := Expr, Y > 0):`, where `X` only exists in the `then` branch
-  and a failure skips straight past it, running the `else` instead
-  rather than aborting the surrounding scope). Design decided (Lumi's
-  call, picking the full version over closing this or building `?T`-
-  only sugar) — not built; this is the semantics + open-questions
-  writeup the decision needs before an implementation attempt.
-  **Update:** comparisons-as-fallible (earlier) shipped WITHOUT this —
-  `logic <expr>` turned out to be a complete discharge path for
-  `if`/`while` on its own, so this was no longer a blocker for anything
-  actually built at the time. **Second update: the BARE-comparison half
-  of what this would add is now its own ACHIEVED bullet above** (a
-  comparison directly in an `if`-with-`else` — or no-`else` — condition,
-  no `logic` needed); what's STILL missing here is specifically the
-  Option-presence BINDING sugar (`X := Expr` introducing a THEN-branch-
-  scoped name), which is a new scoping rule trace has no precedent for
-  (`let` is body-scoped, shadowing is legal), plus the still-fully-open
-  branch-scoped fifo-op/failing-call-as-condition question below. Still
-  just a design, not an implementation attempt, for both.
+- **`if let`: branch-scoped Option-presence binding ACHIEVED** — Verse's
+  general failure-context binding form (`if (X := Expr, Y > 0):`,
+  `08_failure`), narrowed to the Option-only slice: `if let NAME = opt?
+  { then_body } [else { else_body }]` binds `NAME` to `opt`'s own
+  unwrapped value, visible ONLY within `then_body`, branch-scoped and
+  discharged exactly like the bare-comparison `if` feature above
+  (uniform with-else/no-else semantics, no rule-level guard). See
+  DESIGN.md's "`if let`: branch-scoped Option-presence binding" for the
+  full write-up (semantics, v0 scope, the emission machinery reused vs.
+  the one genuinely new piece — resolving `NAME` to `opt.data`).
+  Scoped via `AskUserQuestion` (Lumi's call): binding sugar only, no
+  general multi-clause comma-chain the way Verse's own form has (not
+  needed — a bare `opt?` already reads cleanly as the whole right-hand
+  side), and `?.` safe navigation (Verse's own multi-hop chained
+  unwrap-and-field-access, `opt?.next?.value`) deferred entirely as a
+  separate, larger feature — see its own bullet below. `NAME` may be
+  used as a whole value inside `then_body` but not chased through a
+  further `.field` access (struct-typed `T`) — cleanly rejected with
+  the same message an ordinary `let p = opt?; p.field` already gets,
+  not a gap this feature opens. `if let` inside a `<sequences>`/spawn-
+  callee body (crossing a `tick`) isn't supported — confirmed via
+  direct probe to fail CLEANLY ("a spawned fn's last segment must end
+  with `return`"), not silently, so left as a known v0 gap rather than
+  built out this pass.
+
+  **Three more non-exhaustive-match gaps self-caught the same way the
+  previous `if` feature's bugs were — direct probing before considering
+  this done, not code review.** None of these are compile errors (Rust's
+  exhaustiveness check only fires on an EXHAUSTIVE match; each of these
+  three used a `_ => None`/`_ => {}` fallback instead, so adding `Stmt::
+  IfLet` to the AST silently compiled clean without them): `find_mem_
+  write` (writes.rs) — a memory write buried inside an `if let` was
+  invisible to the "does this rule write this mem at all" gate, so the
+  mem never got a writer port declared at all, silently dropping the
+  write (guard, address, data, all of it) rather than miscompiling one
+  piece of it; `collect_read_sites` (module.rs) — the identical gap for
+  a mem READ address referenced inside an `if let`; `stmt_contains`
+  (writes.rs, used by `set_pos`) — a REASSIGNED local referenced inside
+  an `if let`'s own body would have silently resolved to the rule's
+  FINAL locals snapshot instead of the position-correct one, the exact
+  reassigned-locals miscompile class `examples/reassigned_local.tr`
+  exists to guard against. All three fixed and pinned by regression
+  tests (tests/firrtl.rs) before this was considered done.
+
+  **What's STILL open, unchanged by this bullet:** the harder half of
+  the original design — a fifo op or failing call as a branch-scoped
+  `if`'s condition (not just an Option's presence) — remains fully
+  unbuilt; see the four open questions below, still standing except
+  where noted resolved for the comparison/Option cases specifically.
+
+- **`?.` safe navigation — designed, not built (scope decided via
+  `AskUserQuestion` alongside `if let` above).** Verse's own primary
+  source (`08_failure`, fetched directly, not guessed at) is explicit:
+  `?.` is MULTI-HOP, each `?.` its own independent unwrap-or-fail —
+  `Head?.Next?.Value` chains through however many `?Node` layers `.Next`
+  itself is, not a single unwrap followed by ordinary field reads. That
+  ruled out treating this as a small extension of `if let`'s own
+  one-hop resolution (`if_let_binds`, DESIGN.md): `opt?.field` needs
+  the SAME local-to-root chase-through `if let`'s `x` gets, PLUS a new
+  recursive multi-failure-point guard-fold (find and AND together every
+  `?`/`?.` reachable in one expression — the same shape `comparison_
+  conds` already needed for comparisons, at a new site) PLUS type-
+  checking that threads correctly through a chain of nested `?U`
+  fields. Confirmed the underlying blocker is real before scoping
+  further, not assumed: `let p = opt?; p.field` (T a struct) already
+  fails today with "a struct-typed local must be bound directly to a
+  struct literal, not aliased" — the exact chase-through gap `?.` would
+  need to close, probed directly rather than inferred. Three sizes on
+  the table, smallest to largest, any of which is a real follow-up: (a)
+  one-hop only (`opt?.field`, a single unwrap then plain field reads,
+  usable anywhere a bare `opt?` already is — whole-statement/`:=`
+  RHS/`let` init) is honestly a DIFFERENT, smaller feature than `?.`
+  and shouldn't be called that in DESIGN.md if built; (b) full Verse-
+  faithful multi-hop chaining, the real `?.`; (c) doing nothing further
+  here, `if let` + `.data`/`.valid` already covers the ergonomic gap
+  that's actually been asked for so far.
 
   **The no-else/with-else split is what makes this tractable at all.**
   An `if` whose fallible condition has NO `else` is already exactly
@@ -1096,7 +1154,11 @@ Speculative, bigger, not committed to:
   (binding `opt.data` to a name visible only in `then`) — trace has no
   branch-scoped bindings anywhere else (`let` is body-scoped,
   shadowing is legal, see `let_shadowing_is_allowed`), so even the
-  Option-only case would be a new scoping rule, not free.
+  Option-only case would be a new scoping rule, not free. **Built —
+  see the `if let` ACHIEVED bullet above: the scoping rule turned out
+  to need no new resolve.rs machinery at all, just declaring `NAME`
+  one scope-push deeper than `Stmt::If`'s existing then/else push/pop
+  already goes.**
   The real gap is a FIFO op / failing call as an if's condition: a
   `Deq[]` is a genuine side effect (the fifo's occupancy register
   actually decrements this cycle), and `compile_guard` (writes.rs) is
