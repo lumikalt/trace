@@ -317,6 +317,35 @@ impl<'a> Checker<'a> {
                 // an explicit top-level `opt?` does.
                 if let Expr::Guard(inner) = self.ast.expr(*init) {
                     self.infer_expr(*inner, sig);
+                } else if let Expr::Bracket { callee, args } = self.ast.expr(*init)
+                    && let Some(fifo) = self.fifo_op_target(*callee)
+                {
+                    // `if let x = fifo.Deq[] { ... }`: reads+writes the
+                    // fifo (a real dequeue happens whenever `then` is
+                    // taken) but, like the Option-presence case just
+                    // above, does NOT set `sig.fails` -- this presence
+                    // check never gates the enclosing rule/fn, unlike an
+                    // ordinary top-level `Deq[]`'s own `Expr::Bracket` arm
+                    // (below) does for every OTHER position.
+                    sig.reads.insert(fifo);
+                    sig.writes.insert(fifo);
+                    for arg in args {
+                        self.infer_expr(*arg, sig);
+                    }
+                } else if let Expr::Call { callee, args } = self.ast.expr(*init) {
+                    // `if let x = Classify(a) { ... }`: reads+writes from
+                    // the callee's own effect signature (a real call
+                    // happens whenever `then` is taken), same reasoning
+                    // as the fifo-Deq case above -- does NOT set `sig.
+                    // fails`, unlike the ordinary `Expr::Call` arm below.
+                    if let Some(callee_sig) = self.callee_sig(*callee) {
+                        sig.reads.extend(callee_sig.reads.iter().copied());
+                        sig.writes.extend(callee_sig.writes.iter().copied());
+                    }
+                    self.infer_expr(*callee, sig);
+                    for arg in args {
+                        self.infer_expr(*arg, sig);
+                    }
                 } else {
                     self.infer_expr(*init, sig);
                 }

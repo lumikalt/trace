@@ -380,6 +380,32 @@ impl<'a> Emitter<'a> {
                 });
                 continue;
             }
+            // `if let x = fifo.Deq[] { ... }` -- a Deq used as a branch-
+            // scoped if-let's own init (types.rs's `is_fifo_deq`, Enq
+            // excluded: there's no value to bind a name to). Its dequeue-
+            // enable is `fires_rule AND fifo_guard_cond`, the SAME shape
+            // an `or` alternative's `select` already threads through
+            // module.rs's depth-1 emission — reused verbatim rather than
+            // adding a second mechanism. Does NOT contribute occupancy to
+            // `compile_guard`'s whole-rule fold (writes.rs skips any op
+            // with `select.is_some()`): this presence check never gates
+            // the rule, matching `if let`'s existing Option-presence
+            // semantics exactly.
+            if let Stmt::IfLet { init, .. } = self.ast.stmt(*stmt)
+                && let Some((fifo, depth, false, _)) = self.fifo_op(*init)
+            {
+                let select = fifo_guard_cond(&fifo, false, depth);
+                out.push(RuleFifoOp {
+                    stmt: *stmt,
+                    fifo,
+                    depth,
+                    is_enq: false,
+                    value: None,
+                    callee_ctx: None,
+                    select: Some(select),
+                });
+                continue;
+            }
             let call_expr = match self.ast.stmt(*stmt) {
                 Stmt::Expr(e) if matches!(self.ast.expr(*e), Expr::Call { .. }) => Some(*e),
                 Stmt::Assign { rhs, .. } if matches!(self.ast.expr(*rhs), Expr::Call { .. }) => {

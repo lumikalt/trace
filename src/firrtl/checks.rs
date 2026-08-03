@@ -407,7 +407,7 @@ impl<'a> Emitter<'a> {
 
     pub(crate) fn check_writing_call_positions_in(&mut self, stmts: &[StmtId]) {
         let mut bad = Vec::new();
-        self.calls_outside_allowed_positions(stmts, false, &mut bad);
+        self.calls_outside_allowed_positions(stmts, false, false, &mut bad);
         let logic_args = self.logic_arg_exprs(stmts);
         bad.retain(|e| !logic_args.contains(e));
         for call in bad {
@@ -830,7 +830,12 @@ impl<'a> Emitter<'a> {
     pub(crate) fn check_failing_call_positions(&mut self, rule: ItemId) {
         let body = rule_body(self.ast, rule);
         let mut bad = Vec::new();
-        self.calls_outside_allowed_positions(&body, false, &mut bad);
+        // `allow_if_let: true` -- `if let x = Classify(a) { ... }`'s own
+        // init is a deliberately allowed position for a FAILING call
+        // (types.rs's `is_failing_call` check already requires this
+        // exact shape); `allow_let` stays `false`, a bare `let x =
+        // Classify(a)` is unrelated, unchanged v0 scope.
+        self.calls_outside_allowed_positions(&body, false, true, &mut bad);
         let logic_args = self.logic_arg_exprs(&body);
         bad.retain(|e| !logic_args.contains(e));
         for call in bad {
@@ -1133,6 +1138,7 @@ impl<'a> Emitter<'a> {
         &self,
         stmts: &[StmtId],
         allow_let: bool,
+        allow_if_let: bool,
         out: &mut Vec<ExprId>,
     ) {
         for stmt in stmts {
@@ -1146,8 +1152,21 @@ impl<'a> Emitter<'a> {
                 {
                     Some(init)
                 }
+                // `allow_if_let`, deliberately SEPARATE from `allow_let`
+                // above: `if let x = Classify(a) { ... }` (types.rs's own
+                // `is_failing_call` check) needs this position allowed
+                // for `check_failing_call_positions`'s call below, but
+                // NOT for `check_writing_call_positions_in`'s (a writing-
+                // but-not-failing call can never reach here at all --
+                // types.rs's if-let arm rejects it before firrtl/checks.rs
+                // ever runs -- but a WRITING-AND-failing one could, and
+                // its write isn't branch-gated by anything this feature
+                // built; loosening this position for the write-detection
+                // caller too would let that slip through undetected
+                // instead of hitting its own "must be `:=`-shaped"
+                // rejection).
                 Stmt::IfLet { init, .. }
-                    if allow_let && matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                    if allow_if_let && matches!(self.ast.expr(init), Expr::Call { .. }) =>
                 {
                     Some(init)
                 }
@@ -1173,9 +1192,9 @@ impl<'a> Emitter<'a> {
                     else_body,
                 } => {
                     roots.push(cond);
-                    self.calls_outside_allowed_positions(&then_body, allow_let, out);
+                    self.calls_outside_allowed_positions(&then_body, allow_let, allow_if_let, out);
                     if let Some(b) = &else_body {
-                        self.calls_outside_allowed_positions(b, allow_let, out);
+                        self.calls_outside_allowed_positions(b, allow_let, allow_if_let, out);
                     }
                 }
                 Stmt::IfLet {
@@ -1185,18 +1204,18 @@ impl<'a> Emitter<'a> {
                     ..
                 } => {
                     roots.push(init);
-                    self.calls_outside_allowed_positions(&then_body, allow_let, out);
+                    self.calls_outside_allowed_positions(&then_body, allow_let, allow_if_let, out);
                     if let Some(b) = &else_body {
-                        self.calls_outside_allowed_positions(b, allow_let, out);
+                        self.calls_outside_allowed_positions(b, allow_let, allow_if_let, out);
                     }
                 }
                 Stmt::While { cond, body } => {
                     roots.push(cond);
-                    self.calls_outside_allowed_positions(&body, allow_let, out);
+                    self.calls_outside_allowed_positions(&body, allow_let, allow_if_let, out);
                 }
                 Stmt::WhileLet { init, body, .. } => {
                     roots.push(init);
-                    self.calls_outside_allowed_positions(&body, allow_let, out);
+                    self.calls_outside_allowed_positions(&body, allow_let, allow_if_let, out);
                 }
                 Stmt::Return(None) | Stmt::Tick => {}
             }
@@ -1249,11 +1268,31 @@ impl<'a> Emitter<'a> {
     /// same exemption `check_failing_call_positions`/`check_fifo_op_
     /// positions`/`check_writing_call_positions_in` already apply,
     /// `check_guard_placement`'s own if/while sub-check had simply never
-    /// been taught about it).
+    /// been taught about it), and excluding `IfLet`/`WhileLet`'s own
+    /// `init` — a failing call there IS one by construction (`if let x =
+    /// Classify(a) { ... }`, types.rs's `is_failing_call` check), not a
+    /// NESTED one this scan exists to catch, mirroring `contains_guard`/
+    /// `contains_fifo_op`'s identical init-exemption for their own
+    /// sibling features.
     fn contains_failing_call(&self, stmt: StmtId) -> bool {
+        let scanned: Vec<StmtId> = match self.ast.stmt(stmt).clone() {
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let mut v = then_body;
+                if let Some(b) = else_body {
+                    v.extend(b);
+                }
+                v
+            }
+            Stmt::WhileLet { body, .. } => body,
+            _ => vec![stmt],
+        };
         let mut calls = Vec::new();
-        collect_all_calls_in(self.ast, std::slice::from_ref(&stmt), &mut calls);
-        let logic_args = self.logic_arg_exprs(std::slice::from_ref(&stmt));
+        collect_all_calls_in(self.ast, &scanned, &mut calls);
+        let logic_args = self.logic_arg_exprs(&scanned);
         calls
             .iter()
             .any(|call| !logic_args.contains(call) && self.is_failing_call(*call))

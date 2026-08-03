@@ -1459,6 +1459,228 @@ at its actual position, the identical reassigned-locals miscompile class
 pinned with regression tests (tests/firrtl.rs) before this was considered
 done.
 
+### `if let`: a fifo op's presence
+
+`if let x = fifo.Deq[] { then_body } [else { else_body }]` extends the
+Option-presence feature above to a fifo's own occupancy — the "harder half"
+TODO.md's four open questions left standing (a fifo op as a branch-scoped
+`if`'s condition, not just an Option's). Bare, never `?`-wrapped: unlike an
+Option (which needs an explicit unwrap to become fallible), `Deq[]` is
+already fallible by default, the same as a comparison — `if let x = f.Deq[]?`
+also parses (an explicit, redundant `?` on an already-fallible expression,
+same as `(a > b)?`) but the idiomatic spelling mirrors every other bare
+`Deq[]` use.
+
+```trace
+rule consumer {
+    if let x = f.Deq[] {
+        result := x         -- a real dequeue happened this cycle
+    } else {
+        result := 0         -- f was empty; nothing dequeued
+    }
+}
+```
+
+Same branch-scoped semantics as the Option case: `consumer` fires every
+cycle regardless of `f`'s occupancy (`if let` never gates the enclosing
+rule), but the dequeue itself is real and conditional — it only actually
+fires on a cycle where `f` has data. Verified through real firtool +
+Icarus AND Verilator simulation, not just structurally: `examples/
+if_let_fifo.tr` + `sim/if_let_fifo_tb.v` push one value and confirm
+`result`/`was_present` show it exactly one cycle later, absent on every
+other cycle (`tests/sim.rs`'s `if_let_fifo_deq_drives_a_real_dequeue_
+exactly_when_present`).
+
+**v0 scope, deliberately narrower than the full four-open-questions
+design:**
+- **`Deq` only, not `Enq`.** There's no value to bind `x` to for an
+  enqueue, and enqueuing is never itself "does data exist to read" —
+  the whole reason this feature exists.
+- **A rule's own top-level `if let` only** — not nested inside another
+  `if`/`while`, and no SECOND fifo op/guard/comparison inside `then_body`/
+  `else_body` (the pre-existing "nested in if/while" v0 restriction,
+  `checks.rs`, unaffected by this feature: it already exempts an `if
+  let`'s own `init` from that check, but still applies to anything
+  found deeper inside its branches).
+- **A failing call (`if let x = Classify(a) { ... }`) is explicitly
+  OUT of scope, not just untested** — `types.rs`'s `TypeChecker` has no
+  access to `fx`'s computed `fails` signatures (only `resolve.rs`'s def
+  kinds), so recognizing "this call can fail" would need threading `fx`
+  through a checker that currently doesn't carry it. `checks.rs`'s
+  `calls_outside_allowed_positions` also still runs with `allow_let:
+  false` for `check_failing_call_positions`, unlike the fifo case where
+  `fifo_ops_outside_allowed_positions`'s `IfLet`/`WhileLet` arms were
+  ALREADY unconditionally permissive — dead code until this feature,
+  confirmed by direct probe (`f.Deq[]?` hit exactly the anticipated "v0
+  restriction: a fifo op, failing call, or comparison isn't supported
+  here yet" message in `types.rs` before this landed) rather than
+  assumed. A failing call as `if let`'s rhs still hits the same message
+  a bare comparison does — an explicit rejection, not silent.
+- **`while let`, and a `while`'s own condition, stay untouched** —
+  Verse's own construct is `if`-shaped only (TODO.md), and nothing here
+  argues for extending the loop forms too.
+
+**Implementation, reusing existing mechanisms almost entirely, no new
+`Stmt` variant or position-check surface:**
+- `types.rs`'s `Stmt::IfLet` arm gained one new `else if` branch (`is_
+  fifo_deq`, checking the raw `Expr::Bracket` shape directly — not
+  `Expr::Guard`, since this is never `?`-wrapped) alongside the existing
+  Option-`Guard` check; `type_expr`'s existing `type_bracket` dispatch
+  already returns a `Deq[]`'s own element type, reused as-is.
+- `effects.rs`'s `Stmt::IfLet` arm gained a matching branch: reads+writes
+  the fifo (a real dequeue is a real effect) but deliberately does NOT
+  set `sig.fails` — mirrors the Option-Guard branch's own reasoning
+  (this presence check never gates the enclosing rule/fn) rather than
+  falling through to the generic `Expr::Bracket` arm, which DOES set
+  `fails` for an ordinary, unconditional top-level `Deq[]`.
+- `checks.rs` needed NO changes: `fifo_ops_outside_allowed_positions`
+  already listed `Stmt::IfLet { init, .. } if is_fifo_op(init) =>
+  Some(init)` as an allowed position, and `contains_fifo_op`/`contains_
+  guard` already exempt `IfLet`'s own `init` from the "nested in if/
+  while" scan — forward groundwork from whenever those functions were
+  last touched, dead code until this feature made it reachable.
+- `writes.rs`'s `compile_guard_unwrap_cond` (the SAME function the
+  Option-presence mux-select and the bare-comparison `if` predicate both
+  already call) gained one new branch: when `inner` is a Deq, return
+  `fifo_guard_cond` — the fifo's own occupancy test, reused verbatim
+  from the pass-through/`or`-alternative machinery rather than computed
+  fresh.
+- `fifo.rs`'s `rule_fifo_ops` gained a new case recognizing a top-level
+  `Stmt::IfLet` whose `init` is a Deq, pushing a `RuleFifoOp` with
+  `select: Some(fifo_guard_cond(...))` — the IDENTICAL field `or`-chain
+  alternatives already use for a conditionally-gated dequeue.
+  `compile_guard`'s per-fifo whole-rule fold already skips any op with
+  `select.is_some()` (pre-existing, built for `or`), so this presence
+  check correctly contributes NOTHING to the rule's own guard for free.
+  `module.rs`'s depth-1 Deq emission already branches on `.select`
+  (`when sel: connect valid, 0` vs. unconditional) — also pre-existing,
+  needed zero changes.
+- The 8 near-identical `let Expr::Guard(opt) = self.ast.expr(init).clone()
+  else { unreachable!(...) }` sites across writes.rs/calls.rs (the
+  `if_let_binds` value-threading machinery the Option feature's own
+  write-up above calls "roughly a dozen call sites") became a 3-way
+  match: `Expr::Guard(inner) => inner`, `_ if self.fifo_op(init).is_some()
+  => init`, else unreachable. `if_let_binds: HashMap<DefId, ExprId>`'s
+  value semantics generalize cleanly to "the expr `x` binds to" either
+  way, so every downstream `if_let_binds.insert(def, opt)` call needed no
+  changes at all.
+- `expr.rs`'s `Ident` read-substitution (the ONE genuinely new piece):
+  when `if_let_binds.get(&def)` resolves to a Deq bracket instead of an
+  Option-inner expr, recurse through `compile_expr_hinted` instead of the
+  hardcoded `.data` field chase — `compile_expr_hinted`'s own top-of-
+  function fifo-op check (`fifo_deq_read_expr`) already compiles any Deq
+  bracket to its data-read expression generically, the exact path an
+  ordinary top-level `x := f.Deq[]` already goes through.
+
+Passing an `if let`-bound Deq value WHOLE as another call's argument
+(`Get(x)`, the struct/Option `if let`'s own documented whole-value case
+above) is NOT extended to this feature — `expr.rs`'s PARAM chase-through
+site for that case is gated on `root_ty` matching a struct/Option shape,
+which a scalar `[N]`-typed Deq value never satisfies; untested and
+out of scope, not confirmed broken, since fifos overwhelmingly hold
+scalar element types in every example this codebase has.
+
+### `if let`: a failing call's own presence
+
+`if let x = Classify(a) { then_body } [else { else_body }]` extends the
+same feature to a failing call — the other v0-restricted shape the fifo
+section above named as still out of scope when it landed. Bare, never
+`?`-wrapped, same reasoning as `Deq[]`: a failing call is already
+fallible by default.
+
+```trace
+Classify(x : [8]) : [8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+
+rule compute {
+    if let x = Classify(a) {
+        result := x          -- Classify's own guard held this cycle
+    } else {
+        result := 0          -- Classify would have failed
+    }
+}
+```
+
+Same branch-scoped semantics: `compute` fires every cycle regardless of
+whether `Classify` succeeds, but `x`'s value and the mux-select both
+track `Classify`'s own guard exactly. Verified through real firtool +
+Icarus AND Verilator simulation (`examples/if_let_failing_call.tr` +
+`sim/if_let_failing_call_tb.v`, `tests/sim.rs`'s `if_let_failing_call_
+tracks_the_callees_own_guard`), sweeping `a` through both an absent
+(`0`, `Classify` fails) and present (nonzero) case.
+
+**What unblocked this, closing the gap the fifo section above left
+open:** `TypeChecker` (types.rs) had no access to `fx`'s computed
+`fails` signatures at all — only `resolve.rs`'s def kinds, which don't
+carry it. `types::check`'s own signature gained a third parameter,
+`fx: &Effects`, threaded through every call site (`main.rs`, `lsp.rs`,
+and every test harness that calls it — all of which already had `fx`
+in scope from their own preceding `effects::check` call, confirmed by
+checking each site rather than assuming). `Stmt::IfLet`'s arm gained a
+new `is_failing_call` check (mirroring `checks.rs`'s identical method on
+`Emitter`, duplicated rather than shared since the two types can't see
+each other) alongside `is_fifo_deq`; `type_expr`'s existing `Expr::Call`
+dispatch (`type_call`) already returns the callee's own return type,
+reused as-is.
+
+**v0 scope, same shape of restriction as the fifo case:**
+- A rule's own top-level `if let` only, no nesting, no second guard/
+  fifo op/call inside `then_body`/`else_body` — the pre-existing
+  restriction, unaffected.
+- A callee that BOTH fails AND writes state, used as `if let`'s init,
+  is explicitly rejected — but by a restriction that already existed
+  for an unrelated reason, not new logic this feature had to add:
+  `check_writing_call_positions_in`'s own "a call to a function that
+  writes state may only appear as a whole statement, or as the entire
+  right-hand side of `:=`" still applies unchanged (`if let`'s init is
+  neither), confirmed by direct probe rather than assumed — a real risk
+  named explicitly before writing any code, since `if let`'s mux-select
+  has no branch-gating story for a WRITE the way it does for `x`'s own
+  value. `tests/firrtl.rs`'s `if_let_with_a_writing_and_failing_call_
+  still_hits_the_write_position_restriction` pins this.
+- `while let`/a bare `while`'s own condition stay untouched, same
+  reasoning as the fifo case (Verse's construct is `if`-shaped only).
+
+**Implementation, reusing `calls.rs`'s existing failing-call-inlining
+machinery almost entirely:**
+- `effects.rs`'s `Stmt::IfLet` arm gained a matching branch: merges
+  reads/writes from the callee's own `EffectSig` but deliberately does
+  NOT set `sig.fails` — same reasoning as the fifo-Deq branch beside it.
+- `checks.rs` needed two small, deliberately narrow changes (unlike the
+  fifo case, which needed none — this shape wasn't pre-exempted):
+  `contains_failing_call` gained an `IfLet`/`WhileLet`-specific
+  exemption for their own `init` (mirroring `contains_guard`/`contains_
+  fifo_op`'s identical pattern, which already had it); `calls_outside_
+  allowed_positions` gained a NEW, separate `allow_if_let` parameter —
+  deliberately NOT reusing the existing `allow_let` (which also gates
+  `Stmt::Let`/`Stmt::WhileLet`) — threaded `true` only through `check_
+  failing_call_positions`'s own call site, `false` everywhere else
+  including `check_writing_call_positions_in`'s. This separation is
+  exactly what makes the writing+failing rejection above still fire:
+  loosening the SAME position for both checks would have let an
+  ungated write slip through undetected instead.
+- `writes.rs`'s `compile_guard_unwrap_cond` gained a matching `Expr::
+  Call` branch, reusing `calls.rs`'s `callee_fail_cond` — self-caught a
+  real sign bug while verifying against real FIRRTL, not just adding
+  the branch and trusting it: despite its name, `callee_fail_cond`
+  already returns the callee's own SUCCESS condition (the same sign
+  every other `compile_guard` fold term uses, confirmed by reading its
+  other call site inside `compile_guard` itself, where the result is
+  ANDed directly into the rule's "can fire" guard). An earlier version
+  wrapped it in `not(...)`, inverting the mux — caught by running the
+  probe's actual emitted FIRRTL (`mux(not(neq(a, 0)), a, 0)`, backwards)
+  before writing any test, not by the type checker or by inspection.
+- `expr.rs`'s `Ident` read-substitution widened its existing fifo-op
+  check to also match `Expr::Call`, delegating to `compile_expr_hinted`'s
+  already-generic `Expr::Call` dispatch (`compile_call`, calls.rs) — the
+  exact path an ordinary top-level `x := Classify(a)` already goes
+  through, so no new value-compilation code was needed here either.
+- The 8 `if_let_binds` sites' 3-way match (writes.rs/calls.rs, from the
+  fifo feature above) gained one more arm: `_ if ... || matches!(Expr::
+  Call { .. }) => init`.
+
 ### `?.` safe navigation
 
 `opt?.field?.next` — Verse's own multi-hop chained unwrap-and-field-access

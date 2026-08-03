@@ -148,10 +148,11 @@ const WIDEN_CAP: usize = 50;
 /// change to `?T`'s shape only has one array to update.
 const OPTION_FIELDS: [&str; 2] = ["valid", "data"];
 
-pub fn check(ast: &Ast, res: &Resolution) -> (Types, Vec<TypeError>) {
+pub fn check(ast: &Ast, res: &Resolution, fx: &crate::effects::Effects) -> (Types, Vec<TypeError>) {
     let mut checker = TypeChecker {
         ast,
         res,
+        fx,
         def_items: res.item_defs.iter().map(|(i, d)| (*d, *i)).collect(),
         state_tys: HashMap::new(),
         types: Types::default(),
@@ -180,6 +181,10 @@ pub fn check(ast: &Ast, res: &Resolution) -> (Types, Vec<TypeError>) {
 struct TypeChecker<'a> {
     ast: &'a Ast,
     res: &'a Resolution,
+    /// Computed effect signatures (`fails`, in particular) -- needed only
+    /// by `Stmt::IfLet`'s own "is this a failing call?" check, see `is_
+    /// failing_call` below; nothing else here reads it.
+    fx: &'a crate::effects::Effects,
     def_items: HashMap<DefId, ItemId>,
     /// Declared type of every reg/mem/fifo def.
     state_tys: HashMap<DefId, Ty>,
@@ -1087,12 +1092,30 @@ impl<'a> TypeChecker<'a> {
                         self.error(
                             self.expr_span(init),
                             "`if let`'s right-hand side must be an Option's own unwrap \
-                             (`opt?`, `opt : ?T`) (v0 restriction: a fifo op, failing \
-                             call, or comparison isn't supported here yet)"
+                             (`opt?`, `opt : ?T`) (a fifo op or failing call is fallible \
+                             by default -- drop the `?` -- and a bare comparison isn't \
+                             supported here yet, v0 restriction)"
                                 .to_string(),
                         );
                         Ty::Unknown
                     }
+                } else if self.is_fifo_deq(init) {
+                    // `if let x = fifo.Deq[] { ... }` -- bare, never
+                    // Guard-wrapped: `Deq[]` is fallible by default, same
+                    // as a comparison, no `?` needed (see DESIGN.md's
+                    // "`if let`: a fifo op's presence"). `type_expr`
+                    // already dispatches a `Deq[]` bracket through `type_
+                    // bracket`, which returns the fifo's own element type
+                    // -- reused as-is, nothing fifo-specific to redo here.
+                    self.type_expr(init, locals)
+                } else if self.is_failing_call(init) {
+                    // `if let x = Classify(a) { ... }` -- bare, same
+                    // reasoning as the fifo case: a failing call is
+                    // already fallible by default (`sig.fails`), no `?`
+                    // needed. `type_expr` already dispatches a `Call`
+                    // through `type_call`, which returns the callee's own
+                    // return type -- reused as-is.
+                    self.type_expr(init, locals)
                 } else {
                     self.type_expr(init, locals);
                     self.error(
@@ -2175,7 +2198,52 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Whether `id` is a call to a function whose computed effect
+    /// signature can fail -- the `Stmt::IfLet` sibling of `checks.rs`'s
+    /// identical `is_failing_call`/`call_target_fn` (that copy lives on
+    /// `Emitter`, which can't see `TypeChecker`, hence the duplicate
+    /// rather than a shared helper).
+    fn is_failing_call(&self, id: ExprId) -> bool {
+        let Expr::Call { callee, .. } = self.ast.expr(id) else {
+            return false;
+        };
+        let Some(def) = self.res.expr_defs.get(callee) else {
+            return false;
+        };
+        if !matches!(self.res.def(*def).kind, DefKind::Fn | DefKind::Impl) {
+            return false;
+        }
+        self.res
+            .item_defs
+            .iter()
+            .find(|(_, d)| *d == def)
+            .is_some_and(|(item, _)| self.fx.sigs.get(item).is_some_and(|s| s.fails))
+    }
+
     /// Brackets: memory read, bit/slice select, or fifo op.
+    /// Whether `id` is a bare `fifo.Deq[]` -- the exact shape `type_
+    /// bracket` recognizes as a fifo op, checked independently here
+    /// since `Stmt::IfLet`'s arm needs to know this BEFORE deciding
+    /// whether to call `type_expr` (which would otherwise just report
+    /// `elem`'s type with no way to tell "a real fifo op" apart from any
+    /// other `[N]`-typed expression). `Enq` is deliberately excluded --
+    /// there is no value to bind an if-let's name to.
+    fn is_fifo_deq(&self, id: ExprId) -> bool {
+        let Expr::Bracket { callee, .. } = self.ast.expr(id) else {
+            return false;
+        };
+        let Expr::Field { base, name } = self.ast.expr(*callee) else {
+            return false;
+        };
+        if name != "Deq" {
+            return false;
+        }
+        self.res
+            .expr_defs
+            .get(base)
+            .is_some_and(|def| matches!(self.state_tys.get(def), Some(Ty::Fifo { .. })))
+    }
+
     fn type_bracket(
         &mut self,
         id: ExprId,

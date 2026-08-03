@@ -374,7 +374,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
         };
     }
 
-    let (_fx, effect_errors) = effects::check(&ast, &res);
+    let (fx, effect_errors) = effects::check(&ast, &res);
     for err in &effect_errors {
         push(&err.span, &err.message);
     }
@@ -387,7 +387,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
         };
     }
 
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     for err in &type_errors {
         push(&err.span, &err.message);
     }

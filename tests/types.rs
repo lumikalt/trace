@@ -1,5 +1,5 @@
 use trace::types::{TypeError, Types, check};
-use trace::{ast::Ast, lexer, parser, resolve};
+use trace::{ast::Ast, effects, lexer, parser, resolve};
 
 fn run(src: &str) -> (Ast, Types, Vec<TypeError>) {
     let (tokens, lex_errors) = lexer::lex(src);
@@ -11,7 +11,15 @@ fn run(src: &str) -> (Ast, Types, Vec<TypeError>) {
         resolve_errors.is_empty(),
         "resolve errors: {resolve_errors:?}"
     );
-    let (types, errors) = check(&ast, &res);
+    // Not asserted empty here (unlike `emit_from_source`, tests/firrtl.rs):
+    // this helper is for TYPE-level tests specifically, several of which
+    // exercise a rule/fn shape that's type-valid but not necessarily
+    // effect-valid (e.g. a bare `while` with no `<sequences>`/`<elaborates>`
+    // tag) -- `fx` is only threaded through so `Stmt::IfLet`'s `is_failing_
+    // call` check has signatures to look at, not to gate this helper's own
+    // success on effect-checking passing too.
+    let (fx, _effect_errors) = effects::check(&ast, &res);
+    let (types, errors) = check(&ast, &res, &fx);
     (ast, types, errors)
 }
 
@@ -1824,9 +1832,15 @@ fn if_let_rhs_must_be_an_option_unwrap_not_another_fallible_shape() {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("Option's own unwrap"));
 
-    // A fifo op -- not itself `Expr::Guard`, so it hits the same message.
-    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [8] = 0\n \
-         rule r {\n if let x = f.Deq[] {\n v := x\n }\n }\n}\n");
+    // A bare comparison -- not itself `Expr::Guard`, so it hits the same
+    // message. Unlike a bare fifo `Deq[]`/failing call (see `if_let_
+    // accepts_a_bare_fifo_deq_as_its_rhs`/`if_let_accepts_a_bare_failing_
+    // call_as_its_rhs` below, both ACHIEVED v0 shapes), a bare comparison
+    // as `if let`'s rhs is still explicitly out of scope -- `check_cond`'s
+    // `allow_bare_comparison` exemption is `if`-only, never threaded
+    // through `if let`'s own arm.
+    let (_, _, errors) = run("module M {\n reg v : [8] = 0\n in a : [8]\n in b : [8]\n \
+         rule r {\n if let x = a > b {\n v := x\n }\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("Option's own unwrap"));
 
@@ -1836,6 +1850,48 @@ fn if_let_rhs_must_be_an_option_unwrap_not_another_fallible_shape() {
     // Guard` at all".
     let (_, _, errors) = run("module M {\n reg v : [8] = 0\n in a : [8]\n in b : [8]\n \
          rule r {\n if let x = (a > b)? {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+}
+
+/// `if let x = fifo.Deq[] { ... }` -- bare, no `?` (`Deq[]` is fallible
+/// by default, same as a comparison, unlike an Option which needs an
+/// explicit unwrap): type-checks clean, `x` bound to the fifo's own
+/// element type. `Enq` is deliberately excluded -- there's no value to
+/// bind a name to -- and still hits the ordinary "missing `?`" rejection
+/// like any other non-Option, non-Deq shape.
+#[test]
+fn if_let_accepts_a_bare_fifo_deq_as_its_rhs() {
+    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [8] = 0\n \
+         rule r {\n if let x = f.Deq[] {\n v := x\n } else {\n v := 0\n }\n }\n}\n");
+    assert_eq!(errors.len(), 0, "{errors:?}");
+
+    let (_, _, errors) = run("module M {\n fifo f : [8]\n \
+         rule r {\n if let x = f.Enq[5] {\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+}
+
+/// `if let x = Classify(a) { ... }` -- bare, no `?` (a failing call is
+/// fallible by default, same as `Deq[]`/a comparison): type-checks
+/// clean, `x` bound to the callee's own return type. Needed threading
+/// `fx` (computed effect signatures) into `TypeChecker`, which
+/// previously had no way to know a call's `fails` status at all -- only
+/// `resolve.rs`'s def kinds, which don't carry it.
+#[test]
+fn if_let_accepts_a_bare_failing_call_as_its_rhs() {
+    let (_, _, errors) = run(
+        "Classify(x : [8]) : [8] <combines, fails> {\n (x <> 0)?\n return x\n }\n\
+         module M {\n reg v : [8] = 0\n in a : [8]\n \
+         rule r {\n if let x = Classify(a) {\n v := x\n } else {\n v := 0\n }\n }\n}\n",
+    );
+    assert_eq!(errors.len(), 0, "{errors:?}");
+
+    // A call to a NON-failing fn is still rejected -- there's nothing to
+    // unwrap, and `is_failing_call` correctly says so.
+    let (_, _, errors) = run("Identity(x : [8]) : [8] <combines> {\n return x\n }\n\
+         module M {\n reg v : [8] = 0\n in a : [8]\n \
+         rule r {\n if let x = Identity(a) {\n v := x\n }\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("Option's own unwrap"));
 }

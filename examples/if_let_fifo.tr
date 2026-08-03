@@ -1,0 +1,31 @@
+-- `if let x = fifo.Deq[] { ... }`: a Deq used as a branch-scoped
+-- if-let's own condition -- bare, no `?` (`Deq[]` is fallible by
+-- default, same as a comparison, unlike an Option which needs an
+-- explicit unwrap). `consumer` fires every cycle regardless of whether
+-- the fifo has data (`if let` never gates the rule, same as the
+-- Option-presence case -- see examples/if_let.tr), but the dequeue
+-- itself is real and conditional: it only actually happens on a cycle
+-- where the fifo is non-empty. See DESIGN.md's "`if let`: a fifo op's
+-- presence".
+module FifoIfLet {
+    fifo f : [8]
+    in push : [1]
+    in push_val : [8]
+    out result : [8] = 0
+    out was_present : [1] = 0
+
+    rule producer {
+        push = 1
+        f.Enq[push_val]
+    }
+
+    rule consumer {
+        if let x = f.Deq[] {
+            result := x
+            was_present := 1
+        } else {
+            result := 0
+            was_present := 0
+        }
+    }
+}

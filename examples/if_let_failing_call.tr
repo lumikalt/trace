@@ -1,0 +1,28 @@
+-- `if let x = Classify(a) { ... }`: a failing call used as a
+-- branch-scoped if-let's own condition -- bare, no `?` (a failing call
+-- is fallible by default, same as a comparison/`Deq[]`, unlike an
+-- Option which needs an explicit unwrap). `compute` fires every cycle
+-- regardless of whether `Classify` succeeds (`if let` never gates the
+-- rule, same as every other `if let` shape), and `Classify` itself is
+-- only "really" called on the cycle its own guard actually holds. See
+-- DESIGN.md's "`if let`: a failing call's own presence".
+Classify(x : [8]) : [8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+
+module Top {
+    in a : [8]
+    out result : [8] = 0
+    out was_present : [1] = 0
+
+    rule compute {
+        if let x = Classify(a) {
+            result := x
+            was_present := 1
+        } else {
+            result := 0
+            was_present := 0
+        }
+    }
+}

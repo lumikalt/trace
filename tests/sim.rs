@@ -29,7 +29,7 @@ fn generate_firrtl(tr_src: &str) -> String {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (_ty, type_errors) = types::check(&ast, &res);
+    let (_ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
 
     let (elab_edits, elab_errors) = elaborate::plan(&ast, &res, &fx, tr_src);
@@ -53,7 +53,7 @@ fn generate_firrtl(tr_src: &str) -> String {
         effect_errors1.is_empty(),
         "{effect_errors1:?}\n{elaborated_src}"
     );
-    let (ty1, type_errors1) = types::check(&ast1, &res1);
+    let (ty1, type_errors1) = types::check(&ast1, &res1, &fx1);
     assert!(
         type_errors1.is_empty(),
         "{type_errors1:?}\n{elaborated_src}"
@@ -77,7 +77,7 @@ fn generate_firrtl(tr_src: &str) -> String {
         effect_errors2.is_empty(),
         "{effect_errors2:?}\n{lowered_src}"
     );
-    let (ty2, type_errors2) = types::check(&ast2, &res2);
+    let (ty2, type_errors2) = types::check(&ast2, &res2, &fx2);
     assert!(type_errors2.is_empty(), "{type_errors2:?}\n{lowered_src}");
     let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2);
     assert!(
@@ -515,7 +515,7 @@ fn extmodule_tribuf_runs_a_real_bidirectional_bus() {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
     let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
@@ -556,7 +556,7 @@ fn accumulator_runs_through_real_ports() {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
     let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
@@ -604,7 +604,7 @@ fn optional_rule_sugar_runs_through_real_reset_and_edges() {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
     let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
@@ -654,7 +654,7 @@ fn optional_chain_sugar_runs_through_a_genuinely_absent_intermediate_hop() {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
     let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
@@ -1714,6 +1714,109 @@ fn or_fifos_runs_through_real_ports() {
     );
 }
 
+/// Proves `if let x = fifo.Deq[] { ... }` end to end:
+/// `examples/if_let_fifo.tr`'s `consumer` rule fires every cycle
+/// (`if let` never gates the rule, same as its Option-presence sibling),
+/// but only actually dequeues on the one cycle `f` has data -- `result`/
+/// `was_present` show the pushed value exactly one cycle after the push,
+/// absent every other cycle. See sim/if_let_fifo_tb.v.
+#[test]
+fn if_let_fifo_deq_drives_a_real_dequeue_exactly_when_present() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_let_fifo.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_let_fifo_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of
+/// `if_let_fifo_deq_drives_a_real_dequeue_exactly_when_present`.
+#[test]
+fn if_let_fifo_deq_drives_a_real_dequeue_exactly_when_present_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_let_fifo.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_let_fifo_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// Proves `if let x = Classify(a) { ... }` end to end:
+/// `examples/if_let_failing_call.tr`'s `compute` rule fires every cycle
+/// (`if let` never gates the rule), and `result`/`was_present` track
+/// `Classify`'s own guard exactly across both an absent (`a = 0`) and
+/// present (`a` nonzero) input. See sim/if_let_failing_call_tb.v.
+#[test]
+fn if_let_failing_call_tracks_the_callees_own_guard() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_let_failing_call.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_let_failing_call_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of
+/// `if_let_failing_call_tracks_the_callees_own_guard`.
+#[test]
+fn if_let_failing_call_tracks_the_callees_own_guard_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_let_failing_call.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_let_failing_call_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves general structs end to end: `examples/struct_pair.tr`'s
 /// struct-typed reg `p` and struct-typed output `result` both flatten
 /// to per-field registers/ports, a struct literal write (`p :=
@@ -1922,7 +2025,7 @@ fn accumulator_runs_through_real_ports_under_verilator() {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
     let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
@@ -2000,7 +2103,7 @@ fn extmodule_tribuf_runs_a_real_bidirectional_bus_under_verilator() {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
     let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");

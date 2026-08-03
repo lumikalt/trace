@@ -1281,6 +1281,52 @@ Speculative, bigger, not committed to:
   unbuilt; see the four open questions below, still standing except
   where noted resolved for the comparison/Option cases specifically.
 
+  **UPDATE — the fifo-Deq slice of this harder half is now ACHIEVED,
+  as `if let` (not bare `if`).** `if let x = fifo.Deq[] { ... }` — bare,
+  never `?`-wrapped, `Deq` only (no `Enq`, no value to bind), a rule's
+  own top level only. Turned out to need almost no new machinery:
+  `checks.rs`'s fifo-op position checks already had `Stmt::IfLet`/
+  `WhileLet` exemptions in place (dead code until this landed), and the
+  emission side reuses the `or`-chain `select` mechanism verbatim
+  (`RuleFifoOp::select`, `compile_guard`'s existing "skip ops with
+  `select.is_some()`" fold, `module.rs`'s existing `.select`-branching
+  Deq emission). See DESIGN.md's new "`if let`: a fifo op's presence"
+  section for the full implementation write-up, `examples/
+  if_let_fifo.tr` + `sim/if_let_fifo_tb.v` for a real firtool+Icarus+
+  Verilator-proven example. A failing call as `if let`'s rhs is STILL
+  explicitly out of scope (`TypeChecker` has no `fx` access) — see that
+  same DESIGN.md section for why. Bare `if` (not `if let`) with a fifo
+  op/failing call as its OWN condition — the ORIGINAL literal ask this
+  whole sub-item names — remains unbuilt; the four open questions below
+  were written against that shape specifically and stay open for it,
+  though `if let`'s new fifo-Deq answers may now inform them (in
+  particular, the dequeue-enable question below turned out to be
+  exactly `select`, not a new mechanism).
+
+  **UPDATE 2 — the failing-call slice is now ACHIEVED too, closing the
+  "STILL explicitly out of scope" gap the previous update named.**
+  `if let x = Classify(a) { ... }` — bare, never `?`-wrapped, same
+  reasoning as `Deq[]`. Needed `TypeChecker` to gain `fx` access
+  (`types::check`'s signature grew a third `&Effects` parameter,
+  threaded through every call site) plus two small, deliberately
+  narrow `checks.rs` changes (a `contains_failing_call` init-exemption
+  mirroring the fifo case's pre-existing one, and a NEW `allow_if_let`
+  parameter kept separate from `allow_let` so `check_writing_call_
+  positions_in` doesn't also loosen). A writing-and-failing callee used
+  as `if let`'s init is still cleanly rejected — by that same untouched
+  write-position check, not new logic. Self-caught a real sign bug
+  while verifying against real FIRRTL (not just adding code and
+  trusting it): `calls.rs`'s `callee_fail_cond`, despite its name,
+  already returns the callee's SUCCESS condition, not its fail
+  condition — an early version wrapped it in `not(...)`, silently
+  inverting the mux, caught by reading the actual emitted `mux(...)`
+  text before writing any test. See DESIGN.md's new "`if let`: a
+  failing call's own presence" section, `examples/if_let_failing_call.tr`
+  + `sim/if_let_failing_call_tb.v` for a real firtool+Icarus+Verilator-
+  proven example. Bare `if` (not `if let`) with a fifo op/failing call
+  as its OWN condition remains the one piece of the original ask still
+  unbuilt — see the four open questions below, unchanged by this update.
+
 - **`while`: multi-cycle loops ACHIEVED — found to be a bigger
   prerequisite gap than asked for, then built as its own unit.** Lumi
   asked for `while let` (the loop-shaped sibling of `if let`, "scoped

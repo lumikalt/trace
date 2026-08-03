@@ -15,7 +15,7 @@ fn emit_from_source(src: &str) -> Result<String, Vec<EmitError>> {
     );
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "effect errors: {effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
 
     let (lowered, lower_errors) = lower::plan(&ast, &res, &fx, &ty);
@@ -50,7 +50,7 @@ fn emit_from_source(src: &str) -> Result<String, Vec<EmitError>> {
         effect_errors2.is_empty(),
         "{effect_errors2:?}\n{lowered_src}"
     );
-    let (ty2, type_errors2) = types::check(&ast2, &res2);
+    let (ty2, type_errors2) = types::check(&ast2, &res2, &fx2);
     assert!(type_errors2.is_empty(), "{type_errors2:?}\n{lowered_src}");
     let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2);
     assert!(
@@ -6022,7 +6022,8 @@ module M {
     let (tokens, _) = lexer::lex(src);
     let (ast, _) = parser::parse(src, &tokens);
     let (res, _) = resolve::resolve(&ast);
-    let (_, type_errors) = types::check(&ast, &res);
+    let (fx, _) = effects::check(&ast, &res);
+    let (_, type_errors) = types::check(&ast, &res, &fx);
     assert_eq!(type_errors.len(), 1);
     assert!(type_errors[0].message.contains("condition must be [1]"));
 }
@@ -6210,6 +6211,109 @@ module M {
     assert!(fir.contains("connect v, mux(opt_valid, opt_data, v)"));
     assert!(fir.contains("connect w, tail(add(w, UInt<8>(1)), 1)"));
     run_firtool(&fir, &[]);
+}
+
+/// `if let x = fifo.Deq[] { ... }` -- a Deq used as a branch-scoped
+/// if-let's own init, bare (no `?`: `Deq[]` is fallible by default, same
+/// as a comparison). Never gates the rule (`fires_r = UInt<1>(1)`,
+/// identical to the Option case above), but the dequeue itself is real
+/// and conditional: `when fires_r: when <occupancy>: connect valid, 0`,
+/// reusing the exact `select` mechanism `or`-chain alternatives already
+/// use for a conditional fifo state transition.
+#[test]
+fn if_let_with_a_fifo_deq_gates_the_dequeue_but_not_the_rule() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg v : [8] = 0
+    rule r {
+        if let x = f.Deq[] {
+            v := x
+        } else {
+            v := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("when __fifo_f_valid :\n        connect __fifo_f_valid, UInt<1>(0)"));
+    assert!(fir.contains("connect v, mux(__fifo_f_valid, __fifo_f_data, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// `if let x = Classify(a) { ... }` -- a failing call used as a
+/// branch-scoped if-let's own init, bare (no `?`: a failing call is
+/// fallible by default, same as a comparison/`Deq[]`). Never gates the
+/// rule (`fires_r = UInt<1>(1)`, same as every other `if let` shape),
+/// and the mux-select is the callee's own guard condition AS-IS, not
+/// negated -- `callee_fail_cond` (calls.rs), despite its name, already
+/// returns the callee's SUCCESS condition (self-caught: an earlier
+/// version of this wrapped it in `not(...)`, inverting the mux and
+/// caught by running this exact FIRRTL, not just reasoning about it).
+#[test]
+fn if_let_with_a_failing_call_gates_the_call_but_not_the_rule() {
+    let src = "\
+Classify(x : [8]) : [8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    rule r {
+        if let x = Classify(a) {
+            v := x
+        } else {
+            v := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(neq(a, UInt<8>(0)), a, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A writing-and-failing callee used as `if let`'s init hits the
+/// PRE-EXISTING, untouched "a call to a function that writes state may
+/// only appear as a whole statement, or as the entire right-hand side of
+/// `:=`" restriction (`check_writing_call_positions_in`) -- confirmed
+/// deliberately, not assumed: `calls_outside_allowed_positions`'s new
+/// `allow_if_let` parameter is threaded ONLY through `check_failing_
+/// call_positions`'s own call site, not this sibling check's, so a
+/// callee that both fails AND writes can't slip an ungated write through
+/// this feature's new position exemption.
+#[test]
+fn if_let_with_a_writing_and_failing_call_still_hits_the_write_position_restriction() {
+    let src = "\
+module M {
+    reg other : [8] = 0
+    in a : [8]
+    out result : [8] = 0
+
+    Classify(x : [8]) : [8] <combines, fails> {
+        (x <> 0)?
+        other := x
+        return x
+    }
+
+    rule r {
+        if let x = Classify(a) {
+            result := x
+        } else {
+            result := 0
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("writes state") && e.message.contains("whole statement")),
+        "expected the write-position rejection, got: {err:?}"
+    );
 }
 
 /// `x`'s scope is deliberately narrow (Lumi's call, `AskUserQuestion`:

@@ -961,8 +961,21 @@ impl<'a> Emitter<'a> {
                 then_body,
                 else_body: Some(else_body),
             } => {
-                let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                    unreachable!("types.rs requires an `if let` init to be `opt?`")
+                // See writes.rs's identical match for why this isn't a
+                // plain `let Expr::Guard(opt) = ... else { unreachable!()
+                // }` anymore: a bare `fifo.Deq[]`/failing-call if-let init
+                // is never Guard-wrapped.
+                let opt = match self.ast.expr(init).clone() {
+                    Expr::Guard(inner) => inner,
+                    _ if self.fifo_op(init).is_some()
+                        || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                    {
+                        init
+                    }
+                    _ => unreachable!(
+                        "types.rs requires an `if let` init to be `opt?`, a fifo `Deq[]`, \
+                         or a failing call"
+                    ),
                 };
                 let def = def_of_name(self.res, &name);
                 let prev = self.if_let_binds.insert(def, opt);
@@ -1130,8 +1143,21 @@ impl<'a> Emitter<'a> {
                 then_body,
                 else_body: Some(else_body),
             } => {
-                let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                    unreachable!("types.rs requires an `if let` init to be `opt?`")
+                // See writes.rs's identical match for why this isn't a
+                // plain `let Expr::Guard(opt) = ... else { unreachable!()
+                // }` anymore: a bare `fifo.Deq[]`/failing-call if-let init
+                // is never Guard-wrapped.
+                let opt = match self.ast.expr(init).clone() {
+                    Expr::Guard(inner) => inner,
+                    _ if self.fifo_op(init).is_some()
+                        || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                    {
+                        init
+                    }
+                    _ => unreachable!(
+                        "types.rs requires an `if let` init to be `opt?`, a fifo `Deq[]`, \
+                         or a failing call"
+                    ),
                 };
                 let def = def_of_name(self.res, &name);
                 let prev = self.if_let_binds.insert(def, opt);

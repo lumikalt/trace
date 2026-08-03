@@ -104,7 +104,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     for err in &type_errors {
         report(&path, &src, err.span.clone(), &err.message);
     }

@@ -93,7 +93,24 @@ impl<'a> Emitter<'a> {
                         // this check doesn't matter for correctness, but
                         // checking here first avoids a wasted snapshot
                         // lookup for every if-let-bound reference.
+                        //
+                        // `if let x = fifo.Deq[] { ... }` / `if let x =
+                        // Classify(a) { ... }`'s own `x`: the bound expr
+                        // is the bare Deq/call itself, not Option-wrapped
+                        // -- `compile_expr_hinted`'s own top-of-function
+                        // fifo-op check (above) and its generic `Expr::
+                        // Call` dispatch (below, to `compile_call`) both
+                        // already compile either shape to its own value
+                        // generically, the same path an ordinary top-
+                        // level `x := f.Deq[]`/`x := Classify(a)` goes
+                        // through, so recursing into it here is enough,
+                        // no `.data` chase needed.
                         if let Some(opt) = self.if_let_binds.get(&def).copied() {
+                            if self.fifo_op(opt).is_some()
+                                || matches!(self.ast.expr(opt), Expr::Call { .. })
+                            {
+                                return self.compile_expr_hinted(opt, hint);
+                            }
                             let (root, mut path) = self.struct_field_path(opt);
                             path.push("data".to_string());
                             return self.compile_struct_field_read(id, root, &path, hint);

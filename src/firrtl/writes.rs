@@ -320,6 +320,28 @@ impl<'a> Emitter<'a> {
             path.push("valid".to_string());
             self.compile_struct_field_read(inner, root, &path, Some(1))
                 .unwrap_or_else(|_| "UInt<1>(1)".to_string())
+        } else if let Some((fifo, depth, false, _)) = self.fifo_op(inner) {
+            // `if let x = fifo.Deq[] { ... }`'s own presence check: the
+            // fifo's ordinary occupancy test, the same condition an
+            // unconditional top-level `Deq[]` folds into its rule's guard
+            // — here it's the mux-select between `then`/`else` instead.
+            fifo_guard_cond(&fifo, false, depth)
+        } else if let Expr::Call { callee, args } = self.ast.expr(inner).clone() {
+            // `if let x = Classify(a) { ... }`'s own presence check:
+            // `callee_fail_cond` (calls.rs), despite its name, already
+            // returns the callee's own SUCCESS condition (its body's
+            // guard(s) holding) — the same sign every other `compile_
+            // guard` fold term uses (an ordinary top-level failing call
+            // ANDs this directly into the rule's guard, not its negation)
+            // — so it's used here AS-IS, not negated, as the `then`-taken
+            // test. `None` means either not actually a failing call
+            // (can't reach here — types.rs's `is_failing_call` already
+            // required this) or a callee whose body compiled to no guard
+            // terms at all; `callee_fail_cond` itself already
+            // re-validates via `validate_call` (`check_fails_is_foldable_
+            // guard` included), so there's nothing further to check here.
+            self.callee_fail_cond(inner, callee, &args)
+                .unwrap_or_else(|| "UInt<1>(1)".to_string())
         } else if let Expr::Binary { op, lhs, rhs } = self.ast.expr(inner).clone()
             && op.is_comparison()
         {
@@ -698,8 +720,23 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    // `opt`: an Option's own unwrap (`opt?`), or -- both
+                    // bare, never Guard-wrapped, since both are fallible
+                    // by default like a comparison, no `?` needed -- a
+                    // fifo `Deq[]` (DESIGN.md's "`if let`: a fifo op's
+                    // presence") or a failing call (DESIGN.md's "`if
+                    // let`: a failing call's own presence").
+                    let opt = match self.ast.expr(init).clone() {
+                        Expr::Guard(inner) => inner,
+                        _ if self.fifo_op(init).is_some()
+                            || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                        {
+                            init
+                        }
+                        _ => unreachable!(
+                            "types.rs requires an `if let` init to be `opt?`, a fifo \
+                             `Deq[]`, or a failing call"
+                        ),
                     };
                     let def = def_of_name(self.res, &name);
                     self.if_let_binds.insert(def, opt);
@@ -818,8 +855,23 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    // `opt`: an Option's own unwrap (`opt?`), or -- both
+                    // bare, never Guard-wrapped, since both are fallible
+                    // by default like a comparison, no `?` needed -- a
+                    // fifo `Deq[]` (DESIGN.md's "`if let`: a fifo op's
+                    // presence") or a failing call (DESIGN.md's "`if
+                    // let`: a failing call's own presence").
+                    let opt = match self.ast.expr(init).clone() {
+                        Expr::Guard(inner) => inner,
+                        _ if self.fifo_op(init).is_some()
+                            || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                        {
+                            init
+                        }
+                        _ => unreachable!(
+                            "types.rs requires an `if let` init to be `opt?`, a fifo \
+                             `Deq[]`, or a failing call"
+                        ),
                     };
                     let def = def_of_name(self.res, &name);
                     self.if_let_binds.insert(def, opt);
@@ -1119,8 +1171,23 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    // `opt`: an Option's own unwrap (`opt?`), or -- both
+                    // bare, never Guard-wrapped, since both are fallible
+                    // by default like a comparison, no `?` needed -- a
+                    // fifo `Deq[]` (DESIGN.md's "`if let`: a fifo op's
+                    // presence") or a failing call (DESIGN.md's "`if
+                    // let`: a failing call's own presence").
+                    let opt = match self.ast.expr(init).clone() {
+                        Expr::Guard(inner) => inner,
+                        _ if self.fifo_op(init).is_some()
+                            || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                        {
+                            init
+                        }
+                        _ => unreachable!(
+                            "types.rs requires an `if let` init to be `opt?`, a fifo \
+                             `Deq[]`, or a failing call"
+                        ),
                     };
                     let def = def_of_name(self.res, &name);
                     self.if_let_binds.insert(def, opt);
@@ -1321,8 +1388,23 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    // `opt`: an Option's own unwrap (`opt?`), or -- both
+                    // bare, never Guard-wrapped, since both are fallible
+                    // by default like a comparison, no `?` needed -- a
+                    // fifo `Deq[]` (DESIGN.md's "`if let`: a fifo op's
+                    // presence") or a failing call (DESIGN.md's "`if
+                    // let`: a failing call's own presence").
+                    let opt = match self.ast.expr(init).clone() {
+                        Expr::Guard(inner) => inner,
+                        _ if self.fifo_op(init).is_some()
+                            || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                        {
+                            init
+                        }
+                        _ => unreachable!(
+                            "types.rs requires an `if let` init to be `opt?`, a fifo \
+                             `Deq[]`, or a failing call"
+                        ),
                     };
                     let def = def_of_name(self.res, &name);
                     // Save/restore (not a plain insert-then-remove, unlike
@@ -1438,8 +1520,23 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    // `opt`: an Option's own unwrap (`opt?`), or -- both
+                    // bare, never Guard-wrapped, since both are fallible
+                    // by default like a comparison, no `?` needed -- a
+                    // fifo `Deq[]` (DESIGN.md's "`if let`: a fifo op's
+                    // presence") or a failing call (DESIGN.md's "`if
+                    // let`: a failing call's own presence").
+                    let opt = match self.ast.expr(init).clone() {
+                        Expr::Guard(inner) => inner,
+                        _ if self.fifo_op(init).is_some()
+                            || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                        {
+                            init
+                        }
+                        _ => unreachable!(
+                            "types.rs requires an `if let` init to be `opt?`, a fifo \
+                             `Deq[]`, or a failing call"
+                        ),
                     };
                     let def = def_of_name(self.res, &name);
                     self.if_let_binds.insert(def, opt);
@@ -1619,8 +1716,23 @@ impl<'a> Emitter<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let Expr::Guard(opt) = self.ast.expr(init).clone() else {
-                        unreachable!("types.rs requires an `if let` init to be `opt?`")
+                    // `opt`: an Option's own unwrap (`opt?`), or -- both
+                    // bare, never Guard-wrapped, since both are fallible
+                    // by default like a comparison, no `?` needed -- a
+                    // fifo `Deq[]` (DESIGN.md's "`if let`: a fifo op's
+                    // presence") or a failing call (DESIGN.md's "`if
+                    // let`: a failing call's own presence").
+                    let opt = match self.ast.expr(init).clone() {
+                        Expr::Guard(inner) => inner,
+                        _ if self.fifo_op(init).is_some()
+                            || matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                        {
+                            init
+                        }
+                        _ => unreachable!(
+                            "types.rs requires an `if let` init to be `opt?`, a fifo \
+                             `Deq[]`, or a failing call"
+                        ),
                     };
                     let def = def_of_name(self.res, &name);
                     let prev = self.if_let_binds.insert(def, opt);

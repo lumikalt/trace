@@ -25,7 +25,7 @@ fn run(src: &str) -> Checked {
     );
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "effect errors: {effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
     let (lowered, errors) = plan(&ast, &res, &fx, &ty);
     Checked {
@@ -54,7 +54,7 @@ fn assert_round_trips(src: &str) -> String {
         effect_errors.is_empty(),
         "effect errors in lowered output: {effect_errors:?}\n---\n{src}"
     );
-    let (_ty, type_errors) = types::check(&ast, &res);
+    let (_ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(
         type_errors.is_empty(),
         "type errors in lowered output: {type_errors:?}\n---\n{src}"
