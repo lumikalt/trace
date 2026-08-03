@@ -584,6 +584,39 @@ fn shift_amounts_at_or_past_the_operand_width_are_an_error() {
     );
 }
 
+/// `.!` (ast.rs's `lossy` set, populated by the parser right where it's
+/// written — see tests/parser.rs) is an explicit, per-operator-
+/// application opt-out of `check_literal_fits`/`check_shift_amount`
+/// specifically — the two checks `shift_amounts_at_or_past_the_operand_
+/// width_are_an_error` and `literals_must_fit` above cover. Every case
+/// that errored there must accept its own `.!`-marked twin here.
+#[test]
+fn lossy_suffix_suppresses_the_literal_fits_and_shift_amount_checks() {
+    // Ordinary arithmetic (`literals_must_fit`'s bug class).
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a +.! 100000000\n }\n}\n");
+    // The literal on the LEFT instead of the right — the OTHER absorption arm.
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := 300 +.! a\n }\n}\n");
+    // A comparison against an out-of-range literal.
+    run_ok(
+        "module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n \
+         if a =.! 300 {\n b := 1\n }\n }\n}\n",
+    );
+    // A shift amount `>= w` (`shift_amounts_at_or_past_the_operand_
+    // width_are_an_error`'s bug class) — bare literal, sized literal,
+    // and a non-Shr shift op, each suppressed the same way.
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >>.! 300\n }\n}\n");
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >>.! 8'd8\n }\n}\n");
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a <<.! 8\n }\n}\n");
+
+    // `.!` marks THAT operator application specifically — an UNMARKED
+    // sibling elsewhere in the same statement still errors normally, so
+    // this isn't a blanket per-statement or per-rule suppression.
+    let (_, _, errors) = run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n \
+         b := (a >>.! 300) + (a >> 300)\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("shift by 300"));
+}
+
 #[test]
 fn sized_literals_type_directly_and_check_their_own_width() {
     // Unlike a bare literal, `4'd20` has a definite width of its own —

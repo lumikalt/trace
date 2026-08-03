@@ -564,11 +564,38 @@ impl<'a> Emitter<'a> {
     /// `trunc(value, width)`: the low `width` bits of `value` — exactly
     /// `bits(value, width-1, 0)`, the same FIRRTL `bits` primop
     /// `compile_bit_select` already uses for `x[hi..lo]`, just reached
-    /// through a different spelling. `width` must be const-evaluable
-    /// (types.rs's own restriction, `type_builtin_call`'s `"trunc"` arm:
-    /// a non-const width types as `Bits(Width::Unknown)`, which
-    /// `width_of` rejects with its own explicit error) — no separate
-    /// check needed here.
+    /// through a different spelling. `width` itself is never read HERE —
+    /// it only ever fed into `type_builtin_call`'s `"trunc"` arm, which
+    /// already baked it into `id`'s own `Ty::Bits(Width::Known(_))` (this
+    /// function's `width_of(id)` fallback reads it back out from there).
+    ///
+    /// `trunc(value)`, one argument: same emission, but `width_of(id)`
+    /// can't help — types.rs typed it `Bits(Width::Unknown)` (see that
+    /// arm's own doc comment: bottom-up type-checking has no target width
+    /// to infer FROM at that point). `hint` is where it actually comes
+    /// from instead: this function's own top-down "what width does this
+    /// expression's result need to be" parameter, already threaded down
+    /// from every write target/return type/etc. through `compile_expr_
+    /// hinted`'s recursion — the same mechanism that lets `hint.unwrap_
+    /// or_else(|| self.width_of(id))` already prefer a caller-supplied
+    /// hint over `width_of` even for the explicit two-argument form
+    /// above. This reaches further than a direct `x := trunc(a)` might
+    /// suggest: a `let`-bound local whose own width never pins down to a
+    /// concrete `bits[w]` (`trunc(a)`'s `Unknown` is exactly that shape)
+    /// is compiled LAZILY at its read site instead of eagerly at its
+    /// binding (`writes.rs`'s `enter_rule`/`local_hint`), so `let x =
+    /// trunc(a) ... b := x` still resolves correctly — the hint comes
+    /// from `x`'s read site (`b`'s own width), not its binding.
+    ///
+    /// Where a hint genuinely never reaches this call — nested inside an
+    /// arithmetic operator's operand, say (`compile_binop` computes its
+    /// OWN hint from `types.expr_tys`, not from an outer parameter, so a
+    /// width-less operand there gets none) — `width_of(id)`'s generic
+    /// "no concrete width for this expression" is a correct but unhelpful
+    /// diagnosis: it doesn't say WHAT to do. A one-argument `trunc`
+    /// specifically CAN always be fixed the same way (spell the width
+    /// out), so that's checked and reported here instead, before ever
+    /// reaching `width_of`'s generic fallback.
     fn compile_trunc(
         &mut self,
         id: ExprId,
@@ -576,15 +603,21 @@ impl<'a> Emitter<'a> {
         hint: Option<u64>,
     ) -> Result<String, ()> {
         let span = self.ast.expr_spans[id.0 as usize].clone();
-        let [value, _width] = args else {
+        if !matches!(args.len(), 1 | 2) {
+            self.error(span, "`trunc` takes (value) or (value, width)".to_string());
+            return Err(());
+        }
+        if args.len() == 1 && hint.is_none() {
             self.error(
                 span,
-                "`trunc` takes exactly two arguments: (value, width)".to_string(),
+                "cannot infer `trunc`'s width here; use `trunc(value, width)` with an \
+                 explicit width instead"
+                    .to_string(),
             );
             return Err(());
-        };
+        }
         let w = hint.unwrap_or_else(|| self.width_of(id));
-        let value_str = self.compile_expr(*value)?;
+        let value_str = self.compile_expr(args[0])?;
         Ok(format!("bits({value_str}, {}, 0)", w.saturating_sub(1)))
     }
 

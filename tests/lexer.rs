@@ -133,6 +133,19 @@ fn indexed_part_select_operators_beat_a_bare_plus_or_minus() {
 }
 
 #[test]
+fn lossy_suffix_beats_a_bare_dot_or_range() {
+    // `.!` (the "I know, let it through" operator suffix) is its own
+    // two-character token, same longest-match-wins mechanism `<>`/`>>>`
+    // already rely on to beat `<`/`>>`.
+    assert_eq!(kinds("a >>.! b"), vec![Ident, Shr, Lossy, Ident]);
+    // A bare `.` (field access) and `..` (range) are unaffected — `.!`
+    // only fires when `!` immediately follows the dot, which neither of
+    // those ever has adjacent to them.
+    assert_eq!(kinds("a.b"), vec![Ident, Dot, Ident]);
+    assert_eq!(kinds("a..b"), vec![Ident, DotDot, Ident]);
+}
+
+#[test]
 fn bad_bytes_merge_into_one_error() {
     let (tokens, errors) = lex("a @@ b");
     assert_eq!(

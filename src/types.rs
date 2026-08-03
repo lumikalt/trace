@@ -2072,6 +2072,12 @@ impl<'a> TypeChecker<'a> {
         // what a comparison yields.
         let is_comparison = op.is_comparison();
         let l_ty = l.clone();
+        // `a >>.! 300` (ast.rs's `lossy` set, populated by the parser
+        // right where `.!` is written) — an explicit, per-application
+        // opt-out of exactly the two checks below, `check_literal_fits`/
+        // `check_shift_amount`. Computed once here rather than re-
+        // queried per arm.
+        let lossy = self.ast.lossy.contains(&at);
         match (l, r) {
             (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
             (Ty::Int, Ty::Int) => {
@@ -2098,15 +2104,17 @@ impl<'a> TypeChecker<'a> {
                 // fits` (a "does this VALUE fit" check) doesn't apply.
                 // `check_shift_amount` (a differently-shaped "is this
                 // COUNT too large" check) does.
-                if matches!(op, Shl | Shr | AShr) {
-                    self.check_shift_amount(rhs, &Ty::Bits(w));
-                } else {
-                    self.check_literal_fits(rhs, &Ty::Bits(w));
+                if !lossy {
+                    if matches!(op, Shl | Shr | AShr) {
+                        self.check_shift_amount(rhs, &Ty::Bits(w));
+                    } else {
+                        self.check_literal_fits(rhs, &Ty::Bits(w));
+                    }
                 }
                 if is_comparison { l_ty } else { Ty::Bits(w) }
             }
             (Ty::Int, Ty::Bits(w)) => {
-                if !matches!(op, Shl | Shr | AShr) {
+                if !lossy && !matches!(op, Shl | Shr | AShr) {
                     self.check_literal_fits(lhs, &Ty::Bits(w));
                 }
                 if is_comparison { l_ty } else { Ty::Bits(w) }
@@ -2130,7 +2138,9 @@ impl<'a> TypeChecker<'a> {
                             // `const_eval` finds the same way regardless
                             // of which `Ty` the amount's own expression
                             // happens to carry.
-                            self.check_shift_amount(rhs, &Ty::Bits(a));
+                            if !lossy {
+                                self.check_shift_amount(rhs, &Ty::Bits(a));
+                            }
                             Ty::Bits(a)
                         }
                         _ => Ty::Bits(match (a, b) {
@@ -2442,19 +2452,42 @@ impl<'a> TypeChecker<'a> {
     fn type_builtin_call(&mut self, id: ExprId, name: &str, args: &[ExprId], arg_tys: &[Ty]) -> Ty {
         match name {
             "clog2" | "len" => Ty::Int,
-            "trunc" => {
-                if args.len() != 2 {
-                    self.error(
-                        self.expr_span(id),
-                        "`trunc` takes (value, width)".to_string(),
-                    );
-                    return Ty::Unknown;
-                }
-                match self.const_eval(args[1], &HashMap::new()) {
+            // `trunc(value, width)`: the ordinary explicit form, typed
+            // directly from the const-evaluated `width` argument, same
+            // as always.
+            //
+            // `trunc(value)`, ONE argument: width INFERRED from wherever
+            // this call's own result is used, not spelled out here. Bottom-
+            // up type-checking (this whole pass) has no way to know that
+            // yet — `Ty::Bits(Width::Unknown)` is the honest answer at
+            // this point, not a placeholder to fill in later. Two existing
+            // mechanisms pick up from there without any new machinery:
+            // `check_assignable`/`check_literal_fits` only ever compare
+            // `Width::Known` widths, so `Unknown` here already means
+            // "don't flag a mismatch, not enough information" everywhere
+            // they're called — a real width IS still enforced, just later
+            // and elsewhere: FIRRTL emission's `compile_trunc`
+            // (src/firrtl/calls.rs) resolves the width from `hint`, its
+            // OWN top-down "what does this expression's result need to be"
+            // parameter, threaded through the emitter from every write
+            // target/return type/etc. already — the concrete counterpart
+            // to this type-checking pass's own top-down blind spot. No
+            // hint reaching that call site is `compile_trunc`'s own clean,
+            // separate error, not this function's.
+            "trunc" => match args.len() {
+                1 => Ty::Bits(Width::Unknown),
+                2 => match self.const_eval(args[1], &HashMap::new()) {
                     Some(w) => Ty::Bits(Width::Known(w)),
                     None => Ty::Bits(Width::Unknown),
+                },
+                _ => {
+                    self.error(
+                        self.expr_span(id),
+                        "`trunc` takes (value) or (value, width)".to_string(),
+                    );
+                    Ty::Unknown
                 }
-            }
+            },
             "pack" => {
                 let mut total = 0u64;
                 for t in arg_tys {

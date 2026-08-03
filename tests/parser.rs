@@ -1063,3 +1063,43 @@ fn struct_update_spread_must_be_last_and_a_plain_reference() {
         "expected a trailing-spread-position rejection, got: {errors:?}"
     );
 }
+
+/// `a >>.! b`'s own AST shape is IDENTICAL to plain `a >> b` — `.!`
+/// changes nothing about the `Expr::Binary` node itself, only whether
+/// its id lands in `ast.lossy` (see ast.rs's own doc comment on that
+/// field: a side list, not a new shape, matching `destructures`' own
+/// rationale). Same "no new Expr variant" idiom, checked directly here
+/// rather than through `stmt_sexpr` (which only returns the s-expr
+/// string, throwing away the `Ast` `.lossy` itself lives on).
+#[test]
+fn lossy_operator_suffix_marks_the_binary_exprs_own_id_not_a_new_shape() {
+    let ast = parse_ok("rule t {\n x := a >>.! b\n}\n");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::Assign { rhs, .. } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*rhs), "(>> a b)");
+    assert_eq!(ast.lossy.len(), 1, "expected exactly one marked expr");
+    assert!(ast.lossy.contains(rhs));
+
+    // The SAME shape, no `.!`, marks nothing.
+    let ast = parse_ok("rule t {\n x := a >> b\n}\n");
+    assert!(ast.lossy.is_empty());
+}
+
+/// The marker isn't shift-specific — it parses after every binary
+/// operator the Pratt loop's `infix_bp` table knows about, `+` included.
+#[test]
+fn lossy_operator_suffix_works_on_every_binary_operator_not_just_shifts() {
+    let ast = parse_ok("rule t {\n x := a +.! b\n}\n");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::Assign { rhs, .. } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*rhs), "(+ a b)");
+    assert!(ast.lossy.contains(rhs));
+}

@@ -861,8 +861,12 @@ bitwise operators far too heavily for function-call spelling to be a real
 improvement.
 
 Writing a wider value into a narrower target is always an error, naming
-`trunc(value, width)` as the fix. There is no silent truncation anywhere in the
-language.
+`trunc(value, width)` as the fix (`trunc(value)`, width inferred from the
+write target, also works — see "Inference: two solvers" below). There is no
+silent truncation anywhere in the language. Separately, an oversized-literal
+or total-discard-shift diagnostic on one specific operator application (not
+a write target) can be silenced with a `.!` suffix on that operator, e.g.
+`x >>.! 300` — see the same section for the distinction between the two.
 
 Bit-select and slice: `x[i]` selects one bit; `x[hi..lo]` selects an inclusive
 range, both ends given, descending. Both bounds may be compile-time constants; a
@@ -1836,7 +1840,21 @@ Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
 - **`prio(reqs)`** is a fixed-priority encoder. The lowest set bit wins (bit 0 is
   highest priority); `reqs = 0` returns `0`, a defined but not meaningful value
   — gating on `reqs <> 0` is the caller's job.
-- **`trunc(value, width)`** truncates to the low `width` bits.
+- **`trunc(value, width)`** truncates to the low `width` bits. The 1-argument
+  form, `trunc(value)`, infers `width` from context instead of naming it:
+  types.rs types it `Bits(Width::Unknown)` (bottom-up inference has no
+  target-width visibility at the call site), and FIRRTL emission resolves the
+  real width top-down from the existing `hint` mechanism that already threads
+  a write target's width through `compile_expr_hinted` — the same channel a
+  2-argument `trunc` never needed. This also resolves through a `let`-bound
+  local: `writes.rs`'s `enter_rule` normally compiles a local's RHS eagerly at
+  bind time, but falls back to lazy, read-site-hinted compilation whenever the
+  local's own type doesn't resolve to a concrete `Bits(Width::Known(_))` —
+  exactly what `Width::Unknown` produces — so `let x = trunc(a) ... b := x`
+  picks up `b`'s width for `x` at its read site. A 1-argument `trunc` with no
+  reachable hint (nested in an arithmetic operand rather than a write target
+  or a hinted local) is a compile error naming `trunc(value, width)` as the
+  fix — a known, deliberate boundary, not a gap to close later.
 - **`pack(a, b, ...)`** concatenates its arguments, most significant first: the
   first argument becomes the high bits, matching FIRRTL's `cat`, Chisel's `Cat`,
   and Verilog's `{a, b}` concatenation. The result width is the sum of the
@@ -2048,6 +2066,22 @@ loss, not a statically-knowable total discard, and catching it structurally
 would mean growing `<<`'s result width instead of keeping it at the left
 operand's own (the way `*` already grows to `a + b`), a bigger design change
 than a diagnostic addition.
+
+Both of those checks (the literal-fits range check and the shift-amount
+total-discard check) are per-operator-application, not per-value, so a
+single suffix on the operator itself can silence exactly one and leave every
+other use of the same values alone: `.!` after any binary operator (`a
++.! 100000000`, `x >>.! 300`) marks that one `Expr::Binary` node as an
+explicit "I know, let it through," recorded in a side table
+(`Ast.lossy: HashSet<ExprId>`, same shape as `destructures`) rather than a
+new AST node — `type_binop` checks `self.ast.lossy.contains(&at)` and skips
+`check_literal_fits`/`check_shift_amount` for that one application while an
+unmarked sibling expression using the same operands still errors normally.
+`.!` is scoped narrowly: it silences the two absorption/shift-amount
+sanity checks above, not `check_assignable`'s "would silently truncate"
+check on a write target — `x := a +.! b` where `a + b` is wider than `x`
+still wants `trunc` (either form) to narrow it, `.!` alone does not make
+that assignment legal.
 
 A local reassigned within a rule is re-typed to a fixed point across its whole
 body: its tracked width reflects the widest binding across every reassignment,

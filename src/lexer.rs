@@ -181,6 +181,16 @@ pub enum TokenKind {
     DotDot,
     #[token(".")]
     Dot,
+    /// A binary operator's explicit "I know, let it through" suffix
+    /// (`a >>.! 300`, `x +.! y`) — silences exactly the width-safety
+    /// checks that operator's own operands would otherwise get
+    /// (`check_literal_fits`/`check_shift_amount`, types.rs), never a
+    /// separate operator in its own right. Matched before `.`/`..` the
+    /// same way `<>` beats `<` and `>>>` beats `>>` — logos always
+    /// prefers the longest token at a given position, so this needs no
+    /// explicit priority annotation despite starting with `.`.
+    #[token(".!")]
+    Lossy,
     #[token("?")]
     Question,
     #[token("|")]

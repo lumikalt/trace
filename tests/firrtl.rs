@@ -3213,6 +3213,101 @@ module M {
     run_firtool(&fir, &[]);
 }
 
+/// `trunc(value)`, one argument: same emission as the explicit two-
+/// argument form (`bits(value, w-1, 0)`), but `w` comes from the write
+/// target's own width instead of a spelled-out second argument —
+/// `types.rs` types the call `Bits(Width::Unknown)` (bottom-up type-
+/// checking has no target width to infer from at that point), and
+/// `compile_trunc` (src/firrtl/calls.rs) resolves the real width from
+/// `hint` instead, the same top-down "what width does this need to be"
+/// parameter that's already threaded through every write target/return
+/// type in the emitter.
+#[test]
+fn trunc_with_one_argument_infers_its_width_from_the_write_target() {
+    let src = "\
+module M {
+    in a : [16]
+    out result : [8] = 0
+    rule r {
+        result := trunc(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, bits(a, 7, 0)"));
+    run_firtool(&fir, &[]);
+}
+
+/// The same one-argument `trunc` still resolves correctly through a
+/// `let`-bound local — `x`'s own width never pins down to a concrete
+/// `bits[w]` (`trunc(a)`'s `Unknown` is exactly that shape), so
+/// `writes.rs`'s `enter_rule`/`local_hint` defers compiling it to `x`'s
+/// READ site instead of its binding, which is where the real hint
+/// (`result`'s own width) actually comes from.
+#[test]
+fn trunc_with_one_argument_resolves_through_a_let_bound_local() {
+    let src = "\
+module M {
+    in a : [16]
+    out result : [8] = 0
+    rule r {
+        let x = trunc(a)
+        result := x
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, bits(a, 7, 0)"));
+    run_firtool(&fir, &[]);
+}
+
+/// No hint reaches a one-argument `trunc` nested inside an arithmetic
+/// operator's own operand (`compile_binop` computes ITS hint from
+/// `types.expr_tys`, not from an outer parameter — see that function's
+/// own doc comment) — a clear, actionable error naming the fix
+/// (`trunc(value, width)`), not `width_of`'s generic "no concrete
+/// width" fallback.
+#[test]
+fn trunc_with_one_argument_and_no_reachable_hint_is_a_clear_error() {
+    let src = "\
+module M {
+    in a : [16]
+    in c : [8]
+    out result : [8] = 0
+    rule r {
+        result := trunc(a) + c
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("use `trunc(value, width)`"))
+    );
+}
+
+/// `.!` (an explicit per-operator "let it through" — see tests/types.rs
+/// for the diagnostic-suppression side) changes NOTHING about the
+/// emitted circuit — it only silences a compile-time diagnostic, never
+/// alters what hardware a marked operator computes. `a >>.! 300`'s own
+/// emitted shift is identical to what an in-range, unmarked shift would
+/// produce for the same operator and operands.
+#[test]
+fn lossy_suffix_does_not_change_the_emitted_circuit() {
+    let src = "\
+module M {
+    in a : [8]
+    out result : [8] = 0
+    rule r {
+        result := a >>.! 300
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, pad(shr(a, 300), 8)"));
+    run_firtool(&fir, &[]);
+}
+
 #[test]
 fn prio_encodes_the_lowest_set_bit_as_a_priority_mux_chain() {
     let src = "\

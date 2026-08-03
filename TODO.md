@@ -665,6 +665,43 @@
   covers 7 cases: bare literal, sized literal, exactly `w`, `<<`,
   `>>>`, `w - 1` staying accepted, and a dynamic amount staying
   unchecked.
+- **RESOLVED — no way to silence the two checks above on a specific,
+  intentional operator application, and `trunc` always required naming
+  its width even when the target already implies one.** Two additions,
+  requested together: a `.!` suffix on any binary operator (`a +.! 100000000`,
+  `x >>.! 300`) marks that one `Expr::Binary` node in a new side table
+  (`Ast.lossy: HashSet<ExprId>`, lexed as its own token so it beats a bare
+  `.`/`..` the same way `<>` beats `<`) that `type_binop` checks before
+  calling `check_literal_fits`/`check_shift_amount`, so an unmarked sibling
+  expression using the same values still errors normally — a genuine
+  per-application suppression, not a global toggle (verified directly:
+  `if a =.! 300 { ... }` compiles clean, removing the `.!` reproduces the
+  `300 does not fit in [8]` error). `.!` does NOT reach `check_assignable`;
+  `x := a +.! b` still needs `trunc` if `a + b` is wider than `x`. Second,
+  `trunc(value)` (1 argument, width omitted) infers its width from the
+  write target instead of forcing every call site to repeat a width the
+  target already states — typed `Bits(Width::Unknown)` in `types.rs`
+  (bottom-up inference has no target-width visibility at the call site)
+  and resolved top-down in FIRRTL emission by reusing the existing `hint`
+  mechanism (`compile_expr_hinted`) that a write target's width already
+  threads through emission for every other expression shape; also resolves
+  through a `let`-bound local for free, since `writes.rs`'s lazy,
+  read-site-hinted fallback (used whenever a local's type isn't a concrete
+  `Bits(Width::Known(_))`) was already exactly the right mechanism. A
+  1-argument `trunc` with no reachable hint (e.g. nested inside an
+  arithmetic operand rather than a write target) is a clear compile error
+  naming `trunc(value, width)` as the fix, not a fallthrough to a generic
+  "can't determine width" message. Verified against all 54 shipped
+  examples (clean, committed content) and the full gate
+  (`cargo build`/`clippy`/`fmt --check`/`test`, all green except the
+  still-open, unrelated `call_nested_writes.tr` edit from two entries
+  above); new tests in `tests/lexer.rs`, `tests/parser.rs` (2, confirming
+  `.!` marks the existing `Expr::Binary` id rather than creating a new AST
+  shape), `tests/types.rs` (1 test, 7 sub-cases including the unmarked-
+  sibling-still-errors check), and `tests/firrtl.rs` (4, one of which
+  needed the compiler actually run once to confirm the correct emitted
+  FIRRTL — `pad(shr(a, 300), 8)` for a constant shift amount, not the
+  initially-guessed `dshr(...)`).
 
 ## Language features with no synthesis path yet
 

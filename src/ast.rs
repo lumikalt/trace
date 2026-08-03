@@ -482,6 +482,14 @@ pub struct Ast {
     /// this list anywhere but types.rs only means a missing diagnostic,
     /// never wrong hardware.
     pub destructures: Vec<Destructure>,
+    /// `Expr::Binary` ids parsed with a trailing `.!` on their operator
+    /// (`a >>.! 300`) — same "side list, not a new shape" rationale as
+    /// `destructures`: consumed only by types.rs's `type_binop` (to skip
+    /// `check_literal_fits`/`check_shift_amount` for that one operator
+    /// application), never needed by resolve/effects/elaborate/lower/
+    /// firrtl, which all only ever look at `op`/`lhs`/`rhs` regardless of
+    /// whether this set contains a given id.
+    pub lossy: std::collections::HashSet<ExprId>,
 }
 
 /// Metadata for one `let {...} = source` destructuring pattern, consumed

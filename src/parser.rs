@@ -1682,8 +1682,15 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            // `a >>.! 300` — an explicit "I know, let it through" on
+            // THIS operator application, silencing types.rs's
+            // check_literal_fits/check_shift_amount for it specifically
+            // (see ast.rs's `lossy` field). Checked right after the
+            // operator token itself, before the RHS operand, matching
+            // where it's written.
+            let lossy = self.eat(TokenKind::Lossy);
             let rhs = self.parse_expr(r_bp)?;
-            lhs = self.ast.push_expr(
+            let bin = self.ast.push_expr(
                 Expr::Binary {
                     op: binop_of(kind),
                     lhs,
@@ -1691,6 +1698,10 @@ impl<'a> Parser<'a> {
                 },
                 lo..self.prev_end,
             );
+            if lossy {
+                self.ast.lossy.insert(bin);
+            }
+            lhs = bin;
         }
 
         Some(lhs)
