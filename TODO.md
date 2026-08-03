@@ -1808,5 +1808,24 @@ manually in the meantime.
   `examples/arbiter.tr` (the one shipped example with this shape) is
   now idempotent under the formatter like every other example — no
   longer needs its own skip in `tests/fmt.rs`'s idempotency sweep.
+- **RESOLVED — a closing bracket stranded on its block's last content
+  line** (`return x + 20    }` instead of `}` on its own line — a
+  deleted newline, an editor merge gone wrong) used to render
+  unchanged: plain brace-counting only reindents EXISTING lines, never
+  moves tokens across them. `fmt.rs`'s new `split_stray_closers` pass
+  runs before the reindent pass and inserts a newline before any
+  closing bracket whose matching OPENER is on an earlier line (an
+  unambiguous multi-line-block marker — a deliberate single-line block
+  always has both ends on the same line instead, so this can never
+  misfire against intentional style like `if x = 1 { y := 1 }`).
+  Bracket-agnostic (`}`/`)`/`]` alike), and a stacked run of closers
+  (`}))`) splits out together as one unit, not one per line, matching
+  how the run already renders once correctly placed. Six new tests in
+  `tests/fmt.rs` cover the reported case, `)`/`]`, single-line blocks
+  staying untouched, stacked runs (both already-correct and
+  stray-then-split), a trailing `--` comment riding along with a split
+  closer, and — the one this whole design's two-pass (split, re-lex,
+  reindent) structure actually depends on — that formatting is
+  idempotent on its own split output, not just on already-good input.
 - Not published to a marketplace; local install only (see the extension's
   own README).

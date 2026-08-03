@@ -57,6 +57,97 @@ fn no_trailing_newline_is_preserved() {
     assert!(!out.ends_with('\n'));
 }
 
+/// The reported bug: a multi-line block's closing `}` gets merged onto
+/// the end of its last content line (a deleted newline, an editor
+/// merge gone wrong) — plain brace-counting alone leaves it there,
+/// since it never rearranges tokens across lines, only reindents
+/// existing ones. `split_stray_closers` (fmt.rs) gives it back its own
+/// line before the normal reindent pass runs.
+#[test]
+fn a_closing_brace_merged_onto_its_last_content_line_gets_split_out() {
+    let src = "module M {\n    rule r {\n        y := 1    }\n}\n";
+    assert_eq!(
+        format(src),
+        "module M {\n    rule r {\n        y := 1\n    }\n}\n"
+    );
+}
+
+/// Same bug, `)`/`]` instead of `}` — the rule isn't brace-specific.
+#[test]
+fn a_stray_closing_paren_or_bracket_also_gets_split_out() {
+    let src = "module M {\n    reg x : [8] = f(\n        1 + 2)\n}\n";
+    assert_eq!(
+        format(src),
+        "module M {\n    reg x : [8] = f(\n        1 + 2\n    )\n}\n"
+    );
+}
+
+/// A deliberate single-line block (opener AND closer on the same
+/// source line) must NOT be split apart — only a closer whose OPENER
+/// is on an earlier line is ever a formatting slip; this is a genuine
+/// style choice used throughout examples/ (`if x = 1 { y := 1 }`).
+#[test]
+fn a_genuine_single_line_block_is_left_alone() {
+    let src = "module M {\n    rule r {\n        if x = 1 { y := 1 }\n    }\n}\n";
+    assert_eq!(format(src), src);
+}
+
+/// A run of stacked closers (`}))`) that's ALREADY alone on its own
+/// line must stay stacked together, not get blown apart into one
+/// bracket per line — each one being "first on its line" (after the
+/// one before it) is exactly what makes this idiom legible.
+#[test]
+fn an_already_correct_stacked_closer_line_is_left_alone() {
+    let src = "module M {\n    reg x : [8] = f(g(\n            1\n        )))\n}\n";
+    assert_eq!(format(src), src);
+}
+
+/// The same stacked-closer idiom, but reached via a split: the merged
+/// line's whole trailing closer run moves together as one unit, not
+/// one bracket at a time.
+#[test]
+fn a_stray_stacked_closer_run_splits_out_as_one_unit() {
+    let src = "module M {\n    reg x : [8] = f(g(\n            1)))\n}\n";
+    assert_eq!(
+        format(src),
+        "module M {\n    reg x : [8] = f(g(\n            1\n        )))\n}\n"
+    );
+}
+
+/// `format` is itself a two-pass pipeline now (split stray closers,
+/// re-lex, reindent) — this is the property that pipeline depends on:
+/// formatting already-formatted output is a no-op, for every case above
+/// where the input actually needed a split. Not implied by any single
+/// test above; each of those only checks the FIRST pass's output.
+#[test]
+fn formatting_is_idempotent_on_every_split_case_above() {
+    for src in [
+        "module M {\n    rule r {\n        y := 1    }\n}\n",
+        "module M {\n    reg x : [8] = f(\n        1 + 2)\n}\n",
+        "module M {\n    reg x : [8] = f(g(\n            1)))\n}\n",
+    ] {
+        let once = format(src);
+        assert_eq!(format(&once), once, "not idempotent starting from {src:?}");
+    }
+}
+
+/// A trailing `--` comment survives a split unmoved, riding along on
+/// whichever side of the new line break it started on — here that's
+/// the closer's own new line, since the comment came after it. This
+/// composes fine with `split_stray_closers` precisely because a
+/// comment can only ever trail a real token on a line, never precede
+/// one (see fmt.rs's own module doc comment): the split point is
+/// always inserted before a real token, so it can never land in the
+/// middle of a comment's span.
+#[test]
+fn a_trailing_comment_after_a_stray_closer_stays_with_it() {
+    let src = "module M {\n    rule r {\n        y := 1    } -- done\n}\n";
+    assert_eq!(
+        format(src),
+        "module M {\n    rule r {\n        y := 1\n    } -- done\n}\n"
+    );
+}
+
 #[test]
 fn idempotent_on_every_shipped_example() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");

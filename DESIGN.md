@@ -3008,6 +3008,26 @@ depth by design — no other construct in the grammar needs this kind of
 special-casing, so the formatter stays a brace counter plus this one
 lexical rule, not a real statement-aware pretty-printer.
 
+One more targeted exception, `split_stray_closers`: a closing bracket
+left stranded at the end of a multi-line block's last content line (a
+deleted newline, an editor merge gone wrong — e.g. `return x + 20    }`
+where the block's `{` opened several lines earlier) gets pushed onto its
+own new line before the ordinary reindent pass runs. The discriminator
+is unambiguous and needs no statement awareness: a closing bracket whose
+matching OPENER sits on an earlier line was already, definitionally, a
+multi-line block — never a deliberate single-line style (`if x = 1 { y
+:= 1 }`, common throughout `examples/`), since that always has both ends
+on the same line. A bracket that's already alone on its line is left
+untouched even when other content follows it after (an `if {...} else
+{...}`'s first `}`), and a stacked run of closers (`}))`) splits out
+together as one unit rather than one bracket per line, because a closer
+never itself counts as "content before the next one" — matching how such
+a run already renders once it's correctly placed. This still can't touch
+a comment: `--` comments run to end of line and are never tokenized, so
+a real token (a closing bracket included) can never sit after one on the
+same line in valid source — inserting a newline only ever happens
+immediately before a real token, never near a comment's span.
+
 A language server (`trace --lsp`, `src/lsp.rs`) backs diagnostics,
 go-to-definition, and hover in the VS Code extension. It drives the exact
 same `lex -> parse -> resolve -> effects -> types` pipeline `main.rs`

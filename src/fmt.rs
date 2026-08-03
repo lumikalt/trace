@@ -1,7 +1,9 @@
 //! A simple formatter: fixes each line's leading whitespace to match
 //! brace/paren/bracket nesting depth. Nothing else about a line
 //! changes — inline spacing, trailing comments, and blank-line runs
-//! are all left exactly as written.
+//! are all left exactly as written. The one exception is `split_stray_
+//! closers` below, which can insert a bare newline before a closing
+//! bracket; everything else is unchanged reindenting.
 //!
 //! This is deliberately not an AST pretty-printer. The lexer treats
 //! `--` comments as trivia and never tokenizes them (see lexer.rs), so
@@ -9,7 +11,15 @@
 //! re-emitting from the AST — a pretty-printer would silently delete
 //! every comment in the file. Reindenting from the token stream while
 //! keeping each line's original text intact sidesteps that entirely:
-//! comments are never seen, so they can never be lost.
+//! comments are never seen, so they can never be lost. `split_stray_
+//! closers` keeps that invariant too: since a `--` comment always runs
+//! to end of line and is never tokenized, a REAL token (a closing
+//! bracket included) can never appear after one on the same line in
+//! valid source — a `}` "inside" a comment would leave the brace count
+//! unbalanced, a parse error, not something this formatter ever sees.
+//! So deciding where to insert a newline never has to reason about
+//! comment positions at all: it only ever inserts one immediately
+//! before a real token, never after or across one.
 //!
 //! One special case beyond plain brace counting: `impl F(...) : ty
 //! <combines>\n    refines Spec\n{` (DESIGN.md's multiline-signature
@@ -22,7 +32,7 @@
 //! directly before `{`, which stays at the signature's own depth by
 //! design (see tests/fmt.rs).
 
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{self, Token, TokenKind};
 
 const INDENT_UNIT: &str = "    ";
 
@@ -43,7 +53,84 @@ fn line_of(starts: &[usize], offset: usize) -> usize {
     starts.partition_point(|&s| s <= offset) - 1
 }
 
+/// A closing bracket whose matching opener sits on an EARLIER line (so
+/// the block was already, unambiguously, a multi-line one — never a
+/// case of "this reads fine as one line," which is the situation plain
+/// brace-counting alone must never second-guess) but which itself isn't
+/// alone on its own line gets pushed onto a fresh line: this is always
+/// a formatting slip (a deleted newline, a merge gone wrong), never a
+/// deliberate style choice, since a deliberate single-line block has
+/// its opener on the SAME line as its closer instead. A closing bracket
+/// that's already the first real token on its line is left alone even
+/// when others share that line after it (an `if {...} else {...}`'s
+/// first `}`, immediately followed by ` else {`) — and a RUN of several
+/// closers stacked together (`}))`) splits together, as one unit, not
+/// apart from each other: after the run's first member gets its own
+/// line, every closer immediately after it is once again "first on its
+/// (now virtual) line," so the same rule leaves the rest of the run
+/// untouched.
+///
+/// Returns the source with a `\n` inserted immediately before each such
+/// closer — nothing else about the text changes here; `format`'s own
+/// reindenting pass (re-lexing this returned text) does the rest,
+/// including trimming whatever trailing whitespace used to precede the
+/// bracket on its old line.
+fn split_stray_closers(src: &str, tokens: &[Token]) -> String {
+    let starts = line_starts(src);
+    let mut open_stack: Vec<usize> = Vec::new();
+    let mut splits: Vec<usize> = Vec::new();
+    let mut seen_non_closer = false;
+    for tok in tokens {
+        match tok.kind {
+            TokenKind::Newline => seen_non_closer = false,
+            TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => {
+                open_stack.push(line_of(&starts, tok.span.start));
+                seen_non_closer = true;
+            }
+            TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => {
+                let opener_line = open_stack.pop();
+                let this_line = line_of(&starts, tok.span.start);
+                if seen_non_closer && opener_line.is_some_and(|l| l != this_line) {
+                    splits.push(tok.span.start);
+                    seen_non_closer = false; // now first on its own (new) line
+                }
+                // A closer never itself sets `seen_non_closer`, whether
+                // split or not — that's what lets a stacked run (`}))`)
+                // either split together or stay together as one unit.
+            }
+            _ => seen_non_closer = true,
+        }
+    }
+    if splits.is_empty() {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len() + splits.len());
+    let mut last = 0;
+    for offset in splits {
+        out.push_str(&src[last..offset]);
+        out.push('\n');
+        last = offset;
+    }
+    out.push_str(&src[last..]);
+    out
+}
+
 pub fn format(src: &str, tokens: &[Token]) -> String {
+    let split_src = split_stray_closers(src, tokens);
+    let (src, tokens) = if split_src == src {
+        (src.to_string(), tokens.to_vec())
+    } else {
+        let (tokens, _lex_errors) = lexer::lex(&split_src);
+        // Inserting a newline strictly between two existing tokens can
+        // never introduce a lex error — see this module's doc comment on
+        // why a real token can never sit inside a comment's span — so
+        // `_lex_errors` is unconditionally empty here; not asserted, to
+        // keep this a plain fallback rather than a panic on a claim that
+        // (if ever wrong) would only cost a missed reindent, not a crash.
+        (split_src, tokens)
+    };
+    let src = src.as_str();
+    let tokens = tokens.as_slice();
     let starts = line_starts(src);
     let n_lines = starts.len();
 
