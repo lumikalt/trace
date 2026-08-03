@@ -2343,16 +2343,10 @@ impl<'a> TypeChecker<'a> {
                     None => Ty::Unit,
                 }
             }
-            DefKind::Rule => {
-                self.error(
-                    self.expr_span(id),
-                    format!(
-                        "rules are not callable (`{}` fires on its own)",
-                        def_info.name
-                    ),
-                );
-                Ty::Unknown
-            }
+            // No `DefKind::Rule` arm: a rule name lives in resolve.rs's
+            // own separate `rule_scopes` namespace now, never `expr_defs`
+            // (see that field's doc comment) — this callee can never
+            // resolve to one, so there's nothing to reject here.
             DefKind::Reg
             | DefKind::Mem
             | DefKind::Fifo

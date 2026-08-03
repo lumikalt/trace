@@ -235,6 +235,7 @@ pub fn resolve(ast: &Ast) -> (Resolution, Vec<ResolveError>) {
         res: Resolution::default(),
         errors: Vec::new(),
         scopes: vec![HashMap::new()],
+        rule_scopes: vec![HashMap::new()],
         inst_ports: HashMap::new(),
         current_module: Vec::new(),
         declared_locals: Vec::new(),
@@ -253,6 +254,20 @@ struct Resolver<'a> {
     res: Resolution,
     errors: Vec<ResolveError>,
     scopes: Vec<HashMap<String, DefId>>,
+    /// A SEPARATE namespace for rule names, pushed/popped in lockstep with
+    /// `scopes` at the ONE site rules can ever be declared (`Item::
+    /// Module`'s own scope push/pop — a rule can't appear inside an `if`/
+    /// `while`/`fn` body, so no other push/pop site needs a matching
+    /// frame here). Rule names used to share `scopes` with everything
+    /// else — purely incidental (every item kind funneled through one
+    /// generic `declare`), not a deliberate choice; nothing anywhere
+    /// (checked: no planned feature, no existing use) ever needs a rule
+    /// name to resolve as an ordinary expression VALUE, only as a
+    /// `schedule` directive name. Splitting them out is what unblocks
+    /// `rule foo?` sugar's own `in foo` auto-declaration (see TODO.md) —
+    /// before this, `foo` naming both the rule and the port had nowhere
+    /// to put a second `DefId` under one shared key.
+    rule_scopes: Vec<HashMap<String, DefId>>,
     /// (inst, port name) -> the synthesized `InstPort` resource for it,
     /// memoized so every `c.a` in the file shares one `DefId` (needed for
     /// effects.rs's conflict-set intersection to see them as the same
@@ -364,6 +379,34 @@ impl<'a> Resolver<'a> {
         id
     }
 
+    fn lookup_rule(&self, text: &str) -> Option<DefId> {
+        self.rule_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(text).copied())
+    }
+
+    /// `declare`'s own rule-namespace twin — see `rule_scopes`'s doc
+    /// comment. Every def this ever creates is `DefKind::Rule`, so
+    /// (unlike `declare`) the duplicate-name error can just say "already
+    /// a rule" without needing to describe the previous def's kind.
+    fn declare_rule(&mut self, name: &Name) -> DefId {
+        let id = self.new_def(&name.text, DefKind::Rule, name.span.clone());
+        let scope = self.rule_scopes.last_mut().unwrap();
+        if scope.contains_key(&name.text) {
+            self.error(
+                name.span.clone(),
+                format!("`{}` is already defined in this scope as a rule", name.text),
+            );
+            return id;
+        }
+        self.rule_scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.text.clone(), id);
+        id
+    }
+
     /// Two-phase scope resolution: declare all items first, then resolve
     /// bodies, so items are mutually recursive.
     fn resolve_scope(&mut self, items: &[ItemId]) {
@@ -376,6 +419,18 @@ impl<'a> Resolver<'a> {
     }
 
     fn collect_decl(&mut self, id: ItemId) {
+        // A rule's own name lives in `rule_scopes`, not `scopes` — see
+        // that field's doc comment — so it needs `declare_rule`, not the
+        // generic path every other item kind below shares.
+        if let Item::Rule { name, .. } = self.ast.item(id) {
+            let name = name.clone();
+            let def = self.declare_rule(&name);
+            self.res
+                .def_owner
+                .insert(def, self.current_module.last().copied());
+            self.res.item_defs.insert(id, def);
+            return;
+        }
         let (name, kind) = match self.ast.item(id) {
             Item::Module { name, .. } => (name.clone(), DefKind::Module),
             Item::ExtModule { name, .. } => (name.clone(), DefKind::ExtModule),
@@ -387,7 +442,7 @@ impl<'a> Resolver<'a> {
             Item::Io { name, .. } => (name.clone(), DefKind::Io),
             Item::Attach { .. } => return,
             Item::Inst { name, .. } => (name.clone(), DefKind::Inst),
-            Item::Rule { name, .. } => (name.clone(), DefKind::Rule),
+            Item::Rule { .. } => unreachable!("handled above"),
             Item::Fn { name, kind, .. } => {
                 let def_kind = match kind {
                     FnKind::Fn => DefKind::Fn,
@@ -411,7 +466,12 @@ impl<'a> Resolver<'a> {
             Item::Module { items, .. } => {
                 self.current_module.push(id);
                 self.scopes.push(HashMap::new());
+                // Pushed/popped in lockstep with `scopes` above — the
+                // only site a rule can ever be declared under (see
+                // `rule_scopes`'s doc comment).
+                self.rule_scopes.push(HashMap::new());
                 self.resolve_scope(&items.clone());
+                self.rule_scopes.pop();
                 self.scopes.pop();
                 self.current_module.pop();
             }
@@ -568,21 +628,17 @@ impl<'a> Resolver<'a> {
                         crate::ast::ScheduleDirective::ConflictFree(ns) => ns.clone(),
                     })
                     .collect();
+                // `rule_scopes` can only ever contain `DefKind::Rule`
+                // defs (only `declare_rule` ever inserts into it), so
+                // there's no "found something, but it's the wrong kind"
+                // case to check anymore — `lookup_rule` finding anything
+                // at all already proves it's a rule.
                 for name in names {
-                    match self.lookup(&name.text) {
-                        None => self.error(
+                    if self.lookup_rule(&name.text).is_none() {
+                        self.error(
                             name.span.clone(),
                             format!("cannot find rule `{}`", name.text),
-                        ),
-                        Some(def) if self.res.def(def).kind != DefKind::Rule => self.error(
-                            name.span.clone(),
-                            format!(
-                                "`{}` is {}, not a rule",
-                                name.text,
-                                self.res.def(def).kind.describe()
-                            ),
-                        ),
-                        Some(_) => {}
+                        );
                     }
                 }
             }
@@ -594,6 +650,18 @@ impl<'a> Resolver<'a> {
         for effect in effects {
             for arg in &effect.args {
                 match self.lookup(&arg.text) {
+                    // A rule name is never in `scopes` at all now (see
+                    // `rule_scopes`), so it falls through to `None` here
+                    // like any other unknown name -- checked separately
+                    // for a clearer message than a bare "cannot find".
+                    None if self.lookup_rule(&arg.text).is_some() => self.error(
+                        arg.span.clone(),
+                        format!(
+                            "`{}` is a rule; rules aren't state and can't be named in \
+                             `reads`/`writes`",
+                            arg.text
+                        ),
+                    ),
                     None => self.error(
                         arg.span.clone(),
                         format!("cannot find state `{}`", arg.text),

@@ -1512,31 +1512,38 @@ re-propose these from a fresh read of the same chapters:
   logic already live in one fairly self-contained module,
   `schedule.rs`.
 
-## Rules: optional/enable sugar (design-level, mostly decided, blocked on a prerequisite)
+## Rules: optional/enable sugar (design-level, mostly decided; prerequisite RESOLVED)
 
 **`rule foo? { body }` — sugar for an implicit, rising-edge-triggered enable
 port sharing the rule's own name (Lumi's call, via `AskUserQuestion`).**
-**Blocked on a real prerequisite, not independent (Lumi's call: keep the
-literal shared-name spelling rather than fall back to a derived name like
-`foo_enable`, the same shape `while let` was blocked on `while`'s own FSM
-lowering until that got built first).** Rule names and expression idents
-resolve through the IDENTICAL scope lookup today (`self.lookup`, used both
-by ordinary `Ident` resolution and by a `schedule` block's own `urgency`/
-`mutually_exclusive`/`conflict_free` name references — confirmed by reading
-`resolve.rs`'s `Item::Schedule` handling, not assumed), and `declare`'s own
-`scope` is a plain string-keyed map, one `DefId` per key. So `rule foo?`
-auto-declaring `in foo` under the SAME name isn't a small carve-out over
-`declare`'s duplicate-name check — there's nowhere to even PUT a second
-`DefId` under one key once declared. Building this sugar as specified needs
-a real resolve.rs prerequisite first: genuinely splitting rule-name
-resolution into its own namespace (or some other way to let one syntactic
-name resolve to two different `DefId`s depending on position — a schedule
-directive vs. an ordinary expression). Not designed further here; this is
-the actual first step, not an afterthought to sort out during
-implementation.
 
-Once that prerequisite exists, the rest of the sugar's shape is settled
-except the reset-edge question flagged near the end below.
+**The namespace prerequisite is built.** Rule names used to resolve through
+the IDENTICAL scope lookup as ordinary expression idents (`self.lookup`,
+one string-keyed `scope` map, one `DefId` per key) — so `rule foo?`
+auto-declaring `in foo` under the SAME name had nowhere to put a second
+`DefId`. Fixed by giving rule names their own `rule_scopes: Vec<HashMap<
+String, DefId>>`, pushed/popped in lockstep with `scopes` at the one site a
+rule can ever be declared (`Item::Module`'s own scope push/pop — a rule
+can't appear inside an `if`/`while`/`fn` body). `declare_rule`/`lookup_rule`
+mirror `declare`/`lookup` but read/write this separate map; `collect_decl`
+routes `Item::Rule` through `declare_rule` instead of the generic path;
+`Item::Schedule`'s directive-name lookups (`urgency`/`mutually_exclusive`/
+`conflict_free`) use `lookup_rule` instead of `lookup`. Confirmed a rule and
+a piece of state may now share a spelling with zero collision, at every
+layer including real firrtl emission through firtool (`reg foo`/`rule foo`
+in one module — `regreset foo`/`node fires_foo` are already naturally
+distinct FIRRTL names, no change needed there). A useful side effect,
+not just enabling the sugar: a rule name used as an ordinary expression
+VALUE (not just a `schedule` directive) is now a clean resolve-time
+"cannot find", closing a gap where it used to silently resolve and only
+get caught for the specific call-callee case, in types.rs, one layer late
+(`tests/resolve.rs`'s `a_rules_name_cannot_be_used_as_a_value`, moved from
+`tests/types.rs`'s old `rules_are_not_callable`, which could no longer even
+reach types.rs once resolve.rs rejects it first).
+
+The `foo? { ... }` sugar syntax itself is NOT built yet — only its
+namespace prerequisite. The rest of the sugar's shape is settled except
+the reset-edge question flagged near the end below.
 
 Today, gating a rule on an external trigger is written by hand — `in trigger
 : [1]` plus `trigger?` as the rule's own first statement (see the `spawn`/

@@ -444,24 +444,6 @@ fn shape_errors() {
 }
 
 #[test]
-fn rules_are_not_callable() {
-    let src = "\
-module M {
-    reg a : [8] = 0
-    rule t {
-        a := a + 1
-    }
-    rule r {
-        let x = t()
-    }
-}
-";
-    let (_, _, errors) = run(src);
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("not callable"));
-}
-
-#[test]
 fn generic_bodies_skip_width_checks() {
     // Inside a generic fn, widths are unknown: no false errors.
     run_ok("Mix(a : [N], b : [N]) : [N] <combines> {\n return (a & b) ^ (a | b)\n}\n");

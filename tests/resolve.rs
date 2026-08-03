@@ -451,7 +451,11 @@ module M {
 ";
     let (_, _, errors) = run(src);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("not state"));
+    // `a` is never in `scopes` at all now (it's in the separate `rule_
+    // scopes` namespace — see resolve.rs's own doc comment on that
+    // field), so `check_effect_args` reports it via its dedicated rule
+    // fallback message, not the generic "not state (reg, mem, ...)" one.
+    assert!(errors[0].message.contains("is a rule"));
 }
 
 #[test]
@@ -469,7 +473,60 @@ module M {
 ";
     let (_, _, errors) = run(src);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("not a rule"));
+    // `pc` is a register, not a rule -- it was never in `rule_scopes` at
+    // all (a truly separate namespace, not just a kind tag on one shared
+    // map), so this is the same "cannot find" a schedule directive gets
+    // for any nonexistent rule name, not a "wrong kind" message telling
+    // you what `pc` actually is.
+    assert!(errors[0].message.contains("cannot find rule `pc`"));
+}
+
+/// The whole point of the split: a rule and a piece of state may now
+/// share a spelling with no collision — separate namespaces, separate
+/// `DefId`s, exactly the shape `rule foo?` sugar's own `in foo` auto-
+/// declaration needs (see TODO.md's "Rules: optional/enable sugar").
+#[test]
+fn a_rule_and_a_reg_may_share_a_name() {
+    let (_, res) = run_ok("module M {\n reg foo : [1] = 0\n rule foo {\n foo := foo\n}\n}\n");
+    assert!(
+        res.defs
+            .iter()
+            .filter(|d| d.name == "foo")
+            .map(|d| d.kind)
+            .collect::<Vec<_>>()
+            .contains(&DefKind::Rule)
+    );
+    assert!(
+        res.defs
+            .iter()
+            .any(|d| d.name == "foo" && d.kind == DefKind::Reg)
+    );
+}
+
+/// A rule's name can't be used as an ordinary expression value at all —
+/// not just "can't be called" (the old, narrower check this replaces,
+/// moved here from tests/types.rs: `t` no longer resolves as an `Ident`
+/// anywhere outside a `schedule` directive, since `rule_scopes` is a
+/// wholly separate namespace from `scopes`, so this is a plain "cannot
+/// find" at resolve time, not a types-level "not callable" one call-site
+/// shape used to catch on its own).
+#[test]
+fn a_rules_name_cannot_be_used_as_a_value() {
+    let (_, _, errors) = run("module M {\n reg a : [8] = 0\n rule t {\n a := a + 1\n}\n \
+         rule r {\n let x = t()\n}\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot find `t`"));
+}
+
+/// `declare_rule`'s own collision check (separate from `declare`'s, since
+/// `rule_scopes` is a separate map) — two rules sharing a name must still
+/// be rejected, just via the rule-specific error text.
+#[test]
+fn duplicate_rule_name_is_an_error() {
+    let (_, _, errors) = run("module M {\n rule foo {\n tick\n}\n rule foo {\n tick\n}\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("already defined"));
+    assert!(errors[0].message.contains("rule"));
 }
 
 #[test]
