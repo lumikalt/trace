@@ -188,8 +188,60 @@ Context rules:
   there, that context is `<decides>`; here, it's `fails` (declared, or a
   rule).
 - Elaboration positions are never failure contexts. There is no transaction to
-  abort. Guards and fifo ops in `elaborates` bodies, state types, and
-  initializers are errors.
+  abort. A bare (undischarged) guard, fifo op, or comparison in `elaborates`
+  bodies, state types, and initializers is an error — `logic`-discharging one
+  inside `elaborates` code is fine, though (see "Comparisons: fallible by
+  default", below): discharge is a no-op there, since every value is already
+  a resolved compile-time constant by the time elaboration reaches it.
+
+### Comparisons: fallible by default
+
+`=`/`<>`/`<`/`<=`/`>`/`>=` are a fourth member of the fallible-expression
+family above (alongside a guard, a fifo op, and a failing call), not a
+standalone `[1]`-valued operator: `a > b` yields `a`'s own value/type on
+success, or fails, matching Verse's own `X > 0` (`04_operators`) — the same
+"unwrap-or-fail" shape `opt?`/`f.Deq[]` already have, reusing their existing
+machinery (fails-inference, guard-folding) rather than a new mechanism.
+`type_binop`'s comparison arm returns the left operand's own type, not
+`Ty::Bits(Width::Known(1))`; a comparison's fallibility is tracked entirely
+by AST shape (like a fifo op's), not by a dedicated sentinel type.
+
+```trace
+rule step {
+    a <> 0                    -- bare: implicitly gates this rule, same as (a <> 0)?
+    result := a > b           -- result gets a's VALUE; the rule gates on a > b holding
+    ok := logic a > b         -- discharged: ok gets 0/1, the rule does NOT gate on it
+}
+```
+
+`logic <expr>` (see "Calling a function from a rule", below) converts a
+comparison to a definite `[1]` the same way it already does a fifo op or a
+guard-only `<fails>` call — the way to get today's plain-boolean behavior
+back, and the only way to use a comparison directly as an `if`/`while`
+condition: a BARE comparison there is a type error (its type is no longer
+`[1]`), not silently accepted with the wrong meaning. `logic`'s own operand
+parses looser than any binary operator specifically so this reads cleanly —
+`logic a > b`, no parens — at the cost of the `logic A & logic B`
+`and`-combination idiom needing explicit parens on each side now
+(`(logic A) & (logic B)`); see `logic`'s own entry in TODO.md for the full
+precedence tradeoff.
+
+Unlike a fifo op or failing call, a comparison has no dedicated "whole
+statement / entire RHS of `:=` / `let` init only" position restriction — no
+side effect means no silent-miss risk from a misplaced one, so `a + (a > b)`
+type-checks and its guard is found wherever it is, not just when it's the
+whole RHS. The one restriction that DOES still apply: a comparison nested
+inside an `if`/`while`'s own BODY (not its condition — a statement inside a
+branch) is rejected outright, the same restriction a nested guard/fifo
+op/failing call already has, and for the identical reason a fifo op's
+restriction exists — folding it into the whole rule's guard would be wrong
+when the branch might not even be taken. Self-caught by direct probe before
+either half of this was tested: `x := a + (a > b)` used to compile clean with
+`fires_r = UInt<1>(1)`, silently never gating on `a > b` at all (fixed by
+making the guard-fold genuinely search for a nested comparison instead of
+only checking a statement's top-level shape); `v := a + (a > b)` inside an
+`if` had the identical silent gap one level deeper (fixed by rejecting it,
+matching the fifo-op precedent, rather than folding it unconditionally).
 
 ### `or`: fallback chains
 
@@ -519,7 +571,8 @@ Arithmetic and bitwise operators follow Chisel-style modular width rules:
   a per-operator choice, not a property of the operand's own type — `x >>> n`
   and `x >> n` are both legal on the same `[N]` value, with different
   results whenever the top bit is set.
-- Comparisons produce `[1]`.
+- Comparisons are fallible, not plain `[1]` values — see "Comparisons:
+  fallible by default", below.
 - Unary `-` is two's-complement negate, wrapping within the operand's width.
   Unary `~` is bitwise complement.
 - `not` is logical negation, distinct from `~`: it requires a `[1]` operand.

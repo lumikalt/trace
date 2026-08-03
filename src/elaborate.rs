@@ -615,6 +615,18 @@ impl<'a> Interp<'a> {
                 // reference, same as a plain `Ident` not bound in `env`.
                 Ok(ElabValue::Circuit(self.text_of(id)))
             }
+            // `logic <expr>`: discharge is a no-op at elaboration time --
+            // every value here is ALREADY a fully-resolved compile-time
+            // constant (`eval_elab_int_binop`'s comparison arms already
+            // fold `a > b` straight to `Int(0)`/`Int(1)`, unaffected by
+            // types.rs's separate "comparisons are fallible" rule; this
+            // interpreter never consults `Ty` at all), so there's no
+            // rule to gate and nothing to discharge FROM — `logic`'s
+            // only job here is letting `expr` reach a `[1]`-shaped
+            // position (an `if`/`while` condition) the same way it does
+            // in synthesizable code, not changing what `expr` evaluates
+            // to.
+            Expr::Logic(inner) => self.eval_elab_expr(inner, env, depth),
             Expr::Guard(_)
             | Expr::Spawn(_)
             | Expr::Range { .. }
@@ -622,8 +634,7 @@ impl<'a> Interp<'a> {
             | Expr::StructLit { .. }
             | Expr::OptionTy(_)
             | Expr::Absent
-            | Expr::Optional(_)
-            | Expr::Logic(_) => {
+            | Expr::Optional(_) => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
                 self.error(
                     span,

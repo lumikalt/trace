@@ -508,6 +508,15 @@ impl<'a> Emitter<'a> {
         if let Some((fifo, depth, is_enq, _)) = self.fifo_op(arg) {
             return Ok(fifo_guard_cond(&fifo, is_enq, depth));
         }
+        // A comparison's success condition IS its own ordinary boolean
+        // value — `compile_binop`'s ALREADY-existing `eq`/`neq`/`lt`/...
+        // primop output, unchanged. No fifo/call-style "don't perform
+        // the side effect" concern here: a comparison never had one.
+        if let Expr::Binary { op, lhs, rhs } = self.ast.expr(arg).clone()
+            && op.is_comparison()
+        {
+            return self.compile_binop(arg, op, lhs, rhs);
+        }
         if let Expr::Call {
             callee: inner_callee,
             args: inner_args,
@@ -518,8 +527,8 @@ impl<'a> Emitter<'a> {
         }
         self.error(
             span,
-            "`logic`'s operand is not a fifo op or a failing call (should have \
-             been caught earlier by check_logic_args)"
+            "`logic`'s operand is not a fifo op, a comparison, or a failing \
+             call (should have been caught earlier by check_logic_args)"
                 .to_string(),
         );
         Err(())
@@ -756,12 +765,14 @@ impl<'a> Emitter<'a> {
                     let inner = *inner;
                     conds.push(self.compile_guard_unwrap_cond(inner));
                 } else if is_guard_like(self.ast, self.res, e) {
-                    // An implicit guard: `e` itself IS the condition,
-                    // no `Guard` wrapper to unwrap.
-                    conds.push(
-                        self.compile_expr(e)
-                            .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
-                    );
+                    // An implicit guard: `e` itself IS the condition, no
+                    // `Guard` wrapper to unwrap -- `compile_guard_
+                    // unwrap_cond` handles a bare comparison correctly
+                    // here too (same fix as `compile_guard`'s own
+                    // implicit-guard fold, writes.rs), not `compile_
+                    // expr` directly, which would give a comparison's
+                    // `lhs` VALUE instead of its boolean.
+                    conds.push(self.compile_guard_unwrap_cond(e));
                 }
             }
         }

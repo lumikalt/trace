@@ -128,6 +128,18 @@ impl<'a> Emitter<'a> {
             // that, the same way `tail(add(l, r), 1)` already trusts them
             // to for any two differently-sized real operands.
             Expr::SizedInt { width, value } => Ok(format!("UInt<{width}>({value})")),
+            // A comparison used directly as a VALUE (not through `logic`,
+            // which calls `compile_binop` straight — see its own doc
+            // comment, calls.rs) yields `lhs`'s own value on success,
+            // per `type_binop`'s matching rule (types.rs) — the same
+            // "unwrap, don't discharge" shape a bare `f.Deq[]`/`opt?`
+            // used as a value already has. The comparison ITSELF (its
+            // ordinary `eq`/`neq`/`lt`/... boolean) is `compile_guard`'s
+            // job (writes.rs), which folds it into the rule's own guard
+            // — this fn only ever computes the VALUE half.
+            Expr::Binary { op, lhs, .. } if op.is_comparison() => {
+                self.compile_expr_hinted(lhs, hint)
+            }
             Expr::Binary { op, lhs, rhs } => self.compile_binop(id, op, lhs, rhs),
             Expr::Unary { op, operand } => self.compile_unop(id, op, operand),
             Expr::Bracket { callee, args } => {

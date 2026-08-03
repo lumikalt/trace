@@ -834,7 +834,18 @@ impl<'a> TypeChecker<'a> {
                 // the same bits[1] enforcement an `if`/`while`
                 // condition already gets. Anything else bare (a call,
                 // fifo op, spawn) keeps its own independent type.
-                if is_guard_like(self.ast, self.res, e) {
+                // A bare COMPARISON is the one exception: like a fifo
+                // op, it now has its OWN independent gating mechanism
+                // (`compile_guard_unwrap_cond`, firrtl/writes.rs) that
+                // doesn't route through this [1] requirement at all --
+                // unlike an if/while condition (`check_cond` below,
+                // unchanged), where a bare comparison must still be
+                // REJECTED (not silently exempted) so it doesn't reach
+                // `compile_expr`'s "yields lhs's value" path as a mux
+                // selector; `logic` is the discharge for that position.
+                if matches!(self.ast.expr(e), Expr::Binary { op, .. } if op.is_comparison()) {
+                    self.type_expr(e, locals);
+                } else if is_guard_like(self.ast, self.res, e) {
                     self.check_cond(e, locals);
                 } else {
                     self.type_expr(e, locals);
@@ -895,6 +906,22 @@ impl<'a> TypeChecker<'a> {
         // real condition.
         if let Expr::Guard(inner) = self.ast.expr(cond)
             && matches!(self.types.expr_tys.get(inner), Some(Ty::Option(_)))
+        {
+            return;
+        }
+        // `(a > b)?`: same idea, a comparison's own "value" (per
+        // `type_binop`) is `a`'s type, not [1] -- explicitly gating on
+        // it with `?` doesn't need it to ALSO be a real boolean here.
+        // Unlike a BARE comparison (which this fn still rejects, so it
+        // doesn't reach `compile_expr`'s "yields lhs's value" path as a
+        // mux selector — see `type_stmt`'s own bare-comparison
+        // exemption, which routes around this fn entirely instead), an
+        // EXPLICIT `?` reaching an if/while condition is already
+        // rejected by `check_guard_placement`'s position restriction
+        // regardless of this exemption, so there's no silent-miscompile
+        // risk in exempting it here too.
+        if let Expr::Guard(inner) = self.ast.expr(cond)
+            && matches!(self.ast.expr(*inner), Expr::Binary { op, .. } if op.is_comparison())
         {
             return;
         }
@@ -1621,9 +1648,6 @@ impl<'a> TypeChecker<'a> {
     fn type_binop(&mut self, op: BinOp, l: Ty, r: Ty, at: ExprId) -> Ty {
         use BinOp::*;
         let span = self.expr_span(at);
-        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
-            return Ty::Bits(Width::Known(1));
-        }
         if matches!(op, Range | PlusColon | MinusColon) {
             // Only meaningful as a `Bracket`'s own argument (`type_bracket`
             // re-matches the raw AST shape there for the real width rule);
@@ -1636,21 +1660,53 @@ impl<'a> TypeChecker<'a> {
             // silently miscompiles.
             return Ty::Unknown;
         }
+        // A comparison yields `l`'s own type/value on success (fails
+        // otherwise) — Verse's `X > 0` semantics (TODO.md's "Comparisons
+        // returning their left operand" design), the same "unwrap-or-
+        // fail" shape `opt?`/`f.Deq[]` already have, NOT a standalone
+        // `bits[1]` value anymore. Routed through the SAME `match (l, r)`
+        // compatibility check every other operator gets below (so `a >
+        // b` on incompatible types still errors, same as `a + b` would)
+        // rather than short-circuiting before it the way this used to —
+        // only the RESULT differs (`l`'s type, not the computed common
+        // width). `l`'s original value is captured before the match
+        // moves it in, since which arm actually matches doesn't change
+        // what a comparison yields.
+        let is_comparison = op.is_comparison();
+        let l_ty = l.clone();
         match (l, r) {
             (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
-            (Ty::Int, Ty::Int) => Ty::Int,
-            (Ty::Bits(w), Ty::Int) | (Ty::Int, Ty::Bits(w)) => Ty::Bits(w),
-            (Ty::Bits(a), Ty::Bits(b)) => match op {
-                Mul => Ty::Bits(match (a, b) {
-                    (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
-                    _ => Width::Unknown,
-                }),
-                Shl | Shr | AShr => Ty::Bits(a),
-                _ => Ty::Bits(match (a, b) {
-                    (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y)),
-                    _ => Width::Unknown,
-                }),
-            },
+            (Ty::Int, Ty::Int) => {
+                if is_comparison {
+                    l_ty
+                } else {
+                    Ty::Int
+                }
+            }
+            (Ty::Bits(w), Ty::Int) | (Ty::Int, Ty::Bits(w)) => {
+                if is_comparison {
+                    l_ty
+                } else {
+                    Ty::Bits(w)
+                }
+            }
+            (Ty::Bits(a), Ty::Bits(b)) => {
+                if is_comparison {
+                    l_ty
+                } else {
+                    match op {
+                        Mul => Ty::Bits(match (a, b) {
+                            (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
+                            _ => Width::Unknown,
+                        }),
+                        Shl | Shr | AShr => Ty::Bits(a),
+                        _ => Ty::Bits(match (a, b) {
+                            (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y)),
+                            _ => Width::Unknown,
+                        }),
+                    }
+                }
+            }
             (l, r) => {
                 self.error(
                     span,

@@ -67,13 +67,16 @@ fn return_is_rejected_inside_a_rule() {
 
 #[test]
 fn while_needs_sequences_or_elaborates() {
-    // DESIGN.md's E012 example.
+    // DESIGN.md's E012 example. `logic` discharges the comparison to a
+    // plain [1] condition (a bare comparison no longer types as [1] at
+    // all, see TODO.md's comparisons-as-fallible design) so this is
+    // still exactly one error, the one this test is actually about.
     let (_, _, errors) =
-        run("Bad(x : [8]) : [8] <combines> {\n while x <> 0 { x := x >> 1 }\n return x\n}\n");
+        run("Bad(x : [8]) : [8] <combines> {\n while logic x <> 0 { x := x >> 1 }\n return x\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("one iteration per cycle"));
 
-    run_ok("Ok(x : [8]) : [8] <sequences> {\n while x <> 0 { x := x >> 1 }\n return x\n}\n");
+    run_ok("Ok(x : [8]) : [8] <sequences> {\n while logic x <> 0 { x := x >> 1 }\n return x\n}\n");
 }
 
 #[test]
@@ -220,6 +223,43 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
     run_ok(
         "Classify(x : [8]) : [8] <combines, fails> {\n (x <> 0)?\n return x\n}\n\
          module M {\n out result : [8] = 0\n rule r {\n result := Classify(1)\n }\n}\n",
+    );
+}
+
+#[test]
+fn a_comparison_inside_a_logic_wrapped_calls_argument_still_needs_fails_declared() {
+    // Advisor-caught before commit: `logic <call>` discharges only the
+    // CALLEE's own fail condition, not an independent comparison nested
+    // in the call's arguments -- those are ordinary caller-side
+    // expressions, unrelated to what `logic` is discharging. The first
+    // pass at `infer_expr`'s `Expr::Logic` arm computed the whole
+    // wrapped call's effect in isolation (to capture the callee's own
+    // `reads`), which silently swallowed the argument comparison's
+    // `fails` along with it -- so a fn wrapping `logic Check(a > b)`
+    // could get away with `<combines>` alone, no `<fails>`, exactly the
+    // inconsistency `fails_must_be_declared_wherever_it_ends_up_true`
+    // above exists to catch for the simpler cases.
+    let (_, _, errors) = run(
+        "Check(x : [8]) : [8] <combines, fails> {\n (x <> 0)?\n return x\n}\n\
+         Wrap(a : [8], b : [8]) : [8] <combines> {\n return logic Check(a > b)\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`Wrap`"));
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+
+    // Contrast: `logic`-wrapping the COMPARISON directly (not a call
+    // argument) still discharges it fully, same as ever -- this fix
+    // only narrows the isolation for the call-argument shape above, not
+    // the ordinary comparison case.
+    run_ok("Wrap(a : [8], b : [8]) : [1] <combines> {\n return logic a > b\n}\n");
+
+    // The primary property the rewrite must preserve: `logic <call>`
+    // still discharges the CALLEE's own fails at a fn boundary, same as
+    // before this fix (no argument comparison in this one to worry
+    // about).
+    run_ok(
+        "Check(x : [8]) : [8] <combines, fails> {\n (x <> 0)?\n return x\n}\n\
+         Wrap(a : [8]) : [1] <combines> {\n return logic Check(a)\n}\n",
     );
 }
 

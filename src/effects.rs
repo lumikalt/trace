@@ -335,7 +335,14 @@ impl<'a> Checker<'a> {
             }
             Expr::Int(_) | Expr::SizedInt { .. } | Expr::Wildcard => {}
             Expr::Unary { operand, .. } => self.infer_expr(*operand, sig),
-            Expr::Binary { lhs, rhs, .. } => {
+            // A comparison fails wherever it appears (like a fifo op or
+            // failing call, and unlike every other binop) — conservative
+            // by construction, matching those two: correctness doesn't
+            // depend on WHERE it's nested, only on not missing one.
+            Expr::Binary { op, lhs, rhs } => {
+                if op.is_comparison() {
+                    sig.fails = true;
+                }
                 self.infer_expr(*lhs, sig);
                 self.infer_expr(*rhs, sig);
             }
@@ -456,10 +463,37 @@ impl<'a> Checker<'a> {
             // accept but that isn't actually meaningful (not a fifo
             // op/failing call at all, or a callee that also writes
             // state).
+            //
+            // A `logic`-wrapped CALL is the one shape where full
+            // isolation is wrong: `logic Check(a > b)` only discharges
+            // `Check`'s OWN fail condition, not an independent
+            // comparison (or anything else) inside its ARGUMENTS —
+            // those are ordinary caller-side expressions evaluated
+            // before the call, not part of what `logic` is discharging.
+            // Advisor-caught before commit: the isolated-inner_sig path
+            // used to swallow `a > b`'s own `fails` here, so a wrapping
+            // fn could get away with declaring `<combines>` (no
+            // `<fails>`) despite `e97795e`'s "must declare `<fails>`
+            // wherever it's computed true" rule, and the guard was
+            // silently dropped at the fn boundary. Fixed by handling
+            // the call shape exactly like an ordinary `Expr::Call`
+            // (callee reads merged, args inferred straight into `sig`)
+            // but WITHOUT merging the callee's own `fails`/`writes` —
+            // that part alone is what `logic` discharges.
             Expr::Logic(inner) => {
-                let mut inner_sig = EffectSig::default();
-                self.infer_expr(*inner, &mut inner_sig);
-                sig.reads.extend(inner_sig.reads);
+                if let Expr::Call { callee, args } = self.ast.expr(*inner).clone() {
+                    if let Some(callee_sig) = self.callee_sig(callee) {
+                        sig.reads.extend(callee_sig.reads.iter().copied());
+                    }
+                    self.infer_expr(callee, sig);
+                    for arg in args {
+                        self.infer_expr(arg, sig);
+                    }
+                } else {
+                    let mut inner_sig = EffectSig::default();
+                    self.infer_expr(*inner, &mut inner_sig);
+                    sig.reads.extend(inner_sig.reads);
+                }
             }
         }
     }

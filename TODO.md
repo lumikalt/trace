@@ -638,92 +638,187 @@ Worth building:
   accepted. `and` needed no dedicated syntax: sequential bare guards
   already conjoin for free, and `logic` combined with bitwise `&`
   already covers it in expression position.
-- **Comparisons returning their left operand in a failure context**
-  (Verse: `X > 0` yields `X` on success, fails otherwise) — design
-  decided (Lumi's call, made alongside the if-guard decision above,
-  which this one depends on). Not built; this is the semantics +
-  scope writeup, mirroring the if-guard entry's shape.
+- **Comparisons returning their left operand in a failure context ACHIEVED**
+  (Verse: `X > 0` yields `X` on success, fails otherwise, `04_operators`)
+  — see DESIGN.md's "Comparisons: fallible by default" for the full
+  write-up (semantics, examples). Built as a fourth member of trace's
+  existing closed family of fallible expressions (fifo `Deq[]`, `opt?`,
+  a failing call) rather than a type-system rework: `type_binop`'s
+  comparison arm (types.rs) now returns the LEFT operand's own type
+  instead of a flat `Ty::Bits(Width::Known(1))` — no new `Ty` sentinel,
+  fallibility is tracked entirely by AST shape, mirroring how a fifo
+  `Deq[]`'s own type is just its element type. `logic`'s existing
+  two-way allowlist (`check_logic_args_in`, firrtl/checks.rs) took a
+  third arm for a comparison exactly as predicted — simpler than the
+  fifo-op/call cases, since a comparison has no side effect to guard
+  against silently discarding.
 
-  **Reframe from "rework the type system" to "add a fourth fallible
-  shape."** trace already has a closed family of fallible expressions
-  — fifo `Deq[]`, `opt?` (Option unwrap), a call to a `<fails>`
-  fn/impl — each reusing the same `Expr::Guard`/`is_guard_like`/
-  placement-restriction (`check_guard_placement`)/mandatory-`<fails>`-
-  declaration (`check_fails_declared`) machinery. A comparison becomes
-  a FOURTH member of that family rather than a wholesale rework: `a >
-  b` stops being `Ty::Bits(Width::Known(1))` (`type_binop`'s
-  `Eq|Ne|Lt|Le|Gt|Ge` arm, currently a flat `return Ty::Bits(Width::
-  Known(1))`) and instead succeeds with `a`'s own type/width, or fails
-  — the exact "unwrap-or-fail" shape `opt?`/`f.Deq[]` already have.
-  `x := (a > b)?` would bind `x` to `a`'s value AND gate the rule on
-  the comparison holding, the same way `x := opt?`/`x := f.Deq[]`
-  already do today — no new binding form, just a new source feeding
-  the existing one. `logic a > b` (discharge to a definite `0`/`1`
-  without gating — no parens needed, `logic`'s operand now parses
-  loosely on purpose, see the `logic` bullet above) generalizes cleanly
-  too: `check_logic_args_in` (firrtl/checks.rs) is a hard two-way
-  allowlist (`is_fifo_op` / a
-  call to a guard-only `<fails>` callee), straightforward to extend
-  with a third arm — and a comparison is ALREADY side-effect-free, so
-  the "don't silently discard a write" concern that arm's other two
-  cases both have doesn't even apply here; simpler than what `logic`
-  already handles, not harder.
+  **The predicted if-guard dependency turned out to be avoidable.**
+  This bullet used to say comparisons-as-fallible couldn't ship ahead
+  of the (still-unbuilt) if-guard branch-scoped-fallibility design,
+  since every `if`/`while` conditioned on a bare comparison would
+  break with no discharge path. That was true, but the FIX didn't
+  need branch-scoping at all: `logic <expr>` (already built, and by
+  this point already reworked into a prefix operator with a
+  deliberately loose precedence — see the `logic` bullet above) is a
+  complete, working discharge path for `if`/`while` on its own.
+  `if logic a > b { ... }` reads cleanly BECAUSE of that precedence
+  change, which is why Lumi asked for it right before this decision,
+  not a coincidence. If-guard's branch-scoped `if`-with-`else` design
+  remains a separate, larger, still-unbuilt feature — it would let a
+  BARE comparison (no `logic`) sit directly in an `if`-with-`else`
+  condition; that's a real ergonomic gap this migration left open, not
+  something this work quietly solved.
 
-  **The real cost is `if`/`while`, and it's why this depends on the
-  if-guard decision above.** `if`/`while` conditions go through
-  `check_cond` (types.rs), which demands exactly `[1]` — they are NOT
-  reached via `is_guard_like`/the guard-placement machinery at all
-  today. Once a comparison stops being `[1]`, every existing `if`/
-  `while` whose condition is a bare comparison breaks unless something
-  discharges it back to a plain boolean. Measured, not guessed: 7
-  examples (`adder_tree.tr`, `call_branch.tr`, `mem_write_branch.tr`,
-  `race.tr`, `subleq.tr`, `subleq_boot.tr`, `submodule_cond.tr`) and
-  roughly 50 test snippets across `tests/*.rs` condition an `if`/
-  `while` on a bare comparison today. That is the actual migration
-  cost this decision carries, and it's the SAME machinery the if-guard
-  design above already targets: an `if` with a fallible condition and
-  no `else` is that design's already-supported case (comparison
-  failure just gates the rule, matching every one of the 7 examples
-  above); an `if`-WITH-`else` is that design's new, not-yet-built,
-  branch-scoped case. Comparisons-as-fallible cannot ship as an
-  independent feature ahead of if-guard's build — virtually every
-  existing `if` in the codebase needs if-guard's discharge path to
-  keep compiling at all.
+  **Migration measured and completed, not just predicted.** 7 examples
+  and the ~50 test snippets both bullets estimated needed `logic`-
+  wrapping their `if`/`while` conditions; all migrated, full suite
+  green, firtool + Icarus reconfirmed on every touched example.
+  `adder_tree.tr` — DESIGN.md's own `<elaborates>` showcase — is the
+  one real readability cost: `if logic len(xs) = 1 { ... }`, not the
+  original bare `if len(xs) = 1 { ... }`, because Lumi chose uniform
+  application over carving `<elaborates>` bodies out (see below), and
+  `logic` was the only working discharge path available even there.
 
-  **`while` is forced back into scope, not optional.** The if-guard
-  writeup marked `while` "out of scope unless a concrete need shows
-  up." `while x <> 0 { x := x >> 1 }` is that need: it's a real, tested
-  pattern (`tests/effects.rs`), including one `<sequences>`-lowered
-  case that's genuinely synthesizable, not just an elaboration-time
-  `<combines>` unroll. A `while`'s "condition became false" is
-  semantically its ordinary loop-exit, not a rule-wide failure the way
-  an `if`-with-no-else's condition failing is — confirm this is how
-  `<sequences>`'s existing while-lowering already treats a plain `[1]`
-  condition today, and design the comparison case to match that
-  (looping stops; the REST of the rule after the loop is unaffected),
-  not to gate the whole rule on the final failing comparison.
+  **`<elaborates>` decision: uniform, not carved out (Lumi's call,
+  against the recommendation).** Offered a carve-out (comparisons stay
+  plain `[1]` inside `<elaborates>` bodies, zero migration cost there)
+  versus uniform application (needs `elaborate.rs` to ALSO gain a
+  discharge mechanism, a second feature). Lumi picked uniform. Built:
+  `elaborate.rs`'s own interpreter never consulted `Ty` for a
+  comparison anyway (`eval_elab_int_binop`'s `Eq`/`Ne`/`Lt`/... arms
+  already folded straight to `Int(0)`/`Int(1)`, confirmed by reading
+  before assuming), so the ONLY gap was `Expr::Logic` itself, which
+  used to fall into the same "no meaning in `<elaborates>` code"
+  bucket as `Guard`/`Spawn`/`Optional`. Fixed with one arm:
+  `Expr::Logic(inner) => self.eval_elab_expr(inner, ...)` — discharge
+  is a pure no-op at elaboration time, since every value there is
+  already a resolved compile-time constant with nothing to gate.  A
+  BARE (undischarged) comparison inside `<elaborates>` is still
+  correctly an error, unchanged — it's exactly the SAME "implicit
+  guard, cannot fail at elaboration time" mechanism a bare fifo op/
+  `Guard` already had (`is_guard_like`'s catch-all already covered a
+  comparison before this feature existed at all, so this needed no new
+  code, just confirming the existing tests still pass unchanged —
+  they did:
+  `guards_forbidden_at_elaboration_time`/`implicit_guards_forbidden_
+  at_elaboration_time_too`, tests/effects.rs).
 
-  Two scope questions still open, recommendation given for each rather
-  than left blank:
-  - **All six comparison operators, or just the four orderings (`<`,
-    `<=`, `>`, `>=`)?** Verse's own example is `X > 0`; equality's
-    "return the left operand on success" is a much less useful value
-    (a caller already knows what `a` equals if `a = b` held). Leaning
-    toward all six anyway, for the same reason `17f21e9` ported `=`/
-    `<>` alongside the rest — a comparison-shaped carve-out (some
-    comparisons fallible, some not) is a worse asymmetry than a
-    rarely-useful value on two of the six.
-  - **Nesting.** Should a fallible comparison get the SAME "whole
-    statement / entire RHS of `:=` / let init only" restriction
-    `opt?`/`f.Deq[]` already have (rejecting `(a > b) & (c < d)`,
-    arithmetic, or a call argument outright), or something looser?
-    Recommend the same restriction — consistency with the rest of the
-    fallible family, and `(logic a > b) & (logic c < d)` is the existing
-    escape hatch for the bitwise-combine case (parens around each
-    `logic` needed now that its operand parses loosely, see the `logic`
-    bullet above — otherwise the first `logic` alone would swallow the
-    whole `&` expression), same as `or`'s own doc comment already
-    points to for `and` in expression position.
+  **Nesting: no dedicated position restriction shipped — the original
+  recommendation (below) turned out to be based on the wrong
+  precedent.** Advisor caught this before implementation: a fifo op/
+  failing call's "whole statement only" restriction exists because a
+  MISPLACED one would be SILENTLY missed by `compile_guard`'s fold
+  (which only scans specific top-level shapes) — wrong hardware, not
+  just a worse error. A comparison has no side effect, so instead of
+  restricting WHERE it can appear, `compile_guard`'s fold was made to
+  genuinely SEARCH for one anywhere within a statement's expression
+  tree (`comparison_conds`, firrtl/writes.rs, recursing via
+  `lower::sub_exprs` the same way `logic_arg_exprs`'s own comparison-
+  finding does) — `x := a + (a > b)` folds `a > b`'s condition into
+  the guard correctly, not just `x := a > b` alone. This was
+  UNDER-BUILT on the first pass and self-caught by direct probe before
+  it shipped: the naive version (checking only whether a statement's
+  own top-level RHS/init directly WAS a comparison) compiled `x := a +
+  (a > b)` clean with `fires_r = UInt<1>(1)`, never gating on `a > b`
+  at all despite effects.rs's `sig.fails` already correctly being
+  `true` for it — silently wrong whenever `a > b` didn't hold, pinned
+  by `a_comparison_nested_inside_a_larger_value_still_folds_into_the_
+  guard` (tests/firrtl.rs). One restriction DOES still apply, for a
+  different reason than "silent miss": a comparison nested inside an
+  `if`/`while`'s own BODY (not its condition) is rejected outright,
+  matching the EXISTING guard/fifo-op/failing-call restriction there —
+  folding it into the whole rule's guard would be wrong when the
+  branch might not even be taken, confirmed by the identical class of
+  self-caught bug one level deeper
+  (`a_comparison_nested_in_if_is_an_error_not_a_dropped_guard`).
+
+  **All six operators shipped, per the original recommendation.**
+  `BinOp::is_comparison()` (ast.rs) is the single shared predicate
+  every site (types.rs/effects.rs/firrtl) keys off of, matching
+  `resolve::is_guard_like`'s own "one predicate, not independent
+  re-derivations" rationale.
+
+  **A third self-caught bug, one level deeper still: `logic` itself
+  wasn't discharging.** `comparison_conds`'s recursive search (added
+  for the bug above) and `contains_comparison`'s if/while-nesting walk
+  both recurse via `lower::sub_exprs`, which already includes
+  `Expr::Logic(inner) => vec![inner]` (added when `logic` became a
+  prefix operator) — so both walkers happily descended straight
+  through a `logic` wrapper into the comparison it was supposed to be
+  discharging. `ok := logic a > b` compiled clean but with `fires_r =
+  gt(a, b)` instead of the correct `UInt<1>(1)`: `logic` was
+  contributing NO discharge at all, just silently re-adding the same
+  guard term compile_logic's own boolean already represents —
+  advisor-caught (not self-caught this time) before commit, by probing
+  the exact snippet the "silent-miss risk" reasoning above should have
+  been re-checked against once `comparison_conds` existed but wasn't.
+  Fixed both walkers to stop specifically at `Expr::Logic(inner)`
+  where `inner` IS the comparison itself, not at every `Expr::Logic`
+  — a `logic`-wrapped COMPARISON is fully discharged by `logic`, but a
+  `logic`-wrapped CALL only discharges the call's own fail cond, not
+  an independent comparison nested in its arguments. The first pass at
+  this fix stopped at every `Expr::Logic` unconditionally and was
+  itself caught by a second advisor probe before commit: `logic
+  Check(a > b)` compiled clean with `fires_r = UInt<1>(1)`, silently
+  dropping `a > b`'s own guard entirely. Pinned by
+  `logic_of_a_comparison_reads_its_ordinary_boolean_value`'s new
+  `fires_r = UInt<1>(1)` assertion, plus three new tests
+  (tests/firrtl.rs): `logic_wrapped_comparison_inside_an_if_body_is_
+  allowed_and_discharged`, `two_logic_wrapped_comparisons_combine_
+  with_amp`, and `logic_wrapped_call_with_a_comparison_argument_
+  still_gates_on_it` (the call-argument case specifically).
+
+  **A fourth advisor-caught bug, at the fn-boundary layer this time:**
+  `effects.rs`'s `infer_expr` had the identical isolation mistake as the
+  firrtl walkers above, one layer up the pipeline. `logic <call>`'s
+  effect-inference isolated the WHOLE wrapped call (to capture the
+  callee's own `reads`), discarding `fails`/`writes` entirely — correct
+  for the callee's OWN fail condition (that IS what `logic` discharges),
+  but wrong for an independent comparison inside the call's ARGUMENTS,
+  which is an ordinary caller-side expression `logic` never touches.
+  `Wrap(a, b) : [8] <combines> { return logic Check(a > b) }` used to
+  type-check as `<combines>` (no `<fails>` needed) even though `a > b`
+  is a live, undischarged failure — exactly the inconsistency `e97795e`
+  ("Require `<fails>` to be declared wherever it's computed true")
+  exists to catch, silently bypassed. Fixed by handling the call shape
+  like an ordinary `Expr::Call` (callee's `reads` merged, args inferred
+  straight into the enclosing sig) while specifically omitting the
+  callee's own `fails`/`writes` — only THAT part is what `logic`
+  discharges. Pinned by
+  `a_comparison_inside_a_logic_wrapped_calls_argument_still_needs_
+  fails_declared` (tests/effects.rs).
+
+  **Known remaining gap, diagnostic-only, not a miscompile risk:**
+  `check_guard_placement`'s `Stmt::Assign`/`Stmt::Let` arms still test
+  `rhs_is_comparison` shallowly (top-level shape only), unlike
+  `comparison_conds`'s recursive fold — so `x := a + (a > b)` after a
+  state write does NOT get the "comparison after a state write" error
+  a bare `x := a > b` would. The guard itself still folds correctly
+  regardless (compile_guard doesn't consult this check), so this is a
+  missing diagnostic, not silently wrong hardware. Left as-is; flagging
+  here so it isn't mistaken for solved.
+
+  **Second known gap, same diagnostic-only class, at the fn-boundary
+  fix's edges:** `effects.rs`'s `Expr::Logic` rewrite branches on
+  whether the operand is a `Call`; the firrtl walkers branch on whether
+  the operand IS the comparison. Those agree for the comparison and
+  Call shapes, but the third legal `logic` operand shape — a fifo op —
+  isn't specially handled in effects.rs at all, still fully isolated
+  (existing, intentional behavior: `logic f.Deq[]`/`logic f.Enq[x]` is
+  a pure occupancy TEST, `compile_logic` never emits the actual
+  mutation, so suppressing `writes` there is correct, not a gap). The
+  narrow edge: `logic f.Enq[a > b]`'s `a > b` argument is discarded
+  by `compile_logic` exactly like the rest of `Enq`'s data argument
+  (never emitted at all), but its `fails` is still silently isolated
+  away — reachable only when this whole pattern sits inside a fn
+  boundary (`Wrap(...) : [1] <combines> { return logic f.Enq[a > b] }`
+  wrongly accepted without `<fails>`); a bare rule-body use already
+  folds `a > b` correctly into the guard via the (correctly-fixed)
+  firrtl walkers, confirmed by direct probe. Left undone — deliberately
+  not restructuring effects.rs further for a shape this degenerate
+  (the enqueued value is thrown away either way, so writing this at
+  all is unlikely) — but flagging so it isn't mistaken for solved.
 - trace's `not` is confirmed to be a plain `[1]` boolean operator
   (`types.rs`'s operand-must-already-be-`[1]` rule), not Verse's
   "test success/failure without committing" operator — `17f21e9` was a
@@ -892,6 +987,12 @@ Speculative, bigger, not committed to:
   call, picking the full version over closing this or building `?T`-
   only sugar) — not built; this is the semantics + open-questions
   writeup the decision needs before an implementation attempt.
+  **Update:** comparisons-as-fallible (below) shipped WITHOUT this —
+  `logic <expr>` turned out to be a complete discharge path for
+  `if`/`while` on its own, so this is no longer a blocker for anything
+  that's actually built. What THIS would still add on top: a BARE
+  comparison directly in an `if`-with-`else` condition, no `logic`
+  needed. Still just a design, not an implementation attempt.
 
   **The no-else/with-else split is what makes this tractable at all.**
   An `if` whose fallible condition has NO `else` is already exactly

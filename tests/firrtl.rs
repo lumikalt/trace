@@ -490,7 +490,7 @@ module M {
     fifo f : [8]
     reg cond : [1] = 0
     rule r {
-        if cond = 1 {
+        if logic cond = 1 {
             let x = f.Deq[]
         }
     }
@@ -507,7 +507,7 @@ module M {
     fifo f : [8]
     reg cond : [1] = 0
     rule r {
-        if cond = 1 {
+        if logic cond = 1 {
             f.Enq[cond]
         }
     }
@@ -624,12 +624,20 @@ fn a_fifo_op_in_an_if_condition_is_an_error_not_a_dropped_dequeue() {
     // condition expression -- so a fifo op sitting directly in the
     // condition used to slip past both that check and `fifo_op_stmt`'s
     // exact-shape match entirely.
+    // `logic` around the comparison keeps this type-checking (a bare
+    // comparison no longer types as [1] at all, see TODO.md's
+    // comparisons-as-fallible design) without changing what this test
+    // is actually about: the fifo op is nested TWO levels deep now
+    // (inside the comparison, inside `logic`), and `logic_arg_exprs`'s
+    // exemption only covers the comparison itself, not what's nested
+    // inside it -- confirmed the fifo op is still caught, not silently
+    // exempted along with its wrapper.
     let src = "\
 module M {
     fifo input : [8]
     out result : [8] = 0
     rule compute {
-        if input.Deq[] = 1 {
+        if logic input.Deq[] = 1 {
             result := 5
         } else {
             result := 6
@@ -784,7 +792,7 @@ module M {
     reg v : [8] = 0
 
     rule r {
-        if cond = 1 {
+        if logic cond = 1 {
             m[addr] := v
         }
     }
@@ -819,7 +827,7 @@ module M {
     reg vb : [8] = 0
 
     rule r {
-        if cond = 1 {
+        if logic cond = 1 {
             m[addr_a] := va
         } else {
             m[addr_b] := vb
@@ -876,7 +884,7 @@ module M {
     in addr1 : [8]
 
     rule r {
-        if cond = 1 {
+        if logic cond = 1 {
             m[addr0] := 8'd11
         }
         m[addr1] := 8'd22
@@ -906,10 +914,10 @@ module M {
     in addrB : [8]
 
     rule r {
-        if condA = 1 {
+        if logic condA = 1 {
             m[addrA] := 8'd11
         }
-        if condB = 1 {
+        if logic condB = 1 {
             m[addrB] := 8'd22
         }
     }
@@ -938,7 +946,7 @@ module M {
 
     rule r {
         m[addr0] := 8'd11
-        if cond = 1 {
+        if logic cond = 1 {
             m[addr1] := 8'd22
         }
     }
@@ -1047,7 +1055,7 @@ module Top {
     reg cond : [1] = 0
     reg v : [8] = 0
     rule r {
-        if cond = 1 {
+        if logic cond = 1 {
             c.a := v
         } else {
             c.a := 1
@@ -1078,7 +1086,7 @@ module Top {
     reg cond : [1] = 0
     reg v : [8] = 0
     rule r {
-        if cond = 1 {
+        if logic cond = 1 {
             c.a := v
         }
     }
@@ -1349,17 +1357,19 @@ module M {
 
 #[test]
 fn sized_literal_compares_against_a_wider_operand() {
-    // Comparison ops don't unify operand widths in types.rs (Eq/Ne/etc.
-    // always type as [1] regardless of operand widths), and FIRRTL's
-    // `eq` primop itself implicitly extends the narrower operand -- so
-    // `x = 8'd6` with `x : [16]` needs no special-casing beyond
-    // what the sized literal already does (emit at its own width).
+    // `logic`'s comparison operand doesn't unify widths itself (`eq`'s
+    // own arm in `type_binop` no longer runs for a comparison at all --
+    // it yields `x`'s own type now, see TODO.md's comparisons-as-
+    // fallible design), and FIRRTL's `eq` primop itself implicitly
+    // extends the narrower operand -- so `x = 8'd6` with `x : [16]`
+    // needs no special-casing beyond what the sized literal already
+    // does (emit at its own width).
     let src = "\
 module M {
     in x : [16]
     out eq : [1] = 0
     rule r {
-        eq := x = 8'd6
+        eq := logic x = 8'd6
     }
 }
 ";
@@ -1538,8 +1548,8 @@ module M {
     out lnot : [1] = 0
     out tilde : [1] = 0
     rule r {
-        lnot := not (x = 0)
-        tilde := ~(x = 0)
+        lnot := not (logic x = 0)
+        tilde := ~(logic x = 0)
     }
 }
 ";
@@ -2054,7 +2064,7 @@ module M {
     in a : [8]
 
     Bump(x : [8]) : [8] <combines> {
-        if x > 10 {
+        if logic x > 10 {
             v := x
         } else {
             v := 0
@@ -2091,7 +2101,7 @@ module M {
     out result : [8] = 0
 
     Bump(x : [8]) : [8] <combines> {
-        if x > 10 {
+        if logic x > 10 {
             v := x
         } else {
             v := 0
@@ -2295,6 +2305,65 @@ module M {
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("node fires_compute = neq(a, UInt<8>(0))"));
     run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn a_comparison_nested_inside_a_larger_value_still_folds_into_the_guard() {
+    // A comparison has no dedicated "whole statement only" position
+    // restriction (unlike a guard/fifo op/failing call -- no side
+    // effect, so no silent-miss risk from a misplaced one, see TODO.md's
+    // comparisons-as-fallible design), so `compile_guard`'s fold has to
+    // go FIND one rather than only check the top-level shape. Self-
+    // caught by direct probe: this used to compile clean with `fires_r
+    // = UInt<1>(1)`, never gating on `a > b` at all even though
+    // effects.rs's `sig.fails` was already correctly `true` for it --
+    // `ok` was written unconditionally, silently wrong whenever `a > b`
+    // didn't actually hold.
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    out ok : [8] = 0
+    rule r {
+        ok := a + (a > b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = gt(a, b)"));
+    assert!(fir.contains("connect __out_ok, tail(add(a, a), 1)"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
+fn a_comparison_nested_in_if_is_an_error_not_a_dropped_guard() {
+    // The if/while-nesting sibling of the test above: folding a
+    // comparison found INSIDE a conditional branch into the RULE's own
+    // guard would be wrong regardless of nesting depth (the branch might
+    // not even be taken), so this is rejected outright instead, the
+    // same restriction a nested guard/fifo op/failing call already has.
+    // Self-caught the same way: `v := a + (a > b)` inside an `if` used
+    // to compile clean with `fires_r = UInt<1>(1)`, writing `v`
+    // unconditionally on the branch taken, with no gating on `a > b` at
+    // all.
+    let src = "\
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    in c : [1]
+    rule r {
+        if logic c = 1 {
+            v := a + (a > b)
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("comparison nested in if/while"))
+    );
 }
 
 #[test]
@@ -2657,7 +2726,7 @@ module Top {
     in cond : [1]
     out result : [8] = 0
     rule compute {
-        if cond = 1 {
+        if logic cond = 1 {
             result := Classify(a)
         } else {
             result := 0
@@ -2739,7 +2808,7 @@ fn call_to_a_function_with_a_non_tail_if_is_still_too_complex_to_inline() {
     // statement.
     let src = "\
 Pick(x : [8]) : [8] <combines> {
-    if x > 10 {
+    if logic x > 10 {
         return x
     }
     return 0
@@ -2763,7 +2832,7 @@ module M {
 fn call_inlines_a_function_with_an_if_else_branching_return() {
     let src = "\
 Max(a : [8], b : [8]) : [8] <combines> {
-    if a > b {
+    if logic a > b {
         return a
     } else {
         return b
@@ -2787,7 +2856,7 @@ module M {
 fn call_to_a_function_with_a_tail_if_and_no_else_is_an_error() {
     let src = "\
 Pick(x : [8]) : [8] <combines> {
-    if x > 10 {
+    if logic x > 10 {
         return x
     }
 }
@@ -2816,7 +2885,7 @@ fn call_inlines_a_function_with_lets_inside_branches_that_do_not_leak_out() {
     // branch's local still bound.
     let src = "\
 Pick(a : [8], b : [8]) : [8] <combines> {
-    if a > b {
+    if logic a > b {
         let winner = a
         return winner
     } else {
@@ -3273,6 +3342,58 @@ module M {
 }
 
 #[test]
+fn logic_of_a_comparison_reads_its_ordinary_boolean_value() {
+    // A comparison's success condition IS its own ordinary `eq`/`neq`/
+    // `lt`/... primop -- no side effect to skip, unlike a fifo op or a
+    // call, so `logic`'s job here is purely "type-check as a definite
+    // [1]", not "read some other, less-visible condition".
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    out ok : [1] = 0
+    rule r {
+        ok := logic a > b
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ok, gt(a, b)"));
+    // Pin the discharge itself: `logic` must NOT also fold `a > b` into
+    // the rule's guard (`comparison_conds`' recursive search has to stop
+    // at `Expr::Logic`, not walk through it) -- self-caught by direct
+    // probe, this used to silently emit `fires_r = gt(a, b)`, defeating
+    // the entire point of writing `logic` in the first place.
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_wrapped_comparison_inside_an_if_body_is_allowed_and_discharged() {
+    // The if/while-nesting check (`contains_comparison`) has to make the
+    // same `Expr::Logic`-stops-the-walk exemption as `comparison_conds`
+    // above, or a fully discharged comparison would be wrongly rejected
+    // just for appearing inside a conditional branch.
+    let src = "\
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    in c : [1]
+    rule r {
+        if logic c = 1 {
+            v := logic a > b
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(eq(c, UInt<1>(1)), gt(a, b), v)"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+#[test]
 fn logic_of_a_fifo_op_works_inside_a_callees_own_body() {
     // Advisor flagged this as untested: `check_logic_args` originally
     // only ran per-RULE (module.rs's loop), never on a callee's own
@@ -3400,7 +3521,7 @@ module M {
     let err = emit_from_source(src).unwrap_err();
     assert!(err.iter().any(|e| {
         e.message
-            .contains("needs a fifo op or a call to a function")
+            .contains("needs a fifo op, a comparison, or a call")
     }));
 }
 
@@ -3476,6 +3597,59 @@ module M {
     assert!(fir.contains(
         "connect __out_ok, mux(and(__fifo_f_valid, neq(a, UInt<8>(0))), UInt<1>(1), UInt<1>(0))"
     ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn two_logic_wrapped_comparisons_combine_with_amp() {
+    // DESIGN.md documents `(logic a > b) & (logic c < d)` as the
+    // parenthesized idiom that replaces a Verse-style `and` operator now
+    // that `logic`'s operand parses loosely — pin it directly rather
+    // than relying on the fifo-op/call variant above to stand in for it.
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    in d : [8]
+    out ok : [1] = 0
+    rule r {
+        ok := (logic a > b) & (logic c < d)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ok, and(gt(a, b), lt(c, d))"));
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn logic_wrapped_call_with_a_comparison_argument_still_gates_on_it() {
+    // Advisor-caught before commit: the fix above (stop `comparison_
+    // conds`/`contains_comparison`'s walk at `Expr::Logic`) can't just
+    // stop at EVERY `Expr::Logic` -- only a `logic`-wrapped COMPARISON
+    // is actually discharged by `logic` itself. A `logic`-wrapped CALL
+    // only discharges the call's own fail cond; an independent
+    // comparison nested in its arguments is a separate, undischarged
+    // failure. `logic Check(a > b)` must still gate `fires_r` on
+    // `a > b`, even though `logic` discharges `Check`'s own guard.
+    let src = "\
+Check(x : [8]) : [8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+module M {
+    in a : [8]
+    in b : [8]
+    out ok : [1] = 0
+    rule r {
+        ok := logic Check(a > b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = gt(a, b)"));
     run_firtool(&fir, &[]);
 }
 
@@ -3805,7 +3979,7 @@ module M {
     in go : [1]
 
     rule r {
-        if go = 1 {
+        if logic go = 1 {
             p := Pair{ valid: 1, data: 8'd7 }
         } else {
             p := Pair{ valid: 0, data: 8'd9 }
@@ -3832,7 +4006,7 @@ module M {
     in go : [1]
 
     rule r {
-        if go = 1 {
+        if logic go = 1 {
             p := Pair{ valid: 1, data: 8'd7 }
         }
     }
@@ -4001,7 +4175,7 @@ module M {
     in go : [1]
 
     rule r {
-        if go = 1 {
+        if logic go = 1 {
             f := Frame{ header: Header{ valid: 1, seq: 4'd3 }, data: 8'd7 }
         }
     }
@@ -4037,7 +4211,7 @@ module M {
     in go : [1]
 
     rule r {
-        if go = 1 {
+        if logic go = 1 {
             p := Pair{
                 valid: 1,
                 data: 8'd7

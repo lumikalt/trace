@@ -213,7 +213,7 @@ fn rejects_nested_tick() {
 module M {
     reg x : [8] = 0
     rule r <sequences> {
-        if x = 0 {
+        if logic x = 0 {
             tick
         }
         tick
@@ -750,7 +750,7 @@ module M {
 fn spawn_callee_early_return_is_rejected() {
     let src = "\
 Slow(x : [8]) : [8] <sequences> {
-    if x = 0 {
+    if logic x = 0 {
         return x
     }
     tick

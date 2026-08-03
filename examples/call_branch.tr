@@ -1,5 +1,5 @@
 Max(a : [8], b : [8]) : [8] <combines> {
-    if a > b {
+    if logic a > b {
         return a
     } else {
         return b

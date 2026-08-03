@@ -283,10 +283,69 @@ impl<'a> Emitter<'a> {
             path.push("valid".to_string());
             self.compile_struct_field_read(inner, root, &path, Some(1))
                 .unwrap_or_else(|_| "UInt<1>(1)".to_string())
+        } else if let Expr::Binary { op, lhs, rhs } = self.ast.expr(inner).clone()
+            && op.is_comparison()
+        {
+            // A comparison's OWN test condition is its ordinary boolean
+            // (`eq`/`neq`/`lt`/...) — `compile_expr`'s generic `Expr::
+            // Binary` dispatch would instead give `lhs`'s VALUE now (the
+            // "yields left operand on success" rule, see `type_binop`),
+            // wrong for a guard-fold position that wants the test
+            // itself, not what it unwraps to. `compile_binop` directly,
+            // same reason `compile_logic` (calls.rs) doesn't route a
+            // comparison operand through `compile_expr` either.
+            self.compile_binop(inner, op, lhs, rhs)
+                .unwrap_or_else(|_| "UInt<1>(1)".to_string())
         } else {
             self.compile_expr(inner)
                 .unwrap_or_else(|_| "UInt<1>(1)".to_string())
         }
+    }
+
+    /// Every comparison reachable anywhere within `root` (any nesting
+    /// depth) — used to fold a comparison's condition into the rule's
+    /// guard even when it's not the WHOLE right-hand side/init (`x := a
+    /// + (a > b)`, not just `x := a > b`). Unlike `f.Deq[]`/a failing
+    /// call, a comparison has no dedicated position restriction (no
+    /// side effect, so no silent-miss risk the way a misplaced fifo op/
+    /// call has — see TODO.md's comparisons-as-fallible design), so
+    /// `compile_guard`'s fold has to actually go looking for one rather
+    /// than only checking the top-level shape the way its fifo-op/Guard/
+    /// call folds do. Found the hard way: `x := a + (a > b)` used to
+    /// compile clean with `fires_r = UInt<1>(1)`, silently never gating
+    /// on `a > b` at all, even though effects.rs's `sig.fails` was
+    /// already correctly `true` for it.
+    fn comparison_conds(&mut self, root: ExprId) -> Vec<String> {
+        fn collect(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
+            // `logic <comparison>` is already discharged: its guard term
+            // is `logic`'s own job (compile_logic), so don't descend
+            // into IT or we'd double-guard and defeat the whole point of
+            // `logic` (see comparisons-as-fallible in TODO.md). But
+            // `logic <call>` only discharges the CALL's own fail cond —
+            // an independent comparison nested in the call's arguments
+            // (`logic Check(a > b)`) is a separate failure `logic` never
+            // discharged, so keep searching in that case by falling
+            // through to the ordinary recursion below.
+            if let Expr::Logic(inner) = ast.expr(id)
+                && matches!(ast.expr(*inner), Expr::Binary { op, .. } if op.is_comparison())
+            {
+                return;
+            }
+            if let Expr::Binary { op, .. } = ast.expr(id)
+                && op.is_comparison()
+            {
+                out.push(id);
+            }
+            for child in crate::lower::sub_exprs(ast, id) {
+                collect(ast, child, out);
+            }
+        }
+        let mut found = Vec::new();
+        collect(self.ast, root, &mut found);
+        found
+            .into_iter()
+            .map(|e| self.compile_guard_unwrap_cond(e))
+            .collect()
     }
 
     pub(crate) fn compile_guard(&mut self, rule: ItemId) -> String {
@@ -369,11 +428,13 @@ impl<'a> Emitter<'a> {
                             conds.push(cond);
                         } else if is_guard_like(self.ast, self.res, e) {
                             // An implicit guard: `e` itself IS the
-                            // condition, no `?` wrapper to unwrap.
-                            conds.push(
-                                self.compile_expr(e)
-                                    .unwrap_or_else(|_| "UInt<1>(1)".to_string()),
-                            );
+                            // condition, no `?` wrapper to unwrap —
+                            // `compile_guard_unwrap_cond` handles this
+                            // exactly like an explicit `?`'s own `inner`
+                            // would (Option/comparison special-cased,
+                            // ordinary bits[1] passed through), it just
+                            // has no wrapper to peel off first here.
+                            conds.push(self.compile_guard_unwrap_cond(e));
                         }
                     }
                 }
@@ -392,6 +453,14 @@ impl<'a> Emitter<'a> {
                         // way the bare-statement case above does.
                         let inner = *inner;
                         conds.push(self.compile_guard_unwrap_cond(inner));
+                    } else {
+                        // `x := a > b` (the whole RHS) or `x := a + (a >
+                        // b)` (nested somewhere inside it) — either way,
+                        // no `?` needed, same implicit-guard treatment
+                        // the bare-statement case above gives a
+                        // comparison; `comparison_conds` finds it
+                        // wherever it is.
+                        conds.extend(self.comparison_conds(rhs));
                     }
                 }
                 // A `let`-bound failing call is deliberately out of
@@ -411,6 +480,9 @@ impl<'a> Emitter<'a> {
                     if let Expr::Guard(inner) = self.ast.expr(init) {
                         let inner = *inner;
                         conds.push(self.compile_guard_unwrap_cond(inner));
+                    } else {
+                        // Same as the `Stmt::Assign` case just above.
+                        conds.extend(self.comparison_conds(init));
                     }
                 }
                 _ => {}

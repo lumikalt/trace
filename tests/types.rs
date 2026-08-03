@@ -323,7 +323,7 @@ module M {
     assert!(errors[0].message.contains("[1]"));
 
     run_ok(
-        "module M {\n reg a : [8] = 0\n reg b : [8] = 0\n rule r {\n if a <> 0 { b := 1 }\n }\n}\n",
+        "module M {\n reg a : [8] = 0\n reg b : [8] = 0\n rule r {\n if logic a <> 0 { b := 1 }\n }\n}\n",
     );
 }
 
@@ -422,8 +422,12 @@ module M {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`not` needs a [1] operand"));
 
-    // A genuine [1] value -- a comparison's own result -- is fine.
-    run_ok("module M {\n reg a : [8] = 0\n out b : [1] = 0\n rule r {\n b := not (a = 0)\n }\n}\n");
+    // A genuine [1] value -- `logic`'s discharge of a comparison -- is
+    // fine (a bare comparison itself no longer types as [1] at all; see
+    // TODO.md's comparisons-as-fallible design).
+    run_ok(
+        "module M {\n reg a : [8] = 0\n out b : [1] = 0\n rule r {\n b := not logic a = 0\n }\n}\n",
+    );
 }
 
 #[test]

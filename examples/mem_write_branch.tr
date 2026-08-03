@@ -20,7 +20,7 @@ module MemWriteBranch {
 
     rule step {
         count := count + 1
-        if we = 1 {
+        if logic we = 1 {
             m[addr] := data
         }
         read_data := m[read_addr]

@@ -89,10 +89,13 @@ impl<'a> Emitter<'a> {
                     // behind-`is_state_write` class the `or` case above
                     // was fixed for earlier this session.
                     let rhs_is_guard = matches!(self.ast.expr(rhs), Expr::Guard(_));
+                    let rhs_is_comparison =
+                        matches!(self.ast.expr(rhs), Expr::Binary { op, .. } if op.is_comparison());
                     let contributes_guard = fallible_or.contains(stmt)
                         || self.fifo_op(rhs).is_some()
                         || self.is_failing_call(rhs)
-                        || rhs_is_guard;
+                        || rhs_is_guard
+                        || rhs_is_comparison;
                     if fallible_or.contains(stmt) && seen_write {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -121,6 +124,13 @@ impl<'a> Emitter<'a> {
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
                             "a guard after a state write is not yet supported (v0 \
                              restriction): a guard must gate the whole rule"
+                                .to_string(),
+                        );
+                    } else if rhs_is_comparison && seen_write {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a comparison after a state write is not yet supported (v0 \
+                             restriction): it must gate the whole rule"
                                 .to_string(),
                         );
                     }
@@ -197,6 +207,15 @@ impl<'a> Emitter<'a> {
                              restriction): a guard must gate the whole rule"
                                 .to_string(),
                         );
+                    } else if matches!(self.ast.expr(init), Expr::Binary { op, .. } if op.is_comparison())
+                        && seen_write
+                    {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a comparison after a state write is not yet supported (v0 \
+                             restriction): it must gate the whole rule"
+                                .to_string(),
+                        );
                     } else if fallible_or.contains(stmt) && seen_write {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -228,6 +247,14 @@ impl<'a> Emitter<'a> {
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
                             "a call to a function that can fail, nested in if/while, \
                              is not yet supported (v0 restriction)"
+                                .to_string(),
+                        );
+                    }
+                    if contains_comparison(self.ast, *stmt) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a comparison nested in if/while is not yet supported (v0 \
+                             restriction)"
                                 .to_string(),
                         );
                     }
@@ -447,8 +474,11 @@ impl<'a> Emitter<'a> {
     }
 
     /// `logic <expr>`'s ONLY legal `expr`: a direct fifo op (`f.Deq[]`/
-    /// `f.Enq[x]`), or a direct call to a `sig.fails` fn/impl whose OWN
-    /// `sig.writes` is empty. Anything else is rejected here with a
+    /// `f.Enq[x]`), a direct comparison (`a > b`, ...), or a direct call
+    /// to a `sig.fails` fn/impl whose OWN `sig.writes` is empty. A
+    /// comparison needs no guard+write check of its own (unlike a call)
+    /// — it's side-effect-free by construction, nothing to silently
+    /// discard. Anything else is rejected here with a
     /// specific reason, rather than falling through to `check_failing_
     /// call_positions`/`check_fifo_op_positions`/`check_writing_call_
     /// positions_in`'s generic "nested in a larger expression" messages
@@ -599,11 +629,19 @@ impl<'a> Emitter<'a> {
             if is_fifo_op(self.ast, self.res, arg) {
                 continue;
             }
+            // A comparison (`a > b`, ...) is the third legal shape —
+            // unlike the other two, it's side-effect-free by
+            // construction, so there's no write/discard footgun to
+            // reject here the way a call needs (below); `compile_logic`
+            // reads it straight through `compile_binop`.
+            if matches!(self.ast.expr(arg), Expr::Binary { op, .. } if op.is_comparison()) {
+                continue;
+            }
             let Expr::Call { .. } = self.ast.expr(arg).clone() else {
                 self.error(
                     span,
-                    "`logic` needs a fifo op or a call to a function that can \
-                     fail as its operand"
+                    "`logic` needs a fifo op, a comparison, or a call to a \
+                     function that can fail as its operand"
                         .to_string(),
                 );
                 continue;
@@ -611,8 +649,8 @@ impl<'a> Emitter<'a> {
             let Some(fn_item) = self.call_target_fn(arg) else {
                 self.error(
                     span,
-                    "`logic` needs a fifo op or a call to a function that can \
-                     fail as its operand"
+                    "`logic` needs a fifo op, a comparison, or a call to a \
+                     function that can fail as its operand"
                         .to_string(),
                 );
                 continue;
@@ -1136,6 +1174,62 @@ pub(crate) fn contains_guard(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool 
                     .is_some_and(|b| b.iter().any(|s| contains_guard(ast, res, *s)))
         }
         Stmt::While { body, .. } => body.iter().any(|s| contains_guard(ast, res, *s)),
+        _ => false,
+    }
+}
+
+/// Whether `stmt` (an `if`/`while`, recursively) contains a comparison
+/// ANYWHERE within its own body — not just directly as a statement's
+/// whole RHS/init the way `contains_guard`'s narrower per-statement
+/// check works, since a comparison's own placement isn't restricted to
+/// those exact positions at all (unlike a guard/fifo op/failing call,
+/// it has no dedicated "whole statement only" rule — see TODO.md's
+/// comparisons-as-fallible design) — `x := a + (a > b)` needs catching
+/// here just as much as a bare `x := a > b` does. Folding a comparison
+/// found INSIDE a conditional branch into the RULE's own guard
+/// (`compile_guard`) would be wrong regardless of nesting depth: the
+/// branch might not even be taken, so the comparison might never
+/// actually need to hold — found by direct probe (`v := a + (a > b)`
+/// inside an `if`, compiling clean with `fires_r = UInt<1>(1)`, the
+/// write happening unconditionally on the comparison despite it failing)
+/// before this check existed.
+pub(crate) fn contains_comparison(ast: &Ast, stmt: StmtId) -> bool {
+    fn expr_has_comparison(ast: &Ast, id: ExprId) -> bool {
+        // `logic <comparison>` is already discharged, so it needs no
+        // nesting restriction here — only a bare, undischarged
+        // comparison does (mirrors `comparison_conds`'s writes.rs
+        // exemption, including its "a `logic`-wrapped CALL can still
+        // hide an independent, undischarged comparison in its
+        // arguments" carve-out).
+        if let Expr::Logic(inner) = ast.expr(id)
+            && matches!(ast.expr(*inner), Expr::Binary { op, .. } if op.is_comparison())
+        {
+            return false;
+        }
+        if let Expr::Binary { op, .. } = ast.expr(id)
+            && op.is_comparison()
+        {
+            return true;
+        }
+        crate::lower::sub_exprs(ast, id)
+            .into_iter()
+            .any(|child| expr_has_comparison(ast, child))
+    }
+    match ast.stmt(stmt) {
+        Stmt::Expr(e) => expr_has_comparison(ast, *e),
+        Stmt::Assign { rhs, .. } => expr_has_comparison(ast, *rhs),
+        Stmt::Let { init, .. } => expr_has_comparison(ast, *init),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            then_body.iter().any(|s| contains_comparison(ast, *s))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| contains_comparison(ast, *s)))
+        }
+        Stmt::While { body, .. } => body.iter().any(|s| contains_comparison(ast, *s)),
         _ => false,
     }
 }

@@ -95,6 +95,20 @@ impl BinOp {
             BinOp::MinusColon => "-:",
         }
     }
+
+    /// Whether this operator is one of the six comparisons — the single
+    /// shared predicate types.rs/effects.rs/firrtl (checks.rs, calls.rs,
+    /// writes.rs, expr.rs) all key off of for comparisons' fallible
+    /// treatment (see TODO.md's "Comparisons returning their left
+    /// operand" design), the same rationale `resolve::is_guard_like`
+    /// documents for its own callers: independent re-derivations drift
+    /// out of agreement with each other.
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
