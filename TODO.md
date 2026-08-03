@@ -189,31 +189,71 @@
   an undeclared `winner` that failed to re-resolve at FIRRTL-emission
   stage. See DESIGN.md's "Locals", "`sequences`: multi-cycle code",
   "`spawn`, `sync`, and `race`", and "Sequences lowering" sections.
-- **NEW, REAL BUG — a callee-local reassigned via `:=` is silently
-  dropped at FIRRTL emission; found while fact-checking DESIGN.md's
-  "Calling a function from a rule" section during the pass above, not
-  by the test suite.** Confirmed pre-existing, not a regression from
-  this session's changes (`git stash -u` + rerun on the pre-session
-  baseline reproduces byte-for-byte identical output). Repro: a callee
+- **RESOLVED — a callee-local reassigned via `:=` was silently dropped
+  at FIRRTL emission; found while fact-checking DESIGN.md's "Calling a
+  function from a rule" section in an earlier pass, not by the test
+  suite.** Confirmed pre-existing at the time, not a regression from
+  that session's changes (`git stash -u` + rerun on the pre-session
+  baseline reproduced byte-for-byte identical output). Repro: a callee
   with `let x = input.Deq[]` followed by `x := x + 1` later in the same
-  body — this compiles clean, no error, but the reassignment never
-  appears anywhere in the emitted FIRRTL; every read of `x` resolves to
-  its FIRST binding as if the `x := x + 1` line were never there. Root
-  cause: `enter_rule` (firrtl/writes.rs) is what builds
-  `locals_snapshots`, the position-indexed machinery that makes
-  rule-level `:=` reassignment resolve each read at its own textual
-  position — but it's built from `rule_body`, which returns an empty
-  `Vec` for anything that isn't a top-level `Item::Rule`, so a callee
-  body reached through inlining never populates it at all. Reads
-  instead fall back to the separate, single-binding `self.locals` map
-  (`expr.rs`'s Ident arm), which is what silently serves the stale
-  first value. NOT yet fixed — deliberately out of scope for the `let`
-  feature above (different bug class: silent wrong hardware, not a
-  message-quality or ambiguity gap; unrelated machinery). Needs either
-  extending `locals_snapshots`-style position tracking into callee
-  inlining, or a compile-time rejection of callee-local reassignment
-  until that exists (a `:=` reassignment of an already-`let`-bound
-  local, when the enclosing item isn't a `rule`).
+  body — this used to compile clean, no error, but the reassignment
+  never appeared anywhere in the emitted FIRRTL; every read of `x`
+  resolved to its FIRST binding as if the `x := x + 1` line were never
+  there.
+  Root cause, once probed through every inlining entry point (not just
+  the originally-reported return-value path): `self.locals`
+  (firrtl/expr.rs, calls.rs, writes.rs) substitutes each callee-local's
+  ORIGINAL binding EXPRESSION at every use site — an `ExprId`,
+  re-resolved fresh at each read — rather than a snapshot of its value
+  at bind time, unlike `enter_rule`'s `locals_snapshots` (writes.rs),
+  which gives RULE-level `:=` reassignment its correct position-indexed
+  behavior by eagerly compiling each local to TEXT the moment it's
+  bound. A naive fix (just start tracking `Stmt::Assign`-to-Local in
+  `self.locals`, the same way `Stmt::Let` already is, at each of the
+  four callee-body-walking sites) was tried and REJECTED before
+  shipping, based on a probe that found it would trade one silent bug
+  for another: `let z = x; x := x + 1; return z` currently (correctly,
+  if accidentally) returns `x`'s value AT BIND TIME for `z`, since the
+  reassignment is dropped entirely today; naively threading the
+  reassignment through the lazy `ExprId` map would make `z` resolve to
+  `x`'s NEW value instead, since `self.locals[z]` stores a live
+  reference to `x`, not a copy of what `x` was at the time. A SEPARATE
+  probe also found a branch-nested variant of the original bug
+  (`callee_reg_write`/`callee_port_write` recurse into `if`/`else`
+  branches directly, unlike the return-value path, which restricts
+  `if`/`else` to the body's own trailing position) that a naive
+  sequential fix couldn't have addressed correctly anyway — would need
+  real mux-threading of an arbitrarily-named local across branches, the
+  same class of machinery `while`'s own accumulator restriction defers.
+  **Fixed by rejecting outright, not by threading the fix through.**
+  One new check, `check_no_reassigned_locals_in_callee_body`
+  (firrtl/checks.rs), run once at `validate_call` (calls.rs) — the
+  single choke point every inlining entry point (`compile_call`,
+  `callee_fail_cond`, `call_writes_reg`/`call_writes_port`,
+  `compile_call_field_value`) already goes through — rather than four
+  separate patches at `compile_callee_body`/`compile_callee_body_field`/
+  `callee_reg_write`/`callee_port_write`, each of which would still
+  have been wrong for the `let z = x` shape above even once patched.
+  Recurses into `if`/`if let`/`while`/`while let` bodies too, so the
+  branch-nested variant is caught the same way. Verified against all
+  five probed shapes (return value, state write, `<fails>` guard,
+  branch-nested state write, the `let z = x` chain); the full existing
+  test suite (`all_examples_parse`/`all_examples_resolve` plus every
+  per-example emission test) staying green confirms no existing `.tr`
+  file hits the new restriction. Pinned by
+  `a_callee_local_reassignment_is_rejected_not_silently_dropped` and
+  `a_callee_local_reassignment_is_rejected_through_every_inlining_path`
+  (tests/firrtl.rs).
+  **The REAL fix this rejection defers, not attempted here:** extending
+  `locals_snapshots`-style eager-text, position-indexed local resolution
+  into callee inlining — `self.locals` would need to stop being a plain
+  `HashMap<DefId, ExprId>` for scalar locals specifically, while STAYING
+  an `ExprId` map for struct/`?T`-typed params (`compile_struct_field_
+  read`'s param chase-through resolves those structurally, not by
+  scalar value) — two interacting mechanisms, not a type swap. A future
+  session picking this up should start from the `let z = x` finding
+  above, not from the originally-reported case alone, since that's the
+  shape a partial fix keeps getting wrong.
 - **`bits[N]` respelled `[N]`; fifo depth respelled `{depth}elem_ty`
   (Lumi's call, an explicit syntax simplification, not a bug fix).**
   `bits`/`bit`/`uN` (`u8`, `u32`, ...) sugar all retired outright — no
@@ -797,36 +837,66 @@ Worth building:
   `a_comparison_inside_a_logic_wrapped_calls_argument_still_needs_
   fails_declared` (tests/effects.rs).
 
-  **Known remaining gap, diagnostic-only, not a miscompile risk:**
-  `check_guard_placement`'s `Stmt::Assign`/`Stmt::Let` arms still test
+  **RESOLVED in a follow-up session — was mischaracterized as
+  diagnostic-only; it was actually a real false-positive bug.**
+  `check_guard_placement`'s `Stmt::Assign`/`Stmt::Let` arms used to test
   `rhs_is_comparison` shallowly (top-level shape only), unlike
-  `comparison_conds`'s recursive fold — so `x := a + (a > b)` after a
-  state write does NOT get the "comparison after a state write" error
-  a bare `x := a > b` would. The guard itself still folds correctly
-  regardless (compile_guard doesn't consult this check), so this is a
-  missing diagnostic, not silently wrong hardware. Left as-is; flagging
-  here so it isn't mistaken for solved.
+  `comparison_conds`'s (writes.rs) recursive fold — so `x := a + (a >
+  b)` after a state write did NOT get the "comparison after a state
+  write" error a bare `x := a > b` would, which is the diagnostic-only
+  framing this bullet originally used. But the SAME shallow check also
+  fed `contributes_guard` (the flag deciding whether THIS write itself
+  already gates on its own embedded comparison, and so should NOT close
+  the guard window) — so `x := a + (a > b)` wrongly left `contributes_
+  guard` false, `seen_write` got set true, and a LATER, perfectly legal
+  top-level comparison in the same rule (`y := c > d`) then got a
+  false-positive "comparison after a state write" rejection, even
+  though `compile_guard` itself already correctly gates both writes
+  together (`and(gt(a, b), gt(c, d))`). Confirmed live: isolating the
+  first statement alone showed it was already correctly gated
+  (`fires_r = gt(a, b)`) before this fix, proving the SECOND
+  statement's rejection was the bug, not a missing diagnostic on the
+  first. Fixed by extracting `contains_comparison`'s (checks.rs) private
+  nested `expr_has_comparison` helper to module scope and reusing it at
+  both `check_guard_placement` call sites (the `rhs_is_comparison`/
+  `init`-comparison checks), so the SAME recursive predicate now backs
+  the diagnostic, the `contributes_guard` decision, and the if/while-
+  nesting check uniformly. Pinned by `a_write_whose_rhs_embeds_a_
+  comparison_does_not_falsely_close_the_guard_window` (the false-
+  positive fix) and `a_comparison_embedded_in_a_larger_value_after_an_
+  unrelated_write_is_still_rejected` (confirming the genuinely-bad shape
+  is still caught, tests/firrtl.rs).
 
-  **Second known gap, same diagnostic-only class, at the fn-boundary
-  fix's edges:** `effects.rs`'s `Expr::Logic` rewrite branches on
-  whether the operand is a `Call`; the firrtl walkers branch on whether
-  the operand IS the comparison. Those agree for the comparison and
-  Call shapes, but the third legal `logic` operand shape — a fifo op —
-  isn't specially handled in effects.rs at all, still fully isolated
-  (existing, intentional behavior: `logic f.Deq[]`/`logic f.Enq[x]` is
-  a pure occupancy TEST, `compile_logic` never emits the actual
-  mutation, so suppressing `writes` there is correct, not a gap). The
-  narrow edge: `logic f.Enq[a > b]`'s `a > b` argument is discarded
-  by `compile_logic` exactly like the rest of `Enq`'s data argument
-  (never emitted at all), but its `fails` is still silently isolated
-  away — reachable only when this whole pattern sits inside a fn
-  boundary (`Wrap(...) : [1] <combines> { return logic f.Enq[a > b] }`
-  wrongly accepted without `<fails>`); a bare rule-body use already
-  folds `a > b` correctly into the guard via the (correctly-fixed)
-  firrtl walkers, confirmed by direct probe. Left undone — deliberately
-  not restructuring effects.rs further for a shape this degenerate
-  (the enqueued value is thrown away either way, so writing this at
-  all is unlikely) — but flagging so it isn't mistaken for solved.
+  **RESOLVED in a follow-up session.** `effects.rs`'s `Expr::Logic`
+  rewrite branched on whether the operand was a `Call`; the firrtl
+  walkers branched on whether the operand IS the comparison. Those
+  agreed for the comparison and Call shapes, but the third legal
+  `logic` operand shape — a fifo op — wasn't specially handled in
+  effects.rs at all, still fully isolated (that part was, and remains,
+  existing intentional behavior: `logic f.Deq[]`/`logic f.Enq[x]` is a
+  pure occupancy TEST, `compile_logic` never emits the actual mutation,
+  so suppressing `writes` there is correct, not a gap, and this fix
+  doesn't touch it). The narrow edge that WAS a real gap: `logic
+  f.Enq[a > b]`'s `a > b` argument is discarded by `compile_logic`
+  exactly like the rest of `Enq`'s data argument (never emitted at
+  all), but its `fails` used to be silently isolated away too —
+  reachable only when this whole pattern sits inside a fn boundary
+  (`Wrap(...) : [1] <combines> { return logic f.Enq[a > b] }` used to
+  be wrongly accepted without `<fails>`, confirmed live before fixing);
+  a bare rule-body use already folded `a > b` correctly into the guard
+  via the (correctly-fixed) firrtl walkers, so this was specifically an
+  effects.rs-only gap. Fixed by giving `Expr::Logic`'s `Expr::Bracket`
+  fifo-op shape the identical special-casing its `Expr::Call` sibling
+  already had: the fifo's own occupancy resource is still read (`sig.
+  reads.insert(fifo)`, matching the plain non-`logic` fifo-op arm), but
+  the ARGUMENT is inferred straight into the enclosing `sig` rather
+  than isolated, so an independent embedded comparison's `fails`
+  propagates correctly — the fifo op's OWN `fails`/`writes` stay
+  excluded, unaffected, since that's still exactly what `logic`
+  discharges. Pinned by `a_comparison_inside_a_logic_wrapped_fifo_ops_
+  argument_still_needs_fails_declared` (tests/effects.rs), which also
+  confirms the plain-argument and no-argument (`Deq[]`) shapes are
+  unaffected — still no `<fails>` required for either.
 - trace's `not` is confirmed to be a plain `[1]` boolean operator
   (`types.rs`'s operand-must-already-be-`[1]` rule), not Verse's
   "test success/failure without committing" operator — `17f21e9` was a
@@ -1218,18 +1288,30 @@ Speculative, bigger, not committed to:
   second pass. Both fixed, with matching `Stmt::WhileLet` arms added at
   the same time.
 
-  A THIRD, OLDER gap was found but NOT fixed: a `let`-bound local
-  declared inside a plain `if`'s branch, read more than once, fails to
-  resolve on the second read (`enter_rule` only walks a rule's own
-  top-level statements; none of the branch-recursing write-threading
-  walks has a `Stmt::Let` arm either, so a branch-local's binding is
-  never registered). Confirmed with a PLAIN `if`, no `if let` involved —
-  predates every feature on this page. Pinned as a known gap (`a_branch_
-  local_read_more_than_once_is_a_known_pre_existing_gap`, tests/
-  firrtl.rs), not fixed — a materially different, pre-existing problem
-  (branch-body local tracking generally) than anything this pass needed.
-  `examples/while_let_drain.tr` works around it by recomputing `cnt - 1`
-  at each use instead of binding it once.
+  A THIRD, OLDER gap was found but not fixed in this pass, since it was a
+  materially different, pre-existing problem (branch-body local tracking
+  generally) than anything `while let` itself needed: a `let`-bound local
+  declared inside a plain `if`'s branch failed to resolve on EVERY read,
+  not just a second one — a same-branch local read even exactly once
+  already failed (`enter_rule` only walks a rule's own top-level
+  statements; none of the branch-recursing write-threading walks had a
+  `Stmt::Let` arm either, so a branch-local's binding was never
+  registered anywhere ANY read could find it). Confirmed with a PLAIN
+  `if`, no `if let` involved — predates every feature on this page.
+  **RESOLVED in a follow-up session:** each of the four branch-recursing
+  write-threading walks
+  (`reg_value_in_stmts`, `mem_write_in_stmts`, `struct_field_value_
+  in_stmts`, `inst_port_value_in_stmts`) now binds a branch-local `let`
+  into `self.locals` (saved/restored around each recursive branch call)
+  the moment it's encountered — sound for this shape specifically because
+  a branch-local is bound exactly once and never reassigned via `:=`
+  afterward, unlike the callee-local-reassignment gap above, which this
+  is deliberately NOT the same fix as. `examples/while_let_drain.tr`
+  reverted to the natural `let new_cnt = cnt - 1`, read twice, now that
+  the recompute-workaround is unnecessary — reconfirmed through the full
+  `<sequences>`/`while let` pipeline via real Icarus simulation, not just
+  a plain `if`. Pinned by `a_branch_local_read_more_than_once_resolves_
+  both_reads` (tests/firrtl.rs, renamed from its former known-gap name).
 
   Proven through a real Icarus simulation (examples/while_let_drain.tr +
   sim/while_let_drain_tb.v), the identical x=5/0/12 shape `while_

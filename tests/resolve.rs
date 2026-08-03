@@ -602,6 +602,36 @@ module M {
     assert!(errors[0].message.contains("cannot find `x`"));
 }
 
+/// A plain `if`'s `then`/`else`-scoped `let` (no `if let` involved at
+/// all) is already out of scope after the `if` closes, same as `if
+/// let`'s own binding above — `Stmt::If`'s existing scope push/pop
+/// already isolates it, unrelated to the branch-local EMISSION gap a
+/// later session fixed (`reg_value_in_stmts` and its three siblings,
+/// writes.rs, not resolve.rs) — confirmed here so that emission-level
+/// fix, which binds a branch-local `let` into `self.locals` for its OWN
+/// duration, is never mistaken for having widened resolve.rs's own
+/// scoping.
+#[test]
+fn a_plain_ifs_branch_local_is_not_visible_after_the_branch_closes() {
+    let src = "\
+module M {
+    reg flag : [1] = 0
+    reg cnt : [8] = 0
+    out result : [8] = 0
+    rule r {
+        if flag = 1 {
+            let v = cnt - 1
+            result := v
+        }
+        result := v
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot find `v`"));
+}
+
 #[test]
 fn if_let_bound_name_shadows_silently_like_a_plain_let() {
     // `declare`'s existing shadow-allowance for `DefKind::Local` covers

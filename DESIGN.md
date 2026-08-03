@@ -1463,13 +1463,19 @@ resolve is simply the ordinary "cannot find `x`; use `let x = ...`"
 resolve-time error every fresh-declaration site gets now (see "Locals"
 below), not a callee-specific case. REASSIGNING a callee-local afterward
 (`let x = ...` followed later by `x := ...` in the same callee body) is a
-real, KNOWN GAP, not yet a clean error: it currently compiles and emits
-without complaint, but the reassignment is silently dropped — every read
-resolves to the local's FIRST binding, since a callee's own locals never
-reach the position-snapshot machinery that makes rule-level `:=`
-reassignment sound (see "Locals" below); that machinery is rebuilt only
-per top-level `rule` item (`enter_rule`, firrtl/writes.rs), never for a
-callee body reached through inlining. See TODO.md.
+clean compile-time error — a callee's own locals never reach the
+position-snapshot machinery that makes rule-level `:=` reassignment
+sound (see "Locals" below; that machinery is rebuilt only per top-level
+`rule` item, `enter_rule`, firrtl/writes.rs, never for a callee body
+reached through inlining), and unlike the rule-level case, a callee-local
+reassignment can't simply be threaded through the substitution map that
+resolves callee-local reads (`self.locals`) either: that map substitutes
+each local's ORIGINAL binding expression at every use site, not a
+snapshot of its value, so `let z = x; x := x + 1; return z` would
+silently give `z` `x`'s NEW value instead of the value `z` was actually
+bound to — a real fix needs `locals_snapshots`-style eager, position-
+indexed resolution extended into callee inlining, not attempted yet. See
+TODO.md.
 
 The fold only understands one shape: the callee's _entire_ fail condition must
 reduce to bare guards and fifo ops sitting directly at its own top level —
@@ -2042,23 +2048,45 @@ segment-cutting/rendering machinery itself:**
   body` to find that reference. Confirmed live: a hard resolve-error
   failure on the second pass (not a silent miscompile, but a real gap).
   Fixed, with the matching `Stmt::WhileLet` arm added at the same time.
-- **A THIRD, older gap found but NOT fixed this pass, unrelated to `if
-  let`/`while`/`while let` specifically:** a `let`-bound local declared
-  INSIDE a plain `if`'s branch, read more than once (writing two different
-  registers off the same computed value — an entirely ordinary pattern),
-  fails to resolve on the second read. Root cause: `enter_rule` (writes.rs)
-  only walks a rule's own TOP-LEVEL statements to build `locals_snapshots`,
-  and none of the write-threading walks that DO recurse into branches
-  (`reg_value_in_stmts` and siblings) has a `Stmt::Let` arm either — so a
-  branch-local's binding is never registered anywhere, and a single read
-  happens to still compile it inline, but a second read has nothing to find.
-  Confirmed with a PLAIN `if` (no `if let` involved), so this predates every
-  feature on this page. `examples/while_let_drain.tr` works around it by
-  recomputing `cnt - 1` at each use instead of binding it once through a
-  `let` — pinned as a known gap (`a_branch_local_read_more_than_once_is_a_
-  known_pre_existing_gap`, tests/firrtl.rs) rather than fixed, since it's a
-  materially different, pre-existing problem (branch-body local tracking in
-  general) than anything `while let` itself needed to build.
+- **A THIRD, older gap found this pass, unrelated to `if let`/`while`/
+  `while let` specifically, and later fixed in a follow-up session:** a
+  `let`-bound local declared INSIDE a plain `if`'s branch used to fail to
+  resolve on EVERY read, not just a second one — a same-branch local read
+  even exactly ONCE already failed, confirmed directly (`git stash` back
+  to the pre-fix state and re-probed) rather than assumed from an earlier
+  characterization of this gap that turned out to be imprecise. Root
+  cause: `enter_rule` (writes.rs) only walks a rule's own TOP-LEVEL
+  statements to build `locals_snapshots`, and none of the write-threading
+  walks that DO recurse into branches (`reg_value_in_stmts` and its three
+  siblings — `mem_write_in_stmts`, `struct_field_value_in_stmts`,
+  `inst_port_value_in_stmts`) had a `Stmt::Let` arm either, so a
+  branch-local's binding was never registered anywhere ANY read could
+  find it. Confirmed with a PLAIN `if` (no `if let` involved), so this
+  predates every feature on this page. Originally worked around in
+  `examples/while_let_drain.tr` by recomputing `cnt - 1` at each use
+  instead of binding it once, and pinned as a known gap rather than fixed
+  in this pass, since it was a materially different, pre-existing problem
+  (branch-body local tracking in general) than anything `while let` itself
+  needed to build.
+  **Fixed in a follow-up session:** each of the four branch-recursing
+  write-threading walks now binds a branch-local `let` into `self.locals`
+  (the same lazy `ExprId`-substitution map a callee's own `let`s already
+  use) as it encounters one, saved/restored around each recursive branch
+  call. Sound here specifically — unlike the SEPARATE callee-local-
+  reassignment restriction ("Calling a function from a rule" above),
+  which this fix is deliberately NOT the same shape as — because a
+  branch-local `let` is bound exactly once and never reassigned via `:=`
+  afterward; reassignment of a rule-level local (branch-nested or not) is
+  already `locals_snapshots`/`set_pos`'s own working mechanism, untouched
+  by this fix. `examples/while_let_drain.tr`
+  reverted to the natural form (`let new_cnt = cnt - 1`, read twice) now
+  that the workaround is unnecessary — reconfirmed through the FULL
+  `<sequences>`/`while let` splice-and-reparse pipeline (not just a plain
+  `if`) via real Icarus simulation, since `new_cnt` ends up declared
+  inside the re-parsed `if let` segment's own branch body once `while
+  let`'s own rendering runs. Pinned by
+  `a_branch_local_read_more_than_once_resolves_both_reads` (tests/
+  firrtl.rs, renamed from its former known-gap name).
 
 ## Spawn, sync, and race lowering
 

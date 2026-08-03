@@ -554,9 +554,33 @@ impl<'a> Emitter<'a> {
         addr_width: u64,
     ) -> Option<(String, String, String)> {
         let mut current: Option<(String, String, String)> = None;
+        // A `let` declared INSIDE an if/else branch used to have nowhere
+        // to register its binding at all: `enter_rule`'s `locals_
+        // snapshots` (writes.rs) only walks a rule's own TOP-LEVEL
+        // statements, and this recursive walk itself had no `Stmt::Let`
+        // arm either — so a branch-local's first read already failed
+        // ("cannot find this local's binding"), confirmed by direct
+        // probe before this fix, not assumed. Binding it into `self.
+        // locals` here (the same lazy `ExprId`-substitution map a
+        // callee's own `let`s already use) is sound for this shape
+        // specifically — a branch-local `let` is bound exactly ONCE,
+        // never reassigned via `:=` after the fact, so there's no
+        // `let z = x; x := x + 1` hazard the way a callee's own locals
+        // have (see `check_no_reassigned_locals_in_callee_body`,
+        // checks.rs — reassignment of a RULE-level local, branch-nested
+        // or not, is a separate, already-working mechanism,
+        // `locals_snapshots`/`set_pos`). Saved/restored around each
+        // recursive branch call so a sibling branch, or a LATER call to
+        // this same function for a different reg/mem/port, never sees a
+        // stale binding.
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
         for stmt in stmts {
             self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
+                Stmt::Let { name, init } => {
+                    let def = def_of_name(self.res, &name);
+                    saved.push((def, self.locals.insert(def, init)));
+                }
                 Stmt::Assign { lhs, rhs }
                     if is_mem_write_to(self.ast, self.res, *stmt, mem_name) =>
                 {
@@ -678,6 +702,16 @@ impl<'a> Emitter<'a> {
                 _ => {}
             }
         }
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
+            }
+        }
         current
     }
 
@@ -696,9 +730,18 @@ impl<'a> Emitter<'a> {
         width: u64,
     ) -> Option<String> {
         let mut current: Option<String> = None;
+        // Binds a branch-local `let` into `self.locals` — see `mem_
+        // write_in_stmts`'s identical arm (above) for why this is sound
+        // here specifically (bound once, never reassigned) and what it
+        // fixes.
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
         for stmt in stmts {
             self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
+                Stmt::Let { name, init } => {
+                    let def = def_of_name(self.res, &name);
+                    saved.push((def, self.locals.insert(def, init)));
+                }
                 Stmt::Assign { lhs, rhs } => {
                     if is_ident_named(self.ast, self.res, lhs, reg_name) {
                         current = Some(
@@ -766,6 +809,16 @@ impl<'a> Emitter<'a> {
                     );
                 }
                 _ => {}
+            }
+        }
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
             }
         }
         current
@@ -972,9 +1025,16 @@ impl<'a> Emitter<'a> {
         root_ty: &Ty,
     ) -> Option<String> {
         let mut current: Option<String> = None;
+        // Binds a branch-local `let` into `self.locals` — see `mem_
+        // write_in_stmts`'s identical arm for why this is sound here.
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
         for stmt in stmts {
             self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
+                Stmt::Let { name, init } => {
+                    let def = def_of_name(self.res, &name);
+                    saved.push((def, self.locals.insert(def, init)));
+                }
                 Stmt::Assign { lhs, rhs } => {
                     if is_ident_named(self.ast, self.res, lhs, struct_name)
                         && let Some(value) =
@@ -1065,6 +1125,16 @@ impl<'a> Emitter<'a> {
                     );
                 }
                 _ => {}
+            }
+        }
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
             }
         }
         current
@@ -1275,9 +1345,16 @@ impl<'a> Emitter<'a> {
         width: u64,
     ) -> Option<String> {
         let mut current: Option<String> = None;
+        // Binds a branch-local `let` into `self.locals` — see `mem_
+        // write_in_stmts`'s identical arm for why this is sound here.
+        let mut saved: Vec<(DefId, Option<ExprId>)> = Vec::new();
         for stmt in stmts {
             self.set_pos(rule, *stmt);
             match self.ast.stmt(*stmt).clone() {
+                Stmt::Let { name, init } => {
+                    let def = def_of_name(self.res, &name);
+                    saved.push((def, self.locals.insert(def, init)));
+                }
                 Stmt::Assign { lhs, rhs } => {
                     if let Expr::Field { base, name } = self.ast.expr(lhs).clone()
                         && name == port_name
@@ -1355,6 +1432,16 @@ impl<'a> Emitter<'a> {
                     );
                 }
                 _ => {}
+            }
+        }
+        for (def, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.locals.insert(def, v);
+                }
+                None => {
+                    self.locals.remove(&def);
+                }
             }
         }
         current

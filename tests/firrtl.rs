@@ -2351,6 +2351,68 @@ module M {
     run_firtool(&fir, &["--disable-opt"]);
 }
 
+/// `check_guard_placement`'s own comparison check used to be SHALLOW
+/// (top-level shape only), unlike `comparison_conds`'s (writes.rs)
+/// recursive fold above — so a write whose RHS embeds a comparison
+/// (`x := a + (a > b)`, not just `x := a > b`) wrongly failed to close
+/// its own guard window: `contributes_guard` stayed false, `seen_write`
+/// got set true, and a LATER, perfectly legal top-level comparison in
+/// the same rule (`y := c > d`) then got a false-positive "comparison
+/// after a state write" rejection — even though `compile_guard` itself
+/// already correctly gates BOTH writes on `and(gt(a, b), gt(c, d))`.
+/// This was a real false-positive bug, not just a missing diagnostic
+/// (confirmed by isolating the first statement alone: `fires_r = gt(a,
+/// b)`, already correctly gated, before this fix existed).
+#[test]
+fn a_write_whose_rhs_embeds_a_comparison_does_not_falsely_close_the_guard_window() {
+    let src = "\
+module M {
+    reg x : [8] = 0
+    reg y : [8] = 0
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    in d : [8]
+    rule r <fails> {
+        x := a + (a > b)
+        y := c > d
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = and(gt(a, b), gt(c, d))"));
+    assert!(fir.contains("connect x, tail(add(a, a), 1)"));
+    assert!(fir.contains("connect y, c"));
+    run_firtool(&fir, &["--disable-opt"]);
+}
+
+/// The genuinely-bad shape the check exists to catch, now reached
+/// through the same DEEP check the fix above uses: a comparison embedded
+/// in a larger expression, after an UNRELATED, unconditional write —
+/// still correctly rejected, not accidentally let through by widening
+/// the check from shallow to deep.
+#[test]
+fn a_comparison_embedded_in_a_larger_value_after_an_unrelated_write_is_still_rejected() {
+    let src = "\
+module M {
+    reg x : [8] = 0
+    reg y : [8] = 0
+    in a : [8]
+    in c : [8]
+    in d : [8]
+    rule r <fails> {
+        x := a
+        y := c + (c > d)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("comparison after a state write"))
+    );
+}
+
 #[test]
 fn a_comparison_nested_in_if_is_an_error_not_a_dropped_guard() {
     // The if/while-nesting sibling of the test above: folding a
@@ -3893,6 +3955,111 @@ module M {
 ";
     let err = emit_from_source(src).unwrap_err();
     assert!(!err.is_empty());
+}
+
+/// A callee-local reassigned via `:=` used to compile clean and silently
+/// drop the reassignment entirely — `Bump(a) { let x = a  x := x + 1
+/// return x }` emitted `connect result, a`, `x + 1` never appearing
+/// anywhere. Now a clean compile-time rejection instead
+/// (`check_no_reassigned_locals_in_callee_body`, checks.rs) — see that
+/// function's own doc comment for why threading the reassignment
+/// through `self.locals` the way a rule-level reassignment works isn't
+/// a sound fix here.
+#[test]
+fn a_callee_local_reassignment_is_rejected_not_silently_dropped() {
+    let src = "\
+Bump(a : [8]) : [8] <combines> {
+    let x = a
+    x := x + 1
+    return x
+}
+module M {
+    in a : [8]
+    out result : [8] = 0
+    rule r {
+        result := Bump(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("cannot be reassigned"))
+    );
+}
+
+/// Same rejection reached through the OTHER three inlining paths a
+/// reassigned local could otherwise slip past: a state-writing callee
+/// (`callee_reg_write`), a `<fails>` callee's own guard
+/// (`callee_fail_cond`), and a branch-nested reassignment (which would
+/// need branch-aware mux tracking to thread correctly, not just
+/// sequential `self.locals` mutation, so it's rejected the same way).
+#[test]
+fn a_callee_local_reassignment_is_rejected_through_every_inlining_path() {
+    // The state-writing path.
+    let src = "\
+module M {
+    reg r : [8] = 0
+    in a : [8]
+    Bump(a : [8]) <combines, writes {r}> {
+        let x = a
+        x := x + 1
+        r := x
+    }
+    rule go {
+        Bump(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("cannot be reassigned"))
+    );
+
+    // The `<fails>` guard path.
+    let src = "\
+Chk(a : [8]) : [8] <combines, fails> {
+    let y = a
+    y := y + 1
+    (y <> 0)?
+    return y
+}
+module Top {
+    in a : [8]
+    out result : [8] = 0
+    rule compute <fails> {
+        result := Chk(a)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("cannot be reassigned"))
+    );
+
+    // The branch-nested path.
+    let src = "\
+module M {
+    reg r : [8] = 0
+    in a : [8]
+    in c : [1]
+    Bump(a : [8], c : [1]) <combines, writes {r}> {
+        let x = a
+        if c { x := x + 1 } else { x := x + 2 }
+        r := x
+    }
+    rule go {
+        Bump(a, c)
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("cannot be reassigned"))
+    );
 }
 
 /// Cross-tick guard/fifo-op audit (TODO.md): a fifo op sitting AFTER a
@@ -6141,25 +6308,28 @@ module M {
     run_firtool(&fir, &[]);
 }
 
-/// A previously-undiscovered, PRE-EXISTING gap found while writing a
-/// `while let` example (`examples/while_let_drain.tr`), unrelated to
-/// `while`/`while let`/`if let` specifically: `enter_rule` (writes.rs)
-/// only walks a RULE's own TOP-LEVEL statements to build `locals_
-/// snapshots`/`locals` for eager local resolution — a `let` declared
-/// INSIDE a branch (`if`, not even `if let`) is invisible to it, and
-/// none of the write-threading walks that DO recurse into branches
-/// (`reg_value_in_stmts` and its siblings) have a `Stmt::Let` arm
-/// either, so nothing ever registers that local's binding at all. A
-/// same-branch local read exactly ONCE happens to still work (nothing
-/// needs its OWN prior registration to compile a value inline the first
-/// time), but a SECOND read — writing two different registers off the
-/// same computed value, an entirely ordinary pattern — fails to
-/// resolve. Confirmed with plain `if` (no `if let` involved at all),
-/// so this predates every feature built this session. Not fixed here
-/// (out of scope for `while let`); pinned so the next person doesn't
-/// have to re-derive it. See TODO.md.
+/// A `let` declared INSIDE an `if`/`else` branch, read more than once —
+/// previously a PRE-EXISTING gap (found while writing a `while let`
+/// example, `examples/while_let_drain.tr`, unrelated to `while`/`while
+/// let`/`if let` specifically), now fixed: `enter_rule` (writes.rs)
+/// only ever walked a RULE's own TOP-LEVEL statements to build `locals_
+/// snapshots`, and none of the write-threading walks that recurse into
+/// branches (`reg_value_in_stmts` and its three siblings — `mem_write_
+/// in_stmts`, `struct_field_value_in_stmts`, `inst_port_value_in_
+/// stmts`) had a `Stmt::Let` arm either, so a branch-local's binding was
+/// never registered anywhere a second read could find it. Fixed by
+/// binding a branch-local `let` into `self.locals` (the same lazy
+/// `ExprId`-substitution map a callee's own `let`s already use) as each
+/// of those four walks encounters it — sound here specifically because
+/// a branch-local is bound exactly once and never reassigned via `:=`
+/// after the fact, unlike a callee's own locals (see `check_no_
+/// reassigned_locals_in_callee_body`, checks.rs, and its own doc
+/// comment for the reassignment hazard that restriction exists for,
+/// which doesn't apply to a plain one-time `let`). Confirmed with a
+/// plain `if` (no `if let` involved at all), so this predates every
+/// feature built in the session that found it. See TODO.md.
 #[test]
-fn a_branch_local_read_more_than_once_is_a_known_pre_existing_gap() {
+fn a_branch_local_read_more_than_once_resolves_both_reads() {
     let src = "\
 module M {
     reg flag : [1] = 0
@@ -6178,9 +6348,46 @@ module M {
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(
-        err.iter()
-            .all(|e| e.message.contains("cannot find this local's binding"))
-    );
+    let fir = emit_from_source(src).expect("emission should succeed");
+    let expected = "mux(eq(flag, UInt<1>(1)), tail(sub(cnt, UInt<8>(1)), 1), UInt<8>(0))";
+    assert!(fir.contains(&format!("connect cnt, {expected}")));
+    assert!(fir.contains(&format!("connect acc, {expected}")));
+    run_firtool(&fir, &[]);
+}
+
+/// The same fix's `self.locals` binding is a flat map, no position or
+/// scope tracking of its own — sound only because each recursive branch
+/// call gets its OWN `saved` vec, restored the moment that branch's own
+/// call returns (before its sibling branch ever runs). Pins that
+/// directly: THEN and ELSE each declare their own `let v = ...` (legal
+/// shadowing, different `DefId`s, same name — `let_shadowing_is_
+/// allowed`, tests/resolve.rs), and each branch's two reads of `v` must
+/// resolve to THAT branch's own binding, not leak the other's.
+#[test]
+fn same_named_branch_locals_in_then_and_else_do_not_cross_contaminate() {
+    let src = "\
+module M {
+    reg flag : [1] = 0
+    reg cnt : [8] = 0
+    reg acc : [8] = 0
+
+    rule r {
+        if flag = 1 {
+            let v = cnt - 1
+            cnt := v
+            acc := v
+        } else {
+            let v = cnt + 1
+            cnt := v
+            acc := v
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    let expected = "mux(eq(flag, UInt<1>(1)), tail(sub(cnt, UInt<8>(1)), 1), \
+                     tail(add(cnt, UInt<8>(1)), 1))";
+    assert!(fir.contains(&format!("connect cnt, {expected}")));
+    assert!(fir.contains(&format!("connect acc, {expected}")));
+    run_firtool(&fir, &[]);
 }

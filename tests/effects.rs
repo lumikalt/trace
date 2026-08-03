@@ -277,6 +277,42 @@ fn a_comparison_inside_a_logic_wrapped_calls_argument_still_needs_fails_declared
     );
 }
 
+/// The identical shape one level later, for a fifo op instead of a call
+/// (TODO.md's narrow fn-boundary edge): `logic f.Enq[a > b]` discharges
+/// only the Enq's own occupancy test, not an independent comparison in
+/// its ARGUMENT — an ordinary caller-side expression, same reasoning as
+/// a call's arguments above. `Expr::Bracket`'s own (non-`logic`) arm
+/// merges an Enq/Deq's argument effects into whatever `sig` it's given,
+/// so isolating the WHOLE bracket expr (the pre-fix behavior) silently
+/// folded `a > b`'s `fails` into the SAME flag the occupancy test itself
+/// sets — indistinguishable once merged, and lost the moment only
+/// `reads` was carried back out. Found live: `Wrap() : [1] <combines> {
+/// return logic f.Enq[a > b] }` used to compile clean with zero error.
+#[test]
+fn a_comparison_inside_a_logic_wrapped_fifo_ops_argument_still_needs_fails_declared() {
+    let (_, _, errors) = run(
+        "module M {\n fifo f : [8]\n Wrap(a : [8], b : [8]) : [1] <combines> {\n \
+         return logic f.Enq[a > b]\n }\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("`Wrap`"));
+    assert!(errors[0].message.contains("does not declare `<fails>`"));
+
+    // Contrast: a plain argument (no embedded comparison) still needs no
+    // `<fails>` at all — `logic f.Enq[x]` is a pure occupancy test,
+    // unaffected by this fix, matching TODO.md's own documented
+    // (intentional, not a gap) `writes`-suppression behavior.
+    run_ok(
+        "module M {\n fifo f : [8]\n Wrap(x : [8]) : [1] <combines> {\n \
+         return logic f.Enq[x]\n }\n}\n",
+    );
+
+    // `logic f.Deq[]` has no argument to hide a comparison in at all —
+    // confirms this fix's new `Expr::Bracket` branch doesn't regress the
+    // no-argument fifo-op shape either.
+    run_ok("module M {\n fifo f : [8]\n Wrap() : [1] <combines> {\n return logic f.Deq[]\n }\n}\n");
+}
+
 #[test]
 fn fails_must_be_declared_on_an_impl_too() {
     // `impl` shares the same `Item::Fn` shape as `fn`/`spec` under the

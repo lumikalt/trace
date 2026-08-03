@@ -11,12 +11,12 @@
 -- state directly (v0 restriction, same as plain `while`), so
 -- `cnt`/`acc` are regs, not locals.
 --
--- `cnt - 1` is recomputed rather than bound once through a `let`: `cnt`
--- is a REGISTER, so every read of it within one cycle sees the SAME
--- pre-this-cycle value regardless of how many times it's written, and
--- recomputing is the only way to reuse that value here today -- a
--- known, separate v0 gap (unrelated to `while`/`while let`) currently
--- rejects a same-branch local read more than once, see TODO.md.
+-- `new_cnt` is bound once via `let` and read twice (the `cnt` write,
+-- then the `opt` refill decision) -- a branch-local `let` read more
+-- than once, exercised here through the full `<sequences>`/`while let`
+-- splice-and-reparse pipeline, not just a plain `if` (see the
+-- "branch-local" tests in tests/firrtl.rs for the plain-`if` case
+-- directly).
 module WhileLetDrain {
     in x : [8]
     out iters : [8] = 0
@@ -34,9 +34,10 @@ module WhileLetDrain {
         }
         while let v = opt? {
             acc := acc + 1
-            cnt := cnt - 1
-            if logic (cnt - 1) <> 0 {
-                opt := cnt - 1
+            let new_cnt = cnt - 1
+            cnt := new_cnt
+            if logic new_cnt <> 0 {
+                opt := new_cnt
             } else {
                 opt := false
             }

@@ -376,10 +376,17 @@ impl<'a> Emitter<'a> {
         // defaulted (`fails: false`, so it slips past the guard-fold
         // checks) callee chain that compiled clean with the fifo's own
         // state transition silently missing.
+        // `check_no_reassigned_locals_in_callee_body` is the same
+        // "reject outright, no fold/support exists" shape as `check_no_
+        // or_in_callee_body` just above, for an unrelated reason: see
+        // that check's own doc comment (checks.rs) for why a callee-
+        // local's `:=` reassignment can't just be threaded through
+        // `self.locals` the way a rule-level reassignment can.
         let errors_before = self.errors.len();
         self.check_writing_call_positions_in(&body);
         self.check_logic_args_in(&body);
         self.check_no_or_in_callee_body(&body);
+        self.check_no_reassigned_locals_in_callee_body(&body);
         if self.errors.len() > errors_before {
             return Err(());
         }
@@ -855,7 +862,9 @@ impl<'a> Emitter<'a> {
             );
             return Err(());
         }
-        // A leading `Assign` (a direct state write) or bare-statement
+        // A leading `Assign` (a direct STATE write — `validate_call`'s own
+        // `check_no_reassigned_locals_in_callee_body` call already ruled
+        // out a LOCAL reassignment reaching this far) or bare-statement
         // `Expr` (a call, possibly writing state transitively) is a
         // side effect this walk — which only ever builds the RETURN
         // value — doesn't care about: its own value/write is found

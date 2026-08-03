@@ -88,9 +88,37 @@ impl<'a> Emitter<'a> {
                     // validation-completeness gap, the same else-if-
                     // behind-`is_state_write` class the `or` case above
                     // was fixed for earlier this session.
+                    // Deliberately SHALLOW, unlike `rhs_is_comparison`
+                    // below — a nested `Guard` (`x := a + opt?`) is
+                    // already rejected outright by `check_guard_
+                    // positions`'s own "whole statement/RHS/let-init
+                    // only" restriction (a `Guard`, unlike a comparison,
+                    // has no side-effect-free deep fold — `compile_
+                    // guard`'s own `Stmt::Assign` arm, writes.rs, only
+                    // ever checks a Guard's TOP-LEVEL shape, falling
+                    // through to `comparison_conds` for anything else),
+                    // so a shallow `Guard`-nested-in-a-larger-RHS shape
+                    // can never actually reach this check at all.
+                    // Confirmed by direct probe, not assumed, before
+                    // leaving this asymmetric with the fix just below.
                     let rhs_is_guard = matches!(self.ast.expr(rhs), Expr::Guard(_));
-                    let rhs_is_comparison =
-                        matches!(self.ast.expr(rhs), Expr::Binary { op, .. } if op.is_comparison());
+                    // Deep, not shallow (`x := a + (a > b)` counts, not
+                    // just `x := a > b`) — matches `comparison_conds`'s
+                    // (writes.rs) identical recursive fold, the thing
+                    // that actually threads a nested comparison into the
+                    // emitted guard regardless of position. A shallow
+                    // check here used to be a REAL bug, not just a
+                    // missing diagnostic: `x := a + (a > b)` wrongly left
+                    // `contributes_guard` false below, so its write
+                    // closed the guard window even though `compile_guard`
+                    // itself already gates it on `a > b` — a LATER,
+                    // perfectly legal top-level comparison in the same
+                    // rule then got a false-positive "comparison after a
+                    // state write" rejection. Found live, confirmed via
+                    // `--firrtl` on the isolated first statement alone
+                    // (`fires_r = gt(a, b)`, correctly gated) before
+                    // fixing. See TODO.md.
+                    let rhs_is_comparison = expr_has_comparison(self.ast, rhs);
                     let contributes_guard = fallible_or.contains(stmt)
                         || self.fifo_op(rhs).is_some()
                         || self.is_failing_call(rhs)
@@ -207,9 +235,7 @@ impl<'a> Emitter<'a> {
                              restriction): a guard must gate the whole rule"
                                 .to_string(),
                         );
-                    } else if matches!(self.ast.expr(init), Expr::Binary { op, .. } if op.is_comparison())
-                        && seen_write
-                    {
+                    } else if expr_has_comparison(self.ast, init) && seen_write {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
                             "a comparison after a state write is not yet supported (v0 \
@@ -654,6 +680,76 @@ impl<'a> Emitter<'a> {
                      it directly in the calling rule instead"
                         .to_string(),
                 );
+            }
+        }
+    }
+
+    /// A `Stmt::Assign` inside a callee (`fn`/`impl`) body whose `lhs` is
+    /// a LOCAL (not a state write) reassigns a `let`-bound name — not
+    /// supported, unlike the identical-looking rule-level case
+    /// (`enter_rule`/`set_pos`, writes.rs, this module's own doc comment
+    /// above): `self.locals` inside a callee substitutes each local's
+    /// ORIGINAL binding EXPRESSION at every use site
+    /// (`compile_expr_hinted(*bound, hint)`, expr.rs's Ident arm), not a
+    /// snapshot of its value at bind time, so a later reassignment would
+    /// retroactively change what an EARLIER read already resolved to —
+    /// confirmed concretely, not just reasoned through: `let z = x; x :=
+    /// x + 1; return z` would silently return `x`'s NEW value for `z`,
+    /// not the value `z` was actually bound to. Rule bodies avoid this
+    /// because `enter_rule`'s `locals_snapshots` eagerly compiles each
+    /// local to TEXT at its own bind-time position instead of storing a
+    /// live `ExprId`; extending that design into callee inlining is a
+    /// real fix (`self.locals` would need to stop being a plain
+    /// `ExprId` map), not attempted here — see TODO.md.
+    /// Found live, not by inspection: `Bump(a) { let x = a  x := x + 1
+    /// return x }` used to compile clean, `x + 1` never appearing
+    /// anywhere in the emitted FIRRTL (`connect result, a`) — this is
+    /// the fix, at the one choke point (`validate_call`) every call
+    /// site already goes through, rather than four separate patches to
+    /// `compile_callee_body`/`compile_callee_body_field`/`callee_reg_
+    /// write`/`callee_port_write`, each of which would still be wrong
+    /// for the `let z = x` shape above even once patched.
+    pub(crate) fn check_no_reassigned_locals_in_callee_body(&mut self, stmts: &[StmtId]) {
+        for stmt in stmts {
+            match self.ast.stmt(*stmt).clone() {
+                Stmt::Assign { lhs, .. } => {
+                    if let Some(def) = self.res.expr_defs.get(&lhs).copied()
+                        && self.res.def(def).kind == DefKind::Local
+                    {
+                        self.error(
+                            self.ast.expr_spans[lhs.0 as usize].clone(),
+                            format!(
+                                "`{}` cannot be reassigned inside a called function's \
+                                 body (v0 restriction: inlining substitutes a local's \
+                                 original binding expression at every use site, not a \
+                                 snapshot of its value, so a later reassignment would \
+                                 retroactively change what an earlier read already \
+                                 resolved to); use a fresh `let` under a new name \
+                                 instead",
+                                self.res.def(def).name
+                            ),
+                        );
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                }
+                | Stmt::IfLet {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.check_no_reassigned_locals_in_callee_body(&then_body);
+                    if let Some(b) = &else_body {
+                        self.check_no_reassigned_locals_in_callee_body(b);
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::WhileLet { body, .. } => {
+                    self.check_no_reassigned_locals_in_callee_body(&body);
+                }
+                _ => {}
             }
         }
     }
@@ -1335,28 +1431,45 @@ pub(crate) fn contains_guard(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool 
 /// inside an `if`, compiling clean with `fires_r = UInt<1>(1)`, the
 /// write happening unconditionally on the comparison despite it failing)
 /// before this check existed.
-pub(crate) fn contains_comparison(ast: &Ast, stmt: StmtId) -> bool {
-    fn expr_has_comparison(ast: &Ast, id: ExprId) -> bool {
-        // `logic <comparison>` is already discharged, so it needs no
-        // nesting restriction here — only a bare, undischarged
-        // comparison does (mirrors `comparison_conds`'s writes.rs
-        // exemption, including its "a `logic`-wrapped CALL can still
-        // hide an independent, undischarged comparison in its
-        // arguments" carve-out).
-        if let Expr::Logic(inner) = ast.expr(id)
-            && matches!(ast.expr(*inner), Expr::Binary { op, .. } if op.is_comparison())
-        {
-            return false;
-        }
-        if let Expr::Binary { op, .. } = ast.expr(id)
-            && op.is_comparison()
-        {
-            return true;
-        }
-        crate::lower::sub_exprs(ast, id)
-            .into_iter()
-            .any(|child| expr_has_comparison(ast, child))
+/// Whether a comparison is reachable ANYWHERE within `id` (any nesting
+/// depth) — the shared predicate `contains_comparison` (below, the
+/// if/while-nesting diagnostic) and `check_guard_placement`'s own
+/// `Stmt::Assign`/`Stmt::Let` arms both need, so `x := a + (a > b)`
+/// (comparison nested inside a larger expression, not the WHOLE
+/// right-hand side) is treated the same way EVERYWHERE a comparison's
+/// placement is diagnosed — mirroring `comparison_conds`'s (writes.rs)
+/// identical recursive fold, the thing that actually threads the
+/// comparison into the emitted guard regardless of nesting. Before this
+/// was shared, `check_guard_placement` used a shallow top-level-only
+/// check instead, so `x := a + (a > b)` after a state write silently
+/// got no "comparison after a state write" diagnostic — `compile_guard`
+/// still folded it correctly either way (this was a missing-diagnostic
+/// gap, not silently wrong hardware), but a bare `x := a > b` in the
+/// identical position DID get the error, an inconsistency with no
+/// principled reason behind it. See TODO.md.
+pub(crate) fn expr_has_comparison(ast: &Ast, id: ExprId) -> bool {
+    // `logic <comparison>` is already discharged, so it needs no
+    // nesting restriction here — only a bare, undischarged
+    // comparison does (mirrors `comparison_conds`'s writes.rs
+    // exemption, including its "a `logic`-wrapped CALL can still
+    // hide an independent, undischarged comparison in its
+    // arguments" carve-out).
+    if let Expr::Logic(inner) = ast.expr(id)
+        && matches!(ast.expr(*inner), Expr::Binary { op, .. } if op.is_comparison())
+    {
+        return false;
     }
+    if let Expr::Binary { op, .. } = ast.expr(id)
+        && op.is_comparison()
+    {
+        return true;
+    }
+    crate::lower::sub_exprs(ast, id)
+        .into_iter()
+        .any(|child| expr_has_comparison(ast, child))
+}
+
+pub(crate) fn contains_comparison(ast: &Ast, stmt: StmtId) -> bool {
     match ast.stmt(stmt) {
         Stmt::Expr(e) => expr_has_comparison(ast, *e),
         Stmt::Assign { rhs, .. } => expr_has_comparison(ast, *rhs),

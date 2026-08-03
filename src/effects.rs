@@ -540,12 +540,41 @@ impl<'a> Checker<'a> {
             // (callee reads merged, args inferred straight into `sig`)
             // but WITHOUT merging the callee's own `fails`/`writes` —
             // that part alone is what `logic` discharges.
+            //
+            // A `logic`-wrapped FIFO OP is the identical shape, one
+            // level later (found live, not by inspection: `Wrap() :
+            // [1] <combines> { return logic f.Enq[a > b] }` used to
+            // compile clean with no error, `a > b`'s own `fails` folded
+            // into and lost inside the SAME `inner_sig.fails` boolean
+            // the occupancy test itself sets — `Expr::Bracket`'s own
+            // arm above merges an Enq/Deq's ARGUMENT effects into
+            // whatever `sig` it's given, so isolating the whole bracket
+            // expr conflates "does the occupancy test fail" with "does
+            // the argument itself fail," indistinguishable once both
+            // are the same flag). `logic f.Enq[x]`/`logic f.Deq[]`
+            // themselves stay a pure occupancy TEST — `writes` still
+            // excluded (`compile_logic` never emits the actual
+            // mutation, existing intentional behavior, not touched
+            // here) — but the argument, like a call's arguments, is an
+            // ordinary caller-side expression `logic` never reaches:
+            // inferred straight into `sig`, not isolated, so an
+            // embedded `a > b` propagates its own `fails`/`reads`
+            // correctly. `fifo_op_target`'s own `reads.insert` covers
+            // the occupancy resource itself, same as the plain
+            // (non-`logic`) fifo-op arm above.
             Expr::Logic(inner) => {
                 if let Expr::Call { callee, args } = self.ast.expr(*inner).clone() {
                     if let Some(callee_sig) = self.callee_sig(callee) {
                         sig.reads.extend(callee_sig.reads.iter().copied());
                     }
                     self.infer_expr(callee, sig);
+                    for arg in args {
+                        self.infer_expr(arg, sig);
+                    }
+                } else if let Expr::Bracket { callee, args } = self.ast.expr(*inner).clone()
+                    && let Some(fifo) = self.fifo_op_target(callee)
+                {
+                    sig.reads.insert(fifo);
                     for arg in args {
                         self.infer_expr(arg, sig);
                     }
