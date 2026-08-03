@@ -288,8 +288,15 @@ impl<'a> Emitter<'a> {
     /// expression, collecting the field-name chain in root-to-leaf order
     /// (`p.inner.a`'s `base` — `p.inner` — peels to `(p, ["inner"])`;
     /// the caller pushes the outer access's own field name, `"a"`, on
-    /// top). Only walks through a base that is ITSELF a struct-typed
-    /// `Field` access; a plain struct-typed root value (an `Ident`)
+    /// top). Walks through a base that is ITSELF a struct-typed `Field`
+    /// access, OR an Option-typed `Guard` (`a?.b`'s `base` is `Guard(a)`,
+    /// `a : ?T` — the `?.` chain's own spine, see `lower::guard_chain_
+    /// spine`'s doc comment: unwrapping doesn't move data around, `T`'s
+    /// flattened registers ARE `?T`'s own `data.*`, so a `Guard` on the
+    /// spine just pushes `"data"` the same way `compile_expr_hinted`'s
+    /// own un-chained `Expr::Guard` value arm already does for the
+    /// single-hop case — generalized here so it composes at any depth,
+    /// `a?.b?.c` included). A plain struct-typed root value (an `Ident`)
     /// stops the walk, becoming `root` with an empty path so far.
     pub(crate) fn struct_field_path(&self, id: ExprId) -> (ExprId, Vec<String>) {
         if let Expr::Field { base, name } = self.ast.expr(id).clone()
@@ -300,6 +307,12 @@ impl<'a> Emitter<'a> {
         {
             let (root, mut path) = self.struct_field_path(base);
             path.push(name);
+            (root, path)
+        } else if let Expr::Guard(inner) = self.ast.expr(id).clone()
+            && matches!(self.types.expr_tys.get(&inner), Some(Ty::Option(_)))
+        {
+            let (root, mut path) = self.struct_field_path(inner);
+            path.push("data".to_string());
             (root, path)
         } else {
             (id, Vec::new())

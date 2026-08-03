@@ -1,0 +1,39 @@
+-- `?.` safe navigation (TODO.md's "`?.` safe navigation"): `a?.b?.c`
+-- chains through two independent `?`s, one per hop -- `a`'s own
+-- presence AND `b`'s own presence both gate the rule, not just the
+-- innermost one. sim/optional_chain_tb.v exercises exactly the case
+-- that discriminates a correct multi-hop fold from a naive "only check
+-- the final hop's presence" one: `a` present but `b` absent must NOT
+-- fire, even though a real bug folding only `b`'s own bit would let it.
+struct Inner {
+    c : [8]
+}
+
+struct Outer {
+    b : ?Inner
+}
+
+module OptionalChain {
+    reg a : ?Outer = false
+    out count : [4] = 0
+    out result : [8] = 0
+    in do_write : [1]
+    in mode : [2]
+    in c_in : [8]
+
+    rule write {
+        do_write?
+        if mode = 1 {
+            a := Outer{ b: false }
+        } else if mode = 2 {
+            a := Outer{ b: Inner{ c: c_in } }
+        } else if mode = 3 {
+            a := false
+        }
+    }
+
+    rule nav {
+        result := a?.b?.c
+        count := count + 1
+    }
+}

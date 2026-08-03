@@ -1455,6 +1455,97 @@ at its actual position, the identical reassigned-locals miscompile class
 pinned with regression tests (tests/firrtl.rs) before this was considered
 done.
 
+### `?.` safe navigation
+
+`opt?.field?.next` — Verse's own multi-hop chained unwrap-and-field-access
+(TODO.md's "`?.` safe navigation"): each `?` independently unwraps-or-fails
+one Option layer, and `.field` reads the unwrapped struct's own field,
+chaining through however many `?T` layers the whole expression needs.
+There's no dedicated `?.` token — `?` and `.field` are both ordinary
+postfix operators, chained the same way any two postfix operators compose
+(`a?.b?.c` parses as `Field{base: Guard(Field{base: Guard(a), name: "b"}),
+name: "c"}`, two `Guard` nodes at different depths, no new parser surface
+at all).
+
+```trace
+struct Inner {
+    c : [8]
+}
+struct Outer {
+    b : ?Inner
+}
+module M {
+    reg a : ?Outer = false
+    out result : [8] = 0
+    rule r {
+        result := a?.b?.c   -- fires only when BOTH a and a.b are present
+    }
+}
+```
+
+Usable anywhere a bare `opt?` already is — a whole bare statement, the
+entire right-hand side of `:=`, or the entire init of a `let` — with every
+`?` along the chain folding its own condition into the rule's guard, ANDed
+together (`and(a_data_b_valid, a_valid)` above, not just the innermost
+hop's). A `?.` chain reached through anything else — nested in arithmetic,
+a call argument, an `if` condition — is still a compile-time error, the
+identical v0 restriction a single un-chained `opt?` already has.
+
+**Implementation is almost entirely reuse, not new machinery.** `opt?.field`
+already parsed and type-checked correctly before this feature — `Expr::
+Guard`'s type-check already peels `?T` to `T` generically, and `Expr::
+Field`'s already looks up a field on whatever type its base produced, so a
+chain type-checks by the SAME two rules applied repeatedly, no new type-
+level code at all. The only real gaps were structural (which positions
+allow a `Guard`) and emission (how to find the physical flattened register a
+chain's root and full field path resolve to):
+
+- `guard_chain_spine` (lower.rs), shared by both remaining gaps: every
+  `Expr::Guard` reachable from a root by descending ONLY through `Expr::
+  Guard`/`Expr::Field` — the chain's own spine. A `Guard` reached by
+  descending into anything else isn't part of it.
+- `checks.rs`'s `guards_outside_allowed_positions` now computes each
+  statement's allowed set as this WHOLE spine (not just a single exact-
+  match `Expr::Guard`), so `a?.b?.c` is legal at the same three positions
+  a bare `opt?` already was, while a guard reached any other way still
+  gets rejected with the identical message.
+- `writes.rs`'s `compile_guard` (the rule's own guard-fold) gained
+  `guard_chain_conds`, folding every hop's condition on the spine — proven
+  to matter, not just theoretically: `and(a_data_b_valid, a_valid)`, not
+  a single term, is what actually fires `rule r` above; if only `b`'s own
+  presence folded, `a` absent with a stale/undefined `b` would read
+  garbage as if it were present.
+- `struct_field_path` (expr.rs) gained one new arm: a `Guard` on the
+  spine just pushes `"data"` onto the accumulated path and recurses into
+  its own inner, the same "unwrapping doesn't move data around" rule
+  `compile_expr_hinted`'s existing un-chained Guard-value arm already
+  used for the single-hop case — generalized so it composes at any depth.
+  `compile_expr_hinted`'s own `Field`/`Guard` value-read arms needed ZERO
+  changes: both already delegate to `struct_field_path`, so they pick up
+  chain support automatically.
+
+**`if let`/`while let` deliberately do NOT get multi-hop chaining — a
+scope boundary, not an oversight.** Every one of their own mux-select call
+sites (writes.rs/calls.rs, roughly a dozen: `reg_value_in_stmts`, `mem_
+write_in_stmts`, `struct_field_value_in_stmts`, `inst_port_value_in_stmts`,
+`callee_reg_write`/`callee_port_write`, `compile_callee_body`/`compile_
+callee_body_field`) extracts `init`'s own IMMEDIATE `inner` and folds only
+that one hop's condition (`compile_guard_unwrap_cond(opt)`) — never the
+whole spine. `if let x = a?.b?` would silently read `a.data.b.valid`
+without also gating on `a.valid`'s own presence: wrong hardware that still
+passes a structural FIRRTL check, not caught by anything short of running
+it. Fixing every one of those call sites is real, separate work this pass
+didn't attempt — `guards_outside_allowed_positions` keeps `IfLet`/`WhileLet`
+restricted to a single bare `Expr::Guard`, same as before this feature,
+rejecting a chained init with the same message a misplaced guard gets.
+
+**Proven end to end, not just structurally:** `examples/optional_chain.tr`
++ `sim/optional_chain_tb.v` (`tests/sim.rs`'s `optional_chain_sugar_runs_
+through_a_genuinely_absent_intermediate_hop`) drives the one state that
+actually discriminates a correct multi-hop fold from a naive one — `a`
+present, the intermediate `b` absent — through real firtool + Icarus, not
+just checking the emitted FIRRTL text contains the right `and(...)`.
+
 ## Locals
 
 `let` is the ONLY way to declare a fresh local. `x := value` never declares —
@@ -2991,6 +3082,14 @@ adder_tree.tr`, DESIGN.md's own `AdderTree`).
   rule's guard the same way a fifo `Deq[]` already does, including through a
   `let` init), non-failing `.valid`/`.data` presence check, `T` itself a
   struct or another `?T` (`examples/option.tr`).
+- `?.` safe navigation: multi-hop chained unwrap-and-field-access
+  (`opt?.field?.next`), each `?` folding its own condition into the
+  rule's guard independently, usable anywhere a bare `opt?` already is
+  (`examples/optional_chain.tr`, proven through a genuinely absent
+  intermediate hop — not just a structurally-accepted level — in
+  `tests/sim.rs`'s `optional_chain_sugar_runs_through_a_genuinely_
+  absent_intermediate_hop`). `if let`/`while let` deliberately stay
+  single-hop only (v0 restriction, see "`?.` safe navigation" above).
 - `rule foo?`: optional/enable sugar, desugaring at parse time into an
   implicit `in` port, a rising-edge shadow register (reset to `1`, not `0`,
   so a port already held high at reset does not spuriously fire the rule),

@@ -531,6 +531,56 @@ fn optional_rule_sugar_runs_through_real_reset_and_edges() {
     );
 }
 
+/// Proves `?.` safe navigation's multi-hop guard-fold (TODO.md's "`?.`
+/// safe navigation") end to end, not just that `fires_nav`'s FIRRTL text
+/// contains both hops' `and(...)` terms: sim/optional_chain_tb.v drives
+/// the one state that discriminates a genuine multi-hop fold from a
+/// naive one that only checks the FINAL hop's own presence bit -- `a`
+/// present but the intermediate `b` absent, which must NOT fire `nav`
+/// even though `a` itself is present -- then a fully-present chain
+/// (fires every cycle, reads the right value), then fully absent again
+/// (stops firing). A bug that folded only `b.valid` would let the first
+/// state fire wrongly; a bug that folded only `a.valid` would never be
+/// caught by ANY reachable state in this language (every write to `a`
+/// sets every flattened leaf together, so `a.valid=0` with a STALE
+/// `b.valid=1` isn't reachable here) -- see checks.rs's `guards_
+/// outside_allowed_positions` for why that asymmetry is fine.
+#[test]
+fn optional_chain_sugar_runs_through_a_genuinely_absent_intermediate_hop() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/optional_chain.tr"
+    ))
+    .unwrap();
+    let (tokens, lex_errors) = lexer::lex(&src);
+    assert!(lex_errors.is_empty(), "{lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(&src, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res);
+    assert!(type_errors.is_empty(), "{type_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
+    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
+        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/optional_chain_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves submodule instantiation end to end: sim/submodule_tb.v drives
 /// `Top`'s `x`/`y` and reads `result` through ordinary ports — `Top`
 /// `inst`-instantiates `Adder` and wires its ports (`adder.a := x`,

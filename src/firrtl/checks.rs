@@ -911,6 +911,10 @@ impl<'a> Emitter<'a> {
     /// `opt.data` from ANY position, so a nested-not-folded guard reads
     /// an absent Option as if it were present, with no error. Mirrors
     /// `check_failing_call_positions`/`check_fifo_op_positions` exactly.
+    /// "Entire RHS/init/statement" now also admits a WHOLE `?.` chain
+    /// there (`a?.b?.c`, `guards_outside_allowed_positions`'s own doc
+    /// comment) — every hop's `?` still folds, just at whatever depth
+    /// the chain reaches, not only as the immediate top node.
     pub(crate) fn check_guard_positions(&mut self, rule: ItemId) {
         let body = rule_body(self.ast, rule);
         let mut bad = Vec::new();
@@ -934,7 +938,12 @@ impl<'a> Emitter<'a> {
     /// one of the three positions `check_guard_positions` allows —
     /// walked generically via `sub_exprs` (lower.rs) rather than a
     /// hand-copied exhaustive match, since a guard's own inner expr can
-    /// itself be arbitrarily shaped.
+    /// itself be arbitrarily shaped. `Stmt::Expr`/`Stmt::Assign`/`Stmt::
+    /// Let` allow a WHOLE `?.` chain (`lower::guard_chain_spine` — every
+    /// `Expr::Guard` reachable by descending only through `Guard`/`Field`
+    /// nodes, any number of hops), not just a single bare `Expr::Guard`:
+    /// `compile_guard`/writes.rs folds every hop's own condition, not
+    /// just the outermost.
     fn guards_outside_allowed_positions(&self, stmts: &[StmtId], out: &mut Vec<ExprId>) {
         fn collect_guards(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
             if matches!(ast.expr(id), Expr::Guard(_)) {
@@ -945,31 +954,38 @@ impl<'a> Emitter<'a> {
             }
         }
         for stmt in stmts {
-            let allowed = match self.ast.stmt(*stmt).clone() {
-                Stmt::Expr(e) if matches!(self.ast.expr(e), Expr::Guard(_)) => Some(e),
-                Stmt::Assign { rhs, .. } if matches!(self.ast.expr(rhs), Expr::Guard(_)) => {
-                    Some(rhs)
-                }
-                Stmt::Let { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
-                    Some(init)
-                }
+            let allowed: Vec<ExprId> = match self.ast.stmt(*stmt).clone() {
+                Stmt::Expr(e) => crate::lower::guard_chain_spine(self.ast, e),
+                Stmt::Assign { rhs, .. } => crate::lower::guard_chain_spine(self.ast, rhs),
+                Stmt::Let { init, .. } => crate::lower::guard_chain_spine(self.ast, init),
                 // `if let x = opt?`'s own `init` IS `Expr::Guard(opt)` by
                 // construction (types.rs requires this shape) -- the
                 // WHOLE POINT of the syntax, not a misplaced guard the
                 // way an explicit `(a > b)?` if-CONDITION still is (see
                 // `Stmt::If`'s own comment above: that stays unlisted
-                // here on purpose). Allowed here mirrors `Stmt::Let`'s
-                // own `init` treatment exactly.
+                // here on purpose). Deliberately single-hop only, NOT
+                // `guard_chain_spine` the way the three cases above are:
+                // every `Stmt::IfLet`'s own mux-select site (writes.rs/
+                // calls.rs, ~a dozen call sites) reads `init`'s immediate
+                // `inner` alone (`compile_guard_unwrap_cond(opt)`) as the
+                // presence check, never folding an intermediate hop's OWN
+                // presence in too -- so `if let x = a?.b?` would silently
+                // read `a.data.b.valid` without also gating on `a.valid`,
+                // wrong hardware that still passes a structural FIRRTL
+                // check. Rejecting the chain here, not building the
+                // (much larger) fix across every one of those sites, is
+                // the deliberate v0 scope boundary -- see TODO.md's `?.`
+                // bullet and DESIGN.md's "Option types".
                 Stmt::IfLet { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
-                    Some(init)
+                    vec![init]
                 }
                 // `while let x = opt?`'s own `init` is `Expr::Guard(opt)`
                 // by construction too, the identical reasoning as
                 // `IfLet`'s arm just above.
                 Stmt::WhileLet { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
-                    Some(init)
+                    vec![init]
                 }
-                _ => None,
+                _ => Vec::new(),
             };
             let mut roots: Vec<ExprId> = Vec::new();
             match self.ast.stmt(*stmt).clone() {
@@ -1017,7 +1033,7 @@ impl<'a> Emitter<'a> {
                 let mut guards = Vec::new();
                 collect_guards(self.ast, root, &mut guards);
                 for g in guards {
-                    if Some(g) != allowed {
+                    if !allowed.contains(&g) {
                         out.push(g);
                     }
                 }

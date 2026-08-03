@@ -1533,6 +1533,31 @@ fn find_unsupported_in_expr(ast: &Ast, res: &Resolution, id: ExprId) -> Option<S
     None
 }
 
+/// Every `Expr::Guard` node reachable from `root` by descending ONLY
+/// through `Expr::Guard`/`Expr::Field` -- the `?.` chain's own spine
+/// (`a?.b?.c`, any number of hops, each `?` folding into the rule's
+/// guard independently). A `Guard` reached by descending into anything
+/// else (an arithmetic operand, a call argument, an `if` condition)
+/// isn't part of this spine. Shared by `firrtl/checks.rs` (every OTHER
+/// guard, found via the general `sub_exprs` walk below, stays rejected)
+/// and `firrtl/writes.rs` (every guard ON this spine gets folded into
+/// the rule's own guard, not just the outermost one).
+pub(crate) fn guard_chain_spine(ast: &Ast, root: ExprId) -> Vec<ExprId> {
+    fn walk(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
+        match ast.expr(id) {
+            Expr::Guard(inner) => {
+                out.push(id);
+                walk(ast, *inner, out);
+            }
+            Expr::Field { base, .. } => walk(ast, *base, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(ast, root, &mut out);
+    out
+}
+
 /// Direct expression children the parser can produce, one level.
 pub(crate) fn sub_exprs(ast: &Ast, id: ExprId) -> Vec<ExprId> {
     match ast.expr(id).clone() {

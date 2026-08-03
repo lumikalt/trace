@@ -385,6 +385,30 @@ impl<'a> Emitter<'a> {
             .collect()
     }
 
+    /// Every hop's own condition along a `?.` chain rooted at `root`
+    /// (`lower::guard_chain_spine` — every `Expr::Guard` reachable by
+    /// descending only through `Guard`/`Field` nodes), each folded via
+    /// `compile_guard_unwrap_cond` exactly like a single un-chained
+    /// `opt?` already is. `a?.b?.c` folds BOTH `?`'s own conditions, not
+    /// just the outermost — an absent `a` must still gate the rule even
+    /// though only `a.data.b`'s own presence bit is what the FINAL hop's
+    /// condition alone would read. Empty when `root` isn't Guard/Field-
+    /// shaped at all (an ordinary comparison, a plain value) — every
+    /// call site below checks for that and falls back to its own
+    /// existing non-chain handling.
+    fn guard_chain_conds(&mut self, root: ExprId) -> Vec<String> {
+        crate::lower::guard_chain_spine(self.ast, root)
+            .into_iter()
+            .map(|g| {
+                let Expr::Guard(inner) = self.ast.expr(g) else {
+                    unreachable!("guard_chain_spine only ever returns Guard nodes")
+                };
+                let inner = *inner;
+                self.compile_guard_unwrap_cond(inner)
+            })
+            .collect()
+    }
+
     pub(crate) fn compile_guard(&mut self, rule: ItemId) -> String {
         let body = rule_body(self.ast, rule);
         // `rule_fifo_ops` (fifo.rs) already finds every fifo op this
@@ -454,9 +478,16 @@ impl<'a> Emitter<'a> {
             }
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Expr(e) => {
-                    if let Expr::Guard(inner) = self.ast.expr(e) {
-                        let inner = *inner;
-                        conds.push(self.compile_guard_unwrap_cond(inner));
+                    // A `?.` chain (`opt?.field?...`, any number of
+                    // hops — `guard_chain_conds` is empty for anything
+                    // that isn't Guard/Field-shaped, including the
+                    // un-chained `opt?`/`(cond)?` case this subsumes: a
+                    // bare top-level `Expr::Guard` IS its own one-element
+                    // spine, folding identically to what this branch used
+                    // to do by hand-matching it directly).
+                    let chain = self.guard_chain_conds(e);
+                    if !chain.is_empty() {
+                        conds.extend(chain);
                     } else {
                         conds.extend(stmt_fifo_conds);
                         if let Expr::Call { callee, args } = self.ast.expr(e).clone()
@@ -481,23 +512,26 @@ impl<'a> Emitter<'a> {
                         && let Some(cond) = self.callee_fail_cond(rhs, callee, &args)
                     {
                         conds.push(cond);
-                    } else if let Expr::Guard(inner) = self.ast.expr(rhs) {
-                        // `x := opt?` (or `x := (cond)?`): the guard sits
-                        // as the WHOLE right-hand side, same "bare
-                        // statement or entire RHS of `:=`" position a
-                        // failing call/fifo op is already restricted to
-                        // (`check_guard_placement`) — folds here the same
-                        // way the bare-statement case above does.
-                        let inner = *inner;
-                        conds.push(self.compile_guard_unwrap_cond(inner));
                     } else {
-                        // `x := a > b` (the whole RHS) or `x := a + (a >
-                        // b)` (nested somewhere inside it) — either way,
-                        // no `?` needed, same implicit-guard treatment
-                        // the bare-statement case above gives a
-                        // comparison; `comparison_conds` finds it
-                        // wherever it is.
-                        conds.extend(self.comparison_conds(rhs));
+                        // `x := opt?` / `x := opt?.field?...`: the guard
+                        // (or the whole `?.` chain) sits as the WHOLE
+                        // right-hand side, same "bare statement or entire
+                        // RHS of `:=`" position a failing call/fifo op is
+                        // already restricted to (`check_guard_positions`)
+                        // — folds every hop here the same way the bare-
+                        // statement case above does.
+                        let chain = self.guard_chain_conds(rhs);
+                        if !chain.is_empty() {
+                            conds.extend(chain);
+                        } else {
+                            // `x := a > b` (the whole RHS) or `x := a + (a >
+                            // b)` (nested somewhere inside it) — either way,
+                            // no `?` needed, same implicit-guard treatment
+                            // the bare-statement case above gives a
+                            // comparison; `comparison_conds` finds it
+                            // wherever it is.
+                            conds.extend(self.comparison_conds(rhs));
+                        }
                     }
                 }
                 // A `let`-bound failing call is deliberately out of
@@ -514,11 +548,14 @@ impl<'a> Emitter<'a> {
                 // reached `fires_<rule>`, reading a stale/garbage `x`).
                 Stmt::Let { init, .. } => {
                     conds.extend(stmt_fifo_conds);
-                    if let Expr::Guard(inner) = self.ast.expr(init) {
-                        let inner = *inner;
-                        conds.push(self.compile_guard_unwrap_cond(inner));
+                    // Same as the `Stmt::Assign` case just above: a
+                    // whole `?.` chain (or a single un-chained `opt?`)
+                    // folds every hop; otherwise fall back to
+                    // `comparison_conds`.
+                    let chain = self.guard_chain_conds(init);
+                    if !chain.is_empty() {
+                        conds.extend(chain);
                     } else {
-                        // Same as the `Stmt::Assign` case just above.
                         conds.extend(self.comparison_conds(init));
                     }
                 }

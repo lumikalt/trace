@@ -1318,32 +1318,81 @@ Speculative, bigger, not committed to:
   countdown` pins for plain `while`, gated on a real `opt_valid` register
   instead of a comparison.
 
-- **`?.` safe navigation — designed, not built (scope decided via
-  `AskUserQuestion` alongside `if let` above).** Verse's own primary
-  source (`08_failure`, fetched directly, not guessed at) is explicit:
-  `?.` is MULTI-HOP, each `?.` its own independent unwrap-or-fail —
-  `Head?.Next?.Value` chains through however many `?Node` layers `.Next`
-  itself is, not a single unwrap followed by ordinary field reads. That
-  ruled out treating this as a small extension of `if let`'s own
-  one-hop resolution (`if_let_binds`, DESIGN.md): `opt?.field` needs
-  the SAME local-to-root chase-through `if let`'s `x` gets, PLUS a new
-  recursive multi-failure-point guard-fold (find and AND together every
-  `?`/`?.` reachable in one expression — the same shape `comparison_
-  conds` already needed for comparisons, at a new site) PLUS type-
-  checking that threads correctly through a chain of nested `?U`
-  fields. Confirmed the underlying blocker is real before scoping
-  further, not assumed: `let p = opt?; p.field` (T a struct) already
-  fails today with "a struct-typed local must be bound directly to a
-  struct literal, not aliased" — the exact chase-through gap `?.` would
-  need to close, probed directly rather than inferred. Three sizes on
-  the table, smallest to largest, any of which is a real follow-up: (a)
-  one-hop only (`opt?.field`, a single unwrap then plain field reads,
-  usable anywhere a bare `opt?` already is — whole-statement/`:=`
-  RHS/`let` init) is honestly a DIFFERENT, smaller feature than `?.`
-  and shouldn't be called that in DESIGN.md if built; (b) full Verse-
-  faithful multi-hop chaining, the real `?.`; (c) doing nothing further
-  here, `if let` + `.data`/`.valid` already covers the ergonomic gap
-  that's actually been asked for so far.
+- **`?.` safe navigation — RESOLVED, built (option (b) from the three
+  sizes below, via `AskUserQuestion`: full Verse-faithful multi-hop
+  chaining, not the smaller one-hop-only slice).** See DESIGN.md's
+  "`?.` safe navigation" for the full write-up. In one sentence: `opt?.
+  field?.next` already PARSED and TYPE-CHECKED correctly before this —
+  `?`/`.field` are ordinary postfix operators, no new AST shape, and
+  `Expr::Guard`'s existing `?T`-to-`T` peel plus `Expr::Field`'s
+  existing generic field lookup already compose correctly through
+  arbitrary depth. The actual gaps were narrower than the original
+  survey below predicted: not "PLUS type-checking that threads
+  correctly through a chain of nested `?U` fields" (already worked,
+  confirmed by tracing, not assumed) — just two structural/emission
+  gaps. `lower::guard_chain_spine` (every `Expr::Guard` reachable by
+  descending only through `Guard`/`Field` nodes) is shared by both:
+  `checks.rs`'s `guards_outside_allowed_positions` now permits a WHOLE
+  spine at the three legal positions instead of only a single exact-
+  match `Expr::Guard`; `writes.rs`'s `compile_guard` gained `guard_
+  chain_conds`, folding EVERY hop's condition (not just the outermost)
+  into the rule's guard; `struct_field_path` (expr.rs) gained one new
+  arm treating a `Guard` on the spine as "push `data`, recurse" — the
+  identical rule `compile_expr_hinted`'s pre-existing single-hop Guard-
+  value arm already used, just generalized to compose at any depth
+  (that arm itself needed zero changes, already delegating to `struct_
+  field_path`). Confirmed empirically before writing any test, not
+  just reasoned through: a two-hop chain's `fires_r` is `and(a_data_b_
+  valid, a_valid)` — BOTH hops' conditions, not one — and the flattened
+  register path (`a_data_b_data_c`) matches prediction exactly.
+
+  **`if let`/`while let` deliberately did NOT get multi-hop chaining —
+  a real correctness trap caught before it shipped, not an oversight
+  found later.** Their own mux-select machinery (writes.rs/calls.rs,
+  roughly a dozen call sites) reads `init`'s immediate `inner` alone as
+  the presence check, never the whole chain — `if let x = a?.b?` would
+  have silently read `a.data.b.valid` without also gating on `a.valid`,
+  wrong hardware passing a structural FIRRTL check with nothing to
+  catch it short of running it. `guards_outside_allowed_positions`
+  keeps `IfLet`/`WhileLet` restricted to a single bare `Expr::Guard`,
+  exactly as before this feature; a chained init is rejected with the
+  same message a misplaced guard gets. Fixing every one of those
+  call sites (folding the whole spine into each) is real, separate
+  work, not attempted here.
+
+  **Proven end to end, not just structurally:** `examples/optional_
+  chain.tr` + `sim/optional_chain_tb.v` (`tests/sim.rs`'s `optional_
+  chain_sugar_runs_through_a_genuinely_absent_intermediate_hop`) drives
+  the ONE state that actually discriminates a correct multi-hop fold
+  from a naive one — `a` present, the intermediate `b` absent — through
+  real firtool + Icarus. The OTHER direction (`b`'s own bit stale-`1`
+  while `a` itself is absent) turns out to be unreachable in this
+  language today: every write to `a` (a struct-literal or `false`)
+  writes every flattened leaf together, confirmed by probing `a :=
+  false`'s own emitted FIRRTL before assuming it — so only one half of
+  the theoretical hazard is empirically exercisable, and that's the
+  half that's tested.
+
+  Original survey (kept for context on how the actual gaps compared to
+  what was predicted): Verse's own primary source (`08_failure`,
+  fetched directly, not guessed at) is explicit that `?.` is MULTI-HOP,
+  each `?.` its own independent unwrap-or-fail — `Head?.Next?.Value`
+  chains through however many `?Node` layers `.Next` itself is, not a
+  single unwrap followed by ordinary field reads. That ruled out
+  treating this as a small extension of `if let`'s own one-hop
+  resolution (`if_let_binds`, DESIGN.md). Confirmed the underlying
+  blocker was real before scoping further, not assumed: `let p = opt?;
+  p.field` (T a struct) already failed with "a struct-typed local must
+  be bound directly to a struct literal, not aliased" — a DIFFERENT
+  chase-through gap than the one `?.` actually needed (that one is
+  about a LOCAL aliasing another struct value; `?.` chains through the
+  EXPRESSION tree directly, never through a local alias, so it never
+  actually hit this path). Three sizes were on the table, smallest to
+  largest: (a) one-hop only (`opt?.field`, honestly a DIFFERENT,
+  smaller feature than `?.` and shouldn't be called that in DESIGN.md
+  if built); (b) full Verse-faithful multi-hop chaining, the real `?.`
+  — **this is what got built**; (c) doing nothing further, `if let` +
+  `.data`/`.valid` already covering the ergonomic gap asked for so far.
 
   **The no-else/with-else split is what makes this tractable at all.**
   An `if` whose fallible condition has NO `else` is already exactly

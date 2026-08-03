@@ -4755,16 +4755,20 @@ module M {
     );
 }
 
-/// A `?T`-typed field access over a Guard base (`o?.valid`) is cleanly
-/// rejected by `check_guard_positions`, not silently miscompiled -- the
-/// `Expr::Guard` here isn't the WHOLE right-hand side of `:=` (a
-/// `.valid` field wraps around it), so it's "nested" the same as
-/// `a_guard_nested_in_arithmetic_is_rejected`'s case. Pins the answer
-/// to a question raised while designing `?T`: unwrap via `?` and
-/// non-failing access via `.valid`/`.data` are two DISTINCT idioms, not
-/// composable into one chain.
+/// `o?.valid` -- a `?.` safe-navigation chain (TODO.md's "`?.` safe
+/// navigation") reading `Pair`'s OWN `valid` field, deliberately named
+/// to collide with `?T`'s own synthesized presence-bit field name.
+/// Was rejected outright before this feature (`Expr::Guard` wasn't the
+/// WHOLE right-hand side of `:=` -- a `.valid` field wrapped around it,
+/// "nested" the same as `a_guard_nested_in_arithmetic_is_rejected`'s
+/// case); now legal, and exactly this naming collision is what proves
+/// the fold reads the RIGHT register: `fires_r` must be `o_valid` (the
+/// Option's own presence bit, from the `?`), while the VALUE read must
+/// be `o_data_valid` (Pair's own field, flattened one level deeper) --
+/// two genuinely different registers a wrong path construction could
+/// easily conflate.
 #[test]
-fn a_guard_field_accessed_directly_is_rejected() {
+fn a_guard_chained_into_a_same_named_field_reads_the_right_register() {
     let src = "\
 struct Pair {
     valid : [1]
@@ -4776,6 +4780,116 @@ module M {
     out ok : [1] = 0
     rule r {
         ok := o?.valid
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = o_valid"));
+    assert!(fir.contains("connect __out_ok, o_data_valid"));
+    run_firtool(&fir, &[]);
+}
+
+/// A genuine multi-hop `?.` chain (`a?.b?.c`, TWO independent `?`s, not
+/// just one field hop past a single unwrap): every hop's OWN presence
+/// condition must fold into the rule's guard, not just the outermost --
+/// the whole reason `guard_chain_conds`/`guard_chain_spine` exist rather
+/// than reusing `compile_guard_unwrap_cond` on the WHOLE chain's own
+/// top node alone (which would only ever see `b`'s presence, silently
+/// missing `a`'s). `and(a_data_b_valid, a_valid)`, not just one term,
+/// is the assertion that actually discriminates a one-hop-only fold
+/// from a real multi-hop one.
+#[test]
+fn a_two_hop_guard_chain_folds_every_hops_own_condition() {
+    let src = "\
+struct Inner {
+    c : [8]
+}
+struct Outer {
+    b : ?Inner
+}
+module M {
+    reg a : ?Outer = false
+    out result : [8] = 0
+    rule r {
+        result := a?.b?.c
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = and(a_data_b_valid, a_valid)"));
+    assert!(fir.contains("connect __out_result, a_data_b_data_c"));
+    run_firtool(&fir, &[]);
+}
+
+/// The identical two-hop chain, but as a `let` init and a bare
+/// statement instead of a `:=` right-hand side -- `check_guard_
+/// positions`'s three legal positions (`guards_outside_allowed_
+/// positions`) all now admit a whole `?.` chain, not just a bare `opt?`.
+/// `bare`'s own fifo `Deq[]`, in a DIFFERENT statement alongside the
+/// chain, confirms moving the chain check ahead of `stmt_fifo_conds`
+/// (the one fold site where ordering changed) doesn't drop the fifo's
+/// own occupancy term: both AND together cleanly (`stmt_fifo_conds` is
+/// computed per-statement, and a fifo op's own `Bracket` shape
+/// terminates `guard_chain_spine`'s walk immediately, so the two never
+/// interact).
+#[test]
+fn a_two_hop_guard_chain_is_legal_as_a_let_init_and_a_bare_statement() {
+    let src = "\
+struct Inner {
+    c : [8]
+}
+struct Outer {
+    b : ?Inner
+}
+module M {
+    reg a : ?Outer = false
+    fifo f : [8]
+    out result : [8] = 0
+    rule via_let {
+        let x = a?.b?.c
+        result := x
+    }
+    rule bare {
+        let y = f.Deq[]
+        a?.b?
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_via_let = and(a_data_b_valid, a_valid)"));
+    assert!(fir.contains("node fires_bare = and(and(__fifo_f_valid, a_data_b_valid), a_valid)"));
+    run_firtool(&fir, &[]);
+}
+
+/// `if let x = a?.b?` -- a CHAINED init, not the single-hop `if let x =
+/// opt?` every `Stmt::IfLet` mux-select site (writes.rs/calls.rs) is
+/// actually built for -- is rejected, not silently miscompiled. Every
+/// one of those call sites reads `init`'s immediate `inner` alone as
+/// the presence check (`compile_guard_unwrap_cond(opt)`, never folding
+/// an intermediate hop's OWN presence in); a chained init would read
+/// `a.data.b.valid` without also gating on `a.valid`, wrong hardware
+/// that would still pass a structural FIRRTL check. `guards_outside_
+/// allowed_positions` deliberately keeps `IfLet`/`WhileLet` single-hop
+/// only (v0 restriction, see TODO.md's `?.` bullet), unlike the three
+/// ordinary value positions above.
+#[test]
+fn if_let_with_a_chained_init_is_rejected() {
+    let src = "\
+struct Inner {
+    c : [8]
+}
+struct Outer {
+    b : ?Inner
+}
+module M {
+    reg a : ?Outer = false
+    out result : [8] = 0
+    rule r {
+        if let x = a?.b? {
+            result := x.c
+        } else {
+            result := 0
+        }
     }
 }
 ";
