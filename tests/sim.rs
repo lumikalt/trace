@@ -203,6 +203,96 @@ fn simulate_with_blackbox(verilog: &str, testbench_path: &str, blackbox_path: &s
     String::from_utf8_lossy(&run.stdout).into_owned()
 }
 
+/// Compile `verilog` plus `testbench_path` with Verilator and run the
+/// result, returning stdout — the Verilator-backed twin of `simulate`.
+/// `--binary --timing`: Verilator elaborates the hand-written SV
+/// testbench itself as the simulation's own top (not a separate C++/DPI
+/// harness reaching into a `--public`-exposed signal from outside) and
+/// builds a standalone executable directly — the same "just run it" shape
+/// `simulate`'s iverilog/vvp pair already has. `--timing` is what makes
+/// this mode accept the testbenches' own `#5`/`@(posedge clock)` delays
+/// and `initial` blocks at all — without it Verilator (synthesis-focused
+/// by default) rejects most of that as unsupported. Because the testbench
+/// and DUT elaborate as ONE design this way, a testbench's hierarchical
+/// peeks/pokes (`dut.pc`, `dut.__fifo_input_valid = ...`, in
+/// sim/subleq_tb.v/sim/fifo_bridge_tb.v) are ordinary intra-design SV
+/// hierarchical references, not a C++-boundary crossing — confirmed
+/// empirically (both run clean under this mode, with no
+/// `--public`/`--public-flat-rw` and no Verilator warning about signal
+/// visibility) — see DESIGN.md's/TODO.md's Verilator sections for the
+/// correction to this project's earlier "would need --public" assumption.
+/// `-DSYNTHESIS`: same reason `simulate` passes it to iverilog — kept for
+/// parity with the generated Verilog, not because Verilator needs it (it
+/// has no trouble with the `automatic`-lifetime debug-randomization block
+/// Icarus rejects). `--top-module` is grepped from the testbench file's
+/// own `module <name>` line rather than assumed from `testbench_path`'s
+/// filename, the same defensive choice `devenv.nix`'s `simulate` script
+/// makes for the identical reason.
+fn simulate_verilator(verilog: &str, testbench_path: &str) -> String {
+    simulate_verilator_impl(verilog, testbench_path, None)
+}
+
+/// Same as `simulate_verilator`, plus one extra hand-written Verilog
+/// source compiled alongside — the Verilator-backed twin of
+/// `simulate_with_blackbox`.
+fn simulate_verilator_with_blackbox(
+    verilog: &str,
+    testbench_path: &str,
+    blackbox_path: &str,
+) -> String {
+    simulate_verilator_impl(verilog, testbench_path, Some(blackbox_path))
+}
+
+fn simulate_verilator_impl(
+    verilog: &str,
+    testbench_path: &str,
+    blackbox_path: Option<&str>,
+) -> String {
+    let dir = tempdir();
+    let design_path = dir.join("design.v");
+    std::fs::write(&design_path, verilog).unwrap();
+    let mdir = dir.join("obj_dir");
+
+    let tb_src = std::fs::read_to_string(testbench_path).unwrap();
+    let top = tb_src
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("module "))
+        .and_then(|rest| {
+            rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+        })
+        .unwrap_or_else(|| panic!("no `module <name>` line found in {testbench_path}"))
+        .to_string();
+
+    let mut cmd = Command::new("verilator");
+    cmd.args([
+        "--binary",
+        "--timing",
+        "-DSYNTHESIS",
+        "-Wno-fatal",
+        "--top-module",
+        &top,
+        "--Mdir",
+    ]);
+    cmd.arg(&mdir).arg(&design_path).arg(testbench_path);
+    if let Some(bb) = blackbox_path {
+        cmd.arg(bb);
+    }
+    let compile = cmd.output().expect("failed to spawn verilator");
+    assert!(
+        compile.status.success(),
+        "verilator failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let exe = mdir.join(format!("V{top}"));
+    let run = Command::new(&exe)
+        .output()
+        .expect("failed to spawn the verilated binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
 fn tempdir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "trace-sim-test-{}-{}",
@@ -1790,5 +1880,140 @@ fn call_struct_return_runs_through_real_ports() {
     assert!(
         output.contains("final: from_pair=2a from_opt= 42"),
         "from_pair/from_opt did not settle correctly:\n{output}"
+    );
+}
+
+// --- Verilator backend ------------------------------------------------
+//
+// Not a full second copy of every test above: functional correctness is
+// already fully proven by the iverilog suite this file otherwise is.
+// What's new here is interface PORTABILITY — does the same FIRRTL/
+// testbench pair also run under a completely different simulator — and
+// three tests, one per genuinely distinct access shape, carry that:
+// plain module ports (`accumulator`), hierarchical peek/poke including a
+// nested submodule's own memory array (`subleq`), and an extmodule
+// blackbox compiled alongside the design (`extmodule_tribuf`). Every
+// example not covered here differs from these three only in which
+// LANGUAGE FEATURE it exercises (structs, `spawn`, `while`, ...), which
+// affects the FIRRTL firtool produces, not the simulator interface — so
+// it doesn't need its own Verilator-specific test. See `simulate_
+// verilator`'s own doc comment for the mechanism, and DESIGN.md's/
+// TODO.md's Verilator sections for the full story, including the
+// correction to this project's earlier "would need --public/
+// --public-flat-rw" assumption.
+
+/// The Verilator-backed twin of `accumulator_runs_through_real_ports`.
+#[test]
+fn accumulator_runs_through_real_ports_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/accumulator.tr"
+    ))
+    .unwrap();
+    let (tokens, lex_errors) = lexer::lex(&src);
+    assert!(lex_errors.is_empty(), "{lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(&src, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res);
+    assert!(type_errors.is_empty(), "{type_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
+    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
+        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/accumulator_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: sum=26"),
+        "sum did not accumulate correctly:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of `subleq_runs_and_computes_the_right_
+/// answer`. Its testbench (`sim/subleq_tb.v`) is the strongest
+/// hierarchical-reference case in this repo: a flat `dut.pc` peek AND a
+/// nested submodule's own memory array (`dut.m_ext.Memory[i]`) — the
+/// exact shape `--public`/`--public-flat-rw` govern under a C++/DPI
+/// harness, and exactly what `--binary --timing` sidesteps by keeping
+/// the testbench and DUT in one SV design instead.
+#[test]
+fn subleq_runs_and_computes_the_right_answer_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/subleq.tr"))
+        .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/subleq_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: pc=6"),
+        "pc did not settle at the halt address:\n{output}"
+    );
+    assert!(
+        output.contains("mem[11]=5"),
+        "mem[11] should hold 8 - 3 == 5:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of `extmodule_tribuf_runs_a_real_
+/// bidirectional_bus`: a second, hand-written Verilog source
+/// (`sim/tribuf.v`) compiled alongside the generated design, proving the
+/// blackbox-extmodule wiring works under this backend too.
+#[test]
+fn extmodule_tribuf_runs_a_real_bidirectional_bus_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/extmodule_tribuf.tr"
+    ))
+    .unwrap();
+    let (tokens, lex_errors) = lexer::lex(&src);
+    assert!(lex_errors.is_empty(), "{lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(&src, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res);
+    assert!(type_errors.is_empty(), "{type_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
+    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
+        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/extmodule_tribuf_tb.v");
+    let blackbox = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/tribuf.v");
+    let output = simulate_verilator_with_blackbox(&verilog, testbench, blackbox);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
     );
 }

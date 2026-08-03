@@ -1811,8 +1811,32 @@ manually in the meantime.
 
 ## Simulation
 
-- Icarus only; no Verilator path (would need `--public`/`--public-flat-rw`
-  wiring for the hierarchical-path testbenches).
+- **RESOLVED — Icarus only; no Verilator path.** The stated blocker
+  ("would need `--public`/`--public-flat-rw` wiring for the
+  hierarchical-path testbenches") didn't hold for the invocation that
+  actually matters, the same shape of correction as the CheckCombLoops
+  citation two entries above: `--public`/`--public-flat-rw` govern a
+  C++/DPI harness reaching into an internal signal from OUTSIDE the
+  Verilog design, and nothing here does that. `verilator --binary
+  --timing` instead elaborates the hand-written SV testbench itself as
+  the simulation's own top, DUT included, so `subleq_tb.v`'s/
+  `fifo_bridge_tb.v`'s hierarchical peeks and pokes are ordinary intra-
+  design SystemVerilog references — confirmed empirically, not just
+  inferred (both run clean, no `--public` flags, no Verilator warning
+  about signal visibility). `devenv.nix`'s `simulate` script gained an
+  optional second positional arg (`simulate <name> [iverilog|
+  verilator]`, default `iverilog`, unchanged), version-pinned
+  (`verilator 5.050`) the same way firtool/iverilog already are;
+  `packages` gained `pkgs.verilator` and `pkgs.python3` (the latter
+  purely because Verilator's own `--binary` build step shells out to
+  it). 3 new tests in `tests/sim.rs` (not a full second copy of the
+  46-example `iverilog` suite — functional correctness is already fully
+  proven there; these three prove the Verilator INTERFACE works, one
+  per genuinely distinct access shape: `accumulator` for plain module
+  ports, `subleq` for hierarchical peek/poke including a nested
+  submodule's own memory array, `extmodule_tribuf` for a blackbox `.v`
+  source compiled alongside the design). See sim/README.md's new
+  "Verilator" section for the full mechanism and the exact correction.
 - **RESOLVED — `firtool`/`iverilog` version pin.** `devenv.nix`'s
   `simulate` script now asserts the exact versions this project's
   scripts/tests are written against (`firtool-1.147.0`, iverilog `13.0`)
