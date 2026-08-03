@@ -2135,11 +2135,29 @@ scheduler work stays bounded.
 
 - Enforce no-forward-reference inside `combines` scopes; this makes a local
   cycle inexpressible.
-- Do not build a whole-program cycle checker. The backend is firtool (CIRCT),
-  and its `CheckCombLoops` pass already detects loops; the compiler maps its
-  diagnostics back to source spans.
-- Known blind spot: `CheckCombLoops` has gaps around multi-top-module designs
-  (CIRCT issue #1138).
+- Do not build a whole-program cycle checker. The backend is firtool
+  (CIRCT), and its `CheckCombLoops` pass is the whole-circuit loop check
+  this pipeline relies on — but `trace` never runs firtool itself. The
+  compiler only emits FIRRTL text (`src/firrtl/mod.rs`); firtool is
+  invoked separately, by `devenv.nix`'s `simulate` script and by
+  `tests/sim.rs`'s own integration tests, never by `trace`'s own binary.
+  There is no code anywhere in `src/` that parses a firtool diagnostic or
+  remaps one back to a `.tr` source span — a comb-loop error, if firtool
+  ever raised one, would name FIRRTL-level identifiers in whatever tool
+  ran firtool, not a trace source position.
+- Known CIRCT limitation, not currently reachable through anything this
+  compiler emits: `CheckCombLoops` has a blind spot when a circuit
+  contains more than one `public module` (CIRCT issue #7435, open) —
+  corrected from an earlier, mistaken citation of #1138, a since-closed,
+  unrelated same-module bug (a bare `a <= b; b <= a` loop CIRCT's checker
+  used to miss entirely; fixed by CIRCT PR #1388). `firrtl::emit`
+  (`src/firrtl/mod.rs`) enforces exactly one top module per circuit — a
+  hard compile error ("FIRRTL emission needs exactly one top module")
+  otherwise — and only that module is ever emitted `public module`; every
+  other emitted module, including every instantiated submodule, is plain
+  `module`. #7435's trigger (two or more independent `public module`s in
+  one circuit) is therefore not something anything `trace` itself emits
+  can produce today.
 
 The airtight fix is Filament-style timeline types on ports, which make
 cross-module feedback inexpressible by construction. That is a large feature,

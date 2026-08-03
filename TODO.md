@@ -1796,9 +1796,18 @@ manually in the meantime.
 
 - v0 arrays are one conflict resource each — no partial disjointness
   (Dahlia-style banking is tier 3, explicitly deferred in DESIGN.md).
-- `combines` combinational-loop checking delegates entirely to
-  firtool's `CheckCombLoops`, which has a known blind spot around
-  multi-top-module designs (CIRCT issue #1138).
+- `combines` combinational-loop checking delegates entirely to firtool's
+  `CheckCombLoops`, run only by `devenv.nix`'s `simulate` script and
+  `tests/sim.rs` — never by `trace` itself, and its diagnostics are never
+  remapped to `.tr` source spans.
+- **CORRECTED — this doc previously cited the wrong CIRCT issue for
+  `CheckCombLoops`'s known blind spot.** It's #7435 (open: a blind spot
+  when a circuit has more than one `public module`), not #1138 (closed —
+  an unrelated, already-fixed single-module bug). Not currently reachable
+  through `trace`'s own output either way: `firrtl::emit` hard-errors
+  unless a circuit has exactly one top module, and only that module is
+  ever emitted `public module` — see DESIGN.md's "Combinational loops:
+  what the checker does" for the full correction.
 
 ## Simulation
 
