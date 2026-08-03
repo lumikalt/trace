@@ -813,6 +813,11 @@ unconditionally to a port; the outside world sees the committed value one cycle
 after it is computed. A purely combinational module, with no state at all, is not
 expressible in v0.
 
+No `inout` (bidirectional) port kind yet. An `io name : ty` port, comparable to
+`in`/`out`, is wanted (Lumi's call) but is decided-and-blocked, not built — see
+"`io` ports: design, blocked on blackbox support" in TODO.md for why it can't
+simply extend `in`/`out`'s model and what has to land first.
+
 ```trace
 module Accumulator {
     in inc : [8]
@@ -1650,13 +1655,19 @@ order is declaration order. A `schedule` block overrides it:
 
 ```trace
 schedule {
-    urgency writer_a > writer_b
+    urgency writer_a > writer_b > writer_c
     mutually_exclusive { writer_a, writer_b }   -- claim: never both fire; checked
     conflict_free { reader, writer }            -- claim: safe to fire together; trusted
 }
 ```
 
-`urgency a > b` states that `a` wins any conflict with `b`.
+`urgency a > b` states that `a` wins any conflict with `b`. It is not limited to
+two names: `urgency a > b > c > d` states a whole priority CHAIN in one
+directive — `a` beats `b`, `b` beats `c`, and so on — which the scheduler
+expands into every pairwise conflict resolution that chain implies (Kahn's
+algorithm over the derived edges, `schedule.rs`), not just the adjacent pairs.
+A design with N mutually-conflicting rules needs one chained directive, not one
+`urgency` statement per pair.
 
 `mutually_exclusive { a, b }` claims the two rules never actually fire the same
 cycle, even though their static read/write sets conflict — for example, two

@@ -1512,6 +1512,246 @@ re-propose these from a fresh read of the same chapters:
   logic already live in one fairly self-contained module,
   `schedule.rs`.
 
+## Rules: optional/enable sugar (design-level, mostly decided, blocked on a prerequisite)
+
+**`rule foo? { body }` — sugar for an implicit, rising-edge-triggered enable
+port sharing the rule's own name (Lumi's call, via `AskUserQuestion`).**
+**Blocked on a real prerequisite, not independent (Lumi's call: keep the
+literal shared-name spelling rather than fall back to a derived name like
+`foo_enable`, the same shape `while let` was blocked on `while`'s own FSM
+lowering until that got built first).** Rule names and expression idents
+resolve through the IDENTICAL scope lookup today (`self.lookup`, used both
+by ordinary `Ident` resolution and by a `schedule` block's own `urgency`/
+`mutually_exclusive`/`conflict_free` name references — confirmed by reading
+`resolve.rs`'s `Item::Schedule` handling, not assumed), and `declare`'s own
+`scope` is a plain string-keyed map, one `DefId` per key. So `rule foo?`
+auto-declaring `in foo` under the SAME name isn't a small carve-out over
+`declare`'s duplicate-name check — there's nowhere to even PUT a second
+`DefId` under one key once declared. Building this sugar as specified needs
+a real resolve.rs prerequisite first: genuinely splitting rule-name
+resolution into its own namespace (or some other way to let one syntactic
+name resolve to two different `DefId`s depending on position — a schedule
+directive vs. an ordinary expression). Not designed further here; this is
+the actual first step, not an afterthought to sort out during
+implementation.
+
+Once that prerequisite exists, the rest of the sugar's shape is settled
+except the reset-edge question flagged near the end below.
+
+Today, gating a rule on an external trigger is written by hand — `in trigger
+: [1]` plus `trigger?` as the rule's own first statement (see the `spawn`/
+`race` examples, "`spawn`, `sync`, and `race`" above) — using a SEPARATE port
+name from the rule. The sugar collapses that into one declaration: `rule
+foo? <effects...> { body }` auto-declares `in foo : [1]` and gates `body` on
+it, under the rule's own name.
+
+Three axes, each Lumi's explicit pick over the alternatives offered:
+
+- **The enable is an `in` port, not a `reg`.** Only the outside world (a
+  testbench, a parent module) can drive it — no other rule in the design can
+  set it internally. Mirrors today's manual `trigger` pattern exactly, just
+  auto-named.
+- **One-shot: the rule fires once per external pulse, not every cycle the
+  port is held high.** Ruled out the simpler "level-sensitive, re-fires every
+  cycle `foo` stays true" alternative, which was pure sugar needing zero new
+  machinery — see below for why the `in`-port choice makes this axis cost
+  real new machinery, not free.
+- **`rule foo? { ... }` — a `?` suffix directly on the rule's name,** sitting
+  before any effects tag list the same way `<sequences>`/`<fails>` already
+  do (`rule foo? <sequences> { ... }`), mirroring `?T`'s own use as a type
+  marker.
+
+**The one-shot + `in`-port combination is NOT plain sugar, and that's a real
+architectural consequence, not a detail to wave past.** An `in` port is
+driven from outside the module every cycle; the compiler cannot "clear" it
+after one cycle the way it clears a `reg` at the end of a rule body. One-shot
+behavior therefore has to mean RISING-EDGE detection (fires the cycle `foo`
+transitions 0→1, not every cycle it's held high), which needs a
+compiler-synthesized shadow register tracking `foo`'s previous value —
+genuinely new state, not something `enter_rule`/`locals_snapshots` or any
+existing per-rule machinery already provides for free.
+
+The shadow register's own update (`__prev_foo := foo`) has to run
+UNCONDITIONALLY, every cycle, independent of whether `foo`'s own rule
+actually fires — it cannot live inside the gated rule body (that would only
+update the edge history on cycles the rule fires, corrupting the very
+detection it's supposed to support). The clean way to get an unconditional,
+every-cycle write without inventing a new emission concept ("state written by
+something that isn't a rule," which `schedule.rs`'s conflict matrix would be
+structurally blind to — it only ever looks at `sig.writes` across `Item::
+Rule`s): synthesize a SECOND, always-firing rule (no guard at all, `fires_
+__edge_foo = UInt<1>(1)`, a shape this compiler already emits routinely for
+any unconditional rule) whose only statement is `__prev_foo := foo`. This
+reuses the ordinary rule/schedule machinery wholesale — no new emission
+concept — at the cost of one extra, double-underscore-prefixed synthesized
+rule appearing in `--explain-schedule` output, the same visibility trade-off
+`<sequences>` lowering's own synthesized `{rule}_s{N}` segment rules already
+accept.
+
+**This synthesized rule is NOT scheduler-invisible, and needs an exemption
+to actually work — traced through `firrtl/module.rs`'s own `fires_i`
+formula (`and(guard, not(fires_of_any_higher-urgency_conflicting_rule))`),
+not assumed.** `__edge_foo` writes `__prev_foo`; `foo`'s own rule reads it
+in its guard — an ordinary read/write conflict `schedule.rs` WILL derive a
+stall for, unless exempted. Both orderings break without one: if `__edge_
+foo` (always ready) outranks `foo`, `fires_foo` becomes `and(guard,
+not(1))` — `foo` can never fire, ever. If `foo` outranks `__edge_foo`,
+`fires___edge_foo` becomes `and(1, not(fires_foo))` — the shadow register's
+write gets SUPPRESSED on exactly the cycles `foo` fires, leaving `__prev_
+foo` stale and causing spurious re-fires for as long as the port stays
+held high afterward (the one-shot property breaks). The desugaring must
+therefore also synthesize a `conflict_free { __edge_foo, foo }` exemption
+alongside the two rules. This is a SOUND claim, not a workaround: `foo`'s
+guard reads `__prev_foo`'s pre-this-cycle value regardless of any same-
+cycle write to it (an ordinary register read, same "sees last cycle's
+value" semantics `pc := pc + 3`'s own self-read already relies on
+elsewhere in this document), so there is no real hazard for `conflict_
+free` to be trusting past — the derived stall would only ever be a false
+positive here.
+
+The rule's own body then gets an implicit rising-edge guard prepended:
+
+```trace
+rule step? {
+    ...
+}
+
+-- desugars to something like:
+in step : [1]
+reg __prev_step : [1] = 0
+
+rule __edge_step {
+    __prev_step := step
+}
+
+rule step {
+    (step & not(__prev_step))?
+    ...
+}
+```
+
+(`step & not(__prev_step)`, not a comparison chain — `step`/`__prev_step` are
+already `[1]`-typed booleans, so no `logic`-discharge is needed the way a
+bare `=`/`<>` comparison would now require, per the comparisons-as-fallible
+design above.)
+
+**Open, not decided, a real semantic fork (not a naming detail) — whether a
+port already held high AT RESET counts as a rising edge.** `__prev_foo`
+resets to `0`, so `foo` already `1` on the very first post-reset cycle reads
+as `0→1` by the same logic a genuine external pulse would, spuriously firing
+the rule once on cycle 0 for a design whose enable happens to be tied high
+at reset. Either answer is defensible (reset-time initialization racing a
+real "go" pulse is already an ordinary hardware hazard, not something
+unique to this sugar) but it wasn't asked about and shouldn't be assumed —
+this changes observable hardware behavior, not just an internal detail.
+
+Lower-stakes and genuinely open: exact internal naming (`__prev_{rule}`/
+`__edge_{rule}` above are illustrative, not decided), and whether this
+sugar's existence means the hand-written `trigger`/`trigger?` pattern in the
+`spawn`/`race` examples should be migrated to it once built, or left as-is
+(a manually-named, still-legal, more general pattern the sugar doesn't
+replace — a level-sensitive or `reg`-backed enable still needs the manual
+form).
+
+## `io` ports: design, blocked on blackbox support (decided, blocked on a prerequisite)
+
+**`io name : ty` — a third port kind alongside `in`/`out` (Lumi's call).**
+Requested, then briefly rejected as a non-goal, then re-requested — the
+non-goal call was made from documentation alone; this write-up is from
+probing firtool 1.147.0 directly instead. The technical picture is more
+specific than "hard," and changes what "comparable to `in`/`out`" can
+actually mean.
+
+**Confirmed: FIRRTL's `Analog` type does lower to a real Verilog `inout`,
+and `attach` between two `Analog` ports does work — not assumed, probed
+directly:**
+
+```firrtl
+output bus : Analog<8>
+output other : Analog<8>
+attach(bus, other)
+```
+
+lowers cleanly through firtool to
+
+```verilog
+inout [7:0] bus, other;
+`ifdef SYNTHESIS
+  assign bus = other;
+  assign other = bus;
+`else
+  alias bus = other;
+`endif
+```
+
+(`inout` itself is not valid FIRRTL *port-declaration* syntax — probed and
+rejected, `error: use of unknown declaration 'inout'`; the bidirectionality
+lives in the `Analog` **type**, declared with the ordinary `output`/`input`
+keyword, not a third direction keyword.)
+
+**But: `attach` is the only operation `Analog` supports, and it is net-to-net
+only — both operands must themselves be `Analog`.** Probed directly:
+`attach(bus, data)` with `data : UInt<8>` (an ordinary port) is rejected,
+`operand #1 must be variadic of analog type, but got '!firrtl.uint<8>'`.
+There is no FIRRTL primitive for "drive this `UInt` value onto the bus when
+`enable`, else float" — the exact shape `io` would need to be read/written
+from a rule body the way `in`/`out` are. This matches Chisel's own
+documented stance on `Analog` (found via web search, not just inferred from
+the two error messages above): *"Analog support is limited to allowing
+wiring up of Verilog BlackBoxes with bidirectional (inout) pins. There is
+currently no support for reading or writing of Analog types within Chisel
+code."*
+
+**Consequence: an `io` port cannot join `sig.reads`/`sig.writes`, cannot be
+compared or assigned to with `:=`, and needs no effects tracking at all —
+not because it wasn't built yet, but because there is no legal FIRRTL
+operation for a rule body to perform on one.** The only legal use is
+`attach`ing it to another `Analog` net. So `io` is not an extension of
+`in`/`out`'s rule-integrated model; it is a different, purely structural
+declare-and-wire kind, syntactically comparable to `in`/`out` but not
+semantically comparable inside a rule body.
+
+**What that leaves is buildable in two tiers, and the first is useless
+alone:**
+
+1. **Structural `io` + `attach`.** Declare `io name : ty` on a module; the
+   only legal statement involving it is wiring it to another `io` port —
+   e.g. a parent's `io` port `attach`ed straight through to a child
+   instance's own `io` port, mirroring "Submodule emission"'s existing
+   `inst name : Module` instantiation, but for an Analog pass-through
+   instead of an ordinary driven port. Small, and mechanically close to
+   what's already confirmed to work above.
+2. **Blackbox/extmodule declaration and instantiation — genuinely new,
+   entirely unbuilt (confirmed: `grep -rn "extmodule\|blackbox\|Analog\|
+   attach" src/` matches nothing but unrelated doc-comment homonyms).** Real
+   tri-state drive logic has to live in a hand-written Verilog module,
+   referenced from trace as something like `extmodule Name { ports... }`
+   (declares an external module's port list, including an `Analog` pin, with
+   no trace-level body), instantiated like an ordinary module (`inst x :
+   Name`), with its ordinary `UInt` ports (`enable`, `data`, ...) driven by
+   rule logic exactly like any other instance port today (same
+   per-port-conflict-resource model "Submodule emission" already gives
+   ordinary instances), and its `Analog` pin left untouched by any rule,
+   only ever reachable via `attach`.
+
+Tier 1 alone has no use: nothing at the leaf of an all-trace design can
+actually drive tri-state logic, so a structural `io` port with nothing on
+the other end of its `attach` is a dead-end wire. Tier 2 is the actual
+prerequisite; tier 1 is what makes tier 2's blackbox instance reachable from
+a module's own external port list once tier 2 exists. Both are needed
+together for `io` to do anything real.
+
+Not designed further here — genuinely open, not just unstated: exact
+`extmodule` declaration syntax; how the external Verilog source is
+referenced (inline string literal, a separate file path, a build-managed
+asset); whether `extmodule` ports need their own direction vocabulary
+distinct from `in`/`out`; whether `io` can be declared per-submodule-instance
+or only at a design's true top level; and the simulation story — Icarus
+needs an actual Verilog implementation to simulate a blackbox against, not
+just a port list, so `devenv shell -- simulate` would need a real
+tri-state-buffer `.v` file to exist for any example using this feature, not
+merely a synthesizable stub.
+
 ## Scheduler / arrays
 
 - v0 arrays are one conflict resource each — no partial disjointness
