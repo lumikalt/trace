@@ -8,9 +8,10 @@
     { "include": "#declarations-with-name" },
     { "include": "#sized-numbers" },
     { "include": "#numbers" },
+    { "include": "#schedule-block" },
+    { "include": "#effects-list" },
     { "include": "#keywords" },
     { "include": "#literals" },
-    { "include": "#effect-words" },
     { "include": "#builtins" },
     { "include": "#calls" },
     { "include": "#operators" },
@@ -56,8 +57,9 @@
           "match": "\\bor\\b"
         },
         {
+          "comment": "`schedule` itself is matched by #schedule-block instead (a real lexer keyword, so no ambiguity risk there — see that rule's own comment), which needs to consume it as part of opening its own scoped region.",
           "name": "keyword.declaration.trace",
-          "match": "\\b(module|rule|struct|reg|mem|fifo|in|out|inst|spec|impl|refines|schedule|let|bit)\\b"
+          "match": "\\b(module|rule|struct|reg|mem|fifo|in|out|inst|spec|impl|refines|let|bit)\\b"
         },
         {
           "comment": "uN (u8, u32, ...) is sugar for bits[N] — see src/parser.rs's u_width, same treatment as `bit` above.",
@@ -72,9 +74,50 @@
       "match": "\\bfalse\\b"
     },
     "effect-words": {
-      "comment": "Contextual identifiers, not lexer keywords (see src/lexer.rs) — only meaningful inside <...> effect lists and schedule{} blocks, but a plain word-match is close enough for a simple grammar.",
+      "comment": "Contextual identifiers, not lexer keywords (see src/lexer.rs) — legal as ordinary identifiers everywhere else, so only included from inside #effects-list, never matched bare at the top level (unlike the schedule-directive words below, these can't be scoped by a real keyword the way `schedule` itself can, since there's no unambiguous bracket to anchor on other than the `<...>` this rule lives inside). Known accepted collision: a state name inside the `{...}` argument list of `reads {...}`/`writes {...}` that happens to match one of these words (e.g. `reads {reads}`) highlights as an effect keyword instead of a plain identifier — fixing it would need a dedicated nested region for just that `{...}`, disproportionate for a cosmetic mismatch confined to one token.",
       "name": "keyword.other.effect.trace",
-      "match": "\\b(combines|sequences|elaborates|fails|chooses|reads|writes|urgency|mutually_exclusive|conflict_free)\\b"
+      "match": "\\b(combines|sequences|elaborates|fails|chooses|reads|writes)\\b"
+    },
+    "schedule-directives": {
+      "comment": "Contextual identifiers too, same as #effect-words — only included from inside #schedule-block, never matched bare at the top level.",
+      "name": "keyword.other.effect.trace",
+      "match": "\\b(urgency|mutually_exclusive|conflict_free)\\b"
+    },
+    "effects-list": {
+      "comment": "`<...>` effects tag list. Begins only when `<` is immediately followed by a known effect word — `<` is also the less-than operator (#operators), and this language has no generics to otherwise disambiguate against, so a bare `<` alone can't safely open a region (a runaway match to some unrelated later `>` would be far more confusing than the imprecision this rule fixes). `end` additionally stops at end-of-line as a defensive cap: every real effects list is written on one line in practice, so even the rare adversarial case (`x < reads`, a variable actually named `reads`) can't cascade highlighting past that one line.",
+      "begin": "<(?=\\s*(combines|sequences|elaborates|fails|chooses|reads|writes)\\b)",
+      "beginCaptures": { "0": { "name": "keyword.operator.trace" } },
+      "end": ">|$",
+      "endCaptures": { "0": { "name": "keyword.operator.trace" } },
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#effect-words" },
+        { "include": "#punctuation" },
+        { "include": "#identifiers" }
+      ]
+    },
+    "schedule-block": {
+      "comment": "`schedule { ... }`. `schedule` is a real lexer keyword (src/lexer.rs), unlike the directive words inside it, so anchoring on it carries no ambiguity risk the way #effects-list's `<` does. #schedule-body recurses on its own nested `{ }` (mutually_exclusive/conflict_free's own name lists), so this correctly scopes to the WHOLE block regardless of that inner nesting, not just up to the first `}`.",
+      "begin": "\\bschedule\\b",
+      "beginCaptures": { "0": { "name": "keyword.declaration.trace" } },
+      "end": "(?<=\\})",
+      "patterns": [{ "include": "#comments" }, { "include": "#schedule-body" }]
+    },
+    "schedule-body": {
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.trace" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.trace" } },
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#schedule-directives" },
+        { "include": "#sized-numbers" },
+        { "include": "#numbers" },
+        { "include": "#operators" },
+        { "include": "#schedule-body" },
+        { "include": "#punctuation" },
+        { "include": "#identifiers" }
+      ]
     },
     "builtins": {
       "name": "support.function.builtin.trace",

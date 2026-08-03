@@ -3009,10 +3009,30 @@ special-casing, so the formatter stays a brace counter plus this one
 lexical rule, not a real statement-aware pretty-printer.
 
 There is no language server. Go-to-definition, hover, and inline diagnostics
-come from running `trace file.tr` directly. The grammar is regex-based, so it
-highlights effect-list keywords unconditionally, even where the same word is
-used as an ordinary identifier elsewhere — harmless for readability, not a
-correctness signal.
+come from running `trace file.tr` directly. The grammar is regex-based —
+still pattern matching, not semantic analysis, so it can be fooled (a
+comparison `x < reads` against a variable actually named `reads` reads as
+an opened effects list for that one line — see the grammar's own
+`#effects-list` comment) — but it scopes the contextual effect/directive
+words to where they're actually meaningful instead of matching them
+everywhere: `combines`/`sequences`/`elaborates`/`fails`/`chooses`/`reads`/
+`writes` only inside a `<...>` effects list (`#effects-list`, anchored on
+`<` immediately followed by one of those words, since `<` is also the
+less-than operator and this language has no generics to disambiguate
+against otherwise), and `urgency`/`mutually_exclusive`/`conflict_free`
+only inside a `schedule { ... }` block (`#schedule-block`, anchored on
+the real lexer keyword `schedule` itself — no ambiguity risk there,
+unlike the effects-list case — with `#schedule-body` recursing through
+`mutually_exclusive`/`conflict_free`'s own nested `{ name, name }` lists
+so the scope correctly spans the WHOLE block). Confirmed against the
+real VS Code tokenizer (`vscode-textmate` + `vscode-oniguruma`, not just
+reasoned about), not just the shipped examples: a rule/reg/schedule-
+directive name that happens to collide with one of these words (`reg
+reads : [8]`, `reg mutually_exclusive : [1]`) renders as a plain
+identifier now, and every genuine effect/directive-word usage across
+every example under `examples/` still highlights correctly (a raw grep
+count of every non-comment occurrence matches the tokenizer's own count
+exactly).
 
 # Part 3: Status and prior art
 

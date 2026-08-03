@@ -1741,8 +1741,28 @@ manually in the meantime.
 
 - No language server: no go-to-definition, hover, or inline diagnostics —
   only `trace file.tr` on the command line catches real errors.
-- Grammar is regex-based (TextMate): highlights `reads`/`writes`/effect
-  words unconditionally, even used as plain identifiers outside `<...>`.
+- Grammar is regex-based (TextMate), still pattern matching, not semantic
+  analysis. **RESOLVED — the specific "highlights unconditionally, even
+  as plain identifiers" gap.** `reads`/`writes`/`combines`/`sequences`/
+  `elaborates`/`fails`/`chooses` are now scoped to inside a `<...>`
+  effects list (`#effects-list`, anchored on `<` immediately followed
+  by one of those words — the only viable disambiguator against `<` the
+  less-than operator, since this language has no generics; capped at
+  end-of-line as a defensive fallback for the one adversarial case, `x <
+  reads` against a variable actually named `reads`, so a misfire can't
+  cascade past that one line). `urgency`/`mutually_exclusive`/
+  `conflict_free` are scoped to inside `schedule { ... }`
+  (`#schedule-block`, anchored on the real lexer keyword `schedule`
+  itself — no ambiguity risk there — with a recursive `#schedule-body`
+  handling `mutually_exclusive`/`conflict_free`'s own nested `{ name,
+  name }` lists so the scope spans the whole block, not just up to the
+  first `}`). Confirmed against the real VS Code tokenizer
+  (`vscode-textmate`/`vscode-oniguruma`, not just the regexes read in
+  isolation): a reg/rule named `reads`/`mutually_exclusive` now
+  highlights as a plain identifier, and a raw grep count of every
+  non-comment occurrence of these words across every `examples/*.tr`
+  file matches the tokenizer's own highlighted count exactly (16/16 for
+  the schedule directives) — no regression on real content.
 - Formatter is a reindenter, not a pretty-printer, by deliberate choice
   (see DESIGN.md's "Tooling" section). **RESOLVED — the one known gap
   this deliberately narrow design had**: a multiline `impl ... refines

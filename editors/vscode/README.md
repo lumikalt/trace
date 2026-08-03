@@ -31,7 +31,10 @@ This extension is not published to the Marketplace. To use it locally:
 ## What's not here
 
 No language server — no go-to-definition, hover, or inline diagnostics.
-The grammar is regex-based (TextMate), so highlighting can't distinguish
-contexts a real parser would (e.g. `reads`/`writes` as effect-list words vs.
-as ordinary identifiers) — good enough for readability, not a substitute
-for `trace file.tr` catching real errors.
+The grammar is regex-based (TextMate), not a real parser — it scopes
+`reads`/`writes`/etc. to inside `<...>` effect lists and `urgency`/
+`mutually_exclusive`/`conflict_free` to inside `schedule { ... }` blocks
+(so the same words used as ordinary identifiers elsewhere highlight as
+plain identifiers, not keywords), but this is still pattern matching, not
+semantic analysis — good enough for readability, not a substitute for
+`trace file.tr` catching real errors.
