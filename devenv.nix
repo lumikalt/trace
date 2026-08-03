@@ -52,6 +52,34 @@
         echo "usage: simulate <name>   (expects examples/<name>.tr and sim/<name>_tb.v)" >&2
         exit 1
       fi
+
+      # firtool/iverilog CLI behavior has already drifted once for this
+      # project silently (a firtool bump started needing `-format=fir` for
+      # stdin, with no clear signal until something downstream broke in a
+      # confusing way) -- see sim/README.md and TODO.md's "Simulation"
+      # section. `packages` above pins the exact nixpkgs revision that
+      # resolves to these tool versions, but that pin is only as good as
+      # someone noticing a future `devenv update` moved it; this check
+      # makes a version drift a clear, immediate failure right here
+      # instead of a confusing one three tools downstream.
+      want_firtool="firtool-1.147.0"
+      got_firtool=$(firtool --version | grep -o 'firtool-[0-9.]*' || true)
+      if [ "$got_firtool" != "$want_firtool" ]; then
+        echo "simulate: expected $want_firtool, found '$got_firtool' -- firtool's CLI flags and output shape this project's scripts/tests assume may have changed; re-verify against sim/README.md before updating this pin" >&2
+        exit 1
+      fi
+      want_iverilog="13.0"
+      # Captured into a variable, not piped live through `head -1`: `-V`
+      # keeps writing past its first line, and `head` closing the pipe
+      # early sends the still-writing process SIGPIPE -- a real failure
+      # under `pipefail`, even though the version line was already read.
+      iverilog_version_output=$(iverilog -V 2>&1)
+      got_iverilog=$(printf '%s\n' "$iverilog_version_output" | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p')
+      if [ "$got_iverilog" != "$want_iverilog" ]; then
+        echo "simulate: expected iverilog $want_iverilog, found '$got_iverilog'" >&2
+        exit 1
+      fi
+
       name="$1"
       dir=$(mktemp -d)
       trap 'rm -rf "$dir"' EXIT
@@ -59,7 +87,28 @@
       cargo run -q -- "$dir/elaborated.tr" --lower > "$dir/lowered.tr"
       cargo run -q -- "$dir/lowered.tr" --firrtl > "$dir/design.fir"
       firtool --disable-opt -lowering-options=disallowLocalVariables "$dir/design.fir" -o "$dir/design.v"
-      iverilog -g2012 -DSYNTHESIS -o "$dir/sim" "sim/''${name}_tb.v" "$dir/design.v"
+
+      # An `extmodule Name from "path.v"` declaration's `.v` implementation
+      # is opaque data trace's own FIRRTL output never references at all
+      # (see sim/README.md's "extmodule_tribuf_tb.v needs a second Verilog
+      # source") -- iverilog needs it passed in directly, alongside the
+      # generated design. Convention (this script's own, since trace's
+      # compiler deliberately resolves no path itself): every such path is
+      # resolved relative to sim/, matching where tribuf.v itself already
+      # lives. Scanning the ORIGINAL example source, not the elaborated/
+      # lowered intermediates -- an `extmodule` item is untouched by either
+      # pass, but the original is the one guaranteed to exist regardless.
+      extmodule_srcs=()
+      while IFS= read -r extmodule_path; do
+        v="sim/$extmodule_path"
+        if [ ! -f "$v" ]; then
+          echo "simulate: examples/$name.tr's \`extmodule ... from \"$extmodule_path\"\` has no matching sim/$extmodule_path" >&2
+          exit 1
+        fi
+        extmodule_srcs+=("$v")
+      done < <(grep -oE 'extmodule +[A-Za-z_][A-Za-z0-9_]* +from +"[^"]*"' "examples/$name.tr" | sed -E 's/.*from +"([^"]*)"/\1/' || true)
+
+      iverilog -g2012 -DSYNTHESIS -o "$dir/sim" "sim/''${name}_tb.v" "$dir/design.v" "''${extmodule_srcs[@]:-}"
       vvp "$dir/sim"
     '';
   };

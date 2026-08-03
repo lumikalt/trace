@@ -3043,9 +3043,10 @@ noted:
   `extmodule` (`examples/extmodule_tribuf.tr`, a real bidirectional
   tri-state bus behind a hand-written Verilog blackbox — proven end to
   end in `tests/sim.rs`'s `extmodule_tribuf_runs_a_real_bidirectional_bus`,
-  two instances sharing one wire, driver alternating sides). `devenv
-  shell -- simulate` doesn't yet know to pass an extmodule's `.v` file to
-  iverilog (see TODO.md).
+  two instances sharing one wire, driver alternating sides — `devenv
+  shell -- simulate extmodule_tribuf` also runs this directly now,
+  `simulate` having learned to discover and pass an extmodule's `.v`
+  file to iverilog, see TODO.md).
 - FIFO synthesis, including the enqueue/dequeue pass-through case
   (`examples/fifo_bridge.tr`, `examples/fifo_passthrough.tr`).
 - Port-based memory access (`examples/port_ram.tr`).

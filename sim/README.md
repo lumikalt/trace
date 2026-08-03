@@ -76,18 +76,18 @@ implementation; `extmodule_tribuf_tb.v` instantiates the generated
 `Top` TWICE with their `bus` ports tied together, alternates which side
 drives, and checks the other side senses it — a real bidirectional net.
 
-`devenv.nix`'s `simulate` script does NOT yet know to pass `tribuf.v`
-to iverilog alongside the generated design (it only takes one example
-name and assumes one generated `.v` plus one testbench) — `devenv shell
--- simulate extmodule_tribuf` fails at iverilog elaboration (verified
-directly, not assumed): `Unknown module type: TriBuf ... referenced 2
-times`. `tests/sim.rs`'s own
-`extmodule_tribuf_runs_a_real_bidirectional_bus` test is the only
-currently-working way to run this one; it uses a dedicated
-`simulate_with_blackbox` helper instead of the shared `simulate`. See
-TODO.md for the unbuilt discovery mechanism this would need (the `.tr`
-source only ever says `"tribuf.v"`, not `"sim/tribuf.v"` — no path-
-resolution convention has been decided yet).
+`devenv.nix`'s `simulate` script now discovers this automatically:
+it greps the example's ORIGINAL source (before `--elaborate`/`--lower`,
+which pass an `extmodule` item through untouched but aren't guaranteed
+to exist for every example) for every `extmodule ... from "path.v"`
+declaration and resolves each `path.v` RELATIVE TO `sim/` — the
+convention `tribuf.v`'s own placement here already implied, now made
+real. `devenv shell -- simulate extmodule_tribuf` runs correctly as a
+result. `tests/sim.rs`'s own
+`extmodule_tribuf_runs_a_real_bidirectional_bus` test still uses its
+own dedicated `simulate_with_blackbox` helper rather than the shared
+`simulate` script (a Rust test can't shell out to a devenv script), but
+both now agree on the same "look in `sim/`" resolution.
 
 ## If firtool renames `m_ext`/`Memory`
 

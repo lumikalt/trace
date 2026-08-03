@@ -1705,8 +1705,37 @@ manually in the meantime.
 
 - Icarus only; no Verilator path (would need `--public`/`--public-flat-rw`
   wiring for the hierarchical-path testbenches).
-- `firtool`/`iverilog` CLI behavior has already drifted once this project
-  (firtool 1.147.0 needed `-format=fir` for stdin); no version pin yet.
+- **RESOLVED — `firtool`/`iverilog` version pin.** `devenv.nix`'s
+  `simulate` script now asserts the exact versions this project's
+  scripts/tests are written against (`firtool-1.147.0`, iverilog `13.0`)
+  before doing any real work, failing with a clear message naming what
+  was found instead — the CLI behavior HAD already drifted once
+  silently (firtool started needing `-format=fir` for stdin, with no
+  signal until something else broke confusingly downstream); this turns
+  a future drift into an immediate, actionable failure instead. Doesn't
+  touch `devenv.yaml`'s own nixpkgs pin (still tracks the `rolling`
+  branch, re-resolved on `devenv update`) — this check is a second,
+  independent line of defense, not a replacement for pinning nixpkgs
+  itself, deliberately: it also catches a differently-provisioned
+  environment (system-installed tools, a different channel) that never
+  goes through this project's own lockfile at all.
+- **RESOLVED — `simulate`'s `extmodule` `.v`-discovery gap.** Was:
+  `devenv shell -- simulate extmodule_tribuf` failed at iverilog
+  elaboration (`Unknown module type: TriBuf ... referenced 2 times`) —
+  the script only ever passed one generated `.v` plus one testbench to
+  iverilog, with no way to also supply an `extmodule`'s own real
+  implementation. Fixed by having `simulate` grep the ORIGINAL example
+  source (not the elaborated/lowered intermediates — an `extmodule`
+  item passes through both passes untouched, but the original is the
+  one guaranteed to exist regardless) for every `extmodule ... from
+  "path.v"` declaration, resolving each `path.v` relative to `sim/` —
+  the convention `tribuf.v`'s own placement already established, now
+  made real rather than just documented — and passing each resolved
+  file to iverilog alongside the generated design. A referenced `.v`
+  file that doesn't exist under `sim/` is a clear, immediate error
+  naming the missing path, not a confusing iverilog elaboration
+  failure. Confirmed directly: `devenv shell -- simulate
+  extmodule_tribuf` now runs and reports `SIMULATION PASSED`.
 
 ## Editor tooling (`editors/vscode/`)
 
