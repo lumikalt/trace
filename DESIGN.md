@@ -2995,12 +2995,18 @@ text or position forward. A pretty-printer that rebuilt source from the AST
 would have nowhere to put a comment back, and would silently delete every one on
 first format. Reindenting instead walks the token stream only for
 brace/paren/bracket depth and rewrites each line's leading whitespace — it never
-looks at comments, so it can never lose one. The tradeoff: a line that continues
-a statement without opening a bracket (a multiline `impl ... refines Spec`
-signature) has no depth to hang an indent off, and renders flush left even where
-hand-indented. Fixing that needs statement-level awareness a brace counter does
-not have — a real pretty-printer's problem, which reopens the comment-loss
-problem reindenting was built to avoid.
+looks at comments, so it can never lose one. One case beyond plain brace
+counting is special-cased directly, not left as a gap: a multiline `impl
+... refines Spec` signature (`refines` on its own line, outside any
+bracket — the one construct the parser's own grammar, `parse_fn`'s
+`skip_newlines()` before `Refines`, allows to continue a signature this
+way) gets one extra indent level, matching the `RoundRobin` example below
+and `examples/arbiter.tr`. Every OTHER multiline-signature position is
+either inside an open paren/bracket (already handled by plain depth
+counting) or directly before `{`, which stays at the signature's own
+depth by design — no other construct in the grammar needs this kind of
+special-casing, so the formatter stays a brace counter plus this one
+lexical rule, not a real statement-aware pretty-printer.
 
 There is no language server. Go-to-definition, hover, and inline diagnostics
 come from running `trace file.tr` directly. The grammar is regex-based, so it

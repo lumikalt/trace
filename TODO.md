@@ -1744,7 +1744,18 @@ manually in the meantime.
 - Grammar is regex-based (TextMate): highlights `reads`/`writes`/effect
   words unconditionally, even used as plain identifiers outside `<...>`.
 - Formatter is a reindenter, not a pretty-printer, by deliberate choice
-  (see DESIGN.md's "Tooling" section) — known gap: a multiline signature
-  before `refines`/`{` renders flush left (`tests/fmt.rs` pins this).
+  (see DESIGN.md's "Tooling" section). **RESOLVED — the one known gap
+  this deliberately narrow design had**: a multiline `impl ... refines
+  Spec` signature used to render `refines` flush left instead of hand-
+  indented (no bracket depth to hang an indent off). Fixed narrowly,
+  not by adding real statement awareness: a `Refines` token starting a
+  line is the ONE construct the parser's own grammar (`parse_fn`'s
+  `skip_newlines()` before `Refines`) allows to continue a signature
+  outside any bracket, so `fmt.rs` special-cases exactly that token,
+  giving its line one extra indent level relative to whatever depth its
+  signature sits at (confirmed nested, not just top-level).
+  `examples/arbiter.tr` (the one shipped example with this shape) is
+  now idempotent under the formatter like every other example — no
+  longer needs its own skip in `tests/fmt.rs`'s idempotency sweep.
 - Not published to a marketplace; local install only (see the extension's
   own README).

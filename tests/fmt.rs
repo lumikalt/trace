@@ -58,29 +58,28 @@ fn no_trailing_newline_is_preserved() {
 }
 
 #[test]
-fn idempotent_on_every_shipped_example_except_the_known_continuation_case() {
+fn idempotent_on_every_shipped_example() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "tr") {
             continue;
         }
-        if path.file_name().unwrap() == "arbiter.tr" {
-            continue; // see known_limitation_continuation_line_before_brace below
-        }
         let src = std::fs::read_to_string(&path).unwrap();
         assert_eq!(format(&src), src, "not idempotent on {path:?}");
     }
 }
 
-/// Documents the limitation named in fmt.rs's module doc comment,
-/// rather than leaving it as a silent surprise: a signature that wraps
-/// onto its own line before `refines`/`{` has no bracket depth to hang
-/// an indent off, so the formatter renders it flush left even though
-/// the source hand-indents it. Pinned here so a future change to the
-/// algorithm is a deliberate decision, not an accidental regression.
+/// A multiline `impl` signature's `refines` line — the one construct
+/// the parser's grammar (`parse_fn`'s `skip_newlines()` before
+/// `Refines`) allows to continue a signature outside any bracket — gets
+/// one extra indent level, matching DESIGN.md's own `RoundRobin`
+/// example (`examples/arbiter.tr`) exactly: one level deeper than
+/// `impl`'s own line, with `{` back at the signature's own depth. Used
+/// to render flush left instead (fmt.rs's own module doc comment
+/// documents why plain brace-counting alone can't see this).
 #[test]
-fn known_limitation_continuation_line_before_brace() {
+fn a_multiline_impl_signatures_refines_line_gets_one_extra_indent() {
     let src = "\
 impl RoundRobin(reqs : [N]) : [clog2(N)] <combines>
     refines AnyGrant
@@ -88,6 +87,26 @@ impl RoundRobin(reqs : [N]) : [clog2(N)] <combines>
     return prio(reqs)
 }
 ";
-    let out = format(src);
-    assert!(out.contains("\nrefines AnyGrant\n"), "{out}");
+    assert_eq!(format(src), src);
+}
+
+/// Same as above, one level deeper (`impl` itself nested inside a
+/// module) — confirms `refines`'s extra indent is relative to whatever
+/// depth its own signature line sits at, not hardcoded to top level.
+#[test]
+fn a_nested_multiline_impl_signatures_refines_line_indents_one_past_its_own_depth() {
+    let src = "\
+module M {
+    spec AnyGrant(reqs : [N]) : [clog2(N)] <combines, chooses, fails> {
+        return 0
+    }
+
+    impl RoundRobin(reqs : [N]) : [clog2(N)] <combines>
+        refines AnyGrant
+    {
+        return prio(reqs)
+    }
+}
+";
+    assert_eq!(format(src), src);
 }
