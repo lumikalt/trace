@@ -136,6 +136,20 @@ pub struct Resolution {
     /// it to catch the same boundary crossing happening dynamically,
     /// through a call, to a state def the callee reads or writes.
     pub def_owner: HashMap<DefId, Option<ItemId>>,
+    /// A `reads {a, b}`/`writes {a}` row argument's own name span -> the
+    /// def it names, populated by `check_effect_args` at the same point it
+    /// already looks the name up to validate it. A separate side table
+    /// rather than folding into `expr_defs`: a row argument is a plain
+    /// `Name`, never an `ExprId` (there's no expression there to attach
+    /// one to) — keyed by `Span` rather than adding a dedicated id type
+    /// for what is, so far, a single consumer (the language server's
+    /// hover/go-to-definition, so `pc`/`mem` in `reads {pc, mem}` resolve
+    /// like any other state reference instead of answering nothing).
+    /// Populated for every name that resolves to SOME def, even one the
+    /// surrounding match then rejects as the wrong kind (a rule named in
+    /// `reads`, say) — the def is still real and still worth hovering,
+    /// independent of whether using it there is legal.
+    pub effect_arg_defs: HashMap<Span, DefId>,
 }
 
 impl Resolution {
@@ -649,7 +663,11 @@ impl<'a> Resolver<'a> {
     fn check_effect_args(&mut self, effects: &[Effect]) {
         for effect in effects {
             for arg in &effect.args {
-                match self.lookup(&arg.text) {
+                let looked_up = self.lookup(&arg.text);
+                if let Some(def) = looked_up {
+                    self.res.effect_arg_defs.insert(arg.span.clone(), def);
+                }
+                match looked_up {
                     // A rule name is never in `scopes` at all now (see
                     // `rule_scopes`), so it falls through to `None` here
                     // like any other unknown name -- checked separately

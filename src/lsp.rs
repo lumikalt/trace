@@ -26,9 +26,9 @@
 //! exists yet); a file with only type errors still gets go-to-definition
 //! (needs only `Resolution`) but hover without type info (needs `Types`).
 
-use crate::ast::{Ast, Expr, ExprId};
+use crate::ast::{Ast, Expr, ExprId, FnKind, Item, effects_str};
 use crate::lexer::Span;
-use crate::resolve::{DefId, Resolution};
+use crate::resolve::{DefId, DefKind, Resolution};
 use crate::types::Types;
 use crate::{effects, lexer, parser, resolve, types};
 use lsp_server::{
@@ -42,9 +42,9 @@ use lsp_types::notification::{
 use lsp_types::request::{GotoDefinition, HoverRequest};
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, Location, MarkedString, OneOf, Position,
-    PositionEncodingKind, PublishDiagnosticsParams, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    HoverContents, HoverParams, HoverProviderCapability, Location, MarkedString, MarkupContent,
+    MarkupKind, OneOf, Position, PositionEncodingKind, PublishDiagnosticsParams, Range,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -420,10 +420,57 @@ fn ident_at(ast: &Ast, offset: usize) -> Option<ExprId> {
     best.map(|(id, _)| id)
 }
 
-fn ident_def_at(ast: &Ast, res: &Resolution, offset: usize) -> Option<(ExprId, DefId)> {
-    let expr = ident_at(ast, offset)?;
-    let def = *res.expr_defs.get(&expr)?;
-    Some((expr, def))
+/// A `reads {a, b}`/`writes {a}` row argument (a plain `Name`, never an
+/// `Expr::Ident`) whose own span contains `offset`, if any — the third
+/// case `thing_at` dispatches to, alongside a live use and a declaration
+/// site. Backed by `resolve::Resolution::effect_arg_defs`, populated once
+/// by `check_effect_args` at resolve time rather than re-deriving a
+/// name -> def lookup here (this module never has scope information of
+/// its own to do that with). A flat linear scan, same "fine at these file
+/// sizes" rationale `ident_at`'s own scan already relies on.
+fn effect_arg_at(res: &Resolution, offset: usize) -> Option<(Span, DefId)> {
+    for (span, &def) in &res.effect_arg_defs {
+        if span.start <= offset && offset <= span.end {
+            return Some((span.clone(), def));
+        }
+    }
+    None
+}
+
+/// What's under the cursor, tried in this order: a live `Expr::Ident`
+/// *use* of a def (`Some(expr)`, so a per-expression type is also
+/// available from `expr_tys`); a `reads`/`writes` row argument (`None` —
+/// it's a plain `Name`, not an `Expr::Ident`, but still a real reference to
+/// the def it names, same as a use); or the def's own *declaration site*
+/// (`None` — a `reg`/`in`/`out`/`fn`/... name is never itself an
+/// `Expr::Ident` either, it's plain data on an `Item`). The returned
+/// `Span` is always the SITE actually under the cursor (an expression's
+/// own span, a row argument's own span, or the declaration's own span) —
+/// never assumed from which branch matched, so hover/go-to-definition
+/// always highlight the right text even though only the use-site branch
+/// has a real `ExprId` to also key `expr_tys` with.
+fn thing_at(ast: &Ast, res: &Resolution, offset: usize) -> Option<(Span, Option<ExprId>, DefId)> {
+    if let Some(expr) = ident_at(ast, offset)
+        && let Some(&def) = res.expr_defs.get(&expr)
+    {
+        return Some((ast.expr_spans[expr.0 as usize].clone(), Some(expr), def));
+    }
+    if let Some((span, def)) = effect_arg_at(res, offset) {
+        return Some((span, None, def));
+    }
+    let mut best: Option<(DefId, usize)> = None;
+    for (i, def) in res.defs.iter().enumerate() {
+        if def.span.is_empty() {
+            continue; // builtins (see `resolve::Def::span`'s own doc)
+        }
+        if def.span.start <= offset && offset <= def.span.end {
+            let len = def.span.end - def.span.start;
+            if best.is_none_or(|(_, best_len)| len < best_len) {
+                best = Some((DefId(i as u32), len));
+            }
+        }
+    }
+    best.map(|(id, _)| (res.def(id).span.clone(), None, id))
 }
 
 fn goto_definition(
@@ -437,7 +484,7 @@ fn goto_definition(
     let ast = compiled.ast.as_ref()?;
     let res = compiled.res.as_ref()?;
     let offset = index.offset(params.text_document_position_params.position);
-    let (_, def) = ident_def_at(ast, res, offset)?;
+    let (_, _, def) = thing_at(ast, res, offset)?;
     let def = res.def(def);
     if def.span.is_empty() {
         // Builtins carry an empty span (see `resolve::Def::span`'s own
@@ -456,16 +503,445 @@ fn hover(docs: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
     let index = LineIndex::new(src);
     let compiled = compile(src, &index);
     let ast = compiled.ast.as_ref()?;
-    let res = compiled.res.as_ref()?;
     let offset = index.offset(params.text_document_position_params.position);
-    let (expr, def_id) = ident_def_at(ast, res, offset)?;
+    // Tried before `thing_at`/`res`, and needs neither: an effect keyword
+    // (`reads`/`combines`/...) is pure syntax on `Item::Rule`/`Item::Fn`,
+    // never an `Expr::Ident` and never given a `resolve::Def` either (see
+    // `effect_hover`'s own doc comment), so it needs a third lookup path
+    // independent of both `ident_at` and the `Def::span` fallback —
+    // works even on a file with resolve errors, same as diagnostics do.
+    if let Some(hover) = effect_hover(ast, &index, offset) {
+        return Some(hover);
+    }
+    let res = compiled.res.as_ref()?;
+    let (range, expr, def_id) = thing_at(ast, res, offset)?;
     let def = res.def(def_id);
-    let text = match compiled.ty.as_ref().and_then(|ty| ty.expr_tys.get(&expr)) {
+    // A fn/spec/impl's "type" isn't one scalar `Ty` the way a reg or a
+    // local's is — it's a whole signature (params, return, effects) — so
+    // it gets its own richer rendering: a fenced code block matching the
+    // VS Code extension's own language id (`trace`), syntax-highlighted
+    // the same as the source itself, plus a placeholder description line
+    // since there are no doc comments to pull a real one from yet.
+    if let Some(sig) = fn_signature(ast, res, src, def_id) {
+        let desc = match def.kind {
+            DefKind::Spec => "A spec.",
+            DefKind::Impl => "An impl.",
+            _ => "A function.",
+        };
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```trace\n{sig}\n```\n\n{desc}"),
+            }),
+            range: Some(index.range(&range)),
+        });
+    }
+    // A use site's type comes from `expr_tys` (per-expression, since the
+    // same def can be read at different widths through absorption); a
+    // declaration site has no `ExprId` of its own to key that map with, so
+    // it falls back to the def-keyed `local_tys`/`state_tys` maps instead
+    // — between them, every def with a scalar type is covered (a rule/
+    // module/... def has neither and just shows its kind, same as an
+    // untyped use site already does below).
+    let ty = match expr {
+        Some(expr) => compiled.ty.as_ref().and_then(|ty| ty.expr_tys.get(&expr)),
+        None => compiled.ty.as_ref().and_then(|ty| {
+            ty.local_tys
+                .get(&def_id)
+                .or_else(|| ty.state_tys.get(&def_id))
+        }),
+    };
+    let text = match ty {
         Some(ty) => format!("`{}: {ty}` — {}", def.name, def.kind.describe()),
         None => format!("`{}` — {}", def.name, def.kind.describe()),
     };
     Some(Hover {
         contents: HoverContents::Scalar(MarkedString::String(text)),
-        range: Some(index.range(&ast.expr_spans[expr.0 as usize])),
+        range: Some(index.range(&range)),
     })
+}
+
+/// Hover for an effect keyword (`reads`/`writes`/`combines`/`sequences`/
+/// `elaborates`/`fails`/`chooses`) inside a `<...>` list, if `offset` sits
+/// inside one's own name span. An effect's `Name` is plain syntax on
+/// `Item::Rule`/`Item::Fn` (`ast.rs`'s `Effect` struct) — never an
+/// `Expr::Ident` (so `ident_at` never finds it) and never given a
+/// `resolve::Def` either, unlike every other declaration this module
+/// hovers (nothing ever needs to reference an effect the way a call
+/// references a fn, or a read references a reg) — so this is its own
+/// third lookup path, independent of `thing_at`. `ast.items` is a flat
+/// arena (a module's own nesting is expressed through `ItemId`
+/// cross-references stored ON items, not real Rust-level tree nesting),
+/// so one linear pass already reaches every rule/fn regardless of which
+/// module contains it — same "fine at these file sizes" scan `ident_at`
+/// already relies on.
+fn effect_hover(ast: &Ast, index: &LineIndex, offset: usize) -> Option<Hover> {
+    for item in &ast.items {
+        let effects = match item {
+            Item::Rule { effects, .. } | Item::Fn { effects, .. } => effects,
+            _ => continue,
+        };
+        for effect in effects {
+            if effect.name.span.start <= offset && offset <= effect.name.span.end {
+                let value = effect_doc(&effect.name.text)?;
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: Some(index.range(&effect.name.span)),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// A description and a runnable example for each real effect keyword,
+/// straight from DESIGN.md's own "Effects" section — kept in sync by hand,
+/// the same way `effects_str`'s rendering and the parser's own effect
+/// grammar already have to independently agree on the same 7 names.
+/// `None` for anything else (a typo, or a name this dispatch hasn't been
+/// taught yet) — `effect_hover` just shows nothing rather than guessing.
+fn effect_doc(name: &str) -> Option<String> {
+    let (desc, example): (&str, &str) = match name {
+        "combines" => (
+            "Total, pure, and always terminates — lowers to a plain combinational \
+             expression, never registers. Loops over circuit values are rejected; only \
+             an elaboration-time-bounded loop is legal here.",
+            "Parity(x : [8]) : [1] <combines> {\n    return x[0] ^ x[1] ^ x[2] ^ x[3] ^ \
+             x[4] ^ x[5] ^ x[6] ^ x[7]\n}",
+        ),
+        "sequences" => (
+            "Spans more than one cycle. `tick` marks a cycle boundary; each cycle is \
+             still its own one-cycle transaction — there is no cross-cycle rollback.",
+            "Rmw(addr : [8]) <sequences, reads {mem}, writes {mem}> {\n    let v = \
+             mem[addr]\n    tick\n    mem[addr] := v + 1\n}",
+        ),
+        "elaborates" => (
+            "Runs once, before synthesis, to build the circuit. Recursion and dynamic \
+             allocation are legal here, and only here.",
+            "AdderTree(xs : list[wire[32]]) : wire[32] <elaborates> {\n    if len(xs) = \
+             1 { return xs[0] }\n    let mid = len(xs) / 2\n    return \
+             Add(AdderTree(xs[..mid]), AdderTree(xs[mid..]))\n}",
+        ),
+        "fails" => (
+            "Marks code that can fail: a guard `?`, a fifo operation, or a call to \
+             failing code. Inferred bottom-up through the call graph; must be declared \
+             explicitly wherever the computed result is true, not silently left off.",
+            "Classify(x : [8]) : [2] <combines, fails> {\n    (x <> 0)?\n    return \
+             clog2(x)\n}",
+        ),
+        "chooses" => (
+            "Marks spec-only nondeterminism: `|` and `any` become free variables for a \
+             model checker. Only a `spec` may declare it; synthesizing code with it is \
+             a type error.",
+            "spec AnyGrant(reqs : [N]) : [clog2(N)] <combines, chooses, fails> {\n    \
+             let i = any(0..N-1)\n    reqs[i]?\n    return i\n}",
+        ),
+        "reads" => (
+            "The set of state (`reg`/`mem`/`fifo`/`in`) this rule or function reads. \
+             Inferred by the compiler; stating it asserts an interface — overstating is \
+             legal (a conservative claim is sound), understating is an error.",
+            "rule refill <reads {pc, mem}, writes {ir}> {\n    ir := mem[pc]\n}",
+        ),
+        "writes" => (
+            "The set of state (`reg`/`mem`/`fifo`) this rule or function writes. \
+             Inferred by the compiler; stating it asserts an interface — overstating is \
+             legal (a conservative claim is sound), understating is an error.",
+            "rule refill <reads {pc, mem}, writes {ir}> {\n    ir := mem[pc]\n}",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "```trace\n<{name}>\n```\n\n{desc}\n\n```trace\n{example}\n```"
+    ))
+}
+
+/// Renders a fn/spec/impl's own declared signature as it's written in
+/// source (`fn Outer(x : [8]) : [8] <combines>`), by slicing each
+/// parameter/return type annotation's own span directly out of `src`
+/// rather than re-deriving a `Ty` and reformatting it — the exact text the
+/// user wrote is unambiguous and never needs to handle `Ty::Unknown`/
+/// generic-parameter display edge cases a `Ty`-based rendering would.
+/// `None` for anything that isn't a fn/spec/impl def, or (defensively) if
+/// `res.item_defs` somehow has no entry for one that is — the caller falls
+/// back to the plain `name — kind` hover in either case.
+fn fn_signature(ast: &Ast, res: &Resolution, src: &str, def_id: DefId) -> Option<String> {
+    let mut item_id = None;
+    for (&iid, &did) in &res.item_defs {
+        if did == def_id {
+            item_id = Some(iid);
+            break;
+        }
+    }
+    let item_id = item_id?;
+    let Item::Fn {
+        name,
+        kind,
+        params,
+        ret,
+        effects,
+        ..
+    } = ast.item(item_id)
+    else {
+        return None;
+    };
+    // `fn`/`FnKind::Fn`'s own bare name at item position is ALL source
+    // syntax needs (see `parser.rs`'s `parse_item`, dispatched on a bare
+    // `Ident` with no leading keyword) — `ast.rs`'s own debug dump prints
+    // a synthetic `fn ` prefix for readability there, but hover renders
+    // exactly what's legal to write, so only `spec`/`impl` (which DO
+    // consume a real keyword token) get one here.
+    let keyword = match kind {
+        FnKind::Fn => "",
+        FnKind::Spec => "spec ",
+        FnKind::Impl { .. } => "impl ",
+    };
+    let params = params
+        .iter()
+        .map(|p| {
+            format!(
+                "{} : {}",
+                p.name,
+                &src[ast.expr_spans[p.ty.0 as usize].clone()]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sig = format!("{keyword}{name}({params})");
+    if let Some(ret) = ret {
+        sig.push_str(&format!(
+            " : {}",
+            &src[ast.expr_spans[ret.0 as usize].clone()]
+        ));
+    }
+    sig.push_str(&effects_str(effects));
+    if let FnKind::Impl { refines } = kind {
+        sig.push_str(&format!(" refines {refines}"));
+    }
+    Some(sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drives `hover`/`goto_definition` directly against a one-document
+    /// `docs` map — no stdio framing needed, since both take `&HashMap`/
+    /// typed params rather than a live `Connection`. `line`/`col` are
+    /// 0-indexed, matching LSP's own `Position`.
+    fn doc(src: &str) -> HashMap<String, String> {
+        let mut docs = HashMap::new();
+        docs.insert("file:///t.tr".to_string(), src.to_string());
+        docs
+    }
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    fn hover_at(src: &str, line: u32, character: u32) -> Option<Hover> {
+        let uri: Uri = "file:///t.tr".parse().unwrap();
+        hover(
+            &doc(src),
+            HoverParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams::new(
+                    lsp_types::TextDocumentIdentifier::new(uri),
+                    pos(line, character),
+                ),
+                work_done_progress_params: Default::default(),
+            },
+        )
+    }
+
+    fn goto_at(src: &str, line: u32, character: u32) -> Option<GotoDefinitionResponse> {
+        let uri: Uri = "file:///t.tr".parse().unwrap();
+        goto_definition(
+            &doc(src),
+            GotoDefinitionParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams::new(
+                    lsp_types::TextDocumentIdentifier::new(uri),
+                    pos(line, character),
+                ),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        )
+    }
+
+    fn hover_text(hover: &Hover) -> &str {
+        match &hover.contents {
+            HoverContents::Scalar(MarkedString::String(s)) => s,
+            HoverContents::Markup(MarkupContent { value, .. }) => value,
+            _ => panic!("unexpected hover contents shape: {:?}", hover.contents),
+        }
+    }
+
+    const SRC: &str = "module M {\n    reg counter : [8] = 0\n    rule r {\n        counter := counter + 1\n    }\n}\n";
+
+    #[test]
+    fn hovering_a_use_site_still_works() {
+        // The second `counter` on line 3 (`counter := counter + 1`, both
+        // 0-indexed), well inside its `Expr::Ident` span (19..26) — the
+        // pre-existing, already-covered case.
+        let h = hover_at(SRC, 3, 22).expect("hover over a use site");
+        let text = hover_text(&h);
+        assert!(text.contains("counter"), "{text}");
+        assert!(text.contains("[8]"), "{text}");
+    }
+
+    #[test]
+    fn hovering_the_declaration_site_itself_now_resolves() {
+        // `counter` in `reg counter : [8] = 0` itself — this is the gap
+        // TODO.md flagged: not an `Expr::Ident`, so `ident_at` alone never
+        // found it, and hover/goto-definition returned nothing here.
+        let h = hover_at(SRC, 1, 8).expect("hover over the declaration site");
+        let text = hover_text(&h);
+        assert!(text.contains("counter"), "{text}");
+        assert!(text.contains("[8]"), "{text}");
+        assert!(text.contains("a register"), "{text}");
+    }
+
+    #[test]
+    fn goto_definition_from_the_declaration_site_itself_now_resolves() {
+        // Ctrl-clicking the declaration's own name is a legitimate
+        // request too (many editors send it on any click, not just a
+        // use) — it should resolve to itself rather than answering
+        // nothing, matching `hovering_the_declaration_site_itself_now_
+        // resolves` above.
+        let resp = goto_at(SRC, 1, 8).expect("goto-definition over the declaration site");
+        let GotoDefinitionResponse::Scalar(loc) = resp else {
+            panic!("expected a single location, got {resp:?}");
+        };
+        assert_eq!(loc.range.start.line, 1);
+    }
+
+    #[test]
+    fn hovering_a_declaration_site_with_no_scalar_type_shows_just_the_kind() {
+        // A `rule`/`fn`/`module`/... declaration site has no entry in
+        // `local_tys`/`state_tys` (nothing scalar to show) — same
+        // graceful fallback an untyped use site already gets, just
+        // reached through the declaration-site path instead.
+        let src = "module M {\n    rule my_rule {\n    }\n}\n";
+        let h = hover_at(src, 1, 9).expect("hover over the rule's own name");
+        let text = hover_text(&h);
+        assert_eq!(text, "`my_rule` — a rule");
+    }
+
+    #[test]
+    fn hovering_a_keyword_finds_nothing() {
+        // Line 1 char 4 is the `r` of the `reg` keyword itself — neither
+        // an `Expr::Ident` use nor any def's own name span (that starts
+        // at char 8, `counter`) — should resolve to nothing, not the
+        // nearby declaration.
+        assert!(hover_at(SRC, 1, 4).is_none());
+    }
+
+    // A plain `fn`-flavored function has no leading keyword in real
+    // source syntax (`parser.rs` dispatches on a bare `Ident` at item
+    // position) — matches `examples/call_nested_writes.tr`'s own
+    // `Outer(x : [8]) : [8] <combines> { ... }`.
+    const FN_SRC: &str = "module Top {\n    in a : [8]\n    out v_out : [8] = 0\n\n    \
+                           Outer(x : [8]) : [8] <combines> {\n        v_out := x\n        \
+                           return x\n    }\n\n    rule compute {\n        Outer(a)\n    }\n}\n";
+
+    #[test]
+    fn hovering_a_function_declaration_shows_its_signature_as_a_code_block() {
+        let h = hover_at(FN_SRC, 4, 4).expect("hover over the fn's own declaration");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nOuter(x : [8]) : [8] <combines>\n```\n\nA function."
+        );
+        let HoverContents::Markup(MarkupContent { kind, .. }) = h.contents else {
+            panic!("expected markup content, got {:?}", h.contents);
+        };
+        assert_eq!(kind, MarkupKind::Markdown);
+    }
+
+    #[test]
+    fn hovering_a_function_call_site_shows_the_same_signature() {
+        // `Outer(a)` inside `rule compute` — a USE, not the declaration —
+        // exercises the `Some(expr)` path through `thing_at` rather than
+        // the declaration-site fallback the test above exercises.
+        let h = hover_at(FN_SRC, 10, 8).expect("hover over a call site");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nOuter(x : [8]) : [8] <combines>\n```\n\nA function."
+        );
+    }
+
+    #[test]
+    fn hovering_an_effect_keyword_shows_its_description_and_an_example() {
+        // `combines` inside `Outer`'s own `<combines>` list, line 4 char
+        // 29 — well inside the name's span (26..34), not the fn's own
+        // name span (4..9), so this exercises `effect_hover`'s own
+        // independent lookup path, not `thing_at`/`fn_signature` at all.
+        let h = hover_at(FN_SRC, 4, 29).expect("hover over the combines effect");
+        let text = hover_text(&h);
+        assert!(text.starts_with("```trace\n<combines>\n```\n\n"), "{text}");
+        assert!(text.contains("combinational"), "{text}");
+        assert!(text.contains("```trace\nParity"), "{text}");
+    }
+
+    const EFFECT_ROW_SRC: &str = "module M {\n    in a : [8]\n    reg r : [8] = 0\n    \
+                                   rule refill <reads {a}, writes {r}> {\n        r := a\n    \
+                                   }\n}\n";
+
+    #[test]
+    fn hovering_reads_and_writes_gives_each_its_own_description() {
+        // `reads {a}, writes {r}` on line 3: `reads` spans 17..22, `writes`
+        // spans 28..34 — distinct keywords, distinct doc text (reads
+        // mentions `in`, writes doesn't, since an `in` port can never be
+        // written).
+        let reads = hover_at(EFFECT_ROW_SRC, 3, 19).expect("hover over reads");
+        let reads_text = hover_text(&reads);
+        assert!(
+            reads_text.starts_with("```trace\n<reads>\n```\n\n"),
+            "{reads_text}"
+        );
+        assert!(reads_text.contains("`in`"), "{reads_text}");
+
+        let writes = hover_at(EFFECT_ROW_SRC, 3, 30).expect("hover over writes");
+        let writes_text = hover_text(&writes);
+        assert!(
+            writes_text.starts_with("```trace\n<writes>\n```\n\n"),
+            "{writes_text}"
+        );
+        assert_ne!(reads_text, writes_text);
+    }
+
+    #[test]
+    fn hovering_a_reads_writes_row_argument_resolves_like_a_real_state_reference() {
+        // `a` inside `reads {a}` (char 24) and `r` inside `writes {r}`
+        // (char 36) are effect ROW ARGUMENTS, not the effect keyword
+        // itself — `effect_hover` only ever matches an `Effect::name`
+        // span, never an arg `Name`, so these must NOT produce the
+        // `reads`/`writes` doc (a looser "somewhere inside the effect"
+        // check would have). Instead they resolve through `resolve::
+        // Resolution::effect_arg_defs` to the actual `in`/`reg` they
+        // name, same as any other state reference.
+        let a = hover_at(EFFECT_ROW_SRC, 3, 24).expect("hover over the reads row's `a`");
+        assert_eq!(hover_text(&a), "`a: [8]` — an input port");
+
+        let r = hover_at(EFFECT_ROW_SRC, 3, 36).expect("hover over the writes row's `r`");
+        assert_eq!(hover_text(&r), "`r: [8]` — a register");
+    }
+
+    #[test]
+    fn goto_definition_from_a_reads_writes_row_argument_jumps_to_its_declaration() {
+        let resp =
+            goto_at(EFFECT_ROW_SRC, 3, 24).expect("goto-definition over the reads row's `a`");
+        let GotoDefinitionResponse::Scalar(loc) = resp else {
+            panic!("expected a single location, got {resp:?}");
+        };
+        assert_eq!(loc.range.start.line, 1); // `in a : [8]`
+
+        let resp =
+            goto_at(EFFECT_ROW_SRC, 3, 36).expect("goto-definition over the writes row's `r`");
+        let GotoDefinitionResponse::Scalar(loc) = resp else {
+            panic!("expected a single location, got {resp:?}");
+        };
+        assert_eq!(loc.range.start.line, 2); // `reg r : [8] = 0`
+    }
 }

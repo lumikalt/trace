@@ -1854,12 +1854,10 @@ manually in the meantime.
   never negotiated capabilities as strictly as a real client does. And
   diagnostics/definition/hover all degrade in step with `main.rs`'s own
   early-return-on-error chain (a parse error means no `Resolution` exists
-  yet, so definition/hover answer nothing until it's fixed). Known gap:
-  go-to-definition/hover only resolve identifier *uses*, not declaration
-  sites themselves (hovering the `counter` in `reg counter : [8]` finds
-  nothing; a later `counter := ...` does). Verified end-to-end with a
-  hand-rolled JSON-RPC client script driving real stdio framing through
-  `initialize`/`didOpen`/`hover`/`definition`/`shutdown`/`exit` — this
+  yet, so definition/hover answer nothing until it's fixed). Verified
+  end-to-end with a hand-rolled JSON-RPC client script driving real stdio
+  framing through `initialize`/`didOpen`/`hover`/`definition`/`shutdown`/
+  `exit` — this
   caught a real deadlock on shutdown (`run()` held the `Connection` alive
   across `io_threads.join()`, so the writer thread's channel never closed;
   fixed by moving `Connection` into `main_loop` so it drops first) — and
@@ -1871,6 +1869,125 @@ manually in the meantime.
   side of the LSP wiring couldn't be verified in this environment (no way
   to drive a real VS Code Extension Development Host headlessly); the
   server side is the part verified above.
+- **RESOLVED — the known gap from the entry above: go-to-definition/hover
+  only resolved identifier *uses*, not declaration sites themselves**
+  (hovering the `counter` in `reg counter : [8]` found nothing; a later
+  `counter := ...` did). Root cause: `ident_at` only scans `Expr::Ident`
+  spans, and a declaration's own name (`reg`/`in`/`out`/`fn`/`rule`/...) is
+  never an `Expr::Ident` — it's plain data on an `Item`, resolved once at
+  def-creation time, not re-parsed as an expression. Fixed with a new
+  `thing_at` (`src/lsp.rs`) that falls back to a direct scan over every
+  `resolve::Def`'s own `span` (already recorded — `goto_definition`
+  already jumped there, just never matched a request arriving AT it)
+  whenever `ident_at` finds nothing, so a declaration's own name now
+  resolves directly to its `DefId` with no `ExprId` in hand. Hovering a
+  declaration site has no per-expression type to read from `expr_tys`
+  (there's no `ExprId`), so it falls back to the def-keyed
+  `local_tys`/`state_tys` maps instead — between the two, every def with a
+  scalar type is covered; a `rule`/`fn`/`module`/... declaration (neither
+  map has an entry) shows just its kind, the same graceful fallback an
+  untyped use site already had. Go-to-definition on a declaration's own
+  name now resolves to itself rather than answering nothing — a harmless,
+  expected no-op jump, not new behavior added for its own sake. Verified
+  with 5 new tests in `src/lsp.rs` itself (`#[cfg(test)] mod tests`,
+  matching `main.rs`'s own precedent for testing private helpers in-crate)
+  that call `hover`/`goto_definition` directly with constructed
+  `HoverParams`/`GotoDefinitionParams` — no stdio framing needed, since
+  both already take a plain `&HashMap` of open documents — covering: a use
+  site still resolving (regression check), a declaration site now
+  resolving for both hover and go-to-definition, a declaration with no
+  scalar type falling back to just its kind, and a position on neither an
+  identifier nor a declaration's own name span (a bare keyword) still
+  correctly resolving to nothing.
+- **RESOLVED — hovering a function showed only `` `Outer` — a function ``,
+  no signature.** A fn/spec/impl def has no single scalar `Ty` (its "type"
+  is params + return + effects, not one value), so it fell all the way
+  through to the generic `name — kind` fallback with nothing useful to
+  show. Now `fn_signature` (`src/lsp.rs`) renders a proper Markdown hover
+  for these three kinds specifically: a fenced ` ```trace ` code block
+  holding the signature exactly as written (`Outer(x : [8]) : [8]
+  <combines>`), followed by a placeholder description line (`"A
+  function."`/`"A spec."`/`"An impl."`) since real doc comments don't
+  exist yet. Built by slicing each param/return type annotation's own span
+  directly out of the source rather than re-deriving and reformatting a
+  `Ty` — simpler, and exact (no `Ty::Unknown`/generic-display edge case to
+  handle). `FnKind::Fn` renders with NO leading keyword, matching real
+  source syntax (`parser.rs` dispatches a plain function on a bare `Ident`
+  at item position — only `spec`/`impl` consume an actual keyword token;
+  `ast.rs`'s own debug dump prints a synthetic `fn ` prefix for its own
+  readability, which would have been a wrong, unparseable signature to
+  echo back in a hover). Works from both a call site (`thing_at`'s
+  existing `Expr::Ident`-use path) and the declaration site itself (the
+  previous entry's `Def::span` fallback path) — same signature either way,
+  since both resolve to the same `DefId`. Verified with 2 new tests in
+  `src/lsp.rs` against a function shaped exactly like
+  `examples/call_nested_writes.tr`'s own `Outer`, one hovering the
+  declaration and one hovering a call site, both asserting the exact
+  rendered Markdown string.
+- **RESOLVED — hovering an effect keyword (`reads`/`writes`/`combines`/
+  `sequences`/`elaborates`/`fails`/`chooses`) answered nothing.** An
+  effect's `Name` is plain syntax on `Item::Rule`/`Item::Fn`
+  (`ast.rs`'s `Effect` struct) — never an `Expr::Ident`, and (unlike every
+  other hover target so far) never given a `resolve::Def` either, since
+  nothing ever references an effect the way a call references a fn or a
+  read references a reg. Neither `ident_at` nor `thing_at`'s `Def::span`
+  fallback could ever find one, so this needed a genuinely third,
+  independent lookup path rather than extending either existing one. New
+  `effect_hover` (`src/lsp.rs`) scans `ast.items` (a flat arena — a
+  module's nesting is `ItemId` cross-references, not real tree nesting, so
+  one pass already reaches every rule/fn) for whichever `Effect::name` span
+  contains the cursor, and `effect_doc` renders a small Markdown hover for
+  it: a description plus a runnable example, one per keyword, hand-
+  transcribed from DESIGN.md's own "Effects" section (the same content, no
+  new prose invented) — the closest this untyped-doc-comment language can
+  get to "hover a keyword, see its docs," matching Rust/rust-analyzer's own
+  hover for a language keyword. Checked before `res`/`thing_at` are even
+  required, so it works on a file with resolve errors too, matching how far
+  diagnostics themselves degrade (only a parse error blocks everything).
+  Deliberately narrow: only an effect's own name matches, never `reads {pc,
+  mem}`'s bracketed row arguments — `pc`/`mem` there are real state names,
+  and giving THEM a proper hover needs actual name resolution, not a doc
+  lookup (see the next entry). Verified with 4 new tests in `src/lsp.rs`:
+  hovering `combines` in a fn's own effect list, hovering `reads`/`writes`
+  in a rule's (confirming they get genuinely different text, not a shared
+  generic blob), and a negative test confirming a bracketed row argument
+  (`a` inside `reads {a}`) does NOT accidentally match — a looser
+  "anywhere inside the effect" span check would have produced a wrong,
+  misleading hover there instead of correctly finding nothing (later
+  updated, not removed, once the next entry gave row arguments a real,
+  different hover to correctly find instead).
+- **RESOLVED — a `reads {a, b}`/`writes {a}` row argument itself
+  (`pc`/`mem` in `reads {pc, mem}`) had no hover or go-to-definition at
+  all**, the gap the entry above deliberately left open. Unlike every
+  other hover target so far, the fix wasn't new lookup logic in `lsp.rs`
+  alone — `resolve.rs`'s own `check_effect_args` already looks each
+  argument name up (to validate it names real state) and simply discarded
+  the answer once validated. New `Resolution::effect_arg_defs: HashMap<Span,
+  DefId>` keeps it instead, keyed by the argument `Name`'s own span (a row
+  argument is a plain `Name`, never an `ExprId`, so it can't join
+  `expr_defs` the way a real use does), populated for every name that
+  resolves to SOME def — even one the surrounding match then rejects as
+  the wrong kind (a rule named in `reads`, say) — since the def is still
+  real and still worth hovering regardless of whether using it there is
+  legal. `thing_at` (`src/lsp.rs`) gained a new `effect_arg_at` helper
+  (mirroring `ident_at`'s own linear scan) tried as its second case,
+  between a live `Expr::Ident` use and the `Def::span` declaration
+  fallback. Its return type changed from `(Option<ExprId>, DefId)` to
+  `(Span, Option<ExprId>, DefId)` to carry this through cleanly: the
+  `Span` is now always the actual site under the cursor, computed once
+  inside `thing_at` rather than re-derived by each caller from whichever
+  branch matched. This wasn't just a refactor for its own sake — reusing
+  the OLD two-way `None`-means-declaration-site convention unchanged for
+  this third, meaningfully different kind of `None` would have highlighted
+  the wrong span entirely (the state's own faraway declaration, not the
+  row argument actually under the cursor). Verified with 2 new tests in
+  `src/lsp.rs` covering both `reads`' and `writes`' own arguments, for
+  both hover (confirming the exact `` `name: ty` — kind `` text, same
+  format any other state reference already gets) and go-to-definition
+  (confirming the jump lands on the right declaration line, `in`/`reg`
+  respectively) — plus the previous entry's negative test was updated,
+  not deleted, to assert the row argument now resolves to ITS OWN hover
+  rather than accidentally matching the effect keyword's doc.
 - Grammar is regex-based (TextMate), still pattern matching, not semantic
   analysis. **RESOLVED — the specific "highlights unconditionally, even
   as plain identifiers" gap.** `reads`/`writes`/`combines`/`sequences`/

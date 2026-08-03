@@ -840,7 +840,10 @@ impl Ast {
     }
 }
 
-fn effects_str(effects: &[Effect]) -> String {
+/// Renders an effect list the same way source syntax spells it (` <reads,
+/// writes {a, b}>`, empty string if there are none) — shared between the
+/// debug dump above and the language server's function-signature hover.
+pub fn effects_str(effects: &[Effect]) -> String {
     if effects.is_empty() {
         return String::new();
     }

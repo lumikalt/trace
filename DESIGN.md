@@ -3111,11 +3111,80 @@ would be built on an already-invalid AST) — a file with a parse error
 shows only those parse errors, and go-to-definition/hover both need at
 least a clean `resolve` pass (definition) or `types::check` pass (hover's
 inferred-type text; definition works without it) to answer anything.
-Go-to-definition and hover both resolve only identifier *uses* (looked up
-through `Resolution::expr_defs`, the same side table `is_guard_like` and
-every other resolve-consuming pass reads), not declaration sites
-themselves — hovering the `counter` in `reg counter : [8]` is a known gap,
-only a later `counter := ...` resolves. The compiler is single-file (no
+Go-to-definition and hover resolve identifier *uses* (looked up through
+`Resolution::expr_defs`, the same side table `is_guard_like` and every
+other resolve-consuming pass reads) AND declaration sites themselves
+(hovering the `counter` in `reg counter : [8]` resolves, not just a later
+`counter := ...`) — a declaration's own name is never an `Expr::Ident`
+(it's plain data on an `Item`, resolved once at def-creation time), so
+`thing_at` (`src/lsp.rs`) falls back to a direct linear scan over every
+`resolve::Def`'s own `span` whenever the `Expr::Ident` lookup finds
+nothing, resolving straight to a `DefId` with no `ExprId` in hand. Hover on
+a declaration site has no `ExprId` to key `Types::expr_tys` with, so it
+reads the def-keyed `Types::local_tys`/`Types::state_tys` maps instead —
+together they cover every def with a scalar type; a `rule`/`fn`/`module`/
+... declaration (neither map has an entry for those kinds) shows just its
+kind, the same fallback an untyped use site already had. A fn/spec/impl def
+is a further special case of that same fallback: it has no single scalar
+`Ty` the way a reg or a local does (its "type" is a whole signature —
+params, return, effects), so hovering one renders a Markdown hover instead
+of the plain scalar text every other def gets — a fenced ` ```trace `
+code block holding the signature exactly as it's legal to write
+(`Outer(x : [8]) : [8] <combines>`, sliced straight out of the source at
+each param/return type annotation's own span rather than re-derived from a
+`Ty`, so it never needs to special-case `Ty::Unknown` or any other display
+edge case), followed by a placeholder description line (`"A function."`/
+`"A spec."`/`"An impl."`) — real doc comments don't exist in the language
+yet, so this is a deliberate stand-in for where one would go once they do,
+not a claim that one currently exists. `FnKind::Fn` gets NO leading keyword
+in the rendered signature, matching source syntax exactly: `parser.rs`
+dispatches a plain function on a bare `Ident` at item position, only
+`spec`/`impl` consume a real keyword token (`ast.rs`'s own debug-dump
+function prints a synthetic `fn ` prefix there for its own readability,
+but that's a debug-only convenience, not source syntax hover should echo).
+An effect keyword itself (`reads`/`writes`/`combines`/`sequences`/
+`elaborates`/`fails`/`chooses`, inside a `<...>` list) is a THIRD hover
+case, independent of both the use-site and declaration-site paths above:
+it's plain syntax on `Item::Rule`/`Item::Fn` (`ast.rs`'s `Effect` struct),
+never an `Expr::Ident` and never given a `resolve::Def` either — nothing
+else ever references an effect the way a call references a fn, so there's
+no def to fall back to matching against. `effect_hover` (`src/lsp.rs`)
+scans `ast.items` directly for whichever `Effect::name` span contains the
+cursor and renders a small, hand-written Markdown doc — a description and
+a runnable example, one per keyword, transcribed from DESIGN.md's own
+"Effects" section — same rationale a real doc-comment hover would have,
+just hand-maintained since the language has none yet. Works even on a
+file with resolve errors (checked before `res`/`thing_at` are needed at
+all), matching how diagnostics themselves degrade no further than a
+parse error. Deliberately narrow: only an effect's own NAME matches, never
+`reads {pc, mem}`'s bracketed argument names — those name real state, not
+the effect itself, and get their own, fourth resolution path instead (see
+below), not the effect's Markdown doc.
+
+A `reads {a, b}`/`writes {a}` row argument is that fourth case: unlike
+every hover target above, it isn't found by anything already in
+`lsp.rs` — it's `resolve.rs`'s own `check_effect_args` that already looks
+each argument name up (to validate it names real state) and simply
+discarded the answer once validated. A new `Resolution::effect_arg_defs:
+HashMap<Span, DefId>` keeps it instead, keyed by the argument `Name`'s own
+span (an effect-row argument is a plain `Name`, never an `ExprId`, so it
+can't join `expr_defs`), populated for every name that resolves to SOME
+def — even one the surrounding match then rejects as the wrong kind (a
+rule named in `reads`, say) — since the def is still real and still worth
+hovering regardless of whether using it there is legal. `thing_at`
+(`src/lsp.rs`) tries this as its second case, between a live `Expr::Ident`
+use and the `Def::span` declaration fallback, via a new `effect_arg_at`
+helper mirroring `ident_at`'s own linear scan. Its return type changed from
+`(Option<ExprId>, DefId)` to `(Span, Option<ExprId>, DefId)` to carry this
+through: the `Span` is always the actual site under the cursor (an
+expression's own span, a row argument's own span, or the declaration's own
+span), computed once inside `thing_at` itself rather than re-derived by
+each caller from whichever branch matched — `hover`/`goto_definition` used
+to each recompute "which span do I highlight" from `Option<ExprId>`, which
+would have been actively wrong for a row argument (highlighting the STATE
+DECLARATION's span while the cursor sits somewhere else in the document
+entirely) had the old two-way `None` case been reused unchanged for a
+third, meaningfully different kind of `None`. The compiler is single-file (no
 cross-file imports exist yet), so a definition location is always in the
 SAME document as the request — no cross-file URI resolution needed
 anywhere in `lsp.rs`. Verified end-to-end with a hand-rolled JSON-RPC
