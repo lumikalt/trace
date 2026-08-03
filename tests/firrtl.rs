@@ -6497,3 +6497,29 @@ module M {
     assert!(fir.contains(&format!("connect acc, {expected}")));
     run_firtool(&fir, &[]);
 }
+
+/// `rule foo?`'s desugaring (TODO.md's "Rules: optional/enable sugar",
+/// tests/parser.rs's `optional_rule_sugar_desugars_to_five_items`) emits
+/// exactly as designed: `__prev_step` resets to `1` (not `0` — the reset-
+/// edge semantic Lumi picked, via `AskUserQuestion`: a port already held
+/// high at reset must NOT read as a spurious edge), and the synthesized
+/// `conflict_free` exemption means `fires_step`'s formula carries no
+/// `not(fires___edge_step)` suppression term (schedule.rs would otherwise
+/// derive a stall, since both rules touch `__prev_step`).
+#[test]
+fn optional_rule_sugar_emits_a_reset_to_one_shadow_register_and_no_derived_stall() {
+    let src = "\
+module M {
+    reg count : [4] = 0
+
+    rule step? {
+        count := count + 1
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset __prev_step : UInt<1>, clock, reset, UInt<1>(1)"));
+    assert!(fir.contains("node fires___edge_step = UInt<1>(1)"));
+    assert!(fir.contains("node fires_step = and(step, not(__prev_step))"));
+    run_firtool(&fir, &[]);
+}

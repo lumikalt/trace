@@ -487,6 +487,50 @@ fn accumulator_runs_through_real_ports() {
     );
 }
 
+/// Proves `rule foo?`'s desugaring (TODO.md's "Rules: optional/enable
+/// sugar") end to end, not just that it emits FIRRTL firtool accepts:
+/// sim/optional_rule_tb.v holds `step` high straight through reset (must
+/// NOT fire — `__prev_step` resets to `1`, the reset-edge semantic Lumi
+/// picked, via `AskUserQuestion`), holds it high with no new edge (must
+/// not re-fire), then drives two genuine 0->1 edges and checks `count`
+/// increments exactly once per edge, not once per cycle the port is
+/// held high.
+#[test]
+fn optional_rule_sugar_runs_through_real_reset_and_edges() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/optional_rule.tr"
+    ))
+    .unwrap();
+    let (tokens, lex_errors) = lexer::lex(&src);
+    assert!(lex_errors.is_empty(), "{lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(&src, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res);
+    assert!(type_errors.is_empty(), "{type_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
+    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
+        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/optional_rule_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves submodule instantiation end to end: sim/submodule_tb.v drives
 /// `Top`'s `x`/`y` and reads `result` through ordinary ports — `Top`
 /// `inst`-instantiates `Adder` and wires its ports (`adder.a := x`,

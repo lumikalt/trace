@@ -308,6 +308,72 @@ fn rule_with_effects() {
     assert_eq!(body.len(), 1);
 }
 
+/// `rule foo?` — the optional/enable sugar (TODO.md's "Rules: optional/
+/// enable sugar") — desugars at parse time into five items: the implicit
+/// `in` port, its `__prev`-named shadow register (reset to `1`, not `0`,
+/// so a port already held high at reset reads as no edge — Lumi's call,
+/// via `AskUserQuestion`), an always-firing `__edge`-named rule updating
+/// the shadow register, the original rule with a rising-edge guard
+/// prepended, and a `conflict_free` exemption between the two rules (an
+/// ordinary schedule.rs conflict otherwise, since both touch the shadow
+/// register).
+#[test]
+fn optional_rule_sugar_desugars_to_five_items() {
+    let ast = parse_ok("module M {\n rule step? {\n tick\n}\n}\n");
+    assert_eq!(
+        ast.dump(),
+        "\
+module M
+  in step : (index bits 1)
+  reg __prev_step : (index bits 1) = 1
+  rule __edge_step
+    (:= __prev_step step)
+  rule step
+    (? (& step (not __prev_step)))
+    tick
+  schedule
+    (conflict_free __edge_step step)
+",
+    );
+}
+
+/// The `?` sits before any `<effects>` tag list (`rule foo? <reads {...}>
+/// { ... }`), mirroring `?T`'s own use as a type marker — and the tag
+/// list still ends up on the desugared rule itself, not lost or moved.
+#[test]
+fn optional_rule_sugar_keeps_its_effects_tag_list() {
+    let ast = parse_ok("module M {\n rule step? <reads {pc}> {\n tick\n}\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected module");
+    };
+    assert_eq!(items.len(), 5);
+    let Item::Rule { name, effects, .. } = ast.item(items[3]) else {
+        panic!("expected the rewritten main rule as the 4th synthesized item");
+    };
+    assert_eq!(name.text, "step");
+    assert_eq!(effects[0].name, "reads");
+    assert_eq!(effects[0].args, ["pc"]);
+}
+
+/// `rule foo? <sequences>` is rejected at parse time, not left to panic
+/// deep inside `lower.rs`. Every node the sugar synthesizes shares `foo`'s
+/// own span (harmless for everything downstream that reads structure, not
+/// source text) — except `lower.rs`, which reconstructs a `<sequences>`
+/// rule's segments FROM spans, and hits a real "overlapping lowering
+/// edits" panic on the collision (confirmed by hand before adding this
+/// check). A v0 restriction: the manual `in foo : [1]` + `foo?` pattern
+/// still works fine under `<sequences>` (see the `spawn`/`race` examples).
+#[test]
+fn optional_rule_sugar_rejects_sequences() {
+    let src = "module M {\n reg count : [4] = 0\n rule step? <sequences> {\n \
+               tick\n count := count + 1\n}\n}\n";
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (_, errors) = parser::parse(src, &tokens);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("isn't supported yet"));
+}
+
 #[test]
 fn function_with_signature() {
     let ast = parse_ok("Parity(x : [8]) : [1] <combines> {\n return x[0] ^ x[1]\n}\n");

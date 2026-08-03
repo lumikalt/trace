@@ -529,6 +529,27 @@ fn duplicate_rule_name_is_an_error() {
     assert!(errors[0].message.contains("rule"));
 }
 
+/// `rule foo?`'s whole desugaring depends on `foo` naming BOTH the
+/// synthesized `in` port and the rewritten rule, under separate `DefId`s
+/// in separate namespaces (`scopes` vs `rule_scopes`) — exactly the
+/// prerequisite `a_rule_and_a_reg_may_share_a_name` above exists to prove
+/// in isolation. Resolves clean end to end, through the real parser's
+/// desugaring, not a hand-built AST.
+#[test]
+fn optional_rule_sugar_resolves_with_no_namespace_collision() {
+    let (_, res) = run_ok("module M {\n rule step? {\n tick\n}\n}\n");
+    assert!(
+        res.defs
+            .iter()
+            .any(|d| d.name == "step" && d.kind == DefKind::Input)
+    );
+    assert!(
+        res.defs
+            .iter()
+            .any(|d| d.name == "step" && d.kind == DefKind::Rule)
+    );
+}
+
 #[test]
 fn rules_see_functions_declared_later() {
     let src = "\

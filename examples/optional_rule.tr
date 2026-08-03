@@ -1,0 +1,15 @@
+-- `rule foo?` sugar (TODO.md's "Rules: optional/enable sugar"): an
+-- implicit, rising-edge-triggered enable port sharing the rule's own
+-- name. `step` here is BOTH the port an external testbench drives and
+-- the rule that fires once per external pulse -- held high across
+-- multiple cycles, including straight through reset, still fires only
+-- once, on the 0->1 transition (sim/optional_rule_tb.v exercises exactly
+-- this: held high through reset, held high with no new edge, a real
+-- edge, held high again, a second real edge).
+module OptionalRule {
+    out count : [4] = 0
+
+    rule step? {
+        count := count + 1
+    }
+}

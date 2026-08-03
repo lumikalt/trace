@@ -205,9 +205,8 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            if let Some(item) = self.parse_item() {
-                self.ast.roots.push(item);
-            }
+            let items = self.parse_item();
+            self.ast.roots.extend(items);
             // Recovery must always make progress: `sync` stops before `}`,
             // which nothing consumes at top level. Never loop on one token.
             if self.pos == before {
@@ -216,31 +215,36 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_item(&mut self) -> Option<ItemId> {
+    /// Returns every item one `parse_item` call produced — almost always
+    /// zero or one, except `rule foo?` (see `parse_rule`), which splices
+    /// several synthesized items in at once, the same "real AST nodes,
+    /// spliced at parse time" move `eat_leading_tick` already uses at
+    /// statement level.
+    fn parse_item(&mut self) -> Vec<ItemId> {
         use TokenKind::*;
         match self.peek() {
-            Some(Module) => self.parse_module(),
-            Some(ExtModule) => self.parse_extmodule(),
-            Some(Struct) => self.parse_struct(),
-            Some(Reg) => self.parse_state_decl(Reg),
-            Some(Mem) => self.parse_state_decl(Mem),
-            Some(Fifo) => self.parse_state_decl(Fifo),
-            Some(Input) => self.parse_state_decl(Input),
-            Some(Output) => self.parse_state_decl(Output),
-            Some(Io) => self.parse_state_decl(Io),
-            Some(Attach) => self.parse_attach(),
-            Some(Inst) => self.parse_state_decl(Inst),
+            Some(Module) => self.parse_module().into_iter().collect(),
+            Some(ExtModule) => self.parse_extmodule().into_iter().collect(),
+            Some(Struct) => self.parse_struct().into_iter().collect(),
+            Some(Reg) => self.parse_state_decl(Reg).into_iter().collect(),
+            Some(Mem) => self.parse_state_decl(Mem).into_iter().collect(),
+            Some(Fifo) => self.parse_state_decl(Fifo).into_iter().collect(),
+            Some(Input) => self.parse_state_decl(Input).into_iter().collect(),
+            Some(Output) => self.parse_state_decl(Output).into_iter().collect(),
+            Some(Io) => self.parse_state_decl(Io).into_iter().collect(),
+            Some(Attach) => self.parse_attach().into_iter().collect(),
+            Some(Inst) => self.parse_state_decl(Inst).into_iter().collect(),
             Some(Rule) => self.parse_rule(),
-            Some(Ident) => self.parse_fn(FnFlavor::Fn),
+            Some(Ident) => self.parse_fn(FnFlavor::Fn).into_iter().collect(),
             Some(Spec) => {
                 self.bump();
-                self.parse_fn(FnFlavor::Spec)
+                self.parse_fn(FnFlavor::Spec).into_iter().collect()
             }
             Some(Impl) => {
                 self.bump();
-                self.parse_fn(FnFlavor::Impl)
+                self.parse_fn(FnFlavor::Impl).into_iter().collect()
             }
-            Some(Schedule) => self.parse_schedule(),
+            Some(Schedule) => self.parse_schedule().into_iter().collect(),
             _ => {
                 self.error_here(
                     "expected an item (module, extmodule, struct, reg, mem, fifo, in, out, \
@@ -248,7 +252,7 @@ impl<'a> Parser<'a> {
                         .to_string(),
                 );
                 self.sync();
-                None
+                Vec::new()
             }
         }
     }
@@ -273,9 +277,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     let before = self.pos;
-                    if let Some(item) = self.parse_item() {
-                        items.push(item);
-                    }
+                    items.extend(self.parse_item());
                     if self.pos == before {
                         self.bump();
                     }
@@ -566,22 +568,205 @@ impl<'a> Parser<'a> {
         Some(self.synth_bits_ty(width, span))
     }
 
-    /// `rule name <effects>? { body }`
-    fn parse_rule(&mut self) -> Option<ItemId> {
+    /// `rule name <effects>? { body }`, or, with a `?` directly after the
+    /// name (before any `<effects>` tag list, mirroring `?T`'s own use as
+    /// a type marker): `rule foo? { body }`, sugar for an implicit,
+    /// rising-edge-triggered enable port sharing the rule's own name (see
+    /// TODO.md's "Rules: optional/enable sugar" — Lumi's call, via
+    /// `AskUserQuestion`). Desugars to five items, spliced in as real AST
+    /// nodes at parse time (see `desugar_optional_rule`).
+    fn parse_rule(&mut self) -> Vec<ItemId> {
         let lo = self.cur_span().start;
         self.bump(); // rule
-        let name = self.expect_ident("rule name")?;
-        let effects = self.parse_effects()?;
+        let Some(name) = self.expect_ident("rule name") else {
+            return Vec::new();
+        };
+        let sugar = self.eat(TokenKind::Question);
+        let Some(effects) = self.parse_effects() else {
+            return Vec::new();
+        };
         self.skip_newlines();
-        let body = self.parse_block()?;
-        Some(self.ast.push_item(
+        let Some(body) = self.parse_block() else {
+            return Vec::new();
+        };
+        if sugar && let Some(seq) = effects.iter().find(|e| e.name.text == "sequences") {
+            // `lower.rs` splices SOURCE TEXT by span, reconstructing a
+            // `<sequences>` rule's segments from the original file's own
+            // byte ranges (see DESIGN.md's "Optional rule sugar" for why
+            // this sugar's own splice, unlike that one, is safe to do
+            // directly on the AST instead). Every node this desugaring
+            // synthesizes shares `name`'s span — fine for everything
+            // downstream, which reads structure, not source text, but
+            // `lower.rs` computes segment-boundary edits FROM spans, and
+            // a synthesized node's span colliding with the real `foo`
+            // token's own span produces overlapping edits, a hard panic
+            // (`lower.rs`'s own "overlapping lowering edits" assertion,
+            // confirmed by hand before writing this check, not guessed).
+            // A v0 restriction, not a permanent one: the manual `in foo :
+            // [1]` + `foo?` pattern (see the `spawn`/`race` examples)
+            // still works fine under `<sequences>`.
+            self.errors.push(ParseError {
+                span: seq.name.span.clone(),
+                message: "`rule foo? <sequences>` isn't supported yet: write the \
+                          enable check by hand instead (`in foo : [1]` plus `foo?` \
+                          as the rule's first statement)"
+                    .to_string(),
+            });
+            return Vec::new();
+        }
+        if !sugar {
+            return vec![self.ast.push_item(
+                Item::Rule {
+                    name,
+                    effects,
+                    body,
+                },
+                lo..self.prev_end,
+            )];
+        }
+        self.desugar_optional_rule(name, effects, body, lo)
+    }
+
+    /// `rule foo? <effects> { body }` --> five items, all sharing `foo`'s
+    /// own span (they're synthesized, not really written anywhere, but a
+    /// span pointing at `foo` itself is far more useful in an error
+    /// message than the empty span an entirely fabricated one would give):
+    ///
+    /// ```text
+    /// in foo : [1]
+    /// reg __prev_foo : [1] = 1
+    /// rule __edge_foo {
+    ///     __prev_foo := foo
+    /// }
+    /// rule foo <effects> {
+    ///     (foo & not(__prev_foo))?
+    ///     body...
+    /// }
+    /// schedule {
+    ///     conflict_free { __edge_foo, foo }
+    /// }
+    /// ```
+    ///
+    /// `__edge_foo` has to be a second, always-firing rule rather than
+    /// folded into `foo` itself: the shadow register's update must happen
+    /// EVERY cycle regardless of whether `foo` fires, or the edge history
+    /// it tracks would only advance on cycles `foo` fires, corrupting the
+    /// very detection it exists to support. That makes it an ordinary
+    /// read/write conflict against `foo` in schedule.rs's eyes (both touch
+    /// `__prev_foo`), hence the synthesized `conflict_free` exemption —
+    /// sound here specifically because `foo`'s guard reads `__prev_foo`'s
+    /// pre-this-cycle value regardless of any same-cycle write to it, same
+    /// as any other register read.
+    ///
+    /// `__prev_foo` resets to `1`, not `0` — the one real semantic choice
+    /// here, not just a naming detail. It's what makes a port already held
+    /// high AT reset read as "no edge" (`not(__prev_foo)` is `0` on the
+    /// very first post-reset cycle no matter what `foo` itself reads as)
+    /// rather than a spurious first-cycle fire, which resetting to `0`
+    /// instead would produce (Lumi's call, via `AskUserQuestion`, over the
+    /// "reset value doesn't matter, TODO.md's own illustration used `0`"
+    /// default).
+    fn desugar_optional_rule(
+        &mut self,
+        name: Name,
+        effects: Vec<Effect>,
+        body: Vec<StmtId>,
+        lo: usize,
+    ) -> Vec<ItemId> {
+        let span = name.span.clone();
+        let prev_name = Name {
+            text: format!("__prev_{}", name.text),
+            span: span.clone(),
+        };
+        let edge_name = Name {
+            text: format!("__edge_{}", name.text),
+            span: span.clone(),
+        };
+
+        let port_ty = self.synth_bits_ty(1, span.clone());
+        let port = self.ast.push_item(
+            Item::Input {
+                name: name.clone(),
+                ty: port_ty,
+            },
+            span.clone(),
+        );
+
+        let reg_ty = self.synth_bits_ty(1, span.clone());
+        let one = self.ast.push_expr(Expr::Int(1), span.clone());
+        let shadow = self.ast.push_item(
+            Item::Reg {
+                name: prev_name.clone(),
+                ty: reg_ty,
+                init: Some(one),
+            },
+            span.clone(),
+        );
+
+        let edge_read_foo = self
+            .ast
+            .push_expr(Expr::Ident(name.text.clone()), span.clone());
+        let edge_write_prev = self
+            .ast
+            .push_expr(Expr::Ident(prev_name.text.clone()), span.clone());
+        let edge_assign = self.ast.push_stmt(
+            Stmt::Assign {
+                lhs: edge_write_prev,
+                rhs: edge_read_foo,
+            },
+            span.clone(),
+        );
+        let edge_rule = self.ast.push_item(
             Item::Rule {
-                name,
+                name: edge_name.clone(),
+                effects: Vec::new(),
+                body: vec![edge_assign],
+            },
+            span.clone(),
+        );
+
+        let guard_foo = self
+            .ast
+            .push_expr(Expr::Ident(name.text.clone()), span.clone());
+        let guard_prev = self
+            .ast
+            .push_expr(Expr::Ident(prev_name.text.clone()), span.clone());
+        let guard_not_prev = self.ast.push_expr(
+            Expr::Unary {
+                op: UnOp::Not,
+                operand: guard_prev,
+            },
+            span.clone(),
+        );
+        let guard_cond = self.ast.push_expr(
+            Expr::Binary {
+                op: BinOp::BitAnd,
+                lhs: guard_foo,
+                rhs: guard_not_prev,
+            },
+            span.clone(),
+        );
+        let guard_expr = self.ast.push_expr(Expr::Guard(guard_cond), span.clone());
+        let guard_stmt = self.ast.push_stmt(Stmt::Expr(guard_expr), span.clone());
+        let mut new_body = vec![guard_stmt];
+        new_body.extend(body);
+        let main_rule = self.ast.push_item(
+            Item::Rule {
+                name: name.clone(),
                 effects,
-                body,
+                body: new_body,
             },
             lo..self.prev_end,
-        ))
+        );
+
+        let schedule = self.ast.push_item(
+            Item::Schedule {
+                directives: vec![ScheduleDirective::ConflictFree(vec![edge_name, name])],
+            },
+            span,
+        );
+
+        vec![port, shadow, edge_rule, main_rule, schedule]
     }
 
     /// `Name(params) (: ret)? <effects>? (refines Spec)? { body }`

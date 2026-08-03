@@ -1512,153 +1512,74 @@ re-propose these from a fresh read of the same chapters:
   logic already live in one fairly self-contained module,
   `schedule.rs`.
 
-## Rules: optional/enable sugar (design-level, mostly decided; prerequisite RESOLVED)
+## Rules: optional/enable sugar — RESOLVED, built
 
 **`rule foo? { body }` — sugar for an implicit, rising-edge-triggered enable
-port sharing the rule's own name (Lumi's call, via `AskUserQuestion`).**
+port sharing the rule's own name — built and proven end to end, not just
+"parses and firtool accepts it."** See DESIGN.md's "Optional rule sugar"
+for the full design writeup (the desugaring template, the three axes
+Lumi picked, and why one-shot + `in`-port together cost real new
+machinery, not free sugar) — not re-derived here.
 
-**The namespace prerequisite is built.** Rule names used to resolve through
-the IDENTICAL scope lookup as ordinary expression idents (`self.lookup`,
-one string-keyed `scope` map, one `DefId` per key) — so `rule foo?`
-auto-declaring `in foo` under the SAME name had nowhere to put a second
-`DefId`. Fixed by giving rule names their own `rule_scopes: Vec<HashMap<
-String, DefId>>`, pushed/popped in lockstep with `scopes` at the one site a
-rule can ever be declared (`Item::Module`'s own scope push/pop — a rule
-can't appear inside an `if`/`while`/`fn` body). `declare_rule`/`lookup_rule`
-mirror `declare`/`lookup` but read/write this separate map; `collect_decl`
-routes `Item::Rule` through `declare_rule` instead of the generic path;
-`Item::Schedule`'s directive-name lookups (`urgency`/`mutually_exclusive`/
-`conflict_free`) use `lookup_rule` instead of `lookup`. Confirmed a rule and
-a piece of state may now share a spelling with zero collision, at every
-layer including real firrtl emission through firtool (`reg foo`/`rule foo`
-in one module — `regreset foo`/`node fires_foo` are already naturally
-distinct FIRRTL names, no change needed there). A useful side effect,
-not just enabling the sugar: a rule name used as an ordinary expression
-VALUE (not just a `schedule` directive) is now a clean resolve-time
-"cannot find", closing a gap where it used to silently resolve and only
-get caught for the specific call-callee case, in types.rs, one layer late
-(`tests/resolve.rs`'s `a_rules_name_cannot_be_used_as_a_value`, moved from
-`tests/types.rs`'s old `rules_are_not_callable`, which could no longer even
-reach types.rs once resolve.rs rejects it first).
+**Implementation, in one sentence: five items synthesized as real AST
+nodes directly at parse time** (`parser.rs`'s `parse_rule`/
+`desugar_optional_rule`), spliced into the enclosing module's item list
+exactly as if hand-written — the implicit `in` port, a `__prev_{rule}`
+shadow register, an always-firing `__edge_{rule}` rule updating it, the
+original rule with a rising-edge guard prepended, and a synthesized
+`conflict_free { __edge_{rule}, {rule} }` exemption (an ordinary
+read/write conflict otherwise, since both touch the shadow register —
+sound to exempt because the guard reads the shadow register's
+pre-this-cycle value regardless of any same-cycle write to it). This
+needed `parse_item`/`parse_module`'s item collection to go from
+`Option<ItemId>` to `Vec<ItemId>` throughout the parser, the one real
+plumbing change — the namespace prerequisite from the section above is
+what makes `foo` able to name both the port and the rule with zero
+collision.
 
-The `foo? { ... }` sugar syntax itself is NOT built yet — only its
-namespace prerequisite. The rest of the sugar's shape is settled except
-the reset-edge question flagged near the end below.
+**The reset-edge question is decided: a port already held high AT RESET
+does NOT count as a rising edge** (Lumi's call, via `AskUserQuestion`,
+over the alternative — resetting `__prev_foo` to `0`, which would read a
+tied-high port as a genuine `0→1` pulse and spuriously fire the rule once
+on cycle 0). Implemented by resetting `__prev_foo` to `1`, not `0` — zero
+extra machinery beyond the reset literal itself, since `not(__prev_foo)`
+then reads `0` on the very first post-reset cycle regardless of what
+`foo` itself reads as, while every genuine edge afterward is still
+detected correctly (confirmed by direct cycle-by-cycle trace before
+writing the permanent testbench: held high through reset stays
+suppressed, a real drop-then-rise fires exactly once, holding level
+afterward doesn't refire).
 
-Today, gating a rule on an external trigger is written by hand — `in trigger
-: [1]` plus `trigger?` as the rule's own first statement (see the `spawn`/
-`race` examples, "`spawn`, `sync`, and `race`" above) — using a SEPARATE port
-name from the rule. The sugar collapses that into one declaration: `rule
-foo? <effects...> { body }` auto-declares `in foo : [1]` and gates `body` on
-it, under the rule's own name.
+**Proven end to end:** `examples/optional_rule.tr` + `sim/optional_rule_tb.v`
+(`tests/sim.rs`'s `optional_rule_sugar_runs_through_real_reset_and_edges`)
+drives real reset behavior AND two genuine edges through firtool +
+Icarus, not just a held-high level — the one behavior a naive
+level-sensitive read would get wrong. `tests/parser.rs`'s
+`optional_rule_sugar_desugars_to_five_items` pins the exact desugared
+shape via `Ast::dump()`; `tests/resolve.rs`'s
+`optional_rule_sugar_resolves_with_no_namespace_collision` and
+`tests/firrtl.rs`'s
+`optional_rule_sugar_emits_a_reset_to_one_shadow_register_and_no_derived_stall`
+cover resolve/emission directly.
 
-Three axes, each Lumi's explicit pick over the alternatives offered:
+**One real, documented restriction, found before it shipped as a silent
+footgun, not after: `rule foo? <sequences>` is rejected at parse time.**
+Every synthesized node shares `foo`'s own span; `lower.rs`'s
+`<sequences>` splicing reconstructs a rule's segments FROM spans, and
+the collision panics (`lower.rs`'s "overlapping lowering edits" assert)
+rather than emitting silently-wrong hardware — confirmed by hand
+(`rule step? <sequences> { tick \n ... }` through `--lower`) before
+adding the check, not guessed at. `tests/parser.rs`'s
+`optional_rule_sugar_rejects_sequences` pins the clean parse-time error
+in place of that panic. The manual `in foo : [1]` + `foo?` pattern is
+unaffected — only the sugar itself is restricted, and only under
+`<sequences>`.
 
-- **The enable is an `in` port, not a `reg`.** Only the outside world (a
-  testbench, a parent module) can drive it — no other rule in the design can
-  set it internally. Mirrors today's manual `trigger` pattern exactly, just
-  auto-named.
-- **One-shot: the rule fires once per external pulse, not every cycle the
-  port is held high.** Ruled out the simpler "level-sensitive, re-fires every
-  cycle `foo` stays true" alternative, which was pure sugar needing zero new
-  machinery — see below for why the `in`-port choice makes this axis cost
-  real new machinery, not free.
-- **`rule foo? { ... }` — a `?` suffix directly on the rule's name,** sitting
-  before any effects tag list the same way `<sequences>`/`<fails>` already
-  do (`rule foo? <sequences> { ... }`), mirroring `?T`'s own use as a type
-  marker.
-
-**The one-shot + `in`-port combination is NOT plain sugar, and that's a real
-architectural consequence, not a detail to wave past.** An `in` port is
-driven from outside the module every cycle; the compiler cannot "clear" it
-after one cycle the way it clears a `reg` at the end of a rule body. One-shot
-behavior therefore has to mean RISING-EDGE detection (fires the cycle `foo`
-transitions 0→1, not every cycle it's held high), which needs a
-compiler-synthesized shadow register tracking `foo`'s previous value —
-genuinely new state, not something `enter_rule`/`locals_snapshots` or any
-existing per-rule machinery already provides for free.
-
-The shadow register's own update (`__prev_foo := foo`) has to run
-UNCONDITIONALLY, every cycle, independent of whether `foo`'s own rule
-actually fires — it cannot live inside the gated rule body (that would only
-update the edge history on cycles the rule fires, corrupting the very
-detection it's supposed to support). The clean way to get an unconditional,
-every-cycle write without inventing a new emission concept ("state written by
-something that isn't a rule," which `schedule.rs`'s conflict matrix would be
-structurally blind to — it only ever looks at `sig.writes` across `Item::
-Rule`s): synthesize a SECOND, always-firing rule (no guard at all, `fires_
-__edge_foo = UInt<1>(1)`, a shape this compiler already emits routinely for
-any unconditional rule) whose only statement is `__prev_foo := foo`. This
-reuses the ordinary rule/schedule machinery wholesale — no new emission
-concept — at the cost of one extra, double-underscore-prefixed synthesized
-rule appearing in `--explain-schedule` output, the same visibility trade-off
-`<sequences>` lowering's own synthesized `{rule}_s{N}` segment rules already
-accept.
-
-**This synthesized rule is NOT scheduler-invisible, and needs an exemption
-to actually work — traced through `firrtl/module.rs`'s own `fires_i`
-formula (`and(guard, not(fires_of_any_higher-urgency_conflicting_rule))`),
-not assumed.** `__edge_foo` writes `__prev_foo`; `foo`'s own rule reads it
-in its guard — an ordinary read/write conflict `schedule.rs` WILL derive a
-stall for, unless exempted. Both orderings break without one: if `__edge_
-foo` (always ready) outranks `foo`, `fires_foo` becomes `and(guard,
-not(1))` — `foo` can never fire, ever. If `foo` outranks `__edge_foo`,
-`fires___edge_foo` becomes `and(1, not(fires_foo))` — the shadow register's
-write gets SUPPRESSED on exactly the cycles `foo` fires, leaving `__prev_
-foo` stale and causing spurious re-fires for as long as the port stays
-held high afterward (the one-shot property breaks). The desugaring must
-therefore also synthesize a `conflict_free { __edge_foo, foo }` exemption
-alongside the two rules. This is a SOUND claim, not a workaround: `foo`'s
-guard reads `__prev_foo`'s pre-this-cycle value regardless of any same-
-cycle write to it (an ordinary register read, same "sees last cycle's
-value" semantics `pc := pc + 3`'s own self-read already relies on
-elsewhere in this document), so there is no real hazard for `conflict_
-free` to be trusting past — the derived stall would only ever be a false
-positive here.
-
-The rule's own body then gets an implicit rising-edge guard prepended:
-
-```trace
-rule step? {
-    ...
-}
-
--- desugars to something like:
-in step : [1]
-reg __prev_step : [1] = 0
-
-rule __edge_step {
-    __prev_step := step
-}
-
-rule step {
-    (step & not(__prev_step))?
-    ...
-}
-```
-
-(`step & not(__prev_step)`, not a comparison chain — `step`/`__prev_step` are
-already `[1]`-typed booleans, so no `logic`-discharge is needed the way a
-bare `=`/`<>` comparison would now require, per the comparisons-as-fallible
-design above.)
-
-**Open, not decided, a real semantic fork (not a naming detail) — whether a
-port already held high AT RESET counts as a rising edge.** `__prev_foo`
-resets to `0`, so `foo` already `1` on the very first post-reset cycle reads
-as `0→1` by the same logic a genuine external pulse would, spuriously firing
-the rule once on cycle 0 for a design whose enable happens to be tied high
-at reset. Either answer is defensible (reset-time initialization racing a
-real "go" pulse is already an ordinary hardware hazard, not something
-unique to this sugar) but it wasn't asked about and shouldn't be assumed —
-this changes observable hardware behavior, not just an internal detail.
-
-Lower-stakes and genuinely open: exact internal naming (`__prev_{rule}`/
-`__edge_{rule}` above are illustrative, not decided), and whether this
-sugar's existence means the hand-written `trigger`/`trigger?` pattern in the
-`spawn`/`race` examples should be migrated to it once built, or left as-is
-(a manually-named, still-legal, more general pattern the sugar doesn't
-replace — a level-sensitive or `reg`-backed enable still needs the manual
-form).
+**Left as-is, not decided against, just not done here:** whether the
+hand-written `trigger`/`trigger?` pattern in the `spawn`/`race` examples
+should migrate to this sugar. Left alone — a manually-named, still-legal,
+more general pattern the sugar doesn't replace (a level-sensitive or
+`reg`-backed enable still needs the manual form).
 
 ## `io` ports + `extmodule`: RESOLVED, both tiers built
 

@@ -691,6 +691,93 @@ The `chooses` effect marks spec-only code. Only a `spec` may declare it. Using
 item it is the choice operator. One token, disambiguated by the effect, never by
 the parser.
 
+## Optional rule sugar
+
+Gating a rule on an external trigger, written by hand, is `in trigger : [1]`
+plus `trigger?` as the rule's own first statement — see `FirstWins`/`RaceValue`
+above. `rule foo?` collapses this into one declaration, under the rule's own
+name:
+
+```trace
+rule step? {
+    count := count + 1
+}
+
+-- desugars to:
+in step : [1]
+reg __prev_step : [1] = 1
+
+rule __edge_step {
+    __prev_step := step
+}
+
+rule step {
+    (step & not(__prev_step))?
+    count := count + 1
+}
+
+schedule {
+    conflict_free { __edge_step, step }
+}
+```
+
+The `?` sits directly after the rule's own name, before any `<effects>` tag
+list (`rule step? <reads {...}> { ... }`), mirroring `?T`'s own use as a type
+marker. `rule foo? <sequences>` is rejected at parse time (v0 restriction,
+not a permanent one): every node this sugar synthesizes shares `foo`'s own
+span, which is harmless for every pass that reads AST structure, but
+`lower.rs`'s `<sequences>` splicing reconstructs a rule's segments FROM
+spans, and the collision panics deep inside it. The manual `in foo : [1]`
++ `foo?` pattern still works fine under `<sequences>` — only the sugar
+itself is restricted.
+
+Three things this buys over the hand-written form: `foo` names both the port
+and the rule, so there's no separate `trigger`-style name to invent; the enable
+is one-shot (fires once per external pulse, not every cycle the port is held
+high), which the hand-written form doesn't give you for free; and a port
+already held high AT RESET does not count as a rising edge — `__prev_foo`
+resets to `1`, not `0`, specifically so `not(__prev_foo)` reads `0` on the very
+first post-reset cycle no matter what `foo` itself reads as (Lumi's call, via
+`AskUserQuestion` — the alternative, resetting to `0`, would read a port tied
+high at reset as a genuine `0→1` pulse and spuriously fire the rule once on
+cycle 0).
+
+The `in` port, not a `reg`, is deliberate: only the outside world can drive it,
+never another rule in the design, exactly mirroring the hand-written `trigger`
+pattern. One-shot behavior needs a compiler-synthesized shadow register
+tracking `foo`'s previous value, since an `in` port is driven every cycle and
+the compiler cannot "clear" it the way it clears a `reg` at the end of a rule
+body. The shadow register's own update (`__prev_foo := foo`) has to run
+UNCONDITIONALLY, every cycle, independent of whether `foo`'s own rule fires —
+it cannot live inside the gated rule body, or it would only advance the edge
+history on cycles the rule actually fires, corrupting the very detection it
+exists to support. This is why the desugaring synthesizes a SECOND,
+always-firing rule (`__edge_foo`, no guard at all) whose only statement is the
+update — reusing the ordinary rule/schedule machinery wholesale, at the cost of
+one extra double-underscore-prefixed rule showing up in `--explain-schedule`
+output, the same visibility trade-off `sequences` lowering's own synthesized
+segment rules already accept.
+
+That second rule makes `__edge_foo`/`foo` an ordinary read/write conflict in
+the scheduler's eyes (both touch `__prev_foo`), which is why the desugaring
+also synthesizes the `conflict_free { __edge_foo, foo }` exemption above — see
+"The schedule block". This is sound, not a workaround: `foo`'s guard reads
+`__prev_foo`'s pre-this-cycle value regardless of any same-cycle write to it,
+an ordinary register read, so there is no real hazard for `conflict_free` to be
+trusting past.
+
+All five items (the `in` port, the shadow register, the two rules, and the
+`schedule` block) are synthesized as real AST nodes directly at PARSE time —
+`parser.rs`'s `parse_rule`/`desugar_optional_rule` — and spliced into the
+enclosing module's item list exactly as if hand-written, the same "real nodes,
+spliced inline" move `eat_leading_tick` already uses at statement level. This
+differs from `sequences`/`elaborate` lowering, which splice SOURCE TEXT and
+re-run the whole front end, specifically because those passes synthesize nodes
+only reachable after interpreting the original tree (a segment boundary, an
+elaborated call) — `rule foo?`'s expansion is a fixed template needing no such
+interpretation, so it can enter the one subsequent resolve → effects → types →
+schedule → firrtl run directly, with no retroactive record problem.
+
 ## Expression surface
 
 Integer literals (`Expr::Int`) have no width of their own. They type as `Ty::Int`
@@ -2904,6 +2991,13 @@ adder_tree.tr`, DESIGN.md's own `AdderTree`).
   rule's guard the same way a fifo `Deq[]` already does, including through a
   `let` init), non-failing `.valid`/`.data` presence check, `T` itself a
   struct or another `?T` (`examples/option.tr`).
+- `rule foo?`: optional/enable sugar, desugaring at parse time into an
+  implicit `in` port, a rising-edge shadow register (reset to `1`, not `0`,
+  so a port already held high at reset does not spuriously fire the rule),
+  an always-firing edge-tracking rule, and a synthesized `conflict_free`
+  exemption (`examples/optional_rule.tr`, proven through real reset
+  behavior and repeated edges, not just held-high levels, in
+  `tests/sim.rs`'s `optional_rule_sugar_runs_through_real_reset_and_edges`).
 
 Not yet implemented:
 
