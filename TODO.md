@@ -603,6 +603,68 @@
   `Stmt::Return` outside a callee body. Now a compile-time error in
   `effects.rs`'s `check_stmt` (a `rule` has no return value). See
   DESIGN.md's "Calling a function from a rule" section.
+- **RESOLVED — an over-wide literal combined with a `Bits` value via a
+  binary operator silently absorbed, uncaught.** Found directly: editing
+  `examples/call_nested_writes.tr` to pass `a + 100000000` (`a : [8]`)
+  as a call argument was expected to error and didn't — `type_binop`'s
+  `(Ty::Bits(w), Ty::Int)`/`(Ty::Int, Ty::Bits(w))` arms just absorbed
+  the literal's width from its sibling and moved on, unlike every
+  assignment-shaped coercion site (a state write, a port default, a
+  destructure), which already call `check_literal_fits`.
+  `check_assignable`'s own comment even promised this case was "range-
+  checked at coercion" — it wasn't, because a binary operand was never
+  itself a coercion site the same way an assignment is. Now it is: each
+  arm calls `check_literal_fits` against the correct child `ExprId`
+  (whichever side is the literal), so `a + 100000000` is a clean
+  `100000000 does not fit in [8]` naming the literal's own span, the
+  same diagnostic an over-wide state write already gets. Applies to
+  comparisons too (`a = 300` on an `[8]` `a` can never be true — same
+  bug class). Deliberately EXCLUDED from THIS check: a shift's amount
+  operand (`x >> 300`) — a shift count isn't a value bounded by the
+  shifted operand's own width domain, so "does 300 fit in [8]" is the
+  wrong question (would give a nonsensical "300 does not fit in [8]").
+  Not left unchecked, though — see the next entry, a separate,
+  differently-shaped check added right after this one landed. Verified
+  no regression two ways: every one of the 54 shipped `examples/*.tr`
+  files (read from their clean, committed content, not whatever's
+  currently on disk) still compiles with zero errors, and 6 new tests
+  in `tests/types.rs` cover the literal on either side of `+`, the
+  comparison case, a fitting literal staying accepted, and the shift
+  exclusion specifically (so a future change can't silently reintroduce
+  the false positive this fix's own first draft had).
+- **RESOLVED — a constant shift amount `>= w` on a `[w]` operand went
+  uncaught**, following directly from the entry above: excluding shifts
+  from `check_literal_fits` closed a false-positive gap but left the
+  real, DIFFERENT bug (a shift amount large enough to discard the whole
+  value — `x >> 300`, or a swapped-operand typo) with no check at all.
+  New `check_shift_amount` (`src/types.rs`) fires when a shift's amount
+  is a compile-time constant `>= w`: `Shr`/`AShr` always land on
+  all-zero/all-sign there, and `Shl` shifts every original bit out past
+  the top (the result STAYS `[w]` wide, never grows to `[w + amount]`),
+  so this is a genuine, statically-knowable total discard, not a
+  data-dependent judgment call. Wired into both the bare-literal shift
+  amount case (`x >> 300`, `type_binop`'s `(Bits, Int)` arm) AND a
+  SIZED-literal one (`x >> 8'd8`, a real `Ty::Bits` of its own — a
+  different match arm, `(Bits, Bits)`, that a narrower fix would have
+  missed). A shift amount one less than the width (`x >> 7` on `[8]`,
+  the largest amount that isn't a total discard) stays accepted, and a
+  genuinely dynamic (non-constant) amount is silently skipped — nothing
+  for `const_eval` to evaluate, the same restriction `check_literal_
+  fits` itself already has. Deliberately narrower than "any lossy
+  shift": `x << 7` on `[8]` loses seven of eight bits and is NOT
+  flagged — that's data-dependent partial loss, not a statically-known
+  total discard, and catching it structurally would mean growing `<<`'s
+  result width (like `*` already does, `Bits(a + b)`) instead of
+  keeping it at the left operand's own — a real semantic change to
+  shift's width rule, not a diagnostic addition, and its own separate
+  design conversation if wanted later. Verified no regression against
+  all 54 shipped examples (clean, committed content) and the full
+  `--firrtl`/sim test suites (229 + 49/50 passing, the one failure
+  being the still-open `call_nested_writes.tr` edit from the entry
+  above, unrelated to this change). One new test in `tests/types.rs`
+  covers 7 cases: bare literal, sized literal, exactly `w`, `<<`,
+  `>>>`, `w - 1` staying accepted, and a dynamic amount staying
+  unchecked.
 
 ## Language features with no synthesis path yet
 

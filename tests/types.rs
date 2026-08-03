@@ -462,6 +462,128 @@ fn literals_must_fit() {
     run_ok("module M {\n reg a : [4] = 15\n}\n");
 }
 
+/// The bug this test is named for: `check_literal_fits` used to run
+/// only at assignment-shaped coercion sites (a state write, a port
+/// default, a destructure) — `type_binop`'s own `(Ty::Bits(w), Ty::Int)`
+/// arm just absorbed the literal's `w` and moved on, so `a + 300` where
+/// `a : [8]` silently typed as `[8]` with no diagnostic anywhere, not
+/// even at emission. A call argument is exactly this shape (`Outer(a +
+/// 100000000)`), which is how this was actually found: an edit to
+/// examples/call_nested_writes.tr expected a compile error and got a
+/// silently-accepted overflow instead.
+#[test]
+fn an_oversized_literal_combined_with_a_bits_value_via_a_binop_is_an_error() {
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a + 300\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("300 does not fit in [8]"));
+
+    // Same check with the literal on the LEFT instead of the right —
+    // `type_binop`'s two absorption arms are separate code paths now
+    // (each checks a different child `ExprId`), so this exercises the
+    // other one specifically, not just the same arm from the other side.
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := 300 + a\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("300 does not fit in [8]"));
+
+    // A comparison against an out-of-range literal gets the same check —
+    // `a = 300` where `a : [8]` can never be true, the same class of
+    // near-certainly-a-bug an over-wide state write already catches. A
+    // bare comparison no longer types as [1] at all (TODO.md's
+    // comparisons-as-fallible design; see the `if`-condition tests
+    // below), so this is exercised as an `if` condition, its own
+    // idiomatic use, not a direct assignment.
+    let (_, _, errors) = run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n \
+         if a = 300 {\n b := 1\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("300 does not fit in [8]"));
+
+    // A literal that DOES fit is still fine, on either side.
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a + 20\n }\n}\n");
+
+    // A shift's second operand is a COUNT, not a value in the shifted
+    // operand's own width domain, so `check_literal_fits` (a "does this
+    // VALUE fit" check) is the wrong check for it — see
+    // `shift_amounts_at_or_past_the_operand_width_are_an_error` below
+    // for the shift-specific check this arm defers to instead.
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >> 3\n }\n}\n");
+}
+
+/// A constant shift amount `>= w` discards every bit of a `[w]` operand
+/// — `>>`/`>>>` land on all-zero (or all-sign), `<<` shifts every
+/// original bit out past the top (the result STAYS `[w]` wide; see
+/// `arith_shift_keeps_the_left_operands_width_like_shr` above — it
+/// doesn't grow to `[w + amount]`). Near-certainly a bug (a typo, a
+/// swapped operand order), the same class `literals_must_fit` already
+/// catches for ordinary arithmetic — just via a DIFFERENT bound
+/// (`amount >= w`, not "needs more than `w` bits to represent"), since a
+/// shift amount isn't itself a value bounded by the shifted operand's
+/// width the way an arithmetic operand is (`literals_must_fit`'s own
+/// last case exercises exactly that distinction from the other side).
+#[test]
+fn shift_amounts_at_or_past_the_operand_width_are_an_error() {
+    // Right shift, bare (untyped) literal amount, way past the width.
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >> 300\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("shift by 300 discards every bit of a [8] value")
+    );
+
+    // Exactly `w` is still a total discard (a `[8]` has bit indices
+    // 0..7, so a shift by 8 has nothing left to land on) — off-by-one
+    // from `w - 1`, the largest amount that keeps at least one bit,
+    // deliberately checked as its own case here, not assumed from the
+    // "way past" case above.
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >> 8\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("shift by 8 discards every bit of a [8] value")
+    );
+
+    // A SIZED literal amount (a real Ty::Bits of its own, not the
+    // coercible Ty::Int a bare literal gets — a different match arm in
+    // type_binop entirely) is checked the same way.
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >> 8'd8\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("shift by 8 discards every bit of a [8] value")
+    );
+
+    // Left shift and arithmetic-right-shift get the same treatment, not
+    // just plain right shift.
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a << 8\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("discards every bit"));
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >>> 8\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("discards every bit"));
+
+    // One less than the width leaves exactly the sign/top bit behind —
+    // the largest amount that ISN'T a total discard, so still accepted.
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >> 7\n }\n}\n");
+
+    // A genuinely dynamic (non-constant) shift amount has nothing for
+    // `const_eval` to evaluate, so it's silently skipped rather than
+    // flagged — this check only ever fires against a compile-time
+    // constant, the same restriction `check_literal_fits` itself has.
+    run_ok(
+        "module M {\n in a : [8]\n in n : [8]\n out b : [8] = 0\n rule r {\n \
+         b := a >> n\n }\n}\n",
+    );
+}
+
 #[test]
 fn sized_literals_type_directly_and_check_their_own_width() {
     // Unlike a bare literal, `4'd20` has a definite width of its own —

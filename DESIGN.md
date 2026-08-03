@@ -2029,6 +2029,26 @@ let idx = pc + 3          -- an int literal absorbs the other width: [16]
 sum := trunc(sum, 8)      -- explicit narrowing; silent truncation is an error
 ```
 
+Absorbing is range-checked, not just width-tagged: `pc + 100000000` against a
+`[16]` `pc` is a compile error (`100000000 does not fit in [16]`), the same
+diagnostic an out-of-range state write already gets — the literal's WIDTH
+silently becoming `pc`'s is fine (that's the whole point of absorption), but
+its VALUE not fitting there is exactly the class of near-certainly-a-bug an
+assignment-shaped literal already catches, and a binary operand deserves the
+same scrutiny. A shift's amount operand (`x >> 300`) is deliberately excluded
+from THIS check — a shift count isn't a value bounded by the shifted
+operand's own domain, so "does 300 fit in [8]" is the wrong question — but
+it's not left unchecked: a separate rule catches a constant shift amount
+`>= w` (`x >> 300` on an [8] `x` discards every bit, always landing on
+all-zero/all-sign — near-certainly a bug, the same "value coerces silently
+but the coercion is a mistake" class, just a different bound). `x << 7` on
+an [8] `x`, which loses seven of eight bits without hitting that `>= w`
+threshold, is deliberately NOT caught — that's a data-dependent partial
+loss, not a statically-knowable total discard, and catching it structurally
+would mean growing `<<`'s result width instead of keeping it at the left
+operand's own (the way `*` already grows to `a + b`), a bigger design change
+than a diagnostic addition.
+
 A local reassigned within a rule is re-typed to a fixed point across its whole
 body: its tracked width reflects the widest binding across every reassignment,
 not any one binding's own natural width — this is what lets a bare-literal first

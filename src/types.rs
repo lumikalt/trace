@@ -1513,6 +1513,31 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// A constant shift amount `>= w` discards every bit of a `[w]`
+    /// operand — `Shr`/`AShr` always land on all-zero (or all-sign, for
+    /// `AShr`), and `Shl` shifts every original bit out past the top
+    /// (the result stays `[w]` wide, per `type_binop`'s own `Shl | Shr |
+    /// AShr => Ty::Bits(a)` rule, not `[w + amount]`) — so a shift this
+    /// large is near-certainly a bug (a swapped operand order, a typo),
+    /// the same class `check_literal_fits` already catches for ordinary
+    /// arithmetic. Deliberately separate from `check_literal_fits`
+    /// rather than reusing it: a shift AMOUNT isn't a value bounded by
+    /// the shifted operand's own width domain (`x >> 6` is fine on a
+    /// `[4]` `x`, "6 does not fit in [4]" would be simply wrong), so
+    /// this checks against a different bound (`>= w`, not "needs more
+    /// than `w` bits to represent").
+    fn check_shift_amount(&mut self, amount: ExprId, shifted: &Ty) {
+        if let Ty::Bits(Width::Known(w)) = shifted
+            && let Some(n) = self.const_eval(amount, &HashMap::new())
+            && n >= *w
+        {
+            self.error(
+                self.expr_span(amount),
+                format!("shift by {n} discards every bit of a [{w}] value"),
+            );
+        }
+    }
+
     /// May `value` be written where `target` is expected? Shapes must
     /// match; a known-wider value needs an explicit `trunc`.
     fn check_assignable(&mut self, value: &Ty, target: &Ty, span: Span, what: &str) {
@@ -1706,7 +1731,7 @@ impl<'a> TypeChecker<'a> {
             Expr::Binary { op, lhs, rhs } => {
                 let l = self.type_expr(lhs, locals);
                 let r = self.type_expr(rhs, locals);
-                self.type_binop(op, l, r, id)
+                self.type_binop(op, l, r, lhs, rhs, id)
             }
             // `(cond)?` ordinarily just passes `inner`'s own type
             // through (its "must be bits[1]" side is `check_cond`'s
@@ -2018,7 +2043,7 @@ impl<'a> TypeChecker<'a> {
     /// Solver-2 width rules. Modular arithmetic: `+`/`-`/bitwise keep the
     /// max width; `*` sums; shifts keep the left width; comparisons give
     /// bits[1]. `Int` absorbs into the other side.
-    fn type_binop(&mut self, op: BinOp, l: Ty, r: Ty, at: ExprId) -> Ty {
+    fn type_binop(&mut self, op: BinOp, l: Ty, r: Ty, lhs: ExprId, rhs: ExprId, at: ExprId) -> Ty {
         use BinOp::*;
         let span = self.expr_span(at);
         if matches!(op, Range | PlusColon | MinusColon) {
@@ -2056,12 +2081,35 @@ impl<'a> TypeChecker<'a> {
                     Ty::Int
                 }
             }
-            (Ty::Bits(w), Ty::Int) | (Ty::Int, Ty::Bits(w)) => {
-                if is_comparison {
-                    l_ty
+            (Ty::Bits(w), Ty::Int) => {
+                // The `Int` side absorbs `w` from its sibling (this arm's
+                // whole point), but absorbing silently is exactly the gap
+                // `check_assignable`'s own `(Ty::Int, Ty::Bits(_))` comment
+                // promises is "range-checked at coercion" — this IS that
+                // coercion site for a binary operand, the same way a
+                // state write or port default is for an assignment. Without
+                // this, `a + 100000000` (`a : [8]`) unified silently to
+                // `[8]` with no diagnostic at all, not even at emission.
+                //
+                // EXCEPT for a shift: `Shl|Shr|AShr => Ty::Bits(a)` below
+                // already says the shift AMOUNT'S width never enters the
+                // result at all — it's a count, not a value bounded by
+                // the shifted operand's own domain, so `check_literal_
+                // fits` (a "does this VALUE fit" check) doesn't apply.
+                // `check_shift_amount` (a differently-shaped "is this
+                // COUNT too large" check) does.
+                if matches!(op, Shl | Shr | AShr) {
+                    self.check_shift_amount(rhs, &Ty::Bits(w));
                 } else {
-                    Ty::Bits(w)
+                    self.check_literal_fits(rhs, &Ty::Bits(w));
                 }
+                if is_comparison { l_ty } else { Ty::Bits(w) }
+            }
+            (Ty::Int, Ty::Bits(w)) => {
+                if !matches!(op, Shl | Shr | AShr) {
+                    self.check_literal_fits(lhs, &Ty::Bits(w));
+                }
+                if is_comparison { l_ty } else { Ty::Bits(w) }
             }
             (Ty::Bits(a), Ty::Bits(b)) => {
                 if is_comparison {
@@ -2072,7 +2120,19 @@ impl<'a> TypeChecker<'a> {
                             (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
                             _ => Width::Unknown,
                         }),
-                        Shl | Shr | AShr => Ty::Bits(a),
+                        Shl | Shr | AShr => {
+                            // A real `Bits` shift amount (a sized literal
+                            // like `8'd20`, say, or any constant-foldable
+                            // expression) is just as checkable as a bare
+                            // `Int` one (`type_binop`'s `(Bits, Int)` arm,
+                            // above) — `check_shift_amount` itself only
+                            // needs a compile-time-constant VALUE, which
+                            // `const_eval` finds the same way regardless
+                            // of which `Ty` the amount's own expression
+                            // happens to carry.
+                            self.check_shift_amount(rhs, &Ty::Bits(a));
+                            Ty::Bits(a)
+                        }
                         _ => Ty::Bits(match (a, b) {
                             (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y)),
                             _ => Width::Unknown,
