@@ -1988,6 +1988,30 @@ manually in the meantime.
   respectively) — plus the previous entry's negative test was updated,
   not deleted, to assert the row argument now resolves to ITS OWN hover
   rather than accidentally matching the effect keyword's doc.
+- **RESOLVED — hovering an output port (or any other write target: a
+  `reg`, a `fifo`, a reassigned local) at its own `x := ...` write site
+  showed no type, just its kind** (`` `v` — an output port ``, not `` `v:
+  [8]` — an output port ``). Root cause: a write target IS a live
+  `Expr::Ident` use — `resolve.rs` already gives it an `expr_defs` entry
+  like any read — but `types.rs`'s `type_write` (called from
+  `Stmt::Assign` instead of the ordinary `type_expr`, since a write target
+  has no "value" to compute a `Ty` FROM) never itself called `type_expr`,
+  and nothing else populates `Types::expr_tys` besides `type_expr`'s own
+  wrapper — so a write target's entry there simply never existed, for ANY
+  state kind, not something specific to `out`. Fixed by having
+  `type_write` insert into `Types::expr_tys` itself at the two points it
+  already resolves a write target's type: the `state_tys` lookup (used
+  verbatim) and the `Local` branch (the just-widened `merged` type — the
+  correct type as of that specific write, not necessarily the local's
+  final fixed-point type across the whole body). Verified with 2 new
+  tests in `src/lsp.rs`: hovering the write-target `counter` in the
+  existing `counter := counter + 1` fixture (its OWN LHS span, 8..15 —
+  distinct from the RHS read span the pre-existing use-site test
+  deliberately targets instead, sidestepping this exact gap without
+  realizing it at the time), and a dedicated `out` port write-site test
+  matching the original report. Both assert the exact `` `name: ty` —
+  kind `` string, not just a substring match, so a future regression back
+  to the type-less fallback text would fail loudly.
 - Grammar is regex-based (TextMate), still pattern matching, not semantic
   analysis. **RESOLVED — the specific "highlights unconditionally, even
   as plain identifiers" gap.** `reads`/`writes`/`combines`/`sequences`/

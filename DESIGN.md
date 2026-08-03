@@ -3142,6 +3142,25 @@ dispatches a plain function on a bare `Ident` at item position, only
 `spec`/`impl` consume a real keyword token (`ast.rs`'s own debug-dump
 function prints a synthetic `fn ` prefix there for its own readability,
 but that's a debug-only convenience, not source syntax hover should echo).
+
+A `:=` write TARGET (`v` in `v := 1`) is a live `Expr::Ident` use, exactly
+like a read, and gets one from `resolve.rs`'s own `expr_defs.insert(lhs,
+def)` for it — but `types.rs`'s `type_write` (the function that types a
+write, called from `Stmt::Assign` instead of the ordinary `type_expr`)
+used to never call `type_expr(lhs, ...)` itself, since a write target has
+no "value" to compute a `Ty` FROM the way a read does; it only ever looked
+its type up from `state_tys`/`locals` to check the RHS against. Nothing
+else populates `Types::expr_tys` besides `type_expr`'s own wrapper, so a
+write target's entry there simply never existed, and hover silently fell
+back to showing no type at all — reported against an `out` port's own
+write site specifically, but the gap was in `type_write`'s single shared
+`Expr::Ident` arm, so it was general to every write-target kind (`reg`/
+`out`/`fifo`/a reassigned local), not particular to `out`. Fixed by having
+`type_write` insert into `Types::expr_tys` itself at the same two points
+it already resolves a write target's type — the `state_tys` lookup (used
+verbatim) and the `Local` branch (the just-widened `merged` type, the
+correct type AS OF that specific write, not the local's final fixed-point
+type another write later in the same body might widen further).
 An effect keyword itself (`reads`/`writes`/`combines`/`sequences`/
 `elaborates`/`fails`/`chooses`, inside a `<...>` list) is a THIRD hover
 case, independent of both the use-site and declaration-site paths above:

@@ -792,6 +792,32 @@ mod tests {
     }
 
     #[test]
+    fn hovering_a_write_target_shows_its_type_too() {
+        // The FIRST `counter` on line 3 — `counter := counter + 1`'s own
+        // LHS, span 8..15, not the RHS read `hovering_a_use_site_still_
+        // works` above deliberately targets instead. A write target is
+        // typed through `type_write`, never `type_expr` (the only thing
+        // that populates `expr_tys`), so this used to show just "`counter`
+        // — a register" with no type at all — reproduced directly by an
+        // `out` port write in `hovering_an_output_ports_write_site_shows_
+        // its_type` below, but the gap was in `type_write`'s shared
+        // `Expr::Ident` arm, not anything `out`-specific.
+        let h = hover_at(SRC, 3, 10).expect("hover over the write target");
+        let text = hover_text(&h);
+        assert_eq!(text, "`counter: [8]` — a register");
+    }
+
+    const OUT_SRC: &str =
+        "module M {\n    out v : [8] = 0\n    rule r {\n        v := 1\n    }\n}\n";
+
+    #[test]
+    fn hovering_an_output_ports_write_site_shows_its_type() {
+        // `v := 1`, line 3 char 8 — `v`'s own write-target span.
+        let h = hover_at(OUT_SRC, 3, 8).expect("hover over the output port's write site");
+        assert_eq!(hover_text(&h), "`v: [8]` — an output port");
+    }
+
+    #[test]
     fn hovering_the_declaration_site_itself_now_resolves() {
         // `counter` in `reg counter : [8] = 0` itself — this is the gap
         // TODO.md flagged: not an `Expr::Ident`, so `ident_at` alone never

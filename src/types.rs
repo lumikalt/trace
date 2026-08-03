@@ -1302,6 +1302,20 @@ impl<'a> TypeChecker<'a> {
                     return;
                 };
                 if let Some(state) = self.state_tys.get(&def).cloned() {
+                    // `type_expr` is what normally populates `expr_tys` for
+                    // every expression it types, but a write target never
+                    // goes through it — `type_write` looks its type up
+                    // directly from `state_tys`/`locals` instead, since a
+                    // write has no "value" of its own to compute a `Ty`
+                    // FROM the way a read does. Without this, hovering a
+                    // reg/out/mem/fifo at its own `x := ...` write site
+                    // (the language server's `thing_at` still finds the
+                    // def fine, through `resolve.rs`'s own `expr_defs`
+                    // insert for the LHS) found no entry here and silently
+                    // showed no type — caught by hovering an `out` port at
+                    // its write site specifically, but the gap was general
+                    // to every write-target kind, not particular to `out`.
+                    self.types.expr_tys.insert(lhs, state.clone());
                     self.check_assignable(&rhs_ty, &state, self.expr_span(rhs), "state write");
                     self.check_literal_fits(rhs, &state);
                     if matches!(state, Ty::Struct { .. })
@@ -1354,6 +1368,7 @@ impl<'a> TypeChecker<'a> {
                         Some(old) => self.widen(old.clone(), rhs_ty, lhs),
                         None => rhs_ty,
                     };
+                    self.types.expr_tys.insert(lhs, merged.clone());
                     locals.insert(def, merged);
                 }
             }
