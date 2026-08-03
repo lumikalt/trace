@@ -1653,70 +1653,68 @@ sugar's existence means the hand-written `trigger`/`trigger?` pattern in the
 replace — a level-sensitive or `reg`-backed enable still needs the manual
 form).
 
-## `io` ports: structural half RESOLVED; real tri-state still blocked on blackbox support
+## `io` ports + `extmodule`: RESOLVED, both tiers built
 
-**`io name : ty` — a third port kind alongside `in`/`out` (Lumi's call).**
-The design write-up below (probing firtool 1.147.0 directly, not reasoning
-from docs alone) split this into two tiers; tier 1 is now built, tier 2
-remains an unbuilt prerequisite for anything beyond pass-through wiring.
+**`io name : ty` (a third port kind alongside `in`/`out`) and `extmodule
+Name from "path.v" { ports }` (an external Verilog module's interface) —
+both built, both proven against real firtool AND real Icarus simulation,
+not just "firtool accepts the text."**
 
-**Tier 1 — structural `io` + `attach` — RESOLVED, built.** `io name : ty`
-lowers to FIRRTL's `Analog<N>` (a plain N-bit port, `output`/`input` both
-work identically — Analog's bidirectionality lives in the type, not a
-direction keyword, confirmed by probing both). The only legal statement
-touching one is `attach a, b` (a new module-level item, alongside `reg`/
-`inst`, not inside a rule — unconditional net wiring has no clock/cycle
-semantics), where each operand is a bare `io` name or `instance.port`, both
-sides must be `io`-kind and the same width. Confirmed end-to-end against
-real firtool: a parent's `io bus` `attach`ed to a child instance's own `io
-bus` lowers to genuine Verilog `inout [7:0] bus` ports, wired straight
-through the instance boundary. Since there is no FIRRTL operation for a
-rule body to perform on an `Analog` value (see the still-true technical
-finding below), `io` needed no effects-row/`sig.reads`/`sig.writes`
-integration at all — resolve.rs rejects any bare read/write outright
-(`DefKind::Io`, checked in `resolve_expr`'s `Ident` arm and `resolve_stmt`'s
-`Assign` arm), and types.rs rejects the `instance.port` form the same way
-`in`/`out` port-direction mismatches already are (`find_port`'s `DefKind::
-Io` arm). See DESIGN.md's "Module ports" section for the user-facing
-description.
+**`io` + `attach`.** `io name : ty` lowers to FIRRTL's `Analog<N>`. The
+only legal statement touching one is `attach a, b` (a module-level item,
+alongside `reg`/`inst`, not inside a rule — unconditional net wiring has
+no clock/cycle semantics), where each operand is a bare `io` name or
+`instance.port`, both sides must be `io`-kind and the same width. Since
+`Analog`'s only operation is `attach` (net-to-net, confirmed directly:
+`attach(bus, data)` mixing an `Analog` and a `UInt` operand is rejected,
+`operand #1 must be variadic of analog type`), `io` needs no effects-row/
+`sig.reads`/`sig.writes` integration at all: resolve.rs rejects any bare
+read/write outright (`DefKind::Io`), types.rs rejects the `instance.port`
+form the same way an `in`/`out` direction mismatch already is
+(`find_port`'s `DefKind::Io` arm).
 
-**Still true, still the reason tier 1 alone has no use on its own:**
-`attach` is the only operation FIRRTL's `Analog` type supports, and it's
-net-to-net only — both operands must themselves be `Analog`. Probed
-directly: `attach(bus, data)` with `data : UInt<8>` (an ordinary port) is
-rejected, `operand #1 must be variadic of analog type, but got
-'!firrtl.uint<8>'`. There is no FIRRTL primitive for "drive this `UInt`
-value onto the bus when `enable`, else float." This matches Chisel's own
-documented stance on `Analog` (found via web search): *"Analog support is
-limited to allowing wiring up of Verilog BlackBoxes with bidirectional
-(inout) pins. There is currently no support for reading or writing of
-Analog types within Chisel code."* So a structural `io` port with nothing
-on the other end of its `attach` is a dead-end wire — nothing at the leaf
-of an all-trace design can actually drive tri-state logic.
+**`extmodule`.** Ports reuse the exact same `in`/`out`/`io` vocabulary and
+`find_port`/`inst.port` machinery ordinary module ports already have — an
+extmodule's own `input`/`output` (its own declaration's perspective) map
+onto exactly the same `DefKind::Input`/`Output`/`Io` an ordinary module's
+ports produce, so read/write legality needed zero new logic. The only
+real new machinery: `Item::ExtModule` is collected and declared
+separately from ordinary modules (`all_extmodules`/`item_of_extmodule_def`
+in `firrtl/mod.rs`, never a candidate for "the top", never walked the way
+`emit_module` walks a real module's body — see DESIGN.md's "Extmodule
+emission"), and an instance of one gets no `connect t.clock`/`connect
+t.reset` (v0 restriction: an extmodule has no such port at all; a
+blackbox needing a clock declares one as an ordinary `in` port instead).
+The `.v` path itself (`from "tribuf.v"`) is opaque data trace's compiler
+pipeline never reads or validates — confirmed by hand-lowering an
+extmodule through firtool before writing any trace code: FIRRTL text has
+zero linkage to the implementation file, entirely a downstream build/
+simulation concern.
 
-**Tier 2 — blackbox/extmodule declaration and instantiation — still
-genuinely new, entirely unbuilt** (confirmed: `grep -rn "extmodule\|
-blackbox" src/` matches nothing). Real tri-state drive logic has to live in
-a hand-written Verilog module, referenced from trace as something like
-`extmodule Name { ports... }` (declares an external module's port list,
-including an `Analog` pin, with no trace-level body), instantiated like an
-ordinary module (`inst x : Name`), with its ordinary `UInt` ports
-(`enable`, `data`, ...) driven by rule logic exactly like any other
-instance port today (same per-port-conflict-resource model "Submodule
-emission" already gives ordinary instances), and its `Analog` pin left
-untouched by any rule, only ever reachable via the now-built `attach`. This
-is the actual prerequisite for `io` to do anything beyond pass-through
-wiring.
+**Proven end to end, not just "compiles":** `examples/extmodule_tribuf.tr`
++ `sim/tribuf.v` (a real combinational tri-state buffer) +
+`sim/extmodule_tribuf_tb.v` (two instances of the generated `Top` with
+their `bus` ports tied together) — `tests/sim.rs`'s
+`extmodule_tribuf_runs_a_real_bidirectional_bus` alternates which side
+drives and checks the other side senses it, a genuine bidirectional net
+with neither direction fixed at compile time.
 
-Not designed further here — genuinely open, not just unstated: exact
-`extmodule` declaration syntax; how the external Verilog source is
-referenced (inline string literal, a separate file path, a build-managed
-asset); whether `extmodule` ports need their own direction vocabulary
-distinct from `in`/`out`; and the simulation story — Icarus needs an actual
-Verilog implementation to simulate a blackbox against, not just a port
-list, so `devenv shell -- simulate` would need a real tri-state-buffer `.v`
-file to exist for any example using this feature, not merely a
-synthesizable stub.
+**One real, documented gap left, not silently dropped:** `devenv.nix`'s
+`simulate` script doesn't know to pass an extmodule's `.v` file to
+iverilog alongside the generated design — it assumes one example name
+maps to exactly one generated `.v` plus one testbench.
+`extmodule_tribuf_runs_a_real_bidirectional_bus` uses its own dedicated
+`simulate_with_blackbox` helper in `tests/sim.rs`, not the shared
+`simulate` every other sim test uses. Fixing this needs a real design
+decision not made here: how would `simulate` (or trace itself) DISCOVER
+which `.v` files an example's extmodules need and WHERE to find them
+relative to the invocation — the `.tr` source only ever says `"tribuf.v"`,
+a bare filename with no directory, and trace's compiler deliberately
+never resolves it against any base directory (keeping the pipeline pure
+text-in/text-out, no filesystem awareness added to lexer/parser/resolve/
+types/firrtl passes that have none today). See sim/README.md for where
+this is documented for a human running `devenv shell -- simulate`
+manually in the meantime.
 
 ## Scheduler / arrays
 

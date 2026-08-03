@@ -313,6 +313,32 @@ pub struct Param {
     pub ty: ExprId,
 }
 
+/// An `extmodule` port's direction, spelled with the SAME keywords an
+/// ordinary module's own ports use (`in`/`out`/`io`) — an extmodule's
+/// `input`/`output` (its own FIRRTL declaration's perspective) map onto
+/// exactly the same `DefKind::Input`/`Output`/`Io` an ordinary module's
+/// ports already produce, so `inst.port` read/write checks (types.rs's
+/// `find_port`) need no awareness of which kind of module declared the
+/// port at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtPortDir {
+    In,
+    Out,
+    Io,
+}
+
+/// One `extmodule` port declaration. Not a separately `declare`d item
+/// (like `Item::Struct`'s own `fields: Vec<Param>` — plain structural
+/// data on the `Item::ExtModule` node, never its own `DefId`); only the
+/// `extmodule`'s own name resolves to a def, the way a struct's fields
+/// don't either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtPort {
+    pub dir: ExtPortDir,
+    pub name: Name,
+    pub ty: ExprId,
+}
+
 /// `fn` vs `spec` vs `impl ... refines Spec`. Specs may declare `chooses`;
 /// impls are checked as refinements of the spec they name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +373,19 @@ pub enum Item {
     Module {
         name: Name,
         items: Vec<ItemId>,
+    },
+    /// `extmodule Name from "path.v" { port... }` — declares an external
+    /// Verilog module's interface; `path` is opaque data trace never
+    /// reads or validates (the compiler pipeline stays pure text-in/
+    /// text-out — FIRRTL emission never mentions it either, confirmed by
+    /// hand-lowering an extmodule through firtool: the `.v` implementation
+    /// is entirely a downstream build/simulation concern, not a FIRRTL-
+    /// level one). `inst x : Name` instantiates it exactly like an
+    /// ordinary module (see `Item::Inst`).
+    ExtModule {
+        name: Name,
+        path: String,
+        ports: Vec<ExtPort>,
     },
     Reg {
         name: Name,
@@ -682,6 +721,22 @@ impl Ast {
                         "{inner}{} : {}\n",
                         field.name,
                         self.expr_sexpr(field.ty)
+                    ));
+                }
+            }
+            Item::ExtModule { name, path, ports } => {
+                out.push_str(&format!("{pad}extmodule {name} from {path:?}\n"));
+                let inner = "  ".repeat(depth + 1);
+                for port in ports {
+                    let kw = match port.dir {
+                        ExtPortDir::In => "in",
+                        ExtPortDir::Out => "out",
+                        ExtPortDir::Io => "io",
+                    };
+                    out.push_str(&format!(
+                        "{inner}{kw} {} : {}\n",
+                        port.name,
+                        self.expr_sexpr(port.ty)
                     ));
                 }
             }

@@ -129,6 +129,17 @@ pub fn emit(
         .iter()
         .filter_map(|id| res.item_defs.get(id).map(|d| (*d, *id)))
         .collect();
+    // Same, for `extmodule` targets — kept as its own map rather than
+    // merged into `item_of_module_def` above: an extmodule is never a
+    // candidate for "the top" and never itself walked by `visit_module`
+    // (it has no body/rules/`inst`s of its own), only ever a LEAF `inst`
+    // target, so keeping the two maps separate means `inst_targets`
+    // (which drives top-detection and the transitive walk) stays
+    // Module-only for free, with no extra filtering needed there.
+    let item_of_extmodule_def: HashMap<DefId, ItemId> = all_extmodules(ast)
+        .iter()
+        .filter_map(|id| res.item_defs.get(id).map(|d| (*d, *id)))
+        .collect();
 
     // "The top" is whichever top-level module nobody instantiates. A file
     // with no `inst` at all still works exactly as before: with zero
@@ -179,7 +190,17 @@ pub fn emit(
     let mut blocks = Vec::new();
     let mut all_errors = Vec::new();
     for &m in &to_emit {
-        match emit_module(ast, res, fx, types, sched, m, m == top, &item_of_module_def) {
+        match emit_module(
+            ast,
+            res,
+            fx,
+            types,
+            sched,
+            m,
+            m == top,
+            &item_of_module_def,
+            &item_of_extmodule_def,
+        ) {
             Ok(text) => blocks.push(text),
             Err(errs) => all_errors.extend(errs),
         }
@@ -188,9 +209,33 @@ pub fn emit(
         return Err(all_errors);
     }
 
+    // Every extmodule any emitted module actually `inst`s, each declared
+    // exactly once (dedup by `ItemId`, order doesn't matter — FIRRTL
+    // doesn't care about declaration order). Unlike an ordinary module, an
+    // extmodule contributes no rules/state of its own to walk, so it
+    // never goes through `emit_module` — just its bare port-list
+    // declaration (see `emit_extmodule`).
+    let mut extmodule_ids: Vec<ItemId> = Vec::new();
+    let mut seen_extmodules: std::collections::HashSet<ItemId> = std::collections::HashSet::new();
+    for &m in &to_emit {
+        for target in inst_extmodule_targets(ast, res, m, &item_of_extmodule_def) {
+            if seen_extmodules.insert(target) {
+                extmodule_ids.push(target);
+            }
+        }
+    }
+    let extmodule_blocks: Vec<String> = extmodule_ids
+        .iter()
+        .map(|&m| emit_extmodule(ast, res, types, m))
+        .collect();
+
     let mut out = String::new();
     let _ = writeln!(out, "FIRRTL version 4.0.0");
     let _ = writeln!(out, "circuit {} :", module_name(ast, top));
+    for block in extmodule_blocks {
+        out.push_str(&block);
+        out.push('\n');
+    }
     for block in blocks {
         out.push_str(&block);
         out.push('\n');
@@ -236,6 +281,89 @@ fn inst_targets(
             _ => None,
         })
         .collect()
+}
+
+/// The extmodules a module `m` directly instantiates via `inst` — the
+/// same shape as `inst_targets` above, but resolved against `item_of_
+/// extmodule_def` instead. Kept separate rather than merging the two
+/// maps and filtering here: `inst_targets` drives top-detection and the
+/// transitive walk, which must stay Module-only (see `item_of_extmodule_
+/// def`'s own doc comment in `emit`).
+fn inst_extmodule_targets(
+    ast: &Ast,
+    res: &Resolution,
+    m: ItemId,
+    item_of_extmodule_def: &HashMap<DefId, ItemId>,
+) -> Vec<ItemId> {
+    let Item::Module { items, .. } = ast.item(m) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| match ast.item(*it) {
+            Item::Inst { module, .. } => res
+                .expr_defs
+                .get(module)
+                .and_then(|d| item_of_extmodule_def.get(d))
+                .copied(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `Item::ExtModule` in the file, regardless of lexical nesting —
+/// same reasoning as `all_modules` (FIRRTL has no nested-module concept,
+/// only cross-references via `inst X of Y`), plus `extmodule` declares no
+/// body/rules/`inst`s of its own to recurse into further.
+fn all_extmodules(ast: &Ast) -> Vec<ItemId> {
+    let mut out = Vec::new();
+    let mut worklist: Vec<ItemId> = ast.roots.clone();
+    while let Some(id) = worklist.pop() {
+        match ast.item(id) {
+            Item::Module { items, .. } => worklist.extend(items.iter().copied()),
+            Item::ExtModule { .. } => out.push(id),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// An extmodule's bare FIRRTL declaration: its own port list and a
+/// `defname` line, nothing else — no body, no clock/reset (v0
+/// restriction: an extmodule's ports are plain `in`/`out`/`io` only, see
+/// `ast::ExtPort`'s doc comment; a blackbox needing a clock declares one
+/// as an ordinary port and gets it wired like any other instance input).
+/// The referenced `.v` implementation is never mentioned here — confirmed
+/// by hand-lowering one through firtool: FIRRTL text has no linkage to it
+/// at all, entirely a downstream build/simulation concern.
+///
+/// Reads widths from `types.module_ports` (already computed and shape-
+/// checked by `collect_module_ports`) rather than re-deriving them from
+/// the raw `ast::ExtPort` list — one source of truth for a port's width,
+/// same as every other emission site in this module.
+fn emit_extmodule(ast: &Ast, res: &Resolution, types: &Types, m: ItemId) -> String {
+    let Item::ExtModule { name, .. } = ast.item(m) else {
+        unreachable!("all_extmodules only ever collects Item::ExtModule");
+    };
+    let mut out = String::new();
+    let _ = writeln!(out, "  extmodule {} :", name.text);
+    let empty = Vec::new();
+    let ports = res
+        .item_defs
+        .get(&m)
+        .and_then(|d| types.module_ports.get(d))
+        .unwrap_or(&empty);
+    for (pname, kind, ty) in ports {
+        let w = port_bit_width(ty).unwrap_or(1);
+        let (kw, ty_text) = match kind {
+            crate::resolve::DefKind::Input => ("input", format!("UInt<{w}>")),
+            crate::resolve::DefKind::Io => ("output", format!("Analog<{w}>")),
+            _ => ("output", format!("UInt<{w}>")),
+        };
+        let _ = writeln!(out, "    {kw} {pname} : {ty_text}");
+    }
+    let _ = writeln!(out, "    defname = {}", name.text);
+    out
 }
 
 /// Every module reachable from `top` via `inst`, `top` included. A cycle
@@ -296,6 +424,7 @@ fn visit_module(
 fn module_name(ast: &Ast, m: ItemId) -> &str {
     match ast.item(m) {
         Item::Module { name, .. } => &name.text,
+        Item::ExtModule { name, .. } => &name.text,
         _ => "?",
     }
 }

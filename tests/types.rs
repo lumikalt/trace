@@ -551,6 +551,55 @@ fn instance_ports_check_direction_and_width() {
     assert!(errors.iter().any(|e| e.message.contains("trunc")));
 }
 
+const TRIBUF: &str = "extmodule TriBuf from \"tribuf.v\" {\n in enable : [1]\n \
+     in data : [8]\n out sensed : [8]\n io pad : [8]\n}\n";
+
+#[test]
+fn extmodule_in_and_out_ports_are_writable_and_readable_via_inst_port() {
+    run_ok(&format!(
+        "{TRIBUF}module Top {{\n inst t : TriBuf\n reg v : [8] = 0\n \
+         reg e : [1] = 0\n rule w {{\n t.enable := e\n t.data := v\n v := t.sensed\n}}\n}}\n"
+    ));
+}
+
+#[test]
+fn extmodule_io_port_cannot_be_read_or_written_via_inst_port() {
+    let (_, _, errors) = run(&format!(
+        "{TRIBUF}module Top {{\n inst t : TriBuf\n reg v : [8] = 0\n \
+         rule w {{\n v := t.pad\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("io port")));
+
+    let (_, _, errors) = run(&format!(
+        "{TRIBUF}module Top {{\n inst t : TriBuf\n reg v : [8] = 0\n \
+         rule w {{\n t.pad := v\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("io port")));
+}
+
+#[test]
+fn extmodule_io_port_must_be_a_plain_bit_width() {
+    let src = "\
+struct Pair {
+    x : [8]
+    y : [8]
+}
+
+extmodule Bad from \"bad.v\" {
+    io p : Pair
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(errors.iter().any(|e| e.message.contains("plain bit width")));
+}
+
+#[test]
+fn attach_wires_a_modules_own_io_port_to_an_extmodules_io_port() {
+    run_ok(&format!(
+        "{TRIBUF}module Top {{\n io bus : [8]\n inst t : TriBuf\n attach bus, t.pad\n}}\n"
+    ));
+}
+
 #[test]
 fn instance_io_ports_cannot_be_read_or_written_from_a_rule_body() {
     let child = "module Child {\n io bus : [8]\n}\n";

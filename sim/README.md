@@ -65,6 +65,30 @@ the generated Verilog.
   script and `tests/sim.rs`'s `firrtl_to_verilog` unconditionally,
   rather than only where it happened to be strictly required.
 
+## `extmodule_tribuf_tb.v` needs a second Verilog source
+
+`examples/extmodule_tribuf.tr` declares `extmodule TriBuf from "tribuf.v"`
+— an external module whose real tri-state implementation trace's own
+FIRRTL output never references at all (confirmed by hand-lowering one
+through firtool: the `.v` path is opaque data, purely a downstream build/
+simulation concern). `tribuf.v`, right here in `sim/`, supplies that
+implementation; `extmodule_tribuf_tb.v` instantiates the generated
+`Top` TWICE with their `bus` ports tied together, alternates which side
+drives, and checks the other side senses it — a real bidirectional net.
+
+`devenv.nix`'s `simulate` script does NOT yet know to pass `tribuf.v`
+to iverilog alongside the generated design (it only takes one example
+name and assumes one generated `.v` plus one testbench) — `devenv shell
+-- simulate extmodule_tribuf` fails at iverilog elaboration (verified
+directly, not assumed): `Unknown module type: TriBuf ... referenced 2
+times`. `tests/sim.rs`'s own
+`extmodule_tribuf_runs_a_real_bidirectional_bus` test is the only
+currently-working way to run this one; it uses a dedicated
+`simulate_with_blackbox` helper instead of the shared `simulate`. See
+TODO.md for the unbuilt discovery mechanism this would need (the `.tr`
+source only ever says `"tribuf.v"`, not `"sim/tribuf.v"` — no path-
+resolution convention has been decided yet).
+
 ## If firtool renames `m_ext`/`Memory`
 
 `mem <name>` in a `.tr` file becomes an instantiated `<name>_ext`

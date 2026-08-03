@@ -35,6 +35,7 @@ pub(crate) fn emit_module(
     module: ItemId,
     is_public: bool,
     item_of_module_def: &HashMap<DefId, ItemId>,
+    item_of_extmodule_def: &HashMap<DefId, ItemId>,
 ) -> Result<String, Vec<EmitError>> {
     let Item::Module {
         name: mod_name,
@@ -413,13 +414,14 @@ pub(crate) fn emit_module(
                 module: module_expr,
             } => {
                 let def = res.item_defs[id];
-                let target_item = res
-                    .expr_defs
-                    .get(module_expr)
-                    .and_then(|d| item_of_module_def.get(d));
+                let target_item = res.expr_defs.get(module_expr).and_then(|d| {
+                    item_of_module_def
+                        .get(d)
+                        .or_else(|| item_of_extmodule_def.get(d))
+                });
                 let Some(&target_item) = target_item else {
                     // Already reported by resolve.rs (unknown name or not
-                    // a module).
+                    // a module/extmodule).
                     continue;
                 };
                 // Instance-port wiring below drives every input port and
@@ -475,8 +477,15 @@ pub(crate) fn emit_module(
             // scoped to this module (see resolve.rs) that `inst` can
             // target. It gets its own separate FIRRTL module block,
             // discovered and emitted independently (see `all_modules`).
-            Item::Fn { .. } | Item::Schedule { .. } | Item::Module { .. } | Item::Struct { .. } => {
-            }
+            // An `extmodule` declared inside a module's own body is the
+            // same story (see `all_extmodules`) — its own port list
+            // reaches emission entirely through `emit_extmodule`, not
+            // this per-item walk.
+            Item::Fn { .. }
+            | Item::Schedule { .. }
+            | Item::Module { .. }
+            | Item::Struct { .. }
+            | Item::ExtModule { .. } => {}
         }
     }
 
@@ -852,8 +861,20 @@ pub(crate) fn emit_module(
     let mut instance_body = String::new();
     for (inst_name, target_name, inst_def) in &instances {
         let _ = writeln!(instance_decls, "    inst {inst_name} of {target_name}");
-        let _ = writeln!(instance_body, "    connect {inst_name}.clock, clock");
-        let _ = writeln!(instance_body, "    connect {inst_name}.reset, reset");
+        // An extmodule has no `clock`/`reset` port at all (v0 restriction
+        // — see `ExtPort`'s doc comment: its port list is plain `in`/
+        // `out`/`io` only, nothing FIRRTL-Clock-typed). Connecting one
+        // unconditionally the way an ordinary module instance always
+        // needs would reference a port that doesn't exist in its
+        // declaration.
+        let target_is_extmodule = types
+            .instance_module
+            .get(inst_def)
+            .is_some_and(|d| item_of_extmodule_def.contains_key(d));
+        if !target_is_extmodule {
+            let _ = writeln!(instance_body, "    connect {inst_name}.clock, clock");
+            let _ = writeln!(instance_body, "    connect {inst_name}.reset, reset");
+        }
         let ports = types
             .instance_module
             .get(inst_def)

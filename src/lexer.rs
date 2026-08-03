@@ -17,6 +17,14 @@ pub enum TokenKind {
     // the keyword set only holds words that open or shape a construct.
     #[token("module")]
     Module,
+    /// `extmodule Name from "path.v" { in/out/io port... }` — declares an
+    /// external Verilog module's interface (its own real implementation
+    /// lives in the referenced `.v` file, opaque to trace). `from` is
+    /// deliberately NOT its own keyword here, matching `urgency`/`reads`/
+    /// `writes`: it's a contextual word recognized by text, only ever
+    /// appearing in this one position.
+    #[token("extmodule")]
+    ExtModule,
     #[token("rule")]
     Rule,
     #[token("reg")]
@@ -126,6 +134,13 @@ pub enum TokenKind {
         r"[0-9][0-9_]*'(d[0-9][0-9_]*|h[0-9A-Fa-f][0-9A-Fa-f_]*|b[01][01_]*|o[0-7][0-7_]*|[0-9][0-9_]*)"
     )]
     SizedInt,
+    /// A plain double-quoted string literal: `"path/to/file.v"`. No escape
+    /// sequences (v0 restriction — the only use today is `extmodule`'s
+    /// `from` clause, a bare file path never needing one). Excludes `\n`
+    /// so an unterminated string reports at the line it started on rather
+    /// than silently swallowing the rest of the file.
+    #[regex(r#""[^"\n]*""#)]
+    Str,
 
     #[token(":=")]
     ColonEq,

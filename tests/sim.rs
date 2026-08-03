@@ -168,6 +168,41 @@ fn simulate(verilog: &str, testbench_path: &str) -> String {
     String::from_utf8_lossy(&run.stdout).into_owned()
 }
 
+/// Same as `simulate`, plus one extra hand-written Verilog source file
+/// compiled alongside the generated design — an `extmodule`'s own real
+/// implementation, which trace's FIRRTL output never references (see
+/// `ast::Item::ExtModule`'s doc comment: the `.v` path is opaque data,
+/// entirely a downstream build/simulation concern). A separate fn rather
+/// than threading an `extra_sources` param through `simulate`'s 47
+/// existing call sites for this one, so-far-unique need.
+fn simulate_with_blackbox(verilog: &str, testbench_path: &str, blackbox_path: &str) -> String {
+    let dir = tempdir();
+    let design_path = dir.join("design.v");
+    std::fs::write(&design_path, verilog).unwrap();
+    let sim_path = dir.join("sim");
+
+    let compile = Command::new("iverilog")
+        .args(["-g2012", "-DSYNTHESIS", "-o"])
+        .arg(&sim_path)
+        .arg(testbench_path)
+        .arg(&design_path)
+        .arg(blackbox_path)
+        .output()
+        .expect("failed to spawn iverilog");
+    assert!(
+        compile.status.success(),
+        "iverilog failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new("vvp")
+        .arg(&sim_path)
+        .output()
+        .expect("failed to spawn vvp");
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
 fn tempdir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "trace-sim-test-{}-{}",
@@ -360,6 +395,51 @@ fn port_ram_runs_through_real_ports() {
     assert!(
         output.contains("final: read_data=abcd"),
         "expected address 5 to still hold 0xabcd:\n{output}"
+    );
+}
+
+/// Proves the whole io/attach/extmodule feature set end to end, not just
+/// that firtool accepts the emitted FIRRTL: sim/extmodule_tribuf_tb.v
+/// instantiates TWO of examples/extmodule_tribuf.tr's `Top` sharing one
+/// physical `bus` wire, alternates which side drives it, and checks the
+/// OTHER side senses the driven value — a real bidirectional net,
+/// neither direction fixed at compile time. sim/tribuf.v (compiled
+/// alongside the testbench, not referenced by trace's own FIRRTL output
+/// at all) supplies the `extmodule`'s actual tri-state implementation.
+#[test]
+fn extmodule_tribuf_runs_a_real_bidirectional_bus() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/extmodule_tribuf.tr"
+    ))
+    .unwrap();
+    let (tokens, lex_errors) = lexer::lex(&src);
+    assert!(lex_errors.is_empty(), "{lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(&src, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res);
+    assert!(type_errors.is_empty(), "{type_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
+    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
+        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/extmodule_tribuf_tb.v");
+    let blackbox = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/tribuf.v");
+    let output = simulate_with_blackbox(&verilog, testbench, blackbox);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
     );
 }
 

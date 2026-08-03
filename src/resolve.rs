@@ -35,6 +35,11 @@ pub struct DefId(pub u32);
 pub enum DefKind {
     Builtin,
     Module,
+    /// `extmodule Name from "path.v" { ... }` — like `Module`, a legal
+    /// `inst` target, but its own port list is plain data on the
+    /// `Item::ExtModule` node (see `ast::ExtPort`), never separately
+    /// `declare`d, matching `Struct`'s own fields.
+    ExtModule,
     /// A `struct Name { field : ty, ... }` declaration — a type, not
     /// state; its own fields are never separately `declare`d (they're
     /// plain structural data on the `Item::Struct`, resolved contextually
@@ -86,6 +91,7 @@ impl DefKind {
         match self {
             DefKind::Builtin => "a builtin",
             DefKind::Module => "a module",
+            DefKind::ExtModule => "an extmodule",
             DefKind::Struct => "a struct",
             DefKind::Reg => "a register",
             DefKind::Mem => "a memory",
@@ -372,6 +378,7 @@ impl<'a> Resolver<'a> {
     fn collect_decl(&mut self, id: ItemId) {
         let (name, kind) = match self.ast.item(id) {
             Item::Module { name, .. } => (name.clone(), DefKind::Module),
+            Item::ExtModule { name, .. } => (name.clone(), DefKind::ExtModule),
             Item::Reg { name, .. } => (name.clone(), DefKind::Reg),
             Item::Mem { name, .. } => (name.clone(), DefKind::Mem),
             Item::Fifo { name, .. } => (name.clone(), DefKind::Fifo),
@@ -438,6 +445,14 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(field.ty, false);
                 }
             }
+            // Same shape as `Struct`'s fields: an extmodule's ports are
+            // structural data, not separately declared idents — only
+            // each port's own TYPE expression resolves against scope.
+            Item::ExtModule { ports, .. } => {
+                for port in ports.clone() {
+                    self.resolve_expr(port.ty, false);
+                }
+            }
             Item::Output { ty, init, .. } => {
                 self.resolve_expr(*ty, false);
                 if let Some(init) = init {
@@ -447,12 +462,12 @@ impl<'a> Resolver<'a> {
             Item::Inst { module, .. } => {
                 self.resolve_inst_target(*module);
                 if let Some(def) = self.res.expr_defs.get(module).copied()
-                    && self.res.def(def).kind != DefKind::Module
+                    && !matches!(self.res.def(def).kind, DefKind::Module | DefKind::ExtModule)
                 {
                     self.error(
                         self.ast.expr_spans[module.0 as usize].clone(),
                         format!(
-                            "`{}` is {}, not a module",
+                            "`{}` is {}, not a module or extmodule",
                             self.res.def(def).name,
                             self.res.def(def).kind.describe()
                         ),

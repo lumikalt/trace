@@ -145,6 +145,36 @@ fn attach_resolves_an_instance_io_port() {
 }
 
 #[test]
+fn inst_accepts_an_extmodule_target() {
+    let (_, res) = run_ok(
+        "extmodule TriBuf from \"tribuf.v\" {\n in enable : [1]\n out sensed : [8]\n \
+         io pad : [8]\n}\n\
+         module Top {\n inst t : TriBuf\n}\n",
+    );
+    assert!(
+        res.defs
+            .iter()
+            .any(|d| d.name == "t" && d.kind == DefKind::Inst)
+    );
+    assert!(
+        res.defs
+            .iter()
+            .any(|d| d.name == "TriBuf" && d.kind == DefKind::ExtModule)
+    );
+}
+
+#[test]
+fn inst_rejects_a_target_that_is_neither_module_nor_extmodule() {
+    let (_, _, errors) = run("struct Pair {\n x : [8]\n y : [8]\n}\n\
+         module Top {\n inst t : Pair\n}\n");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("not a module or extmodule"))
+    );
+}
+
+#[test]
 fn inst_resolves_to_a_module_and_ports_are_fields() {
     let (_, res) = run_ok(
         "module Child {\n in a : [8]\n out b : [8] = 0\n \

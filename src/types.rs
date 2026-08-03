@@ -18,7 +18,7 @@
 //! operand's width (it must fit). Writing a wider value into a narrower
 //! register is an error that names `trunc` — no silent truncation.
 
-use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Stmt, StmtId, UnOp};
+use crate::ast::{Ast, BinOp, Expr, ExprId, ExtPortDir, Item, ItemId, Stmt, StmtId, UnOp};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
 use std::collections::HashMap;
@@ -542,37 +542,93 @@ impl<'a> TypeChecker<'a> {
     /// every `inst`'s target module, keyed off `state_tys` already built
     /// by `collect_state`. Must run after it.
     fn collect_module_ports(&mut self) {
+        // Was purely mechanical (no `self.error` calls) before extmodule
+        // ports needed their own shape validation here — needs its own
+        // `emit = true`/`= false` bracket now, same reason `collect_
+        // structs`'s own doc comment gives.
+        self.emit = true;
         let mut stack: Vec<ItemId> = self.ast.roots.clone();
         while let Some(id) = stack.pop() {
-            let Item::Module { items, .. } = self.ast.item(id).clone() else {
-                continue;
-            };
-            if let Some(&module_def) = self.res.item_defs.get(&id) {
-                let mut ports = Vec::new();
-                for item_id in &items {
-                    match self.ast.item(*item_id) {
-                        Item::Input { .. } | Item::Output { .. } | Item::Io { .. } => {
-                            if let Some(&def) = self.res.item_defs.get(item_id) {
-                                let kind = self.res.def(def).kind;
-                                let ty = self.state_tys.get(&def).cloned().unwrap_or(Ty::Unknown);
-                                ports.push((self.res.def(def).name.clone(), kind, ty));
+            match self.ast.item(id).clone() {
+                Item::Module { items, .. } => {
+                    if let Some(&module_def) = self.res.item_defs.get(&id) {
+                        let mut ports = Vec::new();
+                        for item_id in &items {
+                            match self.ast.item(*item_id) {
+                                Item::Input { .. } | Item::Output { .. } | Item::Io { .. } => {
+                                    if let Some(&def) = self.res.item_defs.get(item_id) {
+                                        let kind = self.res.def(def).kind;
+                                        let ty = self
+                                            .state_tys
+                                            .get(&def)
+                                            .cloned()
+                                            .unwrap_or(Ty::Unknown);
+                                        ports.push((self.res.def(def).name.clone(), kind, ty));
+                                    }
+                                }
+                                Item::Inst { module, .. } => {
+                                    if let (Some(&inst_def), Some(&target_def)) = (
+                                        self.res.item_defs.get(item_id),
+                                        self.res.expr_defs.get(module),
+                                    ) {
+                                        self.types.instance_module.insert(inst_def, target_def);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        Item::Inst { module, .. } => {
-                            if let (Some(&inst_def), Some(&target_def)) = (
-                                self.res.item_defs.get(item_id),
-                                self.res.expr_defs.get(module),
-                            ) {
-                                self.types.instance_module.insert(inst_def, target_def);
-                            }
-                        }
-                        _ => {}
+                        self.types.module_ports.insert(module_def, ports);
+                    }
+                    stack.extend(items);
+                }
+                // An extmodule's own port list is never `Item::Input`/
+                // `Output`/`Io` sub-items (unlike a real module's own
+                // body — see `ast::ExtPort`'s doc comment for why: they
+                // never need their own `DefId`), so it needs its own
+                // small port-list builder here rather than reusing the
+                // walk above.
+                Item::ExtModule { ports, .. } => {
+                    if let Some(&extmodule_def) = self.res.item_defs.get(&id) {
+                        let built = ports
+                            .iter()
+                            .map(|p| {
+                                let kind = match p.dir {
+                                    ExtPortDir::In => DefKind::Input,
+                                    ExtPortDir::Out => DefKind::Output,
+                                    ExtPortDir::Io => DefKind::Io,
+                                };
+                                let ty = self.eval_ty(p.ty, &HashMap::new());
+                                if kind == DefKind::Io && !matches!(ty, Ty::Bits(_) | Ty::Unknown) {
+                                    self.error(
+                                        self.expr_span(p.ty),
+                                        format!("an io port holds a plain bit width, not {ty}"),
+                                    );
+                                } else if kind != DefKind::Io
+                                    && !matches!(
+                                        ty,
+                                        Ty::Bits(_)
+                                            | Ty::Struct { .. }
+                                            | Ty::Option(_)
+                                            | Ty::Unknown
+                                    )
+                                {
+                                    self.error(
+                                        self.expr_span(p.ty),
+                                        format!(
+                                            "an extmodule port holds bits or a struct, not {ty}"
+                                        ),
+                                    );
+                                }
+                                (p.name.text.clone(), kind, ty)
+                            })
+                            .collect();
+                        self.types.module_ports.insert(extmodule_def, built);
                     }
                 }
-                self.types.module_ports.insert(module_def, ports);
+                _ => {}
             }
-            stack.extend(items.iter().copied());
         }
+        self.emit = false;
     }
 
     /// `base` names a module instance -> the module `DefId` it instantiates.

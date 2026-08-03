@@ -849,12 +849,53 @@ An `io` port never `attach`ed to anything is legal, not an error — FIRRTL
 itself accepts an unconnected `Analog` port (confirmed directly against
 firtool), and trace adds no stricter requirement on top.
 
-This makes `io` useful only for pass-through wiring today: nothing at the leaf
-of an all-trace design can actually drive tri-state logic onto the net `attach`
-connects. Real tri-state I/O needs a hand-written Verilog module behind an
-`extmodule`/blackbox instance, which trace doesn't support yet — see "`io`
-ports: design, blocked on blackbox support" in TODO.md for that half of the
-story.
+Pass-through wiring alone has no leaf to drive from — real tri-state I/O needs
+a hand-written Verilog module behind the `io` port, declared as an
+`extmodule`:
+
+```trace
+extmodule TriBuf from "tribuf.v" {
+    in enable : [1]
+    in data : [8]
+    out sensed : [8]
+    io pad : [8]
+}
+
+module Top {
+    io bus : [8]
+    in enable : [1]
+    in data : [8]
+    out sensed : [8] = 0
+    inst t : TriBuf
+
+    rule drive {
+        t.enable := enable
+        t.data := data
+        sensed := t.sensed
+    }
+
+    attach bus, t.pad
+}
+```
+
+`extmodule Name from "path.v" { ports }` declares an external Verilog
+module's interface — its real implementation lives entirely in the
+referenced `.v` file, which trace's own compiler never reads or validates
+(the path is opaque data; FIRRTL emission never mentions it either,
+confirmed by hand-lowering one through firtool). Ports use the same
+`in`/`out`/`io` vocabulary as an ordinary module (an extmodule's `input`/
+`output` map onto exactly the same read/write rules `inst.port` already
+gives an ordinary instance), but an extmodule has no `clock`/`reset` port
+and no body — if the underlying Verilog needs a clock, declare it as an
+ordinary `in` port and wire it explicitly (v0 restriction: no FIRRTL-
+Clock-typed port). `inst t : TriBuf` instantiates it exactly like an
+ordinary module; `t.enable`/`t.data`/`t.sensed` are driven/read from rule
+logic like any other instance port, and `t.pad` (its own `io` port) is
+only ever reachable via `attach`.
+
+Getting the `.v` implementation to a simulator is a separate, not-yet-solved
+problem: `devenv shell -- simulate` doesn't know to pass it to iverilog
+alongside the generated design (see sim/README.md and TODO.md).
 
 ```trace
 module Accumulator {
@@ -2390,6 +2431,25 @@ parent's own output built from a child's output is a second register hop behind
 that. Latency compounds once per hop through the hierarchy — a real,
 honestly-modeled consequence of composition.
 
+## Extmodule emission
+
+An `extmodule` is never walked the way an ordinary module is (it has no
+body/rules/`inst`s of its own to recurse into, and is never a candidate
+for "the top") — it's collected separately (`all_extmodules`) and
+declared once, at most, per referenced extmodule: a bare port list plus
+`defname = Name`, nothing else (no body, since firtool never needs one —
+the real implementation is the referenced `.v` file, entirely outside
+this pass's concern). `inst t : TriBuf`'s own wiring reuses the ordinary
+instance machinery unchanged (same `types.module_ports`/`find_port` an
+ordinary module's ports already populate), with exactly one difference:
+no `connect t.clock, clock`/`connect t.reset, reset` — an extmodule
+declares no such port to connect one to (v0 restriction, see "Module
+ports" above). Every ordinary `in`/`out` port still gets the same
+default-0-then-override-on-fire wiring as any other instance input, and
+an `io`-kind port (`t.pad`) gets none at all, reachable only via
+`attach` — identical to how an ordinary module instance's own `io` port
+already works.
+
 ## Struct emission
 
 FIRRTL does support a real bundle type (`{ field : ty, ... }`), confirmed by
@@ -2801,9 +2861,13 @@ noted:
   bit-vector type (told apart from a list literal by content, not position).
 - Module ports (`in`/`out`), including boot-loading a memory through
   ports with a `boot_done` handshake (`examples/subleq_boot.tr`).
-- Structural `io` ports + `attach` (`examples/io_bus.tr`) — pass-through
-  wiring only; real tri-state drive needs blackbox support, not yet built
-  (see TODO.md).
+- `io` ports + `attach` (`examples/io_bus.tr`, pass-through wiring) and
+  `extmodule` (`examples/extmodule_tribuf.tr`, a real bidirectional
+  tri-state bus behind a hand-written Verilog blackbox — proven end to
+  end in `tests/sim.rs`'s `extmodule_tribuf_runs_a_real_bidirectional_bus`,
+  two instances sharing one wire, driver alternating sides). `devenv
+  shell -- simulate` doesn't yet know to pass an extmodule's `.v` file to
+  iverilog (see TODO.md).
 - FIFO synthesis, including the enqueue/dequeue pass-through case
   (`examples/fifo_bridge.tr`, `examples/fifo_passthrough.tr`).
 - Port-based memory access (`examples/port_ram.tr`).

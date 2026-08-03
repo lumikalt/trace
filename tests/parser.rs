@@ -192,6 +192,48 @@ fn attach_requires_a_comma_between_operands() {
 }
 
 #[test]
+fn extmodule_parses_name_path_and_ports() {
+    let ast = parse_ok(
+        "extmodule TriBuf from \"tribuf.v\" {\n in enable : [1]\n \
+         out sensed : [8]\n io pad : [8]\n}\n",
+    );
+    let Item::ExtModule { name, path, ports } = ast.item(ast.roots[0]) else {
+        panic!("expected an extmodule");
+    };
+    assert_eq!(name.text, "TriBuf");
+    assert_eq!(path, "tribuf.v");
+    assert_eq!(ports.len(), 3);
+    assert_eq!(ports[0].dir, trace::ast::ExtPortDir::In);
+    assert_eq!(ports[0].name.text, "enable");
+    assert_eq!(ports[1].dir, trace::ast::ExtPortDir::Out);
+    assert_eq!(ports[2].dir, trace::ast::ExtPortDir::Io);
+}
+
+#[test]
+fn extmodule_requires_the_from_keyword() {
+    let (tokens, _) = lexer::lex("extmodule TriBuf \"tribuf.v\" {\n}\n");
+    let (_, errors) = parser::parse("extmodule TriBuf \"tribuf.v\" {\n}\n", &tokens);
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn extmodule_requires_a_quoted_path() {
+    let (tokens, _) = lexer::lex("extmodule TriBuf from tribuf.v {\n}\n");
+    let (_, errors) = parser::parse("extmodule TriBuf from tribuf.v {\n}\n", &tokens);
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn extmodule_rejects_a_port_with_no_direction_keyword() {
+    let (tokens, _) = lexer::lex("extmodule TriBuf from \"tribuf.v\" {\n pad : [8]\n}\n");
+    let (_, errors) = parser::parse(
+        "extmodule TriBuf from \"tribuf.v\" {\n pad : [8]\n}\n",
+        &tokens,
+    );
+    assert!(!errors.is_empty());
+}
+
+#[test]
 fn spawn_prefix() {
     assert_eq!(
         stmt_sexpr("h1 := spawn ReadBank(bank0, pc)"),

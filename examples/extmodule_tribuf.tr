@@ -1,0 +1,22 @@
+extmodule TriBuf from "tribuf.v" {
+    in enable : [1]
+    in data : [8]
+    out sensed : [8]
+    io pad : [8]
+}
+
+module Top {
+    io bus : [8]
+    in enable : [1]
+    in data : [8]
+    out sensed : [8] = 0
+    inst t : TriBuf
+
+    rule drive {
+        t.enable := enable
+        t.data := data
+        sensed := t.sensed
+    }
+
+    attach bus, t.pad
+}

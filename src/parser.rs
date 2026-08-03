@@ -6,8 +6,8 @@
 //! (or closing brace) and parsing continues, so one typo reports once.
 
 use crate::ast::{
-    Ast, BinOp, Destructure, Effect, Expr, ExprId, FnKind, Item, ItemId, Name, Param,
-    ScheduleDirective, Stmt, StmtId, UnOp,
+    Ast, BinOp, Destructure, Effect, Expr, ExprId, ExtPort, ExtPortDir, FnKind, Item, ItemId, Name,
+    Param, ScheduleDirective, Stmt, StmtId, UnOp,
 };
 use crate::lexer::{Span, Token, TokenKind};
 
@@ -220,6 +220,7 @@ impl<'a> Parser<'a> {
         use TokenKind::*;
         match self.peek() {
             Some(Module) => self.parse_module(),
+            Some(ExtModule) => self.parse_extmodule(),
             Some(Struct) => self.parse_struct(),
             Some(Reg) => self.parse_state_decl(Reg),
             Some(Mem) => self.parse_state_decl(Mem),
@@ -242,8 +243,8 @@ impl<'a> Parser<'a> {
             Some(Schedule) => self.parse_schedule(),
             _ => {
                 self.error_here(
-                    "expected an item (module, struct, reg, mem, fifo, in, out, io, attach, \
-                     rule, schedule, or a function)"
+                    "expected an item (module, extmodule, struct, reg, mem, fifo, in, out, \
+                     io, attach, rule, schedule, or a function)"
                         .to_string(),
                 );
                 self.sync();
@@ -323,6 +324,64 @@ impl<'a> Parser<'a> {
         Some(
             self.ast
                 .push_item(Item::Struct { name, fields }, lo..self.prev_end),
+        )
+    }
+
+    /// `extmodule Name from "path.v" { in/out/io port : ty \n ... }`.
+    /// `from` is a contextual word (matched by text), not a reserved
+    /// keyword — see `TokenKind::ExtModule`'s own doc comment.
+    fn parse_extmodule(&mut self) -> Option<ItemId> {
+        let lo = self.cur_span().start;
+        self.bump(); // extmodule
+        let name = self.expect_ident("extmodule name")?;
+        let from = self.expect_ident("`from`")?;
+        if from.text != "from" {
+            self.errors.push(ParseError {
+                span: from.span,
+                message: format!("expected `from`, found `{}`", from.text),
+            });
+            return None;
+        }
+        let path_span = self.expect(TokenKind::Str, "a quoted `.v` path").ok()?;
+        let path_text = self.text(&path_span);
+        let path = path_text[1..path_text.len() - 1].to_string();
+        self.expect(TokenKind::LBrace, "`{` after extmodule path")
+            .ok()?;
+        let mut ports = Vec::new();
+        loop {
+            self.skip_newlines();
+            let dir = match self.peek() {
+                Some(TokenKind::RBrace) => {
+                    self.bump();
+                    break;
+                }
+                None => {
+                    self.error_here("unclosed extmodule body".to_string());
+                    break;
+                }
+                Some(TokenKind::Input) => ExtPortDir::In,
+                Some(TokenKind::Output) => ExtPortDir::Out,
+                Some(TokenKind::Io) => ExtPortDir::Io,
+                _ => {
+                    self.error_here("expected `in`, `out`, or `io`".to_string());
+                    self.sync();
+                    continue;
+                }
+            };
+            self.bump(); // in/out/io
+            let pname = self.expect_ident("port name")?;
+            self.expect(TokenKind::Colon, "`:` before port type").ok()?;
+            let ty = self.parse_expr(TYPE_MIN_BP)?;
+            ports.push(ExtPort {
+                dir,
+                name: pname,
+                ty,
+            });
+            self.expect_terminator();
+        }
+        Some(
+            self.ast
+                .push_item(Item::ExtModule { name, path, ports }, lo..self.prev_end),
         )
     }
 

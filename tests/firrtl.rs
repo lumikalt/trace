@@ -204,6 +204,83 @@ fn an_unattached_io_port_is_not_an_error() {
 }
 
 #[test]
+fn extmodule_tribuf_emits_declaration_with_no_clock_reset_and_attach() {
+    let fir =
+        emit_from_source(&read_example("extmodule_tribuf.tr")).expect("emission should succeed");
+
+    // The extmodule's own bare declaration: interface only, no body, no
+    // clock/reset port (v0 restriction — see ast::ExtPort's doc comment).
+    assert!(fir.contains("extmodule TriBuf :"));
+    assert!(fir.contains("input enable : UInt<1>"));
+    assert!(fir.contains("input data : UInt<8>"));
+    assert!(fir.contains("output sensed : UInt<8>"));
+    assert!(fir.contains("output pad : Analog<8>"));
+    assert!(fir.contains("defname = TriBuf"));
+
+    // The instance gets no clock/reset connect (an extmodule has no such
+    // port to connect one to) but its ordinary in/out ports still wire
+    // exactly like any other instance's.
+    assert!(!fir.contains("connect t.clock"));
+    assert!(!fir.contains("connect t.reset"));
+    assert!(fir.contains("connect t.enable, enable"));
+    assert!(fir.contains("connect t.data, data"));
+    assert!(fir.contains("connect __out_sensed, t.sensed"));
+    assert!(fir.contains("attach(bus, t.pad)"));
+
+    run_firtool(&fir, &[]);
+}
+
+/// An `extmodule` declared lexically inside a module body (not just at
+/// file top level, matching `struct`'s own existing nesting freedom) is
+/// still discovered and declared correctly — self-caught by probing
+/// exactly this shape before trusting `all_extmodules`'s recursion into
+/// `Item::Module` bodies actually reaches it.
+#[test]
+fn a_nested_extmodule_still_emits_its_own_declaration() {
+    let src = "\
+module Top {
+    extmodule TriBuf from \"tribuf.v\" {
+        in enable : [1]
+        io pad : [8]
+    }
+    io bus : [8]
+    inst t : TriBuf
+    attach bus, t.pad
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("extmodule TriBuf :"));
+    assert!(fir.contains("defname = TriBuf"));
+    run_firtool(&fir, &[]);
+}
+
+/// Instantiating the same `extmodule` twice must still declare it exactly
+/// ONCE — `extmodule_ids` dedups by `ItemId` in `firrtl/mod.rs`'s `emit`;
+/// a second, duplicate `extmodule TriBuf :` block would be invalid
+/// FIRRTL (a name firtool can't redeclare).
+#[test]
+fn instantiating_an_extmodule_twice_declares_it_once() {
+    let src = "\
+extmodule TriBuf from \"tribuf.v\" {
+    in enable : [1]
+    io pad : [8]
+}
+
+module Top {
+    io bus1 : [8]
+    io bus2 : [8]
+    inst t1 : TriBuf
+    inst t2 : TriBuf
+    attach bus1, t1.pad
+    attach bus2, t2.pad
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert_eq!(fir.matches("extmodule TriBuf :").count(), 1);
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn port_ram_emits_addressable_memory_through_ports() {
     let fir = emit_from_source(&read_example("port_ram.tr")).expect("emission should succeed");
 
