@@ -9,6 +9,10 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
+# VS Code extension JS dependencies (vscode-languageclient et al.) —
+# installed via `npm install` in editors/vscode, not checked in.
+editors/vscode/node_modules
+
 
 # Added by cargo
 

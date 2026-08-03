@@ -6,6 +6,9 @@
 // on-disk content.
 const vscode = require('vscode');
 const { spawn } = require('child_process');
+const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
+
+let client;
 
 function formatWithTrace(text, bin) {
   return new Promise((resolve, reject) => {
@@ -27,6 +30,22 @@ function formatWithTrace(text, bin) {
   });
 }
 
+function startLanguageClient() {
+  const bin = vscode.workspace.getConfiguration('trace').get('serverPath') || 'trace';
+  // `--lsp` runs the SAME binary formatterPath points at, in server mode
+  // (see src/lsp.rs) — one process, dispatched by argv, not a second
+  // binary to install or keep in sync.
+  const serverOptions = {
+    run: { command: bin, args: ['--lsp'], transport: TransportKind.stdio },
+    debug: { command: bin, args: ['--lsp'], transport: TransportKind.stdio },
+  };
+  const clientOptions = {
+    documentSelector: [{ scheme: 'file', language: 'trace' }],
+  };
+  client = new LanguageClient('trace', 'trace language server', serverOptions, clientOptions);
+  client.start();
+}
+
 function activate(context) {
   const provider = vscode.languages.registerDocumentFormattingEditProvider('trace', {
     async provideDocumentFormattingEdits(document) {
@@ -45,8 +64,14 @@ function activate(context) {
     },
   });
   context.subscriptions.push(provider);
+  startLanguageClient();
 }
 
-function deactivate() {}
+function deactivate() {
+  if (!client) {
+    return undefined;
+  }
+  return client.stop();
+}
 
 module.exports = { activate, deactivate };

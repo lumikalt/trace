@@ -5,6 +5,7 @@ pub mod firrtl;
 pub mod fmt;
 pub mod lexer;
 pub mod lower;
+pub mod lsp;
 pub mod parser;
 pub mod resolve;
 pub mod schedule;

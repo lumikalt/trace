@@ -7,7 +7,7 @@
   "private": true,
   "license": "SEE LICENSE IN ../../LICENSE",
   "engines": {
-    "vscode": "^1.75.0"
+    "vscode": "^1.91.0"
   },
   "categories": [
     "Programming Languages"
@@ -44,8 +44,16 @@
           "type": "string",
           "default": "trace",
           "description": "Path to the trace compiler binary, used for \"Format Document\" (runs `<path> - --fmt`). Must resolve on PATH by default — e.g. via `cargo install --path .` in the repo root, or by launching VS Code from inside `devenv shell`."
+        },
+        "trace.serverPath": {
+          "type": "string",
+          "default": "trace",
+          "description": "Path to the trace compiler binary, used as the language server (runs `<path> --lsp`) for diagnostics, go-to-definition, and hover. Same binary as trace.formatterPath by default — must resolve on PATH, e.g. via `cargo install --path .` in the repo root, or by launching VS Code from inside `devenv shell`."
         }
       }
     }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0"
   }
 }

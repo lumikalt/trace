@@ -3008,9 +3008,60 @@ depth by design — no other construct in the grammar needs this kind of
 special-casing, so the formatter stays a brace counter plus this one
 lexical rule, not a real statement-aware pretty-printer.
 
-There is no language server. Go-to-definition, hover, and inline diagnostics
-come from running `trace file.tr` directly. The grammar is regex-based —
-still pattern matching, not semantic analysis, so it can be fooled (a
+A language server (`trace --lsp`, `src/lsp.rs`) backs diagnostics,
+go-to-definition, and hover in the VS Code extension. It drives the exact
+same `lex -> parse -> resolve -> effects -> types` pipeline `main.rs`
+drives for the CLI — the same functions, called in the same order, so
+there is only ever one place that knows how to compile a `.tr` file, not
+a second implementation to keep in sync. It's a hand-dispatched JSON-RPC
+loop over `lsp-server`/`lsp-types` (full-document sync only: every
+`didChange` recompiles the whole in-editor buffer, cheap enough at these
+file sizes). `Position.character` is a UTF-16 code-unit offset — the LSP
+spec's default, and, as of this writing, the only encoding
+`vscode-languageclient` actually accepts: it hardcodes `positionEncodings:
+['utf-16']` in what it advertises and throws on any `initialize` result
+that claims otherwise, so an earlier version of this that declared
+`PositionEncodingKind::UTF8` (cheaper — this compiler's own `Span =
+Range<usize>` is already byte-based, so UTF-8 would've needed no
+conversion at all, and the spec has allowed it since 3.17) failed
+immediately against the real client with "Unsupported position encoding
+(utf-8)." `LineIndex` (`src/lsp.rs`) does the resulting byte-offset <->
+UTF-16-code-unit conversion on every position in and out, using
+`str::encode_utf16`/`char::len_utf16` rather than assuming ASCII — this
+repo's own `--` comments use em dashes routinely, and a line containing
+one would otherwise silently misalign every position after it on that
+line. Diagnostics accumulate from whichever pipeline phases actually
+ran; matching `main.rs`'s own early-return-on-error chain, a phase after
+the first one with errors never runs at all (its `Resolution`/`Types`
+would be built on an already-invalid AST) — a file with a parse error
+shows only those parse errors, and go-to-definition/hover both need at
+least a clean `resolve` pass (definition) or `types::check` pass (hover's
+inferred-type text; definition works without it) to answer anything.
+Go-to-definition and hover both resolve only identifier *uses* (looked up
+through `Resolution::expr_defs`, the same side table `is_guard_like` and
+every other resolve-consuming pass reads), not declaration sites
+themselves — hovering the `counter` in `reg counter : [8]` is a known gap,
+only a later `counter := ...` resolves. The compiler is single-file (no
+cross-file imports exist yet), so a definition location is always in the
+SAME document as the request — no cross-file URI resolution needed
+anywhere in `lsp.rs`. Verified end-to-end with a hand-rolled JSON-RPC
+client script (not just unit-level): the full `initialize` ->
+`didOpen` -> `hover`/`definition` -> `shutdown` -> `exit` sequence over
+real stdio framing, confirming correct byte-offset<->position math,
+correct definition-jump and inferred-type-in-hover output, and — the one
+real bug this caught — a clean process exit (an earlier version deadlocked
+on shutdown: `run()` was still holding the `Connection` alive across
+`io_threads.join()`, so the writer thread's channel never closed and the
+join blocked forever; fixed by moving `Connection` into `main_loop` so it
+drops, closing that channel, before the join). Also fuzzed against every
+shipped `examples/*.tr` file truncated at five different cut points plus
+several hand-picked adversarial prefixes (`""`, `"module M {"`, `"schedule
+{ mutually_exclusive {"`, ...) to confirm no pipeline phase panics on
+malformed/mid-edit input — a panic would kill the whole server, not just
+fail one request, unlike a CLI invocation.
+
+The grammar is regex-based — still pattern matching, not semantic
+analysis, so it can be fooled (a
 comparison `x < reads` against a variable actually named `reads` reads as
 an opened effects list for that one line — see the grammar's own
 `#effects-list` comment) — but it scopes the contextual effect/directive

@@ -1739,8 +1739,39 @@ manually in the meantime.
 
 ## Editor tooling (`editors/vscode/`)
 
-- No language server: no go-to-definition, hover, or inline diagnostics —
-  only `trace file.tr` on the command line catches real errors.
+- No language server. **RESOLVED.** `trace --lsp` (`src/lsp.rs`) now backs
+  diagnostics, go-to-definition, and hover, driving the exact same `lex ->
+  parse -> resolve -> effects -> types` pipeline `main.rs` uses for the
+  CLI — no second, drifting implementation. Full-document sync (every
+  `didChange` recompiles the whole buffer — cheap at these file sizes),
+  UTF-16 code-unit positions (`LineIndex` in `src/lsp.rs` converts
+  to/from this compiler's own byte-offset `Span`s) — tried the cheaper
+  `positionEncoding: "utf-8"` first (spec-legal since LSP 3.17, and this
+  compiler's `Span` is already byte-based, so it needed zero conversion),
+  but `vscode-languageclient` hardcodes `positionEncodings: ['utf-16']`
+  in what it advertises and rejects anything else outright — caught
+  immediately on first real VS Code use ("Unsupported position encoding
+  (utf-8)"), not by any test here, since the JSON-RPC smoke test client
+  never negotiated capabilities as strictly as a real client does. And
+  diagnostics/definition/hover all degrade in step with `main.rs`'s own
+  early-return-on-error chain (a parse error means no `Resolution` exists
+  yet, so definition/hover answer nothing until it's fixed). Known gap:
+  go-to-definition/hover only resolve identifier *uses*, not declaration
+  sites themselves (hovering the `counter` in `reg counter : [8]` finds
+  nothing; a later `counter := ...` does). Verified end-to-end with a
+  hand-rolled JSON-RPC client script driving real stdio framing through
+  `initialize`/`didOpen`/`hover`/`definition`/`shutdown`/`exit` — this
+  caught a real deadlock on shutdown (`run()` held the `Connection` alive
+  across `io_threads.join()`, so the writer thread's channel never closed;
+  fixed by moving `Connection` into `main_loop` so it drops first) — and
+  fuzzed against every `examples/*.tr` file truncated at 5 cut points plus
+  several hand-picked adversarial prefixes to confirm no pipeline phase
+  panics on malformed input (a panic kills the whole server, not just one
+  request). The VS Code extension wires it up via `vscode-languageclient`
+  (`editors/vscode/extension.js`), spawning `trace --lsp` — the client
+  side of the LSP wiring couldn't be verified in this environment (no way
+  to drive a real VS Code Extension Development Host headlessly); the
+  server side is the part verified above.
 - Grammar is regex-based (TextMate), still pattern matching, not semantic
   analysis. **RESOLVED — the specific "highlights unconditionally, even
   as plain identifiers" gap.** `reads`/`writes`/`combines`/`sequences`/

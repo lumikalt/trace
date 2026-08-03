@@ -3,6 +3,9 @@ use trace::{effects, elaborate, firrtl, fmt, lexer, lower, parser, resolve, sche
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--lsp") {
+        return trace::lsp::run();
+    }
     let explain = args.iter().any(|a| a == "--explain-schedule");
     let show_elaborate = args.iter().any(|a| a == "--elaborate");
     let show_lower = args.iter().any(|a| a == "--lower");
@@ -15,7 +18,7 @@ fn main() -> std::process::ExitCode {
     else {
         eprintln!(
             "usage: trace <file.tr | -> [--explain-schedule] [--elaborate] [--lower] \
-             [--firrtl] [--fmt [--write]]"
+             [--firrtl] [--fmt [--write]]\n       trace --lsp"
         );
         return std::process::ExitCode::FAILURE;
     };
