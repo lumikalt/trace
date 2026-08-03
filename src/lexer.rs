@@ -29,6 +29,18 @@ pub enum TokenKind {
     Input,
     #[token("out")]
     Output,
+    /// `io name : ty` — a structural, bidirectional port (lowers to
+    /// FIRRTL's `Analog` type + `attach`). Unlike `in`/`out`, never
+    /// readable or writable from a rule body — see `attach`, its only
+    /// legal use.
+    #[token("io")]
+    Io,
+    /// `attach a, b` — wires two `io` ports (a module's own, or an
+    /// instance's) together. A structural item, not a rule statement:
+    /// mirrors FIRRTL's own `attach`, an unconditional net connection
+    /// with no clock/cycle semantics.
+    #[token("attach")]
+    Attach,
     #[token("inst")]
     Inst,
     #[token("spec")]

@@ -175,6 +175,35 @@ fn accumulator_emits_real_ports() {
 }
 
 #[test]
+fn io_bus_emits_analog_ports_and_attach() {
+    let fir = emit_from_source(&read_example("io_bus.tr")).expect("emission should succeed");
+
+    assert!(fir.contains("output bus : Analog<8>"));
+    assert!(fir.contains("attach(bus, c.bus)"));
+
+    // Real end-to-end check, not just text matching: firtool must lower
+    // both `bus` ports to genuine Verilog `inout`s, still wired straight
+    // through the instance boundary. Simulation isn't meaningful here —
+    // nothing drives an Analog net at either end, there's no clocked
+    // behavior to observe — so this stops at Verilog emission.
+    let Some(verilog) = run_firtool(&fir, &[]) else {
+        return; // firtool unavailable in this environment
+    };
+    assert!(verilog.contains("inout [7:0] bus"));
+}
+
+/// An `io` port never `attach`ed to anything is legal — probed directly
+/// against firtool before this feature was built: an unconnected `Analog`
+/// port compiles cleanly (just an "empty module" warning, unrelated).
+/// Trace doesn't add its own stricter requirement on top.
+#[test]
+fn an_unattached_io_port_is_not_an_error() {
+    let fir = emit_from_source("module M {\n io bus : [8]\n}\n").expect("emission should succeed");
+    assert!(fir.contains("output bus : Analog<8>"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn port_ram_emits_addressable_memory_through_ports() {
     let fir = emit_from_source(&read_example("port_ram.tr")).expect("emission should succeed");
 

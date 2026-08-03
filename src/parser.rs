@@ -226,6 +226,8 @@ impl<'a> Parser<'a> {
             Some(Fifo) => self.parse_state_decl(Fifo),
             Some(Input) => self.parse_state_decl(Input),
             Some(Output) => self.parse_state_decl(Output),
+            Some(Io) => self.parse_state_decl(Io),
+            Some(Attach) => self.parse_attach(),
             Some(Inst) => self.parse_state_decl(Inst),
             Some(Rule) => self.parse_rule(),
             Some(Ident) => self.parse_fn(FnFlavor::Fn),
@@ -240,8 +242,8 @@ impl<'a> Parser<'a> {
             Some(Schedule) => self.parse_schedule(),
             _ => {
                 self.error_here(
-                    "expected an item (module, struct, reg, mem, fifo, in, out, rule, \
-                     schedule, or a function)"
+                    "expected an item (module, struct, reg, mem, fifo, in, out, io, attach, \
+                     rule, schedule, or a function)"
                         .to_string(),
                 );
                 self.sync();
@@ -325,7 +327,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `reg name : ty (= init)?` / `mem name : ty` / `fifo name : ty` /
-    /// `in name : ty` / `out name : ty (= init)?` /
+    /// `in name : ty` / `out name : ty (= init)?` / `io name : ty` /
     /// `inst name : Module`
     ///
     /// `reg`/`out` may omit `: ty` when initialized with a sized literal
@@ -391,6 +393,10 @@ impl<'a> Parser<'a> {
                 name,
                 ty: ty.unwrap(),
             },
+            TokenKind::Io => Item::Io {
+                name,
+                ty: ty.unwrap(),
+            },
             TokenKind::Inst => Item::Inst {
                 name,
                 module: ty.unwrap(),
@@ -399,6 +405,21 @@ impl<'a> Parser<'a> {
         };
         self.expect_terminator();
         Some(self.ast.push_item(item, lo..self.prev_end))
+    }
+
+    /// `attach a, b` — each operand parsed as a general expression, same
+    /// as `Stmt::Assign`'s `lhs` (see that arm in `parse_stmt`): resolve.rs
+    /// and types.rs are what actually restrict the shape to a bare `io`
+    /// port name or `instance.port`, not the parser.
+    fn parse_attach(&mut self) -> Option<ItemId> {
+        let lo = self.cur_span().start;
+        self.bump(); // attach
+        let a = self.parse_expr(0)?;
+        self.expect(TokenKind::Comma, "`,` between attach operands")
+            .ok()?;
+        let b = self.parse_expr(0)?;
+        self.expect_terminator();
+        Some(self.ast.push_item(Item::Attach { a, b }, lo..self.prev_end))
     }
 
     /// `{depth}elem_ty` — a fifo's depth, written before its element
@@ -679,7 +700,7 @@ impl<'a> Parser<'a> {
         Some(effects)
     }
 
-    /// Name positions accept `reg`/`mem`/`fifo`/`in`/`out` too: they
+    /// Name positions accept `reg`/`mem`/`fifo`/`in`/`out`/`io` too: they
     /// are keywords only at item-declaration position. DESIGN.md itself
     /// writes `reads {mem}`.
     fn at_name(&self) -> bool {
@@ -691,6 +712,7 @@ impl<'a> Parser<'a> {
                 | Some(TokenKind::Fifo)
                 | Some(TokenKind::Input)
                 | Some(TokenKind::Output)
+                | Some(TokenKind::Io)
                 | Some(TokenKind::Inst)
         )
     }
@@ -1116,11 +1138,11 @@ impl<'a> Parser<'a> {
                 }
             }
             // `sync`/`race` are keywords but appear in call position, and
-            // `reg`/`mem`/`fifo`/`in`/`out` are keywords only at
+            // `reg`/`mem`/`fifo`/`in`/`out`/`io` are keywords only at
             // declaration position (`mem[addr]` is an ordinary read). All
             // become plain idents.
             Some(Sync) | Some(Race) | Some(Reg) | Some(Mem) | Some(Fifo) | Some(Input)
-            | Some(Output) => {
+            | Some(Output) | Some(Io) => {
                 let tok = self.bump().unwrap();
                 let name = self.text(&tok.span).to_string();
                 self.ast.push_expr(Expr::Ident(name), tok.span)

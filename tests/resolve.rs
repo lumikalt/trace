@@ -93,6 +93,58 @@ fn output_ports_are_writable_state() {
 }
 
 #[test]
+fn io_ports_cannot_be_read_in_a_rule_body() {
+    let (_, _, errors) = run("module M {\n io x : [8]\n reg y : [8] = 0\n \
+         rule r {\n y := x\n}\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("io port"));
+    assert!(errors[0].message.contains("attach"));
+}
+
+#[test]
+fn io_ports_cannot_be_written_in_a_rule_body() {
+    let (_, _, errors) = run("module M {\n io x : [8]\n \
+         rule r {\n x := 8'd1\n}\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("io port"));
+    assert!(errors[0].message.contains("attach"));
+}
+
+#[test]
+fn io_ports_cannot_be_named_in_reads_or_writes() {
+    let (_, _, errors) = run("module M {\n io x : [8]\n \
+         rule r <reads {x}> {\n tick\n}\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("io port"));
+}
+
+#[test]
+fn attach_resolves_two_bare_io_ports() {
+    let (_, res) = run_ok("module M {\n io a : [8]\n io b : [8]\n attach a, b\n}\n");
+    assert!(resolved_kinds(&res).contains(&DefKind::Io));
+}
+
+#[test]
+fn attach_rejects_a_non_io_bare_operand() {
+    let (_, _, errors) = run("module M {\n io a : [8]\n reg b : [8] = 0\n attach a, b\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot be attached"));
+    assert!(errors[0].message.contains("not an io port"));
+}
+
+#[test]
+fn attach_resolves_an_instance_io_port() {
+    let (_, res) = run_ok(
+        "module Child {\n io bus : [8]\n}\n\
+         module Top {\n io bus : [8]\n inst c : Child\n attach bus, c.bus\n}\n",
+    );
+    // `c.bus` resolves through the generic InstPort scheme, same as any
+    // other instance port -- kind checking (is `bus` actually `io` on
+    // `Child`?) is types.rs's job, per the Input/Output precedent.
+    assert!(resolved_kinds(&res).contains(&DefKind::InstPort));
+}
+
+#[test]
 fn inst_resolves_to_a_module_and_ports_are_fields() {
     let (_, res) = run_ok(
         "module Child {\n in a : [8]\n out b : [8] = 0\n \

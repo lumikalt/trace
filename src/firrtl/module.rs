@@ -88,6 +88,11 @@ pub(crate) fn emit_module(
     let mut inputs: Vec<(String, u64)> = Vec::new();
     // `(port_name, internal_reg_name, width)`.
     let mut outputs: Vec<(String, String, u64)> = Vec::new();
+    // `(port_name, width)` — emits `output name : Analog<width>`.
+    let mut ios: Vec<(String, u64)> = Vec::new();
+    // `(a, b)` — each side already resolved to its own FIRRTL reference
+    // text (a bare port name, or `inst.port`); emits `attach(a, b)`.
+    let mut attaches: Vec<(String, String)> = Vec::new();
     // `(inst_name, target_module's_firrtl_name, inst_def)`.
     let mut instances: Vec<(String, String, DefId)> = Vec::new();
     let mut rules: Vec<ItemId> = Vec::new();
@@ -208,6 +213,25 @@ pub(crate) fn emit_module(
                         );
                     }
                 }
+            }
+            // No struct/Option case: types.rs's `collect_state` already
+            // restricts an `io` port to `Ty::Bits` (v0 restriction — see
+            // that arm's own doc comment), so the only other outcome here
+            // is an already-reported type error, same catch-all as below.
+            Item::Io { name, .. } => {
+                let def = res.item_defs[id];
+                match cx.state_width(def) {
+                    Some(Ty::Bits(Width::Known(w))) => ios.push((name.text.clone(), w)),
+                    _ => {
+                        cx.error(
+                            ast.item_spans[id.0 as usize].clone(),
+                            format!("`{}` has no concrete bit width", name.text),
+                        );
+                    }
+                }
+            }
+            Item::Attach { a, b } => {
+                attaches.push((attach_operand_ref(ast, *a), attach_operand_ref(ast, *b)));
             }
             Item::Output { name, .. } => {
                 let def = res.item_defs[id];
@@ -894,6 +918,9 @@ pub(crate) fn emit_module(
     body.push_str(&reg_body);
     body.push('\n');
     body.push_str(&port_connects);
+    for (a, b) in &attaches {
+        let _ = writeln!(body, "    attach({a}, {b})");
+    }
     Ok(module_block(
         &mod_name.text,
         is_public,
@@ -902,6 +929,7 @@ pub(crate) fn emit_module(
         &mem_ports,
         &inputs,
         &outputs,
+        &ios,
         &instance_decls,
         &body,
     ))
@@ -914,7 +942,29 @@ pub(crate) fn port_bit_width(ty: &Ty) -> Option<u64> {
     }
 }
 
-// Nine genuinely distinct pieces of one module's assembled text, each
+/// An `attach` operand's FIRRTL reference text: a bare `io` port compiles
+/// to its own name; `inst.port` compiles to FIRRTL's own `inst.port`
+/// subfield syntax (same convention `inst_port_value_in_stmts`'s callers
+/// already use for an ordinary instance port, e.g. `module.rs`'s own
+/// `{inst_name}.{port_name}` instance-input wiring above). types.rs's
+/// `check_attaches` has already rejected every other shape, so this only
+/// ever sees one of these two.
+fn attach_operand_ref(ast: &Ast, id: ExprId) -> String {
+    match ast.expr(id) {
+        Expr::Ident(name) => name.clone(),
+        Expr::Field { base, name } => {
+            let Expr::Ident(inst_name) = ast.expr(*base) else {
+                unreachable!(
+                    "resolve.rs only lets an inst's own Ident stand as an attach field base"
+                );
+            };
+            format!("{inst_name}.{name}")
+        }
+        _ => unreachable!("types.rs's check_attaches rejects any other attach operand shape"),
+    }
+}
+
+// Ten genuinely distinct pieces of one module's assembled text, each
 // used once here; a bundling struct would exist solely to satisfy this
 // lint at this one call site, not to clarify anything.
 #[allow(clippy::too_many_arguments)]
@@ -926,6 +976,7 @@ pub(crate) fn module_block(
     mem_ports: &HashMap<String, (Vec<String>, Option<String>)>,
     inputs: &[(String, u64)],
     outputs: &[(String, String, u64)],
+    ios: &[(String, u64)],
     instance_decls: &str,
     body: &str,
 ) -> String {
@@ -939,6 +990,13 @@ pub(crate) fn module_block(
     }
     for (n, _, w) in outputs {
         let _ = writeln!(out, "    output {n} : UInt<{w}>");
+    }
+    // `Analog`'s bidirectionality lives in the type, not a direction
+    // keyword — `output`/`input` are interchangeable here as far as
+    // firtool is concerned (probed directly); `output` is the arbitrary
+    // pick.
+    for (n, w) in ios {
+        let _ = writeln!(out, "    output {n} : Analog<{w}>");
     }
     out.push('\n');
     out.push_str(instance_decls);

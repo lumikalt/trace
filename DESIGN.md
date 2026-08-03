@@ -813,10 +813,48 @@ unconditionally to a port; the outside world sees the committed value one cycle
 after it is computed. A purely combinational module, with no state at all, is not
 expressible in v0.
 
-No `inout` (bidirectional) port kind yet. An `io name : ty` port, comparable to
-`in`/`out`, is wanted (Lumi's call) but is decided-and-blocked, not built — see
-"`io` ports: design, blocked on blackbox support" in TODO.md for why it can't
-simply extend `in`/`out`'s model and what has to land first.
+A third kind, `io name : ty`, is structural rather than rule-integrated —
+comparable to `in`/`out` only in that it's declared alongside them, not in how
+it behaves:
+
+```trace
+io bus : [8]               -- structural bidirectional port; no rule reads or
+                            -- writes it (see below)
+```
+
+`io` lowers to FIRRTL's `Analog` type, which supports exactly one operation,
+`attach` — net-to-net wiring, nothing else. There is no FIRRTL primitive for
+"drive this value when enabled, else float," so an `io` port carries no value
+a rule body could read or write: no `:=`, no comparison, no `reads`/`writes`
+declaration, no effects row at all. The only legal statement touching one is
+`attach`, itself structural (module-level, alongside `reg`/`inst`, not inside
+a rule — an unconditional net connection has no clock/cycle semantics):
+
+```trace
+module Child {
+    io bus : [8]
+}
+
+module Top {
+    io bus : [8]
+    inst c : Child
+
+    attach bus, c.bus   -- wires the two `bus` ports straight through
+}
+```
+
+An `attach` operand is a bare `io` port name (this module's own) or
+`instance.port` (a child's); both sides must be `io`-kind and the same width.
+An `io` port never `attach`ed to anything is legal, not an error — FIRRTL
+itself accepts an unconnected `Analog` port (confirmed directly against
+firtool), and trace adds no stricter requirement on top.
+
+This makes `io` useful only for pass-through wiring today: nothing at the leaf
+of an all-trace design can actually drive tri-state logic onto the net `attach`
+connects. Real tri-state I/O needs a hand-written Verilog module behind an
+`extmodule`/blackbox instance, which trace doesn't support yet — see "`io`
+ports: design, blocked on blackbox support" in TODO.md for that half of the
+story.
 
 ```trace
 module Accumulator {
@@ -2763,6 +2801,9 @@ noted:
   bit-vector type (told apart from a list literal by content, not position).
 - Module ports (`in`/`out`), including boot-loading a memory through
   ports with a `boot_done` handshake (`examples/subleq_boot.tr`).
+- Structural `io` ports + `attach` (`examples/io_bus.tr`) — pass-through
+  wiring only; real tri-state drive needs blackbox support, not yet built
+  (see TODO.md).
 - FIFO synthesis, including the enqueue/dequeue pass-through case
   (`examples/fifo_bridge.tr`, `examples/fifo_passthrough.tr`).
 - Port-based memory access (`examples/port_ram.tr`).

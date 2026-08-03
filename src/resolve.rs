@@ -46,6 +46,11 @@ pub enum DefKind {
     Fifo,
     Input,
     Output,
+    /// An `io name : ty` structural port. Unlike every other `is_state()`
+    /// kind, never legally read or written as a value anywhere — its only
+    /// legal use is as an `Item::Attach` operand (see `resolve_attach_
+    /// operand`, the one resolution path that doesn't reject it).
+    Io,
     /// A `inst name : Module` child instance.
     Inst,
     /// One specific port of an `inst`, e.g. `c.a` — synthesized on first
@@ -71,6 +76,7 @@ impl DefKind {
                 | DefKind::Fifo
                 | DefKind::Input
                 | DefKind::Output
+                | DefKind::Io
                 | DefKind::Inst
                 | DefKind::InstPort
         )
@@ -86,6 +92,7 @@ impl DefKind {
             DefKind::Fifo => "a fifo",
             DefKind::Input => "an input port",
             DefKind::Output => "an output port",
+            DefKind::Io => "an io port",
             DefKind::Inst => "a module instance",
             DefKind::InstPort => "a module instance port",
             DefKind::Rule => "a rule",
@@ -370,6 +377,8 @@ impl<'a> Resolver<'a> {
             Item::Fifo { name, .. } => (name.clone(), DefKind::Fifo),
             Item::Input { name, .. } => (name.clone(), DefKind::Input),
             Item::Output { name, .. } => (name.clone(), DefKind::Output),
+            Item::Io { name, .. } => (name.clone(), DefKind::Io),
+            Item::Attach { .. } => return,
             Item::Inst { name, .. } => (name.clone(), DefKind::Inst),
             Item::Rule { name, .. } => (name.clone(), DefKind::Rule),
             Item::Fn { name, kind, .. } => {
@@ -405,8 +414,18 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(*init, false);
                 }
             }
-            Item::Mem { ty, .. } | Item::Fifo { ty, .. } | Item::Input { ty, .. } => {
+            Item::Mem { ty, .. }
+            | Item::Fifo { ty, .. }
+            | Item::Input { ty, .. }
+            | Item::Io { ty, .. } => {
                 self.resolve_expr(*ty, false);
+            }
+            // The one legal place to reference an `io` port: `resolve_
+            // attach_operand`, unlike `resolve_expr`, doesn't reject
+            // `DefKind::Io`.
+            Item::Attach { a, b } => {
+                self.resolve_attach_operand(*a);
+                self.resolve_attach_operand(*b);
             }
             // Field names are structural, not scoped idents (matching a
             // module's port names or a fifo's element type) — only each
@@ -564,6 +583,15 @@ impl<'a> Resolver<'a> {
                         arg.span.clone(),
                         format!("cannot find state `{}`", arg.text),
                     ),
+                    Some(def) if self.res.def(def).kind == DefKind::Io => self.error(
+                        arg.span.clone(),
+                        format!(
+                            "`{}` is an io port; io ports carry no value and can't be named \
+                             in `reads`/`writes` (only `attach` touches one, and it's never \
+                             part of a rule)",
+                            arg.text
+                        ),
+                    ),
                     Some(def) if !self.res.def(def).kind.is_state() => self.error(
                         arg.span.clone(),
                         format!(
@@ -610,6 +638,15 @@ impl<'a> Resolver<'a> {
                                             "cannot assign to `{text}`: it is an input port \
                                              (inputs are read-only, driven from outside the \
                                              module)"
+                                        ),
+                                    );
+                                } else if self.res.def(def).kind == DefKind::Io {
+                                    self.error(
+                                        self.ast.expr_spans[lhs.0 as usize].clone(),
+                                        format!(
+                                            "cannot assign to `{text}`: it is an io port (io \
+                                             ports carry no value — the only legal use is \
+                                             `attach`ing it to another io port)"
                                         ),
                                     );
                                 } else if self.res.def(def).kind == DefKind::Inst {
@@ -732,6 +769,49 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// An `attach` operand: a bare `io` port name, or `inst.port` (an
+    /// instance's `io` port, checked further in types.rs via `find_port`
+    /// the same way an instance's `in`/`out` ports already are). Bare
+    /// names resolve here directly rather than through `resolve_expr`,
+    /// since that generic path rejects `DefKind::Io` outright — this is
+    /// the one place that must NOT.
+    fn resolve_attach_operand(&mut self, id: ExprId) {
+        let Expr::Ident(text) = self.ast.expr(id).clone() else {
+            // `inst.port` and anything else: the generic Field arm
+            // already resolves `inst.port` without an Io-specific ban
+            // (deferred to types.rs, same as Input/Output); any other
+            // shape resolves fine too and is rejected as the wrong shape
+            // in types.rs's own attach check.
+            self.resolve_expr(id, false);
+            return;
+        };
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let Some(def) = self.lookup(&text) else {
+            self.error(span, format!("cannot find `{text}`"));
+            return;
+        };
+        // `is_state()` is true for every def this fn accepts (Io) and
+        // every wrong-kind def worth a boundary check too; only a
+        // genuinely non-state name (a rule, a fn, ...) skips it, matching
+        // `resolve_expr`'s own `in_scope` guard above.
+        if self.res.def(def).kind.is_state()
+            && !self.check_module_boundary(def, span.clone(), &text)
+        {
+            return;
+        }
+        if self.res.def(def).kind != DefKind::Io {
+            self.error(
+                span,
+                format!(
+                    "`{text}` cannot be attached: it is {}, not an io port",
+                    self.res.def(def).kind.describe()
+                ),
+            );
+            return;
+        }
+        self.res.expr_defs.insert(id, def);
+    }
+
     /// `in_type`: name misses bind implicit parameters instead of erroring
     /// (only signature types pass true).
     fn resolve_expr(&mut self, id: ExprId, in_type: bool) {
@@ -744,7 +824,16 @@ impl<'a> Resolver<'a> {
                             self.ast.expr_spans[id.0 as usize].clone(),
                             &text,
                         );
-                    if ok {
+                    if ok && self.res.def(def).kind == DefKind::Io {
+                        self.error(
+                            self.ast.expr_spans[id.0 as usize].clone(),
+                            format!(
+                                "cannot use `{text}` as a value: it is an io port (io ports \
+                                 carry no value — the only legal use is `attach`ing it to \
+                                 another io port)"
+                            ),
+                        );
+                    } else if ok {
                         self.res.expr_defs.insert(id, def);
                         self.read_locals.insert(def);
                     }

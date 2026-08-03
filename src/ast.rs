@@ -372,6 +372,24 @@ pub enum Item {
         ty: ExprId,
         init: Option<ExprId>,
     },
+    /// `io name : ty` — a structural bidirectional port (lowers to
+    /// FIRRTL's `Analog` type). No initializer: it carries no value a
+    /// reset could apply to. Never readable/writable from a rule body —
+    /// see `Item::Attach`, its only legal use.
+    Io {
+        name: Name,
+        ty: ExprId,
+    },
+    /// `attach a, b` — wires two `io` ports together (FIRRTL's own
+    /// `attach`). `a`/`b` are always a bare `Ident` (a module-local `io`
+    /// port) or a `Field { base: Ident(inst), name }` (an instance's `io`
+    /// port); parsed as general expressions, like `Stmt::Assign`'s `lhs`,
+    /// and validated to that shape in resolve.rs/types.rs rather than
+    /// restricted at parse time.
+    Attach {
+        a: ExprId,
+        b: ExprId,
+    },
     /// `inst name : Module` — a child module instance. `module` is an
     /// identifier expression naming a sibling top-level `module`, not a
     /// `bits[...]` type; ports are accessed as `name.port`.
@@ -598,6 +616,16 @@ impl Ast {
                     out.push_str(&format!(" = {}", self.expr_sexpr(*init)));
                 }
                 out.push('\n');
+            }
+            Item::Io { name, ty } => {
+                out.push_str(&format!("{pad}io {name} : {}\n", self.expr_sexpr(*ty)));
+            }
+            Item::Attach { a, b } => {
+                out.push_str(&format!(
+                    "{pad}attach {}, {}\n",
+                    self.expr_sexpr(*a),
+                    self.expr_sexpr(*b)
+                ));
             }
             Item::Inst { name, module } => {
                 out.push_str(&format!(

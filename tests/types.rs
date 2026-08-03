@@ -552,6 +552,87 @@ fn instance_ports_check_direction_and_width() {
 }
 
 #[test]
+fn instance_io_ports_cannot_be_read_or_written_from_a_rule_body() {
+    let child = "module Child {\n io bus : [8]\n}\n";
+
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n inst c : Child\n reg v : [8] = 0\n \
+         rule w {{\n c.bus := v\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("io port")));
+
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n inst c : Child\n reg v : [8] = 0\n \
+         rule w {{\n v := c.bus\n}}\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("io port")));
+}
+
+#[test]
+fn attach_accepts_two_matching_width_io_ports() {
+    run_ok("module M {\n io a : [8]\n io b : [8]\n attach a, b\n}\n");
+    run_ok(
+        "module Child {\n io bus : [8]\n}\n\
+         module Top {\n io bus : [8]\n inst c : Child\n attach bus, c.bus\n}\n",
+    );
+}
+
+#[test]
+fn attach_rejects_mismatched_widths() {
+    let (_, _, errors) = run("module M {\n io a : [8]\n io b : [16]\n attach a, b\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("same type"));
+}
+
+#[test]
+fn attach_rejects_a_non_io_instance_port() {
+    let child = "module Child {\n out b : [8] = 0\n}\n";
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n io a : [8]\n inst c : Child\n attach a, c.b\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("not an io port")));
+}
+
+#[test]
+fn attach_rejects_a_sibling_modules_own_name_instead_of_an_instance() {
+    // `A.bus` here names the MODULE `A`, not a bound `inst c : A` — a
+    // shape that must be rejected here rather than reach emission (it
+    // isn't `instance.port`, and letting it through would emit FIRRTL
+    // referencing a declaration that doesn't exist in this module's own
+    // scope; firtool would reject it with a confusing raw error instead
+    // of trace giving a clean one -- self-caught by probing exactly this).
+    let (_, _, errors) = run("module A {\n io bus : [8]\n}\n\
+         module Top {\n io bus : [8]\n inst c : A\n attach bus, A.bus\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("instance.port"));
+}
+
+#[test]
+fn attach_rejects_an_unknown_instance_port() {
+    let child = "module Child {\n io bus : [8]\n}\n";
+    let (_, _, errors) = run(&format!(
+        "{child}module Top {{\n io a : [8]\n inst c : Child\n attach a, c.nope\n}}\n"
+    ));
+    assert!(errors.iter().any(|e| e.message.contains("no port")));
+}
+
+#[test]
+fn io_port_holds_a_plain_bit_width_not_a_struct() {
+    let src = "\
+struct Pair {
+    x : [8]
+    y : [8]
+}
+
+module M {
+    io p : Pair
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(errors.iter().any(|e| e.message.contains("plain bit width")));
+}
+
+#[test]
 fn spawn_types_a_handle_whose_result_and_done_fields_are_readable() {
     let src = "\
 Slow(x : [8]) : [8] <sequences> {

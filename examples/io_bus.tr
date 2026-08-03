@@ -1,0 +1,10 @@
+module Child {
+    io bus : [8]
+}
+
+module Top {
+    io bus : [8]
+    inst c : Child
+
+    attach bus, c.bus
+}

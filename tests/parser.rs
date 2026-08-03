@@ -130,6 +130,68 @@ fn decl_keywords_are_contextual() {
 }
 
 #[test]
+fn io_port_parses_name_and_type() {
+    let ast = parse_ok("module M {\n io bus : [8]\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Io { name, ty } = ast.item(items[0]) else {
+        panic!("expected an io port");
+    };
+    assert_eq!(name.text, "bus");
+    assert_eq!(ast.expr_sexpr(*ty), "(index bits 8)");
+}
+
+#[test]
+fn io_port_requires_an_explicit_type() {
+    let (tokens, _) = lexer::lex("module M {\n io bus\n}\n");
+    let (_, errors) = parser::parse("module M {\n io bus\n}\n", &tokens);
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn io_port_rejects_an_initializer() {
+    let (tokens, _) = lexer::lex("module M {\n io bus : [8] = 0\n}\n");
+    let (_, errors) = parser::parse("module M {\n io bus : [8] = 0\n}\n", &tokens);
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn attach_parses_two_operands() {
+    let ast = parse_ok("module M {\n io a : [8]\n io b : [8]\n attach a, b\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Attach { a, b } = ast.item(items[2]) else {
+        panic!("expected an attach item");
+    };
+    assert_eq!(ast.expr_sexpr(*a), "a");
+    assert_eq!(ast.expr_sexpr(*b), "b");
+}
+
+#[test]
+fn attach_parses_an_instance_field_operand() {
+    let ast = parse_ok("module M {\n io a : [8]\n inst c : Child\n attach a, c.bus\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Attach { b, .. } = ast.item(items[2]) else {
+        panic!("expected an attach item");
+    };
+    assert_eq!(ast.expr_sexpr(*b), "(. c bus)");
+}
+
+#[test]
+fn attach_requires_a_comma_between_operands() {
+    let (tokens, _) = lexer::lex("module M {\n io a : [8]\n io b : [8]\n attach a b\n}\n");
+    let (_, errors) = parser::parse(
+        "module M {\n io a : [8]\n io b : [8]\n attach a b\n}\n",
+        &tokens,
+    );
+    assert!(!errors.is_empty());
+}
+
+#[test]
 fn spawn_prefix() {
     assert_eq!(
         stmt_sexpr("h1 := spawn ReadBank(bank0, pc)"),

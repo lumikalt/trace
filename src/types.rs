@@ -166,6 +166,7 @@ pub fn check(ast: &Ast, res: &Resolution) -> (Types, Vec<TypeError>) {
     checker.collect_structs();
     checker.collect_state();
     checker.collect_module_ports();
+    checker.check_attaches();
     checker.check_all();
     // Runs last: needs every body's `expr_tys` already populated (see
     // `Destructure::source_field_base`'s own doc comment, ast.rs), and
@@ -305,6 +306,22 @@ impl<'a> TypeChecker<'a> {
                     ) {
                         let span = self.ast.item_spans[id.0 as usize].clone();
                         self.error(span, format!("an input holds bits or a struct, not {ty}"));
+                    }
+                    self.state_tys.insert(def, ty);
+                }
+                // `io` lowers to FIRRTL's `Analog<N>`, a plain N-bit net —
+                // no struct/Option shape (v0 restriction: neither has an
+                // established Analog-bundle equivalent, and nothing
+                // downstream needs one since an io port is never read or
+                // written as a value, only `attach`ed whole).
+                Item::Io { ty, .. } => {
+                    let ty = self.eval_ty(ty, &HashMap::new());
+                    if !matches!(ty, Ty::Bits(_) | Ty::Unknown) {
+                        let span = self.ast.item_spans[id.0 as usize].clone();
+                        self.error(
+                            span,
+                            format!("an io port holds a plain bit width, not {ty}"),
+                        );
                     }
                     self.state_tys.insert(def, ty);
                 }
@@ -534,7 +551,7 @@ impl<'a> TypeChecker<'a> {
                 let mut ports = Vec::new();
                 for item_id in &items {
                     match self.ast.item(*item_id) {
-                        Item::Input { .. } | Item::Output { .. } => {
+                        Item::Input { .. } | Item::Output { .. } | Item::Io { .. } => {
                             if let Some(&def) = self.res.item_defs.get(item_id) {
                                 let kind = self.res.def(def).kind;
                                 let ty = self.state_tys.get(&def).cloned().unwrap_or(Ty::Unknown);
@@ -571,6 +588,101 @@ impl<'a> TypeChecker<'a> {
             .iter()
             .find(|(n, _, _)| n == name)
             .map(|(_, k, t)| (*k, t.clone()))
+    }
+
+    /// `attach a, b`'s type/kind check for one operand — resolve.rs has
+    /// already restricted a bare-name operand to `DefKind::Io` (see
+    /// `resolve_attach_operand`), so only the `inst.port` shape (and
+    /// anything not even Ident/Field, which resolve.rs lets through
+    /// unrestricted since it isn't a bare name) needs checking here.
+    fn attach_operand(&mut self, id: ExprId) -> Option<Ty> {
+        match self.ast.expr(id).clone() {
+            Expr::Ident(_) => {
+                let def = self.res.expr_defs.get(&id).copied()?;
+                self.state_tys.get(&def).cloned()
+            }
+            Expr::Field { base, name } => {
+                // Unlike an ordinary `.field` read/write (which falls back
+                // to struct/handle field access when `base` isn't an
+                // instance), an attach operand's ONLY legal `.field` shape
+                // is `instance.port` — falling through silently here would
+                // let a sibling module's own NAME (not a bound `inst`)
+                // reach emission unchecked, producing FIRRTL referencing a
+                // declaration that doesn't exist in this module's scope
+                // (self-caught: `attach bus, A.bus` where `A` is a module,
+                // not an `inst c : A`, emitted clean with zero trace error
+                // and firtool then rejected it with `use of unknown
+                // declaration 'A'` — a confusing raw-FIRRTL error instead
+                // of a real one).
+                let Some(module_def) = self.instance_module_of(base) else {
+                    self.error(
+                        self.expr_span(id),
+                        "an attach operand must be an io port name, or `instance.port` \
+                         (this isn't a reference to a module instance)"
+                            .to_string(),
+                    );
+                    return None;
+                };
+                self.types.expr_tys.insert(base, Ty::Unknown);
+                match self.find_port(module_def, &name) {
+                    Some((DefKind::Io, ty)) => Some(ty),
+                    Some((_, _)) => {
+                        self.error(
+                            self.expr_span(id),
+                            format!(
+                                "cannot attach `.{name}`: it is not an io port on this instance"
+                            ),
+                        );
+                        None
+                    }
+                    None => {
+                        self.error(
+                            self.expr_span(id),
+                            format!("this instance has no port `{name}`"),
+                        );
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.error(
+                    self.expr_span(id),
+                    "an attach operand must be an io port name, or `instance.port`".to_string(),
+                );
+                None
+            }
+        }
+    }
+
+    /// `attach a, b`: both operands must be `io` ports (checked per-
+    /// operand by `attach_operand`) of the same width — FIRRTL's own
+    /// `attach` doesn't itself require matching widths between an
+    /// arbitrary N operands, but two DIFFERENTLY-sized `Analog` nets
+    /// wired together has no sensible meaning for this language's model,
+    /// so it's rejected here rather than left to whatever firtool would
+    /// do with it.
+    fn check_attaches(&mut self) {
+        self.emit = true;
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            match self.ast.item(id).clone() {
+                Item::Module { items, .. } => stack.extend(items),
+                Item::Attach { a, b } => {
+                    let ta = self.attach_operand(a);
+                    let tb = self.attach_operand(b);
+                    if let (Some(ta), Some(tb)) = (ta, tb)
+                        && ta != tb
+                    {
+                        self.error(
+                            self.ast.item_spans[id.0 as usize].clone(),
+                            format!("attach operands must have the same type: {ta} vs {tb}"),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.emit = false;
     }
 
     /// A fifo's type is either a bare element type (`bits[8]`, depth 1)
@@ -1222,6 +1334,14 @@ impl<'a> TypeChecker<'a> {
                             );
                             self.check_literal_fits(rhs, &port_ty);
                         }
+                        Some((DefKind::Io, _)) => self.error(
+                            self.expr_span(lhs),
+                            format!(
+                                "cannot write `{name}`: it is an io port on this instance \
+                                 (io ports carry no value — the only legal use is `attach`ing \
+                                 it to another io port)"
+                            ),
+                        ),
                         Some((_, _)) => self.error(
                             self.expr_span(lhs),
                             format!(
@@ -1549,6 +1669,17 @@ impl<'a> TypeChecker<'a> {
                     self.types.expr_tys.insert(base, Ty::Unknown);
                     match self.find_port(module_def, &name) {
                         Some((DefKind::Output, port_ty)) => port_ty,
+                        Some((DefKind::Io, _)) => {
+                            self.error(
+                                self.expr_span(id),
+                                format!(
+                                    "cannot read `{name}`: it is an io port on this instance \
+                                     (io ports carry no value — the only legal use is \
+                                     `attach`ing it to another io port)"
+                                ),
+                            );
+                            Ty::Unknown
+                        }
                         Some((_, _)) => {
                             self.error(
                                 self.expr_span(id),

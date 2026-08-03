@@ -1653,104 +1653,70 @@ sugar's existence means the hand-written `trigger`/`trigger?` pattern in the
 replace — a level-sensitive or `reg`-backed enable still needs the manual
 form).
 
-## `io` ports: design, blocked on blackbox support (decided, blocked on a prerequisite)
+## `io` ports: structural half RESOLVED; real tri-state still blocked on blackbox support
 
 **`io name : ty` — a third port kind alongside `in`/`out` (Lumi's call).**
-Requested, then briefly rejected as a non-goal, then re-requested — the
-non-goal call was made from documentation alone; this write-up is from
-probing firtool 1.147.0 directly instead. The technical picture is more
-specific than "hard," and changes what "comparable to `in`/`out`" can
-actually mean.
+The design write-up below (probing firtool 1.147.0 directly, not reasoning
+from docs alone) split this into two tiers; tier 1 is now built, tier 2
+remains an unbuilt prerequisite for anything beyond pass-through wiring.
 
-**Confirmed: FIRRTL's `Analog` type does lower to a real Verilog `inout`,
-and `attach` between two `Analog` ports does work — not assumed, probed
-directly:**
+**Tier 1 — structural `io` + `attach` — RESOLVED, built.** `io name : ty`
+lowers to FIRRTL's `Analog<N>` (a plain N-bit port, `output`/`input` both
+work identically — Analog's bidirectionality lives in the type, not a
+direction keyword, confirmed by probing both). The only legal statement
+touching one is `attach a, b` (a new module-level item, alongside `reg`/
+`inst`, not inside a rule — unconditional net wiring has no clock/cycle
+semantics), where each operand is a bare `io` name or `instance.port`, both
+sides must be `io`-kind and the same width. Confirmed end-to-end against
+real firtool: a parent's `io bus` `attach`ed to a child instance's own `io
+bus` lowers to genuine Verilog `inout [7:0] bus` ports, wired straight
+through the instance boundary. Since there is no FIRRTL operation for a
+rule body to perform on an `Analog` value (see the still-true technical
+finding below), `io` needed no effects-row/`sig.reads`/`sig.writes`
+integration at all — resolve.rs rejects any bare read/write outright
+(`DefKind::Io`, checked in `resolve_expr`'s `Ident` arm and `resolve_stmt`'s
+`Assign` arm), and types.rs rejects the `instance.port` form the same way
+`in`/`out` port-direction mismatches already are (`find_port`'s `DefKind::
+Io` arm). See DESIGN.md's "Module ports" section for the user-facing
+description.
 
-```firrtl
-output bus : Analog<8>
-output other : Analog<8>
-attach(bus, other)
-```
+**Still true, still the reason tier 1 alone has no use on its own:**
+`attach` is the only operation FIRRTL's `Analog` type supports, and it's
+net-to-net only — both operands must themselves be `Analog`. Probed
+directly: `attach(bus, data)` with `data : UInt<8>` (an ordinary port) is
+rejected, `operand #1 must be variadic of analog type, but got
+'!firrtl.uint<8>'`. There is no FIRRTL primitive for "drive this `UInt`
+value onto the bus when `enable`, else float." This matches Chisel's own
+documented stance on `Analog` (found via web search): *"Analog support is
+limited to allowing wiring up of Verilog BlackBoxes with bidirectional
+(inout) pins. There is currently no support for reading or writing of
+Analog types within Chisel code."* So a structural `io` port with nothing
+on the other end of its `attach` is a dead-end wire — nothing at the leaf
+of an all-trace design can actually drive tri-state logic.
 
-lowers cleanly through firtool to
-
-```verilog
-inout [7:0] bus, other;
-`ifdef SYNTHESIS
-  assign bus = other;
-  assign other = bus;
-`else
-  alias bus = other;
-`endif
-```
-
-(`inout` itself is not valid FIRRTL *port-declaration* syntax — probed and
-rejected, `error: use of unknown declaration 'inout'`; the bidirectionality
-lives in the `Analog` **type**, declared with the ordinary `output`/`input`
-keyword, not a third direction keyword.)
-
-**But: `attach` is the only operation `Analog` supports, and it is net-to-net
-only — both operands must themselves be `Analog`.** Probed directly:
-`attach(bus, data)` with `data : UInt<8>` (an ordinary port) is rejected,
-`operand #1 must be variadic of analog type, but got '!firrtl.uint<8>'`.
-There is no FIRRTL primitive for "drive this `UInt` value onto the bus when
-`enable`, else float" — the exact shape `io` would need to be read/written
-from a rule body the way `in`/`out` are. This matches Chisel's own
-documented stance on `Analog` (found via web search, not just inferred from
-the two error messages above): *"Analog support is limited to allowing
-wiring up of Verilog BlackBoxes with bidirectional (inout) pins. There is
-currently no support for reading or writing of Analog types within Chisel
-code."*
-
-**Consequence: an `io` port cannot join `sig.reads`/`sig.writes`, cannot be
-compared or assigned to with `:=`, and needs no effects tracking at all —
-not because it wasn't built yet, but because there is no legal FIRRTL
-operation for a rule body to perform on one.** The only legal use is
-`attach`ing it to another `Analog` net. So `io` is not an extension of
-`in`/`out`'s rule-integrated model; it is a different, purely structural
-declare-and-wire kind, syntactically comparable to `in`/`out` but not
-semantically comparable inside a rule body.
-
-**What that leaves is buildable in two tiers, and the first is useless
-alone:**
-
-1. **Structural `io` + `attach`.** Declare `io name : ty` on a module; the
-   only legal statement involving it is wiring it to another `io` port —
-   e.g. a parent's `io` port `attach`ed straight through to a child
-   instance's own `io` port, mirroring "Submodule emission"'s existing
-   `inst name : Module` instantiation, but for an Analog pass-through
-   instead of an ordinary driven port. Small, and mechanically close to
-   what's already confirmed to work above.
-2. **Blackbox/extmodule declaration and instantiation — genuinely new,
-   entirely unbuilt (confirmed: `grep -rn "extmodule\|blackbox\|Analog\|
-   attach" src/` matches nothing but unrelated doc-comment homonyms).** Real
-   tri-state drive logic has to live in a hand-written Verilog module,
-   referenced from trace as something like `extmodule Name { ports... }`
-   (declares an external module's port list, including an `Analog` pin, with
-   no trace-level body), instantiated like an ordinary module (`inst x :
-   Name`), with its ordinary `UInt` ports (`enable`, `data`, ...) driven by
-   rule logic exactly like any other instance port today (same
-   per-port-conflict-resource model "Submodule emission" already gives
-   ordinary instances), and its `Analog` pin left untouched by any rule,
-   only ever reachable via `attach`.
-
-Tier 1 alone has no use: nothing at the leaf of an all-trace design can
-actually drive tri-state logic, so a structural `io` port with nothing on
-the other end of its `attach` is a dead-end wire. Tier 2 is the actual
-prerequisite; tier 1 is what makes tier 2's blackbox instance reachable from
-a module's own external port list once tier 2 exists. Both are needed
-together for `io` to do anything real.
+**Tier 2 — blackbox/extmodule declaration and instantiation — still
+genuinely new, entirely unbuilt** (confirmed: `grep -rn "extmodule\|
+blackbox" src/` matches nothing). Real tri-state drive logic has to live in
+a hand-written Verilog module, referenced from trace as something like
+`extmodule Name { ports... }` (declares an external module's port list,
+including an `Analog` pin, with no trace-level body), instantiated like an
+ordinary module (`inst x : Name`), with its ordinary `UInt` ports
+(`enable`, `data`, ...) driven by rule logic exactly like any other
+instance port today (same per-port-conflict-resource model "Submodule
+emission" already gives ordinary instances), and its `Analog` pin left
+untouched by any rule, only ever reachable via the now-built `attach`. This
+is the actual prerequisite for `io` to do anything beyond pass-through
+wiring.
 
 Not designed further here — genuinely open, not just unstated: exact
 `extmodule` declaration syntax; how the external Verilog source is
 referenced (inline string literal, a separate file path, a build-managed
 asset); whether `extmodule` ports need their own direction vocabulary
-distinct from `in`/`out`; whether `io` can be declared per-submodule-instance
-or only at a design's true top level; and the simulation story — Icarus
-needs an actual Verilog implementation to simulate a blackbox against, not
-just a port list, so `devenv shell -- simulate` would need a real
-tri-state-buffer `.v` file to exist for any example using this feature, not
-merely a synthesizable stub.
+distinct from `in`/`out`; and the simulation story — Icarus needs an actual
+Verilog implementation to simulate a blackbox against, not just a port
+list, so `devenv shell -- simulate` would need a real tri-state-buffer `.v`
+file to exist for any example using this feature, not merely a
+synthesizable stub.
 
 ## Scheduler / arrays
 
