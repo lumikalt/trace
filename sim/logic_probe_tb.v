@@ -1,4 +1,4 @@
-// Icarus testbench for examples/logic_probe.tr, proving `logic(...)`
+// Icarus testbench for examples/logic_probe.tr, proving `logic <expr>`
 // through real firtool + simulation: `input_ready`/`x_valid` are pure
 // status reads (no side effect of their own), and coexist correctly
 // with `drain`'s REAL dequeue of the SAME fifo in the SAME cycle

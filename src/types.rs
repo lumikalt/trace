@@ -1597,6 +1597,21 @@ impl<'a> TypeChecker<'a> {
                 self.type_expr(inner, locals);
                 Ty::Optional(inner)
             }
+            // `logic <expr>`: converts a fallible expression into a
+            // plain boolean, always `bits[1]` regardless of `expr`'s own
+            // type — `expr` is still type-checked normally (populating
+            // `expr_tys`, running ordinary diagnostics), just its
+            // resulting Ty is discarded here. Whether `expr` is actually
+            // a fallible SHAPE (a fifo op, or a call to a guard-only
+            // `<fails>` fn/impl) isn't a width/type question — checked
+            // later in firrtl/checks.rs's `check_logic_args`, once
+            // effects.rs's inferred signatures exist to consult,
+            // matching where `check_failing_call_positions`/`check_
+            // fifo_op_positions` already live for the same reason.
+            Expr::Logic(inner) => {
+                self.type_expr(inner, locals);
+                Ty::Bits(Width::Known(1))
+            }
         }
     }
 
@@ -1971,23 +1986,6 @@ impl<'a> TypeChecker<'a> {
                 Some(Ty::Bits(Width::Known(w))) => Ty::Bits(Width::Known(clog2(*w).max(1))),
                 _ => Ty::Bits(Width::Unknown),
             },
-            // `logic(e)`: converts a fallible expression into a plain
-            // boolean, always `bits[1]` regardless of `e`'s own type —
-            // `e` is still type-checked normally above (as any argument
-            // is), just its resulting Ty is discarded here. Whether `e`
-            // is actually a fallible SHAPE (a fifo op, or a call to a
-            // guard-only `<fails>` fn/impl) isn't a width/type question
-            // — checked later in firrtl/checks.rs's `check_logic_args`,
-            // once effects.rs's inferred signatures exist to consult,
-            // matching where `check_failing_call_positions`/`check_
-            // fifo_op_positions` already live for the same reason.
-            "logic" => {
-                if args.len() != 1 {
-                    self.error(self.expr_span(id), "`logic` takes one argument".to_string());
-                    return Ty::Unknown;
-                }
-                Ty::Bits(Width::Known(1))
-            }
             "sync" => Ty::Unit,
             // Guard-only (`race[...]` as its own statement) never reads
             // this type; value-producing (`value := race[...]`) does —

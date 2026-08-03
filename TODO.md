@@ -590,11 +590,44 @@ committed to.
 
 Worth building:
 
-- `logic(...)` boolean-success operator ACHIEVED — see DESIGN.md's
+- `logic <expr>` boolean-success operator ACHIEVED — see DESIGN.md's
   "Builtins" section for the full write-up (semantics, the guard+write
   v0 restriction and why it mirrors Verse's own `<decides>`/`<transacts>`
   split, examples). Confirmed as a real Verse port (`02_primitives`'s
-  `logic{ exp }`), not just a plausible trace-only name.
+  `logic{ exp }`), not just a plausible trace-only name. **Follow-up:
+  reworked from `logic(...)` call syntax into a real prefix OPERATOR
+  (Lumi's call, step one of building on the comparisons-as-fallible
+  decision above — `logic` needs to read a bare operand, including
+  eventually a bare fallible comparison, not force parens around
+  everything).** A genuine AST node now (`Expr::Logic`, ast.rs), a
+  dedicated lexer keyword, parsed at the same precedence tier as `not`/
+  `optional`/`spawn` — not resolved as an identifier against the
+  `BUILTINS` list the way `prio`/`trunc`/`pack` still are. `logic(e)`
+  still parses (parens are just grouping, absorbed by the operand
+  parse), but every example/test now uses the bare form as the
+  canonical spelling.
+  **Second follow-up: lowered `logic`'s operand parse from `PREFIX_BP`
+  to `0` (Lumi's call — "logic a>b looks neater" than `logic (a > b)`)
+  — a full expression, same as a parenthesized group's inner parse, not
+  the tight `not`/`optional`/`spawn` tier anymore.** `logic a > b` now
+  reads as `logic (a > b)` with no parens needed, the actual point of
+  asking. Traded away deliberately, not a surprise found later: this
+  language's bitwise operators (`&`/`|`/`^`) bind TIGHTER than
+  comparisons (Rust-style, `precedence_matches_rust_not_c`), so no
+  single threshold can swallow a bare comparison without ALSO
+  swallowing `&`/`|`/`^` — flagged this exact conflict before touching
+  anything (`logic A & logic B`, the `and`-combination idiom just
+  below, would reparse as one `logic` wrapping the whole `&`
+  expression) and let Lumi pick which side keeps the parens requirement
+  rather than choosing unilaterally. `logic A & logic B` now needs
+  explicit parens on each side — `(logic A) & (logic B)` — to keep its
+  old two-separately-discharged-values meaning; the bare form instead
+  wraps the whole `&` expression in one `logic`, which `check_logic_
+  args` (firrtl/checks.rs) cleanly rejects (bitwise `&` can't take a
+  still-fallible left operand) rather than silently doing something
+  else. The one existing example/test using this idiom (`tests/
+  firrtl.rs`'s `logic_wrapped_call_is_allowed_inside_an_if_condition`)
+  updated to the now-required parenthesized form.
 - `or` fallback chain ACHIEVED (v0: `Deq[]`-only alternatives, depth-1
   fifos, optional infallible default tail) — see DESIGN.md's "`or`:
   fallback chains" section for the full write-up (semantics, v0
@@ -603,7 +636,7 @@ Worth building:
   alternatives, depth>1 fifos, and `or` nested in `if`/`while` or a
   callee's own body are all separate, larger gaps, not silently
   accepted. `and` needed no dedicated syntax: sequential bare guards
-  already conjoin for free, and `logic(...)` combined with bitwise `&`
+  already conjoin for free, and `logic` combined with bitwise `&`
   already covers it in expression position.
 - **Comparisons returning their left operand in a failure context**
   (Verse: `X > 0` yields `X` on success, fails otherwise) — design
@@ -625,9 +658,11 @@ Worth building:
   `x := (a > b)?` would bind `x` to `a`'s value AND gate the rule on
   the comparison holding, the same way `x := opt?`/`x := f.Deq[]`
   already do today — no new binding form, just a new source feeding
-  the existing one. `logic(a > b)` (discharge to a definite `0`/`1`
-  without gating) generalizes cleanly too: `check_logic_args_in`
-  (firrtl/checks.rs) is a hard two-way allowlist (`is_fifo_op` / a
+  the existing one. `logic a > b` (discharge to a definite `0`/`1`
+  without gating — no parens needed, `logic`'s operand now parses
+  loosely on purpose, see the `logic` bullet above) generalizes cleanly
+  too: `check_logic_args_in` (firrtl/checks.rs) is a hard two-way
+  allowlist (`is_fifo_op` / a
   call to a guard-only `<fails>` callee), straightforward to extend
   with a third arm — and a comparison is ALREADY side-effect-free, so
   the "don't silently discard a write" concern that arm's other two
@@ -683,9 +718,12 @@ Worth building:
     `opt?`/`f.Deq[]` already have (rejecting `(a > b) & (c < d)`,
     arithmetic, or a call argument outright), or something looser?
     Recommend the same restriction — consistency with the rest of the
-    fallible family, and `logic(a > b) & logic(c < d)` is the existing
-    escape hatch for the bitwise-combine case, same as `or`'s own doc
-    comment already points to for `and` in expression position.
+    fallible family, and `(logic a > b) & (logic c < d)` is the existing
+    escape hatch for the bitwise-combine case (parens around each
+    `logic` needed now that its operand parses loosely, see the `logic`
+    bullet above — otherwise the first `logic` alone would swallow the
+    whole `&` expression), same as `or`'s own doc comment already
+    points to for `and` in expression position.
 - trace's `not` is confirmed to be a plain `[1]` boolean operator
   (`types.rs`'s operand-must-already-be-`[1]` rule), not Verse's
   "test success/failure without committing" operator — `17f21e9` was a

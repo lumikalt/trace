@@ -187,19 +187,6 @@ pub fn is_guard_like(ast: &Ast, res: &Resolution, expr: ExprId) -> bool {
     }
 }
 
-/// Whether `expr` is a call to the builtin named `name` — e.g. spotting
-/// a `logic(...)` call site specifically, not just "any builtin".
-/// Shared by effects.rs and firrtl/checks.rs, which both need this
-/// beyond `is_guard_like`'s coarser "is this ANY builtin" check
-/// (`types.rs` keeps its own pre-existing private copy, predating this
-/// function, rather than being migrated to avoid an unrelated churn).
-pub fn is_builtin_named(res: &Resolution, expr: ExprId, name: &str) -> bool {
-    res.expr_defs.get(&expr).is_some_and(|d| {
-        let def = res.def(*d);
-        def.kind == DefKind::Builtin && def.name == name
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveError {
     pub span: Span,
@@ -210,7 +197,10 @@ pub struct ResolveError {
 /// `prio` is a priority encoder; the rest are the primitive vocabulary
 /// DESIGN.md examples assume. `__race_value` is compiler-internal —
 /// lower.rs's own rendering of a value-producing `race[...]`, never
-/// written by a user (see types.rs's `type_builtin_call`).
+/// written by a user (see types.rs's `type_builtin_call`). `logic` is
+/// NOT here — it's a real prefix operator (`Expr::Logic`, ast.rs, a
+/// dedicated lexer keyword), not an identifier resolved against this
+/// list the way the call-syntax builtins below are.
 const BUILTINS: &[&str] = &[
     "bits",
     "wire",
@@ -223,7 +213,6 @@ const BUILTINS: &[&str] = &[
     "sync",
     "race",
     "prio",
-    "logic",
     "__race_value",
 ];
 
@@ -805,6 +794,9 @@ impl<'a> Resolver<'a> {
             // resolves in whatever context `Optional` itself was reached
             // from, like `Unary`/`Guard`/`Spawn` above, unlike `OptionTy`.
             Expr::Optional(inner) => self.resolve_expr(inner, in_type),
+            // `logic <expr>`'s `<expr>` is a value, not a type — same
+            // pass-through as `Optional` above.
+            Expr::Logic(inner) => self.resolve_expr(inner, in_type),
         }
     }
 }

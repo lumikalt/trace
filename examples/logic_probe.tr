@@ -1,10 +1,11 @@
--- `logic(...)`: converts a fallible expression into a plain `[1]`
--- value -- 1 if it would succeed, 0 if it would fail -- without gating
--- the enclosing rule and without performing the underlying op's own
--- side effect. `probe` tests both supported shapes (a fifo op, a
--- guard-only `<fails>` call) as pure status outputs; `drain` performs
--- the REAL dequeue in a SEPARATE rule, proving the probe alone doesn't
--- disturb it -- both fire the same cycle, with no conflict between them.
+-- `logic <expr>`: a prefix operator (not a function call -- no parens)
+-- converting a fallible expression into a plain `[1]` value -- 1 if it
+-- would succeed, 0 if it would fail -- without gating the enclosing
+-- rule and without performing the underlying op's own side effect.
+-- `probe` tests both supported shapes (a fifo op, a guard-only
+-- `<fails>` call) as pure status outputs; `drain` performs the REAL
+-- dequeue in a SEPARATE rule, proving the probe alone doesn't disturb
+-- it -- both fire the same cycle, with no conflict between them.
 Validate(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
     return x
@@ -18,8 +19,8 @@ module LogicProbe {
     out consumed : [8] = 0
 
     rule probe {
-        input_ready := logic(input.Deq[])
-        x_valid := logic(Validate(x))
+        input_ready := logic input.Deq[]
+        x_valid := logic Validate(x)
     }
 
     rule drain {

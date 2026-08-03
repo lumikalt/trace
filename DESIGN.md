@@ -228,17 +228,18 @@ fifo op can (a whole statement, the entire right-hand side of `:=`, or a `let`
 init) — nested inside `if`/`while` or inside a larger expression is rejected
 by the same generic position checks a misplaced fifo op already gets. Inside a
 callee's own body is a DIFFERENT gap with its own dedicated check
-(`check_no_or_in_callee_body`): unlike a bare guard, fifo op, or `logic(...)`,
+(`check_no_or_in_callee_body`): unlike a bare guard, fifo op, or `logic`,
 `or` has no callee-body support to fall back to at all yet — a first attempt
 compiled a defaulted chain cleanly with the fifo's own dequeue silently
 missing (found by hand-testing, not by construction), which is what that
 check exists to close off.
 
 Verse's `and` needs no dedicated syntax of its own: sequential bare guards
-already conjoin into one rule's readiness for free, and `logic(...)` (see
+already conjoin into one rule's readiness for free, and `logic` (see
 "Calling a function from a rule" below) combined with bitwise `&` already
-covers `and` in expression position (`logic(A) & logic(B)` inside an `if`
-condition, for example) — there is no missing capability to port, only `or`'s
+covers `and` in expression position (`(logic A) & (logic B)` inside an `if`
+condition, for example — parens on each side needed, see `logic`'s own
+precedence note below) — there is no missing capability to port, only `or`'s
 discharge behavior, which is what this section covers.
 
 See `examples/or_fifos.tr` + `sim/or_fifos_tb.v`.
@@ -1195,7 +1196,7 @@ value (for example, as an argument to `prio` inside a generic callee), is only
 resolvable by following it back to a concrete call site; used elsewhere, this
 fails cleanly rather than compiling to the wrong width.
 
-Of the builtins, `prio`, `trunc`, `pack`, and `logic` are synthesizable as calls:
+Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
 
 - **`prio(reqs)`** is a fixed-priority encoder. The lowest set bit wins (bit 0 is
   highest priority); `reqs = 0` returns `0`, a defined but not meaningful value
@@ -1205,39 +1206,61 @@ Of the builtins, `prio`, `trunc`, `pack`, and `logic` are synthesizable as calls
   first argument becomes the high bits, matching FIRRTL's `cat`, Chisel's `Cat`,
   and Verilog's `{a, b}` concatenation. The result width is the sum of the
   argument widths.
-- **`logic(e)`** converts a fallible expression into a plain `[1]` value —
-  `1` if `e` would succeed, `0` if it would fail — without gating the enclosing
-  rule (the failure is *discharged*, not propagated) and without performing
-  `e`'s own side effect. `e` must be exactly one of two shapes: a fifo op
-  (`logic(f.Deq[])`/`logic(f.Enq[x])`, which reads the fifo's own occupancy/
-  space condition but never actually dequeues/enqueues) or a call to a
-  guard-only `<fails>` fn/impl (`logic(Classify(x))`, which reads the callee's
-  already-substituted guard condition but never runs its body). A call whose
-  fail condition also writes state is a compile-time error, not silently
-  supported or silently wrong — see below. Ported from Verse's own `logic{
-  exp }` (a curly-brace cast in Verse's syntax; `logic(...)`, parens, matches
-  this language's own `prio`/`trunc`/`pack` call convention instead), confirmed
-  against Verse's `02_primitives` chapter: "To convert an expression that has
-  the `<decides>` effect to `true` on success or `false` on failure, use
-  `logic{ exp }`". See `examples/logic_probe.tr` + `sim/logic_probe_tb.v`,
-  which also proves a `logic(...)`-probing rule and a rule doing the real fifo
-  touch coexist correctly the same cycle under `conflict_free` (a plain
-  occupancy read has nothing to hazard against a same-cycle write to the same
-  register — the read always sees the pre-edge value regardless).
 
-  The guard+write restriction is not just "hard to implement": a callee whose
-  fail condition folds into a caller's guard AND also writes state is fully
-  supported for an ordinary direct call (see above), but wrapping one in
-  `logic(...)` would mean silently discarding its write — running only the
-  guard-fold half of what a real call does — which is a confusing footgun even
-  where it would be internally safe, not a feature. It also isn't an ad hoc
-  trace limitation: Verse's own `logic{}` only accepts a `<decides>`-effect
-  expression, and `<decides>` in Verse's effect system means
-  side-effect-free-but-fallible by construction — a `<transacts>`
-  (state-writing) computation is not legal `logic{}` input there either. trace
-  enforces the same boundary with an explicit check rather than a separate
-  effect category, since trace has no `<decides>`/`<transacts>` type-level
-  split.
+`logic <expr>` is different: a real prefix OPERATOR (`Expr::Logic`, ast.rs), not
+a call — no parens, no comma-separated arguments. Unlike every other prefix
+operator here (`not`/`optional`/`spawn`, all parsed at `PREFIX_BP`, tighter
+than any binary operator), `logic`'s operand parses as a full expression
+(binding power `0`, the same as a parenthesized group's inner parse) —
+deliberately loose, so `logic a > b` reads as `logic (a > b)` without parens,
+since a bare fallible comparison (see TODO.md) is `logic`'s main operand shape
+going forward. It converts a fallible expression into a plain `[1]`
+value — `1` if `expr` would succeed, `0` if it would fail — without gating the
+enclosing rule (the failure is *discharged*, not propagated) and without
+performing `expr`'s own side effect. `expr` must be exactly one of two shapes
+today: a fifo op (`logic f.Deq[]`/`logic f.Enq[x]`, which reads the fifo's own
+occupancy/space condition but never actually dequeues/enqueues) or a call to a
+guard-only `<fails>` fn/impl (`logic Classify(x)`, which reads the callee's
+already-substituted guard condition but never runs its body). A call whose
+fail condition also writes state is a compile-time error, not silently
+supported or silently wrong — see below.
+
+The loose operand parse has one real consequence: this language's bitwise
+operators (`&`/`|`/`^`) bind *tighter* than comparisons (Rust-style, see
+`precedence_matches_rust_not_c`), so there is no binding-power threshold that
+lets `logic` swallow a bare comparison without ALSO swallowing `&`/`|`/`^` —
+`logic A & logic B` (the `and`-combination idiom just below) now needs
+explicit parens on each side, `(logic A) & (logic B)`, the same way any other
+expression needs parens to `&`-combine two things wider than a single token.
+A bare `logic A & logic B` instead parses as one `logic` wrapping the whole
+`&` expression (`logic (A & (logic B))`), which `check_logic_args`
+(firrtl/checks.rs) rejects with a clear error rather than silently doing
+something else.
+
+Ported from Verse's own `logic{ exp }` (a curly-brace cast in Verse's syntax;
+`logic <expr>`, no delimiter at all, matches this language's own `not`/
+`optional` prefix-keyword convention instead), confirmed against Verse's
+`02_primitives` chapter: "To convert an expression that has the `<decides>`
+effect to `true` on success or `false` on failure, use `logic{ exp }`". See
+`examples/logic_probe.tr` + `sim/logic_probe_tb.v`, which also proves a
+`logic`-probing rule and a rule doing the real fifo touch coexist correctly
+the same cycle under `conflict_free` (a plain occupancy read has nothing to
+hazard against a same-cycle write to the same register — the read always sees
+the pre-edge value regardless).
+
+The guard+write restriction is not just "hard to implement": a callee whose
+fail condition folds into a caller's guard AND also writes state is fully
+supported for an ordinary direct call (see above), but wrapping one in
+`logic` would mean silently discarding its write — running only the
+guard-fold half of what a real call does — which is a confusing footgun even
+where it would be internally safe, not a feature. It also isn't an ad hoc
+trace limitation: Verse's own `logic{}` only accepts a `<decides>`-effect
+expression, and `<decides>` in Verse's effect system means
+side-effect-free-but-fallible by construction — a `<transacts>`
+(state-writing) computation is not legal `logic{}` input there either. trace
+enforces the same boundary with an explicit check rather than a separate
+effect category, since trace has no `<decides>`/`<transacts>` type-level
+split.
 
 `clog2` and `len` type as `Ty::Int`: they are compile-time-only, not synthesizable
 values. `wire`, `list`, and `any` are type- or elaboration-position constructs
@@ -2180,7 +2203,7 @@ noted:
   guard, including the Enq+Deq pass-through case split across the call
   boundary — `examples/call_guard.tr`, `examples/call_fifo.tr`), the
   synthesizable builtins `prio`/`trunc`/`pack` (`examples/call*.tr`).
-- `logic(e)`: a fallible expression's success as a plain `[1]` value,
+- `logic <expr>`: a fallible expression's success as a plain `[1]` value,
   discharged rather than propagated, with no side effect of its own
   (`examples/logic_probe.tr`).
 - `A or B or C`: a fallback chain over fifo `Deq[]` alternatives, with an

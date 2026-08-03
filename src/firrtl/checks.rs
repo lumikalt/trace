@@ -32,7 +32,7 @@ use super::fifo::*;
 use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, ItemId, Stmt, StmtId};
 use crate::lexer::Span;
-use crate::resolve::{DefKind, Resolution, is_builtin_named, is_guard_like};
+use crate::resolve::{DefKind, Resolution, is_guard_like};
 use std::collections::HashMap;
 
 pub(crate) fn is_mem_write_to(ast: &Ast, res: &Resolution, stmt: StmtId, mem_name: &str) -> bool {
@@ -375,30 +375,30 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Every `logic(...)` call's sole argument, found anywhere within
-    /// `stmts` (any nesting depth, any statement, including inside
-    /// `if`/`while`) — regardless of whether that argument is actually a
-    /// VALID `logic(...)` argument (`check_logic_args_in` decides that
-    /// separately). This is the exemption list `check_failing_call_
-    /// positions`/`check_fifo_op_positions`/`check_writing_call_
-    /// positions_in` all subtract from their own "outside allowed
-    /// positions" findings: once wrapped in `logic(...)`, a fifo op or a
-    /// failing/writing call is no longer something that needs to be
-    /// foldable into a rule's own guard, or found by the write-hunt —
-    /// `logic` converts it into a plain, already-composable `bits[1]`
-    /// VALUE with no fold/write obligation left, so the position
-    /// restrictions that exist specifically to guarantee foldability/
-    /// write-discovery no longer apply. `stmts` generic (not rule-
-    /// specific) since `check_writing_call_positions_in` is ALSO the
-    /// callee-body check `validate_call` runs (calls.rs) — a `logic(...)`
-    /// inside a callee's own body needs the identical exemption a rule
-    /// body does. Reuses `collect_calls` (an ordinary `Expr::Call` IS
-    /// what `logic(...)` looks like syntactically) rather than a new
-    /// generic expression walker — same "roots per statement, recurse
-    /// into if/while" traversal shape as `calls_outside_allowed_
-    /// positions`/`fifo_ops_outside_allowed_positions`, kept as its own
-    /// copy for the same reason those two are already separate copies of
-    /// each other.
+    /// Every `logic <expr>`'s operand, found anywhere within `stmts`
+    /// (any nesting depth, any statement, including inside `if`/`while`)
+    /// — regardless of whether that operand is actually a VALID `logic`
+    /// operand (`check_logic_args_in` decides that separately). This is
+    /// the exemption list `check_failing_call_positions`/`check_fifo_
+    /// op_positions`/`check_writing_call_positions_in` all subtract from
+    /// their own "outside allowed positions" findings: once wrapped in
+    /// `logic`, a fifo op or a failing/writing call is no longer
+    /// something that needs to be foldable into a rule's own guard, or
+    /// found by the write-hunt — `logic` converts it into a plain,
+    /// already-composable `bits[1]` VALUE with no fold/write obligation
+    /// left, so the position restrictions that exist specifically to
+    /// guarantee foldability/write-discovery no longer apply. `stmts`
+    /// generic (not rule-specific) since `check_writing_call_positions_
+    /// in` is ALSO the callee-body check `validate_call` runs
+    /// (calls.rs) — a `logic <expr>` inside a callee's own body needs
+    /// the identical exemption a rule body does. Same "roots per
+    /// statement, recurse into if/while" traversal shape as `calls_
+    /// outside_allowed_positions`/`fifo_ops_outside_allowed_positions`,
+    /// kept as its own copy for the same reason those two are already
+    /// separate copies of each other; the per-expression descent below
+    /// reuses `crate::lower::sub_exprs` (generic one-level children)
+    /// rather than another hand-written walker, matching `check_no_or_
+    /// in_callee_body`'s own `collect_or_exprs`.
     fn logic_arg_exprs(&self, stmts: &[StmtId]) -> Vec<ExprId> {
         fn roots_of(ast: &Ast, stmts: &[StmtId], out: &mut Vec<ExprId>) {
             for stmt in stmts {
@@ -429,42 +429,41 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        fn collect_logic_exprs(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
+            if let Expr::Logic(inner) = ast.expr(id) {
+                out.push(*inner);
+            }
+            for child in crate::lower::sub_exprs(ast, id) {
+                collect_logic_exprs(ast, child, out);
+            }
+        }
         let mut roots = Vec::new();
         roots_of(self.ast, stmts, &mut roots);
         let mut out = Vec::new();
         for root in roots {
-            let mut calls = Vec::new();
-            collect_calls(self.ast, root, &mut calls);
-            for call in calls {
-                let Expr::Call { callee, args } = self.ast.expr(call) else {
-                    continue;
-                };
-                if args.len() == 1 && is_builtin_named(self.res, *callee, "logic") {
-                    out.push(args[0]);
-                }
-            }
+            collect_logic_exprs(self.ast, root, &mut out);
         }
         out
     }
 
-    /// `logic(e)`'s ONLY legal `e`: a direct fifo op (`f.Deq[]`/
+    /// `logic <expr>`'s ONLY legal `expr`: a direct fifo op (`f.Deq[]`/
     /// `f.Enq[x]`), or a direct call to a `sig.fails` fn/impl whose OWN
     /// `sig.writes` is empty. Anything else is rejected here with a
     /// specific reason, rather than falling through to `check_failing_
     /// call_positions`/`check_fifo_op_positions`/`check_writing_call_
     /// positions_in`'s generic "nested in a larger expression" messages
-    /// (those three are told to ignore every `logic(...)` argument
-    /// entirely via `logic_arg_exprs`, so this is the one and only error
-    /// source for anything wrong inside a `logic(...)` call — including
-    /// inside a callee's own body, via `check_logic_args`'s callee-body
-    /// caller `validate_call`, calls.rs). The guard+write restriction
-    /// mirrors Verse's own `logic{ exp }`, confirmed against its primary
-    /// source (`02_primitives`): it only accepts a `<decides>`-effect
+    /// (those three are told to ignore every `logic` operand entirely
+    /// via `logic_arg_exprs`, so this is the one and only error source
+    /// for anything wrong inside a `logic <expr>` — including inside a
+    /// callee's own body, via `check_logic_args`'s callee-body caller
+    /// `validate_call`, calls.rs). The guard+write restriction mirrors
+    /// Verse's own `logic{ exp }`, confirmed against its primary source
+    /// (`02_primitives`): it only accepts a `<decides>`-effect
     /// expression, and `<decides>` means side-effect-free-but-fallible
     /// BY Verse's own effect system — a state-writing computation isn't
     /// legal `logic{}` input there either. This isn't merely "hard to
     /// implement": silently discarding a callee's write because it
-    /// happened to be reached through `logic(...)` would be a confusing
+    /// happened to be reached through `logic` would be a confusing
     /// footgun even if internally safe, so it's rejected outright rather
     /// than silently honored.
     pub(crate) fn check_logic_args(&mut self, rule: ItemId) {
@@ -479,7 +478,7 @@ impl<'a> Emitter<'a> {
     /// larger gap too — see TODO.md). `Enq` needs no explicit rejection
     /// here: it has no value of its own for `or` to select between
     /// (confirmed against DESIGN.md — `Enq[x]` only ever appears as a
-    /// bare statement or wrapped in `logic(...)`, never as a value-
+    /// bare statement or wrapped in `logic`, never as a value-
     /// producing expression), so types.rs's ordinary width-assignability
     /// check on `Or`'s alternatives already rejects it (a `unit`-typed
     /// `Enq` bracket can never match a fifo element's `bits[N]`) before
@@ -603,8 +602,8 @@ impl<'a> Emitter<'a> {
             let Expr::Call { .. } = self.ast.expr(arg).clone() else {
                 self.error(
                     span,
-                    "`logic(...)` needs a fifo op or a call to a function that can \
-                     fail as its sole argument"
+                    "`logic` needs a fifo op or a call to a function that can \
+                     fail as its operand"
                         .to_string(),
                 );
                 continue;
@@ -612,8 +611,8 @@ impl<'a> Emitter<'a> {
             let Some(fn_item) = self.call_target_fn(arg) else {
                 self.error(
                     span,
-                    "`logic(...)` needs a fifo op or a call to a function that can \
-                     fail as its sole argument"
+                    "`logic` needs a fifo op or a call to a function that can \
+                     fail as its operand"
                         .to_string(),
                 );
                 continue;
@@ -624,15 +623,15 @@ impl<'a> Emitter<'a> {
             if !callee_sig.fails {
                 self.error(
                     span,
-                    "`logic(...)`'s call argument must be able to fail (declare \
+                    "`logic`'s call operand must be able to fail (declare \
                      `<fails>`, or a bare condition/fifo op inside it) — a call \
-                     that always succeeds has nothing for `logic(...)` to test"
+                     that always succeeds has nothing for `logic` to test"
                         .to_string(),
                 );
             } else if !callee_sig.writes.is_empty() {
                 self.error(
                     span,
-                    "`logic(...)` cannot test a function that also writes state \
+                    "`logic` cannot test a function that also writes state \
                      (v0 restriction): testing success here would either silently \
                      discard the write or require it to happen regardless of \
                      whether the result is used — write the call directly instead \
@@ -981,8 +980,8 @@ impl<'a> Emitter<'a> {
 
     /// Whether `stmt` (an `if`/`while`, recursively) contains a call to
     /// a failing function anywhere within it — excluding one wrapped in
-    /// `logic(...)` (found via the `and`-redundancy probes when adding
-    /// `or`: `logic(...)`'s whole point is converting a failing call
+    /// `logic` (found via the `and`-redundancy probes when adding
+    /// `or`: `logic`'s whole point is converting a failing call
     /// into a plain, already-composable `bits[1]` value with no
     /// remaining guard-fold obligation, so it may appear inside an
     /// `if`/`while` condition same as any other value — this is the

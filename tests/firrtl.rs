@@ -3183,14 +3183,14 @@ module M {
     fifo f : [8]
     out ready : [1] = 0
     rule r {
-        ready := logic(f.Deq[])
+        ready := logic f.Deq[]
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("connect __out_ready, __fifo_f_valid"));
-    // No dequeue side effect anywhere -- `logic(...)` alone never
-    // touches the fifo's own state, only reads it.
+    // No dequeue side effect anywhere -- `logic` alone never touches
+    // the fifo's own state, only reads it.
     assert!(!fir.contains("connect __fifo_f_valid, UInt<1>(0)"));
     run_firtool(&fir, &[]);
 }
@@ -3206,7 +3206,7 @@ module M {
     in a : [8]
     out ok : [1] = 0
     rule r {
-        ok := logic(Classify(a))
+        ok := logic Classify(a)
     }
 }
 ";
@@ -3221,8 +3221,8 @@ fn logic_rejects_a_call_that_also_writes_state() {
     // `logic{}` (confirmed against `02_primitives`, see TODO.md): a
     // callee that both guard-folds AND writes state is fine as a DIRECT
     // call (`call_writes_runs_through_real_ports` etc.), but silently
-    // discarding its write just because it's reached through `logic
-    // (...)` would be a confusing footgun, not a supported feature.
+    // discarding its write just because it's reached through `logic`
+    // would be a confusing footgun, not a supported feature.
     let src = "\
 module M {
     reg v : [8] = 0
@@ -3236,7 +3236,7 @@ module M {
     }
 
     rule r {
-        ok := logic(Bump(a))
+        ok := logic Bump(a)
     }
 }
 ";
@@ -3260,14 +3260,14 @@ module M {
     in x : [8]
     out has_space : [1] = 0
     rule r {
-        has_space := logic(f.Enq[x])
+        has_space := logic f.Enq[x]
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("connect __out_has_space, not(__fifo_f_valid)"));
     // No enqueue side effect -- the fifo's own data register never gets
-    // written by `logic(...)` alone.
+    // written by `logic` alone.
     assert!(!fir.contains("connect __fifo_f_data"));
     run_firtool(&fir, &[]);
 }
@@ -3285,7 +3285,7 @@ module M {
     out ready : [1] = 0
 
     Probe() : [1] <combines> {
-        return logic(f.Deq[])
+        return logic f.Deq[]
     }
 
     rule r {
@@ -3321,7 +3321,7 @@ module M {
     }
 
     Probe(x : [8]) : [1] <combines> {
-        return logic(Bump(x))
+        return logic Bump(x)
     }
 
     rule r {
@@ -3338,12 +3338,12 @@ fn logic_after_a_state_write_is_not_rejected_by_guard_placement() {
     // `check_guard_placement`'s "guard/fifo op/failing call after a
     // state write" restriction looks for the raw shapes directly
     // (`self.fifo_op(e)`, `self.is_failing_call(e)`, `is_guard_like`) --
-    // `logic(...)` is none of those (a plain `Expr::Call` to a builtin
-    // returning a `[1]` VALUE), so it correctly falls outside that
-    // restriction entirely and may appear anywhere an ordinary value
-    // can, including after a write. Pins that this is real, deliberate
-    // behavior (a plain value has nothing left to fold into a guard),
-    // not an accidental gap in `check_guard_placement`'s shape matching.
+    // `Expr::Logic` is none of those (a real prefix node yielding a
+    // `[1]` VALUE), so it correctly falls outside that restriction
+    // entirely and may appear anywhere an ordinary value can, including
+    // after a write. Pins that this is real, deliberate behavior (a
+    // plain value has nothing left to fold into a guard), not an
+    // accidental gap in `check_guard_placement`'s shape matching.
     let src = "\
 module M {
     fifo f : [8]
@@ -3351,7 +3351,7 @@ module M {
     out ready : [1] = 0
     rule r {
         v := v + 1
-        ready := logic(f.Deq[])
+        ready := logic f.Deq[]
     }
 }
 ";
@@ -3370,7 +3370,7 @@ module M {
     in a : [8]
     out ok : [1] = 0
     rule r {
-        ok := logic(Pure(a))
+        ok := logic Pure(a)
     }
 }
 ";
@@ -3383,13 +3383,17 @@ module M {
 
 #[test]
 fn logic_rejects_a_non_fallible_argument() {
+    // Parens are no longer load-bearing here (unlike when this test was
+    // first written): `logic`'s operand parses loosely now, so a bare
+    // `logic a + b` already means `logic (a + b)` -- kept anyway since
+    // they read clearly either way.
     let src = "\
 module M {
     in a : [8]
     in b : [8]
     out ok : [1] = 0
     rule r {
-        ok := logic(a + b)
+        ok := logic (a + b)
     }
 }
 ";
@@ -3402,7 +3406,7 @@ module M {
 
 #[test]
 fn logic_of_a_fifo_op_composes_with_a_real_conflict_free_dequeue() {
-    // Mirrors examples/logic_probe.tr: `probe`'s `logic(input.Deq[])`
+    // Mirrors examples/logic_probe.tr: `probe`'s `logic input.Deq[]`
     // must not interfere with `drain`'s real, separately-scheduled
     // dequeue of the SAME fifo -- proving effects.rs correctly excludes
     // the probe from `sig.writes` (a naive merge would make `probe`
@@ -3416,7 +3420,7 @@ module M {
     out consumed : [8] = 0
 
     rule probe {
-        ready := logic(input.Deq[])
+        ready := logic input.Deq[]
     }
 
     rule drain {
@@ -3436,15 +3440,20 @@ module M {
 #[test]
 fn logic_wrapped_call_is_allowed_inside_an_if_condition() {
     // `check_guard_placement`'s if/while sub-checks (`contains_guard`/
-    // `contains_fifo_op`/`contains_failing_call`) predate `logic(...)`
+    // `contains_fifo_op`/`contains_failing_call`) predate `logic`
     // and originally had no exemption for it, even though the other
     // three position checks (`check_failing_call_positions`/`check_
     // fifo_op_positions`/`check_writing_call_positions_in`) already did
-    // — found while probing whether `logic(A) & logic(B)` fully
+    // — found while probing whether `logic A & logic B` fully
     // replaces a Verse-style `and` operator (it does, once this compiled
-    // at all): `logic(Check(a))` here is a plain `[1]` value with no
+    // at all): `logic Check(a)` here is a plain `[1]` value with no
     // remaining guard-fold obligation, and belongs anywhere any other
-    // value does, including an `if` condition combined with `&`.
+    // value does, including an `if` condition combined with `&`. Each
+    // side needs its own parens now that `logic`'s operand parses
+    // loosely (see `logic_combined_with_amp_now_needs_parens_on_each_
+    // side`, tests/parser.rs) — a bare `logic f.Deq[] & logic Check(a)`
+    // would parse as one `logic` wrapping the whole `&` expression
+    // instead of two separately-discharged values.
     let src = "\
 Check(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
@@ -3455,7 +3464,7 @@ module M {
     in a : [8]
     out ok : [1] = 0
     rule r {
-        if logic(f.Deq[]) & logic(Check(a)) {
+        if (logic f.Deq[]) & (logic Check(a)) {
             ok := 1
         } else {
             ok := 0

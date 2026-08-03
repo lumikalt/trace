@@ -622,7 +622,8 @@ impl<'a> Interp<'a> {
             | Expr::StructLit { .. }
             | Expr::OptionTy(_)
             | Expr::Absent
-            | Expr::Optional(_) => {
+            | Expr::Optional(_)
+            | Expr::Logic(_) => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
                 self.error(
                     span,

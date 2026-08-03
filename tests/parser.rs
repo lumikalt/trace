@@ -649,6 +649,55 @@ fn optional_is_a_real_prefix_node_distinct_from_its_wrapped_expression() {
     );
 }
 
+#[test]
+fn logic_is_a_prefix_operator_not_a_call() {
+    // `logic <expr>` -- no parens needed, not through call syntax
+    // (`logic` isn't in the `BUILTINS` identifier list at all anymore --
+    // see resolve.rs).
+    assert_eq!(
+        stmt_sexpr("x := logic f.Deq[]"),
+        "(:= x (logic (index (. f Deq))))"
+    );
+    // Old call-style parens still parse -- they're just grouping,
+    // absorbed by the operand parse.
+    assert_eq!(
+        stmt_sexpr("x := logic(f.Deq[])"),
+        "(:= x (logic (index (. f Deq))))"
+    );
+}
+
+#[test]
+fn logic_binds_looser_than_every_binary_operator() {
+    // Unlike `not`/`optional` (`PREFIX_BP`, tighter than any binary
+    // operator), `logic`'s operand parses at `0` -- deliberately loose,
+    // so a bare comparison reads naturally: `logic a > b` is
+    // `logic (a > b)`, not `(logic a) > b` (Lumi's call, trading away
+    // the OTHER direction: see the next test).
+    assert_eq!(stmt_sexpr("x := logic a > b"), "(:= x (logic (> a b)))");
+    assert_eq!(stmt_sexpr("x := logic a + b"), "(:= x (logic (+ a b)))");
+}
+
+#[test]
+fn logic_combined_with_amp_now_needs_parens_on_each_side() {
+    // The trade Lumi picked when asking to lower `logic`'s precedence:
+    // this language's bitwise operators bind TIGHTER than comparisons
+    // (Rust-style, `precedence_matches_rust_not_c`), so no threshold
+    // lets `logic` swallow a bare comparison without ALSO swallowing
+    // `&`/`|`/`^` -- the `and`-combination idiom (`logic A & logic B`,
+    // DESIGN.md) now parses as ONE `logic` wrapping the whole `&`
+    // expression, not two separately-discharged fallible values.
+    assert_eq!(
+        stmt_sexpr("x := logic a & logic b"),
+        "(:= x (logic (& a (logic b))))"
+    );
+    // Each side needs its own parens to keep the old two-`logic`
+    // meaning.
+    assert_eq!(
+        stmt_sexpr("x := (logic a) & (logic b)"),
+        "(:= x (& (logic a) (logic b)))"
+    );
+}
+
 fn let_sexpr(ast: &Ast, s: trace::ast::StmtId) -> String {
     match ast.stmt(s) {
         trace::ast::Stmt::Let { name, init } => {

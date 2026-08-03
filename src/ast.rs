@@ -214,6 +214,19 @@ pub enum Expr {
     /// inner rather than a type it precomputed, so nesting (`optional
     /// (optional e)`) peels one target layer per `optional`.
     Optional(ExprId),
+    /// `logic <expr>` — converts a fallible expression's success into a
+    /// plain `bits[1]` value (`1` if it would succeed, `0` if it would
+    /// fail), discharging the failure rather than propagating it, and
+    /// without performing the operand's own side effect (no real
+    /// dequeue/enqueue, no callee write). A real prefix operator, not a
+    /// builtin call — Verse's own `logic{ exp }` is a dedicated cast
+    /// form, not an ordinary function; matches this language's `not`/
+    /// `optional`/`spawn` prefix operators instead of `prio`/`trunc`/
+    /// `pack`'s call syntax. `inner` must be exactly one of two shapes
+    /// (a fifo op, or a call to a guard-only `<fails>` fn/impl) —
+    /// checked in `firrtl/checks.rs`'s `check_logic_args`, once
+    /// effects.rs's inferred signatures exist to consult, not here.
+    Logic(ExprId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,6 +498,7 @@ impl Ast {
             Expr::OptionTy(inner) => format!("(option {})", self.expr_sexpr(*inner)),
             Expr::Absent => "false".to_string(),
             Expr::Optional(inner) => format!("(optional {})", self.expr_sexpr(*inner)),
+            Expr::Logic(inner) => format!("(logic {})", self.expr_sexpr(*inner)),
         }
     }
 

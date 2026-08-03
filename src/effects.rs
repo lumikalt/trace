@@ -25,7 +25,7 @@
 
 use crate::ast::{Ast, Effect, Expr, ExprId, FnKind, Item, ItemId, Stmt, StmtId};
 use crate::lexer::Span;
-use crate::resolve::{DefId, DefKind, Resolution, is_builtin_named, is_guard_like};
+use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -367,26 +367,6 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Call { callee, args } => {
-                // `logic(...)` DISCHARGES its argument's failure into a
-                // plain boolean value: neither `fails` nor `writes`
-                // propagate to the enclosing sig (the whole point — see
-                // TODO.md's `logic(...)` design note). Compute the
-                // argument's own effect in ISOLATION and merge only its
-                // `reads` back in, still needed so scheduling correctly
-                // orders this rule against anything that writes the same
-                // resource being probed. `firrtl/checks.rs`'s
-                // `check_logic_args` separately rejects a shape this
-                // isolation would otherwise silently accept but that
-                // isn't actually meaningful (not a fifo op/failing call
-                // at all, or a callee that also writes state).
-                if is_builtin_named(self.res, *callee, "logic") {
-                    if let Some(arg) = args.first() {
-                        let mut inner = EffectSig::default();
-                        self.infer_expr(*arg, &mut inner);
-                        sig.reads.extend(inner.reads);
-                    }
-                    return;
-                }
                 if let Some(callee_sig) = self.callee_sig(*callee) {
                     sig.fails |= callee_sig.fails;
                     sig.reads.extend(callee_sig.reads.iter().copied());
@@ -415,7 +395,7 @@ impl<'a> Checker<'a> {
                     self.infer_expr(*hi, sig);
                 }
             }
-            // `A or B or C` — unlike `logic(...)`, a selected alternative's
+            // `A or B or C` — unlike `logic`, a selected alternative's
             // fifo op is a REAL effect (mutates the fifo), so its
             // reads/writes are NOT discharged. Only `fails` is special:
             // each alternative failing individually doesn't fail the
@@ -464,6 +444,23 @@ impl<'a> Checker<'a> {
             Expr::OptionTy(_) => {}
             Expr::Absent => {}
             Expr::Optional(inner) => self.infer_expr(*inner, sig),
+            // `logic <expr>` DISCHARGES `expr`'s failure into a plain
+            // boolean value: neither `fails` nor `writes` propagate to
+            // the enclosing sig (the whole point — see TODO.md's
+            // `logic` design note). Compute `expr`'s own effect in
+            // ISOLATION and merge only its `reads` back in, still
+            // needed so scheduling correctly orders this rule against
+            // anything that writes the same resource being probed.
+            // `firrtl/checks.rs`'s `check_logic_args` separately
+            // rejects a shape this isolation would otherwise silently
+            // accept but that isn't actually meaningful (not a fifo
+            // op/failing call at all, or a callee that also writes
+            // state).
+            Expr::Logic(inner) => {
+                let mut inner_sig = EffectSig::default();
+                self.infer_expr(*inner, &mut inner_sig);
+                sig.reads.extend(inner_sig.reads);
+            }
         }
     }
 
@@ -675,7 +672,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Unary { operand, .. } => self.check_expr(operand, item, sig, elab),
-            Expr::Optional(inner) => self.check_expr(inner, item, sig, elab),
+            Expr::Optional(inner) | Expr::Logic(inner) => self.check_expr(inner, item, sig, elab),
             Expr::Binary { lhs, rhs, .. } => {
                 self.check_expr(lhs, item, sig, elab);
                 self.check_expr(rhs, item, sig, elab);

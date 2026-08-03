@@ -1191,6 +1191,27 @@ impl<'a> Parser<'a> {
                 let inner = self.parse_expr(PREFIX_BP)?;
                 self.ast.push_expr(Expr::Optional(inner), lo..self.prev_end)
             }
+            // `logic <expr>` — a prefix operator, not `logic(...)` call
+            // syntax (see `Expr::Logic`'s own doc comment, ast.rs).
+            // Unlike every OTHER prefix operator here, its operand parses
+            // at `0` (a full expression, same as a parenthesized group's
+            // inner parse), not `PREFIX_BP` — deliberately loose, so
+            // `logic a > b` reads as `logic (a > b)` without parens
+            // (Lumi's call: comparisons are `logic`'s main operand shape
+            // going forward, see TODO.md's comparisons-as-fallible
+            // design). This language's own bitwise operators (`&`/`|`/
+            // `^`) bind TIGHTER than comparisons (Rust-style, see
+            // `precedence_matches_rust_not_c`), so there is no threshold
+            // that swallows a comparison without ALSO swallowing those —
+            // `logic A & logic B` (the `and`-combination idiom, DESIGN.md)
+            // now needs explicit parens on each side, same as any other
+            // expression `&`-combines two things wider than a single
+            // token: `(logic A) & (logic B)`.
+            Some(Logic) => {
+                self.bump();
+                let inner = self.parse_expr(0)?;
+                self.ast.push_expr(Expr::Logic(inner), lo..self.prev_end)
+            }
             _ => {
                 self.error_here("expected an expression".to_string());
                 self.sync();

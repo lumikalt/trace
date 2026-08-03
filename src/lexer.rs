@@ -88,6 +88,15 @@ pub enum TokenKind {
     /// coerce through every remaining `?` layer at once).
     #[token("optional")]
     Optional,
+    /// `logic <expr>` (`Expr::Logic`, ast.rs) — converts a fallible
+    /// expression's success into a plain `bits[1]` value without
+    /// gating the enclosing rule. A real keyword, not an identifier
+    /// resolved to a builtin def the way `prio`/`trunc`/`pack` still
+    /// are: unlike those, `logic` is a prefix OPERATOR (no parens, no
+    /// comma-separated args), matching `not`/`optional`/`spawn`'s own
+    /// spelling instead of a function call's.
+    #[token("logic")]
+    Logic,
 
     #[token("_", priority = 100)]
     Underscore,

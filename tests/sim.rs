@@ -1332,7 +1332,7 @@ fn adder_tree_runs_through_real_ports() {
     );
 }
 
-/// Proves `logic(...)` end to end: `examples/logic_probe.tr`'s `probe`
+/// Proves `logic <expr>` end to end: `examples/logic_probe.tr`'s `probe`
 /// rule reads a fifo's occupancy and a guard-only `<fails>` call's
 /// condition as plain status outputs, with neither side effect (no real
 /// dequeue, no callee write) — `drain`, a SEPARATE rule doing the real

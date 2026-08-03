@@ -188,6 +188,7 @@ impl<'a> Emitter<'a> {
                     self.compile_expr_hinted(inner, hint)
                 }
             }
+            Expr::Logic(inner) => self.compile_logic(id, inner),
             _ => {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
