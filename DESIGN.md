@@ -419,6 +419,109 @@ assignment's own right-hand side instead of standing alone:
 `value := tick race[h1, h2]` is exactly `tick` followed by `value :=
 race[h1, h2]`, just spelled on one line.
 
+### `while`: multi-cycle loops
+
+`while COND { body }` inside a `<sequences>` rule iterates once per cycle —
+the loop's own back-edge acts as a cycle boundary, the same role `tick` plays
+between straight-line segments, which is exactly why an explicit `tick` still
+can't nest inside one (a conditional cycle boundary would be a second,
+overlapping way to cut the same segment). `COND` follows the same
+`logic`-discharge rule as `if`'s own bare-comparison exemption does NOT
+extend to: a bare comparison there is a type error, `logic COND` the
+discharge, unaffected by anything `if` gained (see "Comparisons: fallible by
+default" above).
+
+```trace
+rule r <sequences, fails> {
+    cnt := x
+    while logic cnt <> 0 {
+        cnt := cnt - 1
+    }
+    result := cnt
+}
+```
+
+v0 scope: `while` must sit at a sequences rule's (or a spawned fn's) top
+level, the same restriction `tick`/`spawn` already have — not nested inside
+`if`/`if let`/another `while`. A `return` nested inside a `while`'s own body
+is rejected the same way an early `return` anywhere else is (no early
+return; `return` must be the last statement of a spawned fn's last segment).
+
+**A `while` loop may only write module state (a reg/mem/output) directly —
+not a local.** A local written inside the loop and needed elsewhere, an
+accumulator (`acc := acc + n`) or anything else surviving past the loop, is
+rejected with a clear error rather than silently accepted or miscompiled:
+
+```trace
+rule r <sequences, fails> {
+    let acc = 0
+    let n = x
+    while logic n <> 0 {
+        acc := acc + n      -- error: written across a `while` loop boundary
+        n := n - 1
+    }
+    result := acc
+}
+```
+
+This is narrower than the general case for a real reason, not an arbitrary
+cut: `compute_captures` (see "Sequences lowering" below) requires a captured
+local be write-once and read only in STRICTLY LATER segments — the same
+invariant that makes an ordinary tick-crossing value sound to promote to a
+register. A `while` loop's own segment is re-entered every iteration, so an
+accumulator writes the SAME segment index every pass and reads its own prior
+value in that SAME segment (`acc := acc + n` — semantically sound, a
+register read genuinely sees last cycle's value, but indistinguishable from
+the read-before-write hazard those checks exist to catch without teaching
+`compute_captures` to reason about loop-carried dataflow specifically, which
+this pass doesn't attempt). A local computed BEFORE the loop and only READ
+inside it (never reassigned there) is unaffected and works today — its
+single assignment segment is the pre-loop one, satisfying the existing
+invariant exactly:
+
+```trace
+let limit = bound
+cnt := 0
+while logic cnt <> limit {    -- fine: limit is read-only inside the loop
+    cnt := cnt + 1
+}
+```
+
+### `while let`: looping over Option presence
+
+`while let NAME = opt? { body }` is the loop-shaped sibling of `if let`
+(above): each iteration re-checks `opt`'s presence, binding `NAME` to the
+unwrapped value for that iteration only — visible ONLY within `body`, never
+after the loop, the same new-scoping-rule shape `if let`'s `then_body` has.
+No `else`: a loop has nothing to run once instead of looping, the same
+reason plain `while` has no `else` either — absence just ends the loop.
+
+```trace
+rule r <sequences, fails> {
+    while let x = opt? {
+        acc := acc + x
+        opt := false      -- module state only, refilling/clearing opt each pass
+    }
+}
+```
+
+Inherits `if let`'s v0 restrictions verbatim, not as a new gap this feature
+opens: `init` must be an Option's own unwrap (`opt?`, `opt : ?T`) — never a
+fifo op, failing call, or comparison — and `NAME` may be used as a whole
+value inside `body` but not chased through a further `.field` access. It
+also inherits plain `while`'s own v0 restriction just above: the loop body
+may only write module state directly, never a local that would need
+capturing across iterations — `while let`'s own loop segment is subject to
+the identical `compute_captures` write-once invariant, no differently from
+a comparison-gated one.
+
+Scoped this way deliberately (Lumi's call): `while` was asked for first
+(`while let`, "scoped the same way" as `if let`), and direct probing found
+`while` itself had no working FIRRTL emission path at all — building
+`while`'s own multi-cycle lowering came first, as its own unit (see
+"`while` lowering" below), with `while let` following as a much cheaper
+second step once that foundation existed.
+
 ### `spawn`, `sync`, and `race`
 
 `spawn` starts an independent, parallel computation. `sync` waits for one or more
@@ -1788,6 +1891,174 @@ rejects this directly once two captures resolve to the same name, before any
 text is generated.
 
 A `sequences` rule reports its own cost: segment count and saved-register bits.
+
+### `while` lowering
+
+A top-level `while COND { body }` cuts a segment boundary the same way
+`tick` does, but unlike `tick` (a pure separator with no content of its own)
+it gets a dedicated segment holding exactly itself (`Segment::while_cond:
+Option<ExprId>`, `Some` only for this one) — `render_rule`/`render_spawn_
+segments` unwrap `COND`/`body` from that one statement at render time and
+render it as an `if`/`else` self-loop instead of the ordinary straight-
+line-then-advance shape:
+
+```trace
+rule r_s1 {
+    (__cont_r = 1)?
+    if COND {
+        <body, spliced verbatim>
+        __cont_r := 1        -- stay: loop back to this same segment
+    } else {
+        __cont_r := 2        -- advance: the loop is done
+    }
+}
+```
+
+This needed **zero** changes to `firrtl.rs` — the existing `Stmt::If`
+write-threading (already covering every reg/mem/instance-port/callee write
+path) produces exactly the right mux for a register conditionally written
+across the loop's two mutually-exclusive continuation values, since a
+generated `while` segment's body is, by the time it reaches emission,
+ordinary `if`/`else` trace text like any other. The entire new surface is in
+`lower.rs`: segment-cutting, the render-time text shape above, and the
+capture-rejection messaging below.
+
+`split_into_segments` only ever inspects a body's TOP level, so `find_
+nested_while` (mirroring `find_nested_tick`/`find_nested_spawn` exactly)
+rejects a `while` nested inside `if`/`if let`/another `while` before
+splitting ever runs — left unchecked, a nested one would silently fold into
+whichever segment it landed in as ordinary, un-lowered text. `plan()`'s own
+top-level gate (deciding whether a `<sequences>` rule needs `plan_rule` at
+all) had to change from "does the body contain a top-level `Tick`" to
+scanning for a `Tick` OR `While` ANYWHERE in the body, not just the top
+level — a `while` nested inside an `if` has no TOP-LEVEL tick/while either,
+so the shallow version would skip straight past `plan_rule` (and therefore
+`find_nested_while`'s own rejection) entirely, leaving the nested `while` to
+fail some later, more confusing way instead (self-caught: the first version
+of this change silently accepted a nested `while` with no error at all).
+
+A `return` nested inside a `while`'s body needs no new check: `find_returns`
+already walks into `Stmt::While { body, .. }` recursively (finding the
+nested `Return`), and the existing "must be the LAST statement of the LAST
+segment" check (`plan_spawn`) can never be satisfied by a statement nested
+one level inside a `Stmt::While` — that requires the found return to equal
+the OUTER statement being checked, never true for anything nested.
+
+`compute_captures` (the write-once, read-only-in-later-segments checks
+above) is UNCHANGED — a `while` loop's own segment index is just another
+segment number to it. What changes is only the ERROR MESSAGE: `compute_
+captures` computes the set of segment indices with `while_cond.is_some()`
+and, when a rejected def's touched segments intersect that set, swaps the
+generic "assigned in multiple segments"/"write-once" text for one naming
+the real cause ("written across a `while` loop boundary") — the generic
+text would read as nonsense for an accumulator, since there's no OTHER
+segment reassigning it, just the loop's own one, executed every iteration.
+
+Six pre-existing recursive scans in this file — `find_returns`, `find_
+nested_tick`/`find_tick_anywhere`, `find_nested_spawn`/`find_spawn_
+anywhere`, `find_unsupported_construct` — turned out to be missing a
+`Stmt::IfLet` arm (only `Stmt::If`/`Stmt::While` were matched), a gap dating
+to when `if let` first added `Stmt::IfLet` to the AST and updated `scan_
+stmts`/`collect_renames`/`stmt_exprs` but missed this second family of
+functions. Self-caught while extending this exact code for `find_nested_
+while`: a `tick` nested inside `if let`'s own body silently escaped
+detection, surfacing as the confusing "a spawned fn's last segment must end
+with `return`" instead of the clear "must be at the top level, not nested
+in if/while" every other nested-tick shape already gets. Fixed by adding
+the missing arm to all six, mirroring their existing `Stmt::If` arm exactly.
+
+A `while` as a rule's own last top-level statement still gets a trailing
+empty segment after it (matching a trailing bare `tick`'s existing
+tolerance) — its only content is `cont := 0`, wrapping back to the rule's
+own start. One idle cycle between the loop finishing and the rule becoming
+eligible to fire again from segment 0, not a bug.
+
+### `while let` lowering
+
+`while let`'s own segment (`Segment.is_while_loop`, shared with plain
+`while` — a single `bool` marker, not `Option<ExprId>`: which of `Stmt::
+While`/`Stmt::WhileLet` applies, and therefore which shape to render,
+depends entirely on which statement `stmts[0]` actually is, so render time
+just matches on it directly rather than duplicating that data into the
+segment) renders as literal **`if let` source text**:
+
+```trace
+rule r_s1 {
+    (__cont_r = 1)?
+    if let NAME = EXPR {
+        <body, spliced verbatim>
+        __cont_r := 1        -- stay: loop back to this same segment
+    } else {
+        __cont_r := 2        -- advance: the loop is done
+    }
+}
+```
+
+`while_loop_header` (lower.rs) is the one function that knows both shapes:
+`Stmt::While` renders `if COND {`, `Stmt::WhileLet` renders `if let NAME =
+EXPR {`, shared by `render_rule` and `render_spawn_segments` alike. Reusing
+`if let`'s OWN syntax verbatim — not hand-rolling an equivalent mux — means
+this needed **zero** new emission code, on top of the zero plain `while`
+already needed: the rendered text re-enters the full pipeline (re-parse,
+re-resolve, re-check) as an ordinary `if let` statement and gets its mux
+synthesis, `if_let_binds`, and every write-threading arm for free. `NAME`'s
+own scoping (visible only inside `body`, invisible after the loop) falls
+out of `if let`'s existing resolve.rs treatment unchanged, for the same
+reason.
+
+Every place that needed a `Stmt::WhileLet` arm mirrors its already-built
+`Stmt::IfLet` sibling exactly: `find_returns`, `find_nested_tick`/`find_
+tick_anywhere`, `find_nested_spawn`/`find_spawn_anywhere`, `find_nested_
+while`/`find_while_anywhere` (a `while let` nested inside `if`/`while` is
+rejected the identical way, and `find_while_anywhere` itself now matches
+`Stmt::WhileLet { .. }` as a terminal "found one" case, not just `Stmt::
+While`), `find_unsupported_construct`, `scan_stmts`, `collect_renames`,
+`stmt_exprs`, `split_into_segments` (cuts on `Stmt::While { .. } | Stmt::
+WhileLet { .. }` together), `compute_captures`'s `while_segments` set
+(built from `is_while_loop`, so a `while let` accumulator gets the
+identical sharpened rejection message plain `while`'s does), and the
+parallel resolve.rs/types.rs/effects.rs/elaborate.rs arms (a `while let`'s
+own `init`, like `if let`'s, is `Expr::Guard(inner)` over `Ty::Option(T)`,
+requires the same `<sequences>`/`<elaborates>` declaration `while`'s
+`cond` does, and is rejected the same way inside `<elaborates>` code).
+
+**Two pre-existing gaps, both self-caught while writing this section's own
+worked example (`examples/while_let_drain.tr`), not while building the
+segment-cutting/rendering machinery itself:**
+
+- **Six recursive scans in lower.rs were already missing a `Stmt::IfLet`
+  arm** — `find_returns`, `find_nested_tick`/`find_tick_anywhere`, `find_
+  nested_spawn`/`find_spawn_anywhere`, `find_unsupported_construct` matched
+  only `Stmt::If`/`Stmt::While`, a gap dating to `if let`'s own landing (that
+  section's own bullet, TODO.md, is updated to match). Confirmed live: a
+  `tick` nested inside `if let`'s body used to surface as "a spawned fn's
+  last segment must end with `return`" instead of the clear "not nested in
+  if/while" every other nested-tick shape gets. Fixed all six, alongside
+  adding their `Stmt::WhileLet` arms in the same pass.
+- **`collect_renames` (lower.rs, the spawn callee-body text-rewrite pass)
+  had no `Stmt::IfLet` arm either** — a captured param referenced INSIDE an
+  `if let`'s own branches, in a spawned callee, never got renamed to its
+  private register name, since nothing recursed into `then_body`/`else_
+  body` to find that reference. Confirmed live: a hard resolve-error
+  failure on the second pass (not a silent miscompile, but a real gap).
+  Fixed, with the matching `Stmt::WhileLet` arm added at the same time.
+- **A THIRD, older gap found but NOT fixed this pass, unrelated to `if
+  let`/`while`/`while let` specifically:** a `let`-bound local declared
+  INSIDE a plain `if`'s branch, read more than once (writing two different
+  registers off the same computed value — an entirely ordinary pattern),
+  fails to resolve on the second read. Root cause: `enter_rule` (writes.rs)
+  only walks a rule's own TOP-LEVEL statements to build `locals_snapshots`,
+  and none of the write-threading walks that DO recurse into branches
+  (`reg_value_in_stmts` and siblings) has a `Stmt::Let` arm either — so a
+  branch-local's binding is never registered anywhere, and a single read
+  happens to still compile it inline, but a second read has nothing to find.
+  Confirmed with a PLAIN `if` (no `if let` involved), so this predates every
+  feature on this page. `examples/while_let_drain.tr` works around it by
+  recomputing `cnt - 1` at each use instead of binding it once through a
+  `let` — pinned as a known gap (`a_branch_local_read_more_than_once_is_a_
+  known_pre_existing_gap`, tests/firrtl.rs) rather than fixed, since it's a
+  materially different, pre-existing problem (branch-body local tracking in
+  general) than anything `while let` itself needed to build.
 
 ## Spawn, sync, and race lowering
 

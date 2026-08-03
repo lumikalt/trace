@@ -958,6 +958,48 @@ impl<'a> TypeChecker<'a> {
                     self.type_stmt(s, locals, ret);
                 }
             }
+            Stmt::WhileLet { name, init, body } => {
+                // Same v0-restricted `Expr::Guard(inner)`-over-`Ty::
+                // Option` shape `IfLet`'s own arm above requires, for the
+                // identical reason -- `while let`'s WHOLE distinction from
+                // `while` is that its own presence check is exactly this
+                // Option-unwrap, not a general fallible condition (see
+                // DESIGN.md's "`while`: multi-cycle loops").
+                let bound_ty = if let Expr::Guard(inner) = self.ast.expr(init) {
+                    let inner = *inner;
+                    let ty = self.type_expr(init, locals);
+                    if matches!(self.types.expr_tys.get(&inner), Some(Ty::Option(_))) {
+                        ty
+                    } else {
+                        self.error(
+                            self.expr_span(init),
+                            "`while let`'s right-hand side must be an Option's own unwrap \
+                             (`opt?`, `opt : ?T`) (v0 restriction: a fifo op, failing \
+                             call, or comparison isn't supported here yet)"
+                                .to_string(),
+                        );
+                        Ty::Unknown
+                    }
+                } else {
+                    self.type_expr(init, locals);
+                    self.error(
+                        self.expr_span(init),
+                        "`while let`'s right-hand side must be an Option's own unwrap \
+                         (`opt?`, `opt : ?T`) -- missing the `?`?"
+                            .to_string(),
+                    );
+                    Ty::Unknown
+                };
+                for (i, d) in self.res.defs.iter().enumerate() {
+                    if d.span == name.span {
+                        locals.insert(DefId(i as u32), bound_ty);
+                        break;
+                    }
+                }
+                for s in body {
+                    self.type_stmt(s, locals, ret);
+                }
+            }
         }
     }
 

@@ -1076,10 +1076,16 @@ Speculative, bigger, not committed to:
   further `.field` access (struct-typed `T`) — cleanly rejected with
   the same message an ordinary `let p = opt?; p.field` already gets,
   not a gap this feature opens. `if let` inside a `<sequences>`/spawn-
-  callee body (crossing a `tick`) isn't supported — confirmed via
-  direct probe to fail CLEANLY ("a spawned fn's last segment must end
-  with `return`"), not silently, so left as a known v0 gap rather than
-  built out this pass.
+  callee body (crossing a `tick`) isn't supported — a `tick` nested
+  inside `if let`'s own body is cleanly rejected ("must be at the top
+  level, not nested in if/while", the same message `if`/`while` get)
+  since the `while`-lowering pass below fixed `find_nested_tick`/`find_
+  tick_anywhere` (and three siblings) to recognize `Stmt::IfLet`, which
+  they'd been silently missing since this bullet shipped — before that
+  fix the SAME source hit a confusing "a spawned fn's last segment must
+  end with `return`" instead. Still a known v0 gap (a captured local
+  crossing a `tick` from inside `if let`'s body isn't built), just with
+  the right error now.
 
   **Three more non-exhaustive-match gaps self-caught the same way the
   previous `if` feature's bugs were — direct probing before considering
@@ -1105,6 +1111,130 @@ Speculative, bigger, not committed to:
   `if`'s condition (not just an Option's presence) — remains fully
   unbuilt; see the four open questions below, still standing except
   where noted resolved for the comparison/Option cases specifically.
+
+- **`while`: multi-cycle loops ACHIEVED — found to be a bigger
+  prerequisite gap than asked for, then built as its own unit.** Lumi
+  asked for `while let` (the loop-shaped sibling of `if let`, "scoped
+  the same way"); direct probing through the real `emit_from_source`
+  harness found `while` itself had NO working FIRRTL emission path at
+  all — `firrtl::emit` unconditionally rejects any `<sequences>`-tagged
+  rule (module.rs), and `lower::plan` only lowered a rule with a
+  top-level `tick` (a `while`-only rule has none, `tick` can never nest
+  inside `while` either, so there was no way to reach a working state).
+  `while` type-checked and effect-checked (the `logic`-discharge
+  restriction above, "one iteration per cycle") but was never wired to
+  synthesize the loop itself. Scoped via `AskUserQuestion`: build
+  `while`'s own lowering first, `while let` after. See DESIGN.md's
+  "`while`: multi-cycle loops" (feature-level) and "`while` lowering"
+  (implementation) sections for the full write-up.
+
+  A top-level `while COND { body }` cuts its own self-looping segment
+  the same way `tick` cuts a straight-line one, rendered as `if COND {
+  <body>; cont := SELF } else { cont := NEXT }` — needing **zero**
+  `firrtl.rs` changes, since the existing `Stmt::If` write-threading
+  already produces exactly this mux for any reg/mem/instance-port/
+  callee write. The entire new surface is in `lower.rs`: segment-
+  cutting (`Segment::while_cond`), `find_nested_while` (top-level-only,
+  mirroring `find_nested_tick`/`find_nested_spawn`), and `plan()`'s own
+  gate widened from "top-level `Tick` present" to "`Tick` OR `While`
+  ANYWHERE" (self-caught: the narrower version let a nested `while`
+  skip `find_nested_while`'s own rejection entirely, silently passing
+  through unchecked).
+
+  **A `while` loop may only write module state directly, not a local**
+  — an accumulator, or any local surviving past the loop, is rejected
+  with a message naming the real cause instead of the generic write-
+  once capture text. This is the one deliberately deferred half:
+  `compute_captures`'s write-once/read-only-in-later-segments invariant
+  would need teaching to reason about loop-carried dataflow (a same-
+  segment self-referential read is semantically sound for an
+  accumulator — a register genuinely sees last cycle's value — but
+  indistinguishable from the read-before-write hazard those checks
+  exist to catch, without new machinery this pass doesn't attempt). A
+  local computed BEFORE the loop and only READ inside it (never
+  reassigned there) already works today, unaffected — confirmed by
+  direct probe plus a firtool-checked regression test.
+
+  **Six pre-existing recursive scans in lower.rs were self-caught
+  missing a `Stmt::IfLet` arm** while extending this exact function
+  family for `find_nested_while` — `find_returns`, `find_nested_tick`/
+  `find_tick_anywhere`, `find_nested_spawn`/`find_spawn_anywhere`,
+  `find_unsupported_construct` all matched only `Stmt::If`/`Stmt::
+  While`, a gap dating to when `if let` first shipped (see that bullet
+  above, now corrected). Confirmed live by direct probe: a `tick`
+  nested inside `if let`'s body used to surface as "a spawned fn's last
+  segment must end with `return`" instead of the clear "not nested in
+  if/while" every other nested-tick shape gets. Fixed all six.
+
+  Proven through the full pipeline, not just structural FIRRTL: examples/
+  while_countdown.tr + sim/while_countdown_tb.v drives a real Icarus
+  simulation across many real clock cycles (firtool + iverilog), holding
+  `x` at 5, 0, then 12 in turn and checking the loop's own iteration
+  count settles exactly right each time — `x=0` pins the zero-iteration
+  edge case (the loop's own condition already false the first time it's
+  checked). Also self-caught along the way: `emit_from_source` (tests/
+  firrtl.rs's own full-pipeline test harness) only asserted `lower::
+  plan`'s errors were empty INSIDE the branch where something had
+  already lowered successfully — a rule whose ONLY lowering candidate
+  failed outright (`lowered` empty, `lower_errors` not) silently fell
+  through to re-running the ORIGINAL, unlowered source instead of
+  surfacing the real error, exactly the shape `while`'s own accumulator
+  rejection has. Fixed; one existing test (`errors_on_unlowered_
+  sequences_rule`) had been unknowingly relying on this exact gap to
+  reach a DIFFERENT downstream error and needed rewriting to reach its
+  actual target (`firrtl::emit`'s own "still a `<sequences>` rule"
+  check) a cleaner way.
+
+  **`while let` itself — the original ask — built as a follow-up, see its
+  own bullet below.**
+
+- **`while let`: looping over Option presence ACHIEVED** — the original
+  ask this whole `while` detour started from, built once `while`'s own
+  lowering (bullet above) existed to build on. `while let NAME = opt? {
+  body }` renders its own segment as literal `if let` source text (`if
+  let NAME = EXPR { <body>; cont := SELF } else { cont := NEXT }`),
+  reusing `if let`'s ENTIRE existing emission machinery — needing zero
+  new emission code, on top of the zero plain `while` already needed.
+  See DESIGN.md's "`while let`: looping over Option presence" (feature)
+  and "`while let` lowering" (implementation) for the full write-up.
+
+  Inherits `if let`'s v0 restrictions verbatim (Option-only `init`, no
+  `.field` chase-through) and plain `while`'s own (module state only
+  inside the loop body, no locally-captured accumulator) — neither is a
+  new gap this feature opens.
+
+  Two more pre-existing gaps self-caught while writing this feature's
+  own worked example (`examples/while_let_drain.tr`), NOT while building
+  the segment-cutting/rendering machinery itself: six lower.rs recursive
+  scans (`find_returns`, `find_nested_tick`/`find_tick_anywhere`, `find_
+  nested_spawn`/`find_spawn_anywhere`, `find_unsupported_construct`)
+  were already missing a `Stmt::IfLet` arm, dating to `if let`'s own
+  landing — a `tick` nested inside `if let` used to surface as "a
+  spawned fn's last segment must end with `return`" instead of the
+  clear "not nested in if/while" message; and `collect_renames` (the
+  spawn callee-body text-rewrite pass) also had no `Stmt::IfLet` arm, so
+  a captured param referenced inside `if let`'s own branches in a
+  spawned callee never got renamed, a hard resolve-error failure on the
+  second pass. Both fixed, with matching `Stmt::WhileLet` arms added at
+  the same time.
+
+  A THIRD, OLDER gap was found but NOT fixed: a `let`-bound local
+  declared inside a plain `if`'s branch, read more than once, fails to
+  resolve on the second read (`enter_rule` only walks a rule's own
+  top-level statements; none of the branch-recursing write-threading
+  walks has a `Stmt::Let` arm either, so a branch-local's binding is
+  never registered). Confirmed with a PLAIN `if`, no `if let` involved —
+  predates every feature on this page. Pinned as a known gap (`a_branch_
+  local_read_more_than_once_is_a_known_pre_existing_gap`, tests/
+  firrtl.rs), not fixed — a materially different, pre-existing problem
+  (branch-body local tracking generally) than anything this pass needed.
+  `examples/while_let_drain.tr` works around it by recomputing `cnt - 1`
+  at each use instead of binding it once.
+
+  Proven through a real Icarus simulation (examples/while_let_drain.tr +
+  sim/while_let_drain_tb.v), the identical x=5/0/12 shape `while_
+  countdown` pins for plain `while`, gated on a real `opt_valid` register
+  instead of a comparison.
 
 - **`?.` safe navigation — designed, not built (scope decided via
   `AskUserQuestion` alongside `if let` above).** Verse's own primary

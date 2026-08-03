@@ -265,6 +265,214 @@ module M {
     assert!(c.errors[0].message.contains("write-once"));
 }
 
+/// `while`'s own segment-cutting (DESIGN.md's "`while`: multi-cycle
+/// loops"): a top-level `while` gets its own dedicated segment,
+/// `while_cond` set, plus the ordinary trailing segment for whatever
+/// follows — three segments total for one `while` with code before and
+/// after it. `cont_width` picks up the extra segments automatically
+/// (`clog2` over the new total), not hand-maintained.
+#[test]
+fn while_loop_structural_shape() {
+    let src = "\
+module M {
+    in x : [8]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        while logic cnt <> 0 {
+            cnt := cnt - 1
+        }
+        result := cnt
+    }
+}
+";
+    let c = run(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered.len(), 1);
+    let lr = &c.lowered[0];
+    assert_eq!(
+        lr.segments.len(),
+        3,
+        "pre-while, the while itself, post-while"
+    );
+    assert!(!lr.segments[0].is_while_loop);
+    assert!(lr.segments[1].is_while_loop);
+    assert!(!lr.segments[2].is_while_loop);
+    assert_eq!(lr.cont_width, 2, "3 segments need 2 bits");
+
+    let rendered = render(&c.ast, src, &c.lowered);
+    assert_round_trips(&rendered);
+    assert!(rendered.contains("if logic cnt <> 0 {"));
+    assert!(rendered.contains(&format!("{} := 1\n    }} else {{", lr.cont_name)));
+    assert!(rendered.contains(&format!("{} := 2\n    }}", lr.cont_name)));
+}
+
+/// A local written inside a `while` loop's own segment and needed
+/// elsewhere — an accumulator (`acc := acc + n`), or anything else
+/// surviving past the loop — is a clean v0 rejection naming the real
+/// cause, not the generic write-once capture text (`rejects_
+/// reassignment_across_segments`'s message would read as nonsense here:
+/// there's no OTHER segment reassigning `acc`, just the loop's own one,
+/// executed every iteration). `while` may only write module state
+/// directly this pass.
+#[test]
+fn while_loop_local_accumulator_across_iterations_is_rejected() {
+    let src = "\
+module M {
+    in x : [8]
+    out result : [8] = 0
+
+    rule r <sequences, fails> {
+        let acc = 0
+        let n = x
+        while logic n <> 0 {
+            acc := acc + n
+            n := n - 1
+        }
+        result := acc
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 2, "{:?}", c.errors);
+    assert!(
+        c.errors
+            .iter()
+            .all(|e| e.message.contains("across a `while` loop boundary"))
+    );
+}
+
+/// `while` must sit at a sequences rule's top level, not nested inside
+/// `if`/another `while` — the same v0 restriction `tick`/`spawn` already
+/// have, and for the same reason: `split_into_segments` only ever looks
+/// at the top level, so a nested `while` would otherwise silently fold
+/// into whichever segment it landed in as ordinary, un-lowered text.
+#[test]
+fn while_nested_in_if_is_rejected() {
+    let src = "\
+module M {
+    reg cnt : [8] = 0
+    reg flag : [1] = 0
+
+    rule r <sequences, fails> {
+        if logic flag = 1 {
+            while logic cnt <> 0 {
+                cnt := cnt - 1
+            }
+        }
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("top level"));
+    assert!(c.errors[0].message.contains("nested in if/while"));
+}
+
+/// `while let`'s own segment-cutting (DESIGN.md's "`while`: multi-cycle
+/// loops"): identical structural shape to plain `while`'s own
+/// (`while_loop_structural_shape` above) — `while let` cuts a dedicated
+/// segment the same way, `is_while_loop` set the same way. What's
+/// DIFFERENT is render time: `while_loop_header` renders `if let NAME =
+/// EXPR { ... }` instead of `if COND { ... }`, reusing `if let`'s own
+/// already-tested emission machinery wholesale rather than adding any.
+#[test]
+fn while_let_loop_structural_shape() {
+    let src = "\
+module M {
+    in x : [8]
+    out result : [8] = 0
+    reg opt : ?[8] = false
+
+    rule r <sequences, fails> {
+        opt := x
+        while let v = opt? {
+            result := v
+            opt := false
+        }
+    }
+}
+";
+    let c = run(src);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(c.lowered.len(), 1);
+    let lr = &c.lowered[0];
+    assert_eq!(
+        lr.segments.len(),
+        3,
+        "pre-while, the while let itself, post-while"
+    );
+    assert!(!lr.segments[0].is_while_loop);
+    assert!(lr.segments[1].is_while_loop);
+    assert!(!lr.segments[2].is_while_loop);
+
+    let rendered = render(&c.ast, src, &c.lowered);
+    assert_round_trips(&rendered);
+    assert!(rendered.contains("if let v = opt? {"));
+    assert!(rendered.contains(&format!("{} := 1\n    }} else {{", lr.cont_name)));
+    assert!(rendered.contains(&format!("{} := 2\n    }}", lr.cont_name)));
+}
+
+/// `while let`'s own bound name inherits `if let`'s v0 restrictions
+/// verbatim — a local written inside the loop and needed elsewhere is
+/// rejected the same way `while`'s own arm is, since `while let`'s loop
+/// segment is just another segment `compute_captures` treats no
+/// differently from a plain `while` segment.
+#[test]
+fn while_let_loop_local_accumulator_across_iterations_is_rejected() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    out result : [8] = 0
+
+    rule r <sequences, fails> {
+        let acc = 0
+        while let v = opt? {
+            acc := acc + v
+            opt := false
+        }
+        result := acc
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
+    assert!(
+        c.errors[0]
+            .message
+            .contains("across a `while` loop boundary")
+    );
+}
+
+/// `while let` must sit at a top level too, the identical restriction
+/// plain `while` has, checked by the SAME `find_nested_while` (folded
+/// into one function rather than a separate `find_nested_while_let`).
+#[test]
+fn while_let_nested_in_if_is_rejected() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    reg flag : [1] = 0
+    out result : [8] = 0
+
+    rule r <sequences, fails> {
+        if logic flag = 1 {
+            while let v = opt? {
+                result := v
+                opt := false
+            }
+        }
+    }
+}
+";
+    let c = run(src);
+    assert_eq!(c.errors.len(), 1);
+    assert!(c.errors[0].message.contains("top level"));
+    assert!(c.errors[0].message.contains("nested in if/while"));
+}
+
 #[test]
 fn uncaptured_locals_are_left_alone() {
     // A local used only within its own segment needs no save register.

@@ -1,0 +1,46 @@
+-- `while let NAME = opt? { body }` — the loop-shaped sibling of `if
+-- let`: each iteration re-checks `opt`'s presence, binding `NAME` to
+-- its unwrapped value for that iteration only. Renders as literal `if
+-- let` text one loop-iteration segment (DESIGN.md's "`while` lowering"
+-- and "`if let`: branch-scoped Option-presence binding"), reusing `if
+-- let`'s own emission machinery wholesale.
+--
+-- `opt` is a single-slot register, not a real queue, so this module
+-- re-seeds it every iteration from `cnt` (present while `cnt <> 0`,
+-- absent once it hits zero) -- the loop body may only write module
+-- state directly (v0 restriction, same as plain `while`), so
+-- `cnt`/`acc` are regs, not locals.
+--
+-- `cnt - 1` is recomputed rather than bound once through a `let`: `cnt`
+-- is a REGISTER, so every read of it within one cycle sees the SAME
+-- pre-this-cycle value regardless of how many times it's written, and
+-- recomputing is the only way to reuse that value here today -- a
+-- known, separate v0 gap (unrelated to `while`/`while let`) currently
+-- rejects a same-branch local read more than once, see TODO.md.
+module WhileLetDrain {
+    in x : [8]
+    out iters : [8] = 0
+    reg cnt : [8] = 0
+    reg opt : ?[8] = false
+    reg acc : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        acc := 0
+        if logic x <> 0 {
+            opt := x
+        } else {
+            opt := false
+        }
+        while let v = opt? {
+            acc := acc + 1
+            cnt := cnt - 1
+            if logic (cnt - 1) <> 0 {
+                opt := cnt - 1
+            } else {
+                opt := false
+            }
+        }
+        iters := acc
+    }
+}

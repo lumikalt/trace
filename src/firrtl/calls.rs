@@ -77,6 +77,14 @@ fn direct_callees(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Vec<(ItemId,
                     collect_calls(ast, *cond, out);
                     body_call_exprs(ast, body, out);
                 }
+                // `while let`, like plain `While` above, only ever
+                // reaches emission fully lowered away (DESIGN.md's
+                // "`while` lowering") -- kept for exhaustiveness, same
+                // shape as `IfLet`'s arm above.
+                Stmt::WhileLet { init, body, .. } => {
+                    collect_calls(ast, *init, out);
+                    body_call_exprs(ast, body, out);
+                }
             }
         }
     }

@@ -193,6 +193,7 @@ fn scan_body(
                 }
             }
             Stmt::While { body, .. } => scan_body(ast, res, fx, src, body, edits, errors),
+            Stmt::WhileLet { body, .. } => scan_body(ast, res, fx, src, body, edits, errors),
             _ => {}
         }
     }
@@ -212,6 +213,7 @@ fn stmt_exprs(ast: &Ast, id: StmtId) -> Vec<ExprId> {
         Stmt::If { cond, .. } => vec![cond],
         Stmt::IfLet { init, .. } => vec![init],
         Stmt::While { cond, .. } => vec![cond],
+        Stmt::WhileLet { init, .. } => vec![init],
     }
 }
 
@@ -489,6 +491,22 @@ impl<'a> Interp<'a> {
                         span,
                         "`if let` (Option-presence binding) is not supported in \
                          `<elaborates>` code"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                // Same defensive status as `IfLet`'s own arm above: a
+                // loop is already rejected outright by `Stmt::While`'s
+                // arm, so `while let` — a loop as much as a plain
+                // `while` is — would already hit that rejection if this
+                // arm didn't exist; kept explicit anyway, both for a
+                // clearer message (naming the actual construct) and so
+                // this match stays exhaustive without a wildcard.
+                Stmt::WhileLet { .. } => {
+                    self.error(
+                        span,
+                        "`while let` (a loop) is not supported in `<elaborates>` code \
+                         (v0 restriction: use recursion, DESIGN.md's `AdderTree` style)"
                             .to_string(),
                     );
                     return Err(());

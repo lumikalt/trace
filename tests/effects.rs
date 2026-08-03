@@ -80,6 +80,20 @@ fn while_needs_sequences_or_elaborates() {
 }
 
 #[test]
+fn while_let_needs_sequences_or_elaborates() {
+    // Same "one iteration per cycle" requirement `while`'s own arm above
+    // enforces -- `while let`'s arm is the one piece of `check_stmt`
+    // written from scratch rather than mirrored from `IfLet`, so it's
+    // the arm most worth pinning directly.
+    let (_, _, errors) =
+        run("Bad(o : ?[8]) : [8] <combines> {\n while let x = o? {\n return x\n }\n return 0\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("one iteration per cycle"));
+
+    run_ok("Ok(o : ?[8]) : [8] <sequences> {\n while let x = o? {\n return x\n }\n return 0\n}\n");
+}
+
+#[test]
 fn any_requires_chooses() {
     let (_, _, errors) = run("F(x : [4]) : [2] <combines> {\n return any(0..3)\n}\n");
     assert_eq!(errors.len(), 1);

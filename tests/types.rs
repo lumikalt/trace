@@ -1603,3 +1603,42 @@ module M {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("must be a struct literal"));
 }
+
+/// `while let v = opt? { ... }`'s own `v` binds to `opt`'s UNWRAPPED type,
+/// same as `if let`'s equivalent test above -- `Stmt::WhileLet`'s arm
+/// shares `type_expr`'s existing `Expr::Guard` handling.
+#[test]
+fn while_let_binds_the_unwrapped_option_type() {
+    run_ok(
+        "module M {\n reg opt : ?[8] = false\n reg v : [8] = 0\n \
+         rule r {\n while let x = opt? {\n v := x\n }\n }\n}\n",
+    );
+    let (_, _, errors) = run("module M {\n reg opt : ?[8] = false\n reg v : [4] = 0\n \
+         rule r {\n while let x = opt? {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+}
+
+/// `while let`'s right-hand side must be an Option's own `?`-unwrap, same
+/// v0 restriction as `if let`'s equivalent test above -- pins the
+/// "while let"-worded error message `Stmt::WhileLet`'s arm produces.
+#[test]
+fn while_let_rhs_must_be_an_option_unwrap_not_another_fallible_shape() {
+    // Missing `?` entirely.
+    let (_, _, errors) = run("module M {\n reg opt : ?[8] = false\n reg v : [8] = 0\n \
+         rule r {\n while let x = opt {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+
+    // A fifo op -- not itself `Expr::Guard`, so it hits the same message.
+    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [8] = 0\n \
+         rule r {\n while let x = f.Deq[] {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+
+    // A bare comparison, explicitly `?`-guarded (`Expr::Guard`, but its
+    // own inner isn't `Ty::Option`).
+    let (_, _, errors) = run("module M {\n reg v : [8] = 0\n in a : [8]\n in b : [8]\n \
+         rule r {\n while let x = (a > b)? {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("Option's own unwrap"));
+}

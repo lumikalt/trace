@@ -19,10 +19,18 @@ fn emit_from_source(src: &str) -> Result<String, Vec<EmitError>> {
     assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
 
     let (lowered, lower_errors) = lower::plan(&ast, &res, &fx, &ty);
+    // Asserting only inside the `else` branch below would silently drop
+    // any error from a rule that needed lowering but failed it entirely
+    // (nothing pushed to `plan`'s own `out`, so `lowered` comes back
+    // empty even though `lower_errors` is not) — self-caught while
+    // testing `while`'s own lowering, whose rejections (a local
+    // accumulated across loop iterations, currently unsupported) are
+    // exactly this shape: the one rule needing lowering fails outright,
+    // `lowered` is empty, and the assert below never ran.
+    assert!(lower_errors.is_empty(), "lower errors: {lower_errors:?}");
     let lowered_src = if lowered.is_empty() {
         src.to_string()
     } else {
-        assert!(lower_errors.is_empty(), "lower errors: {lower_errors:?}");
         lower::render(&ast, src, &lowered)
     };
 
@@ -191,17 +199,25 @@ fn port_ram_emits_addressable_memory_through_ports() {
 
 #[test]
 fn errors_on_unlowered_sequences_rule() {
-    // emit_from_source lowers automatically when lowering applies; use
-    // a rule shape lowering itself rejects (nested tick) so a still-
-    // <sequences> rule with a tick reaches the emitter unlowered.
+    // emit_from_source lowers automatically when lowering applies, and
+    // (self-caught while testing `while`'s own lowering) now correctly
+    // fails loudly if `lower::plan` itself reports an error rather than
+    // silently falling through to the ORIGINAL, unlowered source —
+    // which used to make a rule shape lowering itself rejects (a nested
+    // tick) the way to reach this test's actual target, `firrtl::
+    // emit`'s own defensive "still a <sequences> rule" check, since that
+    // check's error was masked behind a first, unrelated lowering
+    // failure. A `<sequences>` rule with no `tick`/`while` at all is the
+    // cleaner way to reach it now: a legal (if pointless) over-
+    // declaration by DESIGN.md's stated-effects policy, so `lower::
+    // plan` has nothing to cut and skips it (`lowered` AND `lower_
+    // errors` both empty) — the ORIGINAL, still-`<sequences>`-tagged
+    // text reaches the second pass and `firrtl::emit` unmodified.
     let src = "\
 module M {
     reg x : [1] = 0
     rule r <sequences> {
-        if x = 1 {
-            tick
-        }
-        tick
+        x := 1
     }
 }
 ";
@@ -5977,4 +5993,194 @@ module M {
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("connect __out_result, mux(opt_valid, opt_data_inner_z, UInt<8>(0))"));
     run_firtool(&fir, &[]);
+}
+
+/// `while`'s multi-cycle lowering (DESIGN.md's "`while`: multi-cycle
+/// loops"), through the FULL pipeline `emit_from_source` runs (lower ->
+/// re-parse -> re-check -> emit), not just `lower::render`'s own text —
+/// proves the self-looping segment's `if COND { ...; cont := SELF }
+/// else { cont := NEXT }` shape is well-formed trace that resolves,
+/// type-checks, schedules, and emits real FIRRTL (sim/while_countdown_
+/// tb.v separately proves it runs correctly cycle by cycle).
+#[test]
+fn while_loop_over_a_register_compiles_to_a_self_looping_segment() {
+    let src = "\
+module M {
+    in x : [8]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        while logic cnt <> 0 {
+            cnt := cnt - 1
+        }
+        result := cnt
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset __cont_r"));
+    assert!(
+        fir.contains("connect cnt, mux(neq(cnt, UInt<8>(0)), tail(sub(cnt, UInt<8>(1)), 1), cnt)")
+    );
+    assert!(fir.contains("connect __cont_r, mux(neq(cnt, UInt<8>(0)), UInt<2>(1), UInt<2>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// A local computed BEFORE a `while` loop, only READ inside it (never
+/// reassigned there), composes fine with the ordinary capture machinery
+/// — the write-once-then-read-later invariant already holds (its single
+/// assignment segment is the pre-loop one, its read segment is the
+/// loop's own, strictly later) — proving the `while` restriction above
+/// is specifically about a value WRITTEN inside the loop, not about
+/// referencing anything computed earlier.
+#[test]
+fn while_loop_condition_can_read_a_pre_loop_local_bound() {
+    let src = "\
+module M {
+    in bound : [8]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+
+    rule r <sequences, fails> {
+        let limit = bound
+        cnt := 0
+        while logic cnt <> limit {
+            cnt := cnt + 1
+        }
+        result := cnt
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    run_firtool(&fir, &[]);
+}
+
+/// A captured param referenced INSIDE `if let`'s own branches, in a
+/// spawned callee, used to never get renamed to its private register
+/// name -- `collect_renames` (lower.rs, the spawn callee-body text-
+/// rewrite pass) had no `Stmt::IfLet` arm, so nothing recursed into
+/// `then_body`/`else_body` to find that reference at all, leaving the
+/// callee's ORIGINAL param name in the spliced text. Self-caught while
+/// extending this exact function for `while let`: confirmed live by
+/// direct probe, a hard resolve-error failure on the second pass (not a
+/// silent miscompile, but a real gap all the same) before the fix.
+#[test]
+fn iflet_body_references_a_spawned_callees_captured_param_correctly() {
+    let src = "\
+module M {
+    reg acc : [8] = 0
+    out result : [8] = 0
+
+    Bump(p : [8], o : ?[8]) : [8] <sequences> {
+        if let x = o? {
+            acc := p + x
+        } else {
+            acc := p
+        }
+        return acc
+    }
+
+    rule r <sequences> {
+        let h = spawn Bump(3, 5)
+        tick sync[h]
+        result := h.result
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect acc, mux"), "{fir}");
+    run_firtool(&fir, &[]);
+}
+
+/// `while let`'s multi-cycle lowering (DESIGN.md's "`while`: multi-cycle
+/// loops"), through the full `emit_from_source` pipeline. Renders the
+/// loop's own segment as literal `if let` TEXT (`while_loop_header`,
+/// lower.rs) rather than any new emission code, so what's actually
+/// under test is that the rendered `if let NAME = EXPR { ...; cont :=
+/// SELF } else { cont := NEXT }` shape re-parses, re-resolves (`v`
+/// scoped correctly), and re-emits through `if let`'s OWN, already-
+/// tested machinery — `opt_valid`-gated self-loop vs advance, same as
+/// plain `while`'s comparison-gated one.
+#[test]
+fn while_let_loop_over_a_register_compiles_to_a_self_looping_segment() {
+    let src = "\
+module M {
+    in x : [8]
+    out iters : [8] = 0
+    reg cnt : [8] = 0
+    reg opt : ?[8] = false
+    reg acc : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        acc := 0
+        if logic x <> 0 {
+            opt := x
+        } else {
+            opt := false
+        }
+        while let v = opt? {
+            acc := acc + 1
+            cnt := cnt - 1
+            if logic (cnt - 1) <> 0 {
+                opt := cnt - 1
+            } else {
+                opt := false
+            }
+        }
+        iters := acc
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("regreset __cont_r"));
+    assert!(fir.contains("connect __cont_r, mux(opt_valid, UInt<2>(1), UInt<2>(2))"));
+    assert!(fir.contains("connect acc, mux(opt_valid, tail(add(acc, UInt<8>(1)), 1), acc)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A previously-undiscovered, PRE-EXISTING gap found while writing a
+/// `while let` example (`examples/while_let_drain.tr`), unrelated to
+/// `while`/`while let`/`if let` specifically: `enter_rule` (writes.rs)
+/// only walks a RULE's own TOP-LEVEL statements to build `locals_
+/// snapshots`/`locals` for eager local resolution — a `let` declared
+/// INSIDE a branch (`if`, not even `if let`) is invisible to it, and
+/// none of the write-threading walks that DO recurse into branches
+/// (`reg_value_in_stmts` and its siblings) have a `Stmt::Let` arm
+/// either, so nothing ever registers that local's binding at all. A
+/// same-branch local read exactly ONCE happens to still work (nothing
+/// needs its OWN prior registration to compile a value inline the first
+/// time), but a SECOND read — writing two different registers off the
+/// same computed value, an entirely ordinary pattern — fails to
+/// resolve. Confirmed with plain `if` (no `if let` involved at all),
+/// so this predates every feature built this session. Not fixed here
+/// (out of scope for `while let`); pinned so the next person doesn't
+/// have to re-derive it. See TODO.md.
+#[test]
+fn a_branch_local_read_more_than_once_is_a_known_pre_existing_gap() {
+    let src = "\
+module M {
+    reg flag : [1] = 0
+    reg cnt : [8] = 0
+    reg acc : [8] = 0
+
+    rule r {
+        if flag = 1 {
+            let new_cnt = cnt - 1
+            cnt := new_cnt
+            acc := new_cnt
+        } else {
+            cnt := 0
+            acc := 0
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .all(|e| e.message.contains("cannot find this local's binding"))
+    );
 }

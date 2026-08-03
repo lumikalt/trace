@@ -335,6 +335,21 @@ impl<'a> Checker<'a> {
                     self.infer_stmt(*s, sig);
                 }
             }
+            Stmt::WhileLet { init, body, .. } => {
+                // Mirrors `Stmt::IfLet`'s own arm above exactly, for the
+                // identical reason: `init` is `Expr::Guard(inner)`
+                // (types.rs's own arm requires this), and the presence
+                // check never gates the enclosing item the way a bare
+                // top-level `opt?` does.
+                if let Expr::Guard(inner) = self.ast.expr(*init) {
+                    self.infer_expr(*inner, sig);
+                } else {
+                    self.infer_expr(*init, sig);
+                }
+                for s in body {
+                    self.infer_stmt(*s, sig);
+                }
+            }
         }
     }
 
@@ -688,6 +703,27 @@ impl<'a> Checker<'a> {
                     self.check_stmt(s, item, sig, elab);
                 }
                 for s in else_body.unwrap_or_default() {
+                    self.check_stmt(s, item, sig, elab);
+                }
+            }
+            Stmt::WhileLet { init, body, .. } => {
+                // A loop, same as `Stmt::While`'s own arm above -- needs
+                // the identical `<sequences>`/`<elaborates>` requirement
+                // (`while let` is still "one iteration per cycle", just
+                // with an Option-presence condition instead of a plain
+                // comparison). `init`'s own guard-in-elaborates rejection
+                // falls out of `check_expr` for free, same as `IfLet`'s
+                // arm above.
+                if !sig.sequences && !sig.elaborates {
+                    self.error(
+                        span,
+                        "loop needs `<sequences>` (one iteration per cycle) or an \
+                         elaboration-time bound under `<elaborates>`"
+                            .to_string(),
+                    );
+                }
+                self.check_expr(init, item, sig, elab);
+                for s in body {
                     self.check_stmt(s, item, sig, elab);
                 }
             }

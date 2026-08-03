@@ -697,6 +697,19 @@ impl<'a> Resolver<'a> {
                 self.resolve_stmts(&body);
                 self.scopes.pop();
             }
+            Stmt::WhileLet { name, init, body } => {
+                // Same shape as `IfLet`'s own arm above, one scope-push
+                // deeper than `While`'s `cond` — `name` is declared
+                // INSIDE `body`'s own pushed scope, invisible after the
+                // loop, for the same reason `IfLet`'s `name` is
+                // invisible outside `then_body`.
+                self.resolve_expr(init, false);
+                self.scopes.push(HashMap::new());
+                let def = self.declare(&name, DefKind::Local);
+                self.declared_locals.push((def, name));
+                self.resolve_stmts(&body);
+                self.scopes.pop();
+            }
         }
     }
 

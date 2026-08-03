@@ -667,7 +667,7 @@ impl<'a> Emitter<'a> {
                         ));
                     }
                 }
-                Stmt::While { .. } => {
+                Stmt::While { .. } | Stmt::WhileLet { .. } => {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
                         "a loop in an emitted rule body is not supported (sequences \
@@ -757,7 +757,7 @@ impl<'a> Emitter<'a> {
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
-                Stmt::While { .. } => {
+                Stmt::While { .. } | Stmt::WhileLet { .. } => {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
                         "a loop in an emitted rule body is not supported (sequences \
@@ -1056,7 +1056,7 @@ impl<'a> Emitter<'a> {
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
-                Stmt::While { .. } => {
+                Stmt::While { .. } | Stmt::WhileLet { .. } => {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
                         "a loop in an emitted rule body is not supported (sequences \
@@ -1346,7 +1346,7 @@ impl<'a> Emitter<'a> {
                         current = Some(format!("mux({cond_str}, {t}, {e})"));
                     }
                 }
-                Stmt::While { .. } => {
+                Stmt::While { .. } | Stmt::WhileLet { .. } => {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
                         "a loop in an emitted rule body is not supported (sequences \

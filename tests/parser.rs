@@ -654,6 +654,42 @@ fn if_let_without_an_else_parses_with_none() {
 }
 
 #[test]
+fn while_let_parses_name_init_and_body() {
+    // `while let NAME = EXPR { ... }` -- the loop-shaped sibling of `if
+    // let` (DESIGN.md's "`while let`: looping over Option presence").
+    let src = "rule t {\n while let x = opt? {\n v := x\n }\n}\n";
+    let ast = parse_ok(src);
+    let trace::ast::Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 1, "expected one statement: {body:?}");
+    let trace::ast::Stmt::WhileLet { name, init, body } = ast.stmt(body[0]) else {
+        panic!(
+            "expected a while-let statement, got: {:?}",
+            ast.stmt(body[0])
+        );
+    };
+    assert_eq!(name.text, "x");
+    assert!(matches!(ast.expr(*init), trace::ast::Expr::Guard(_)));
+    assert_eq!(body.len(), 1);
+}
+
+#[test]
+fn while_let_rejects_a_trailing_else() {
+    // Unlike `if let`, `while let` has no `else`/`else if` handling at
+    // all -- `parse_while_let` calls `expect_terminator()` right after
+    // `parse_block()`, so a dangling `else` is a parse error, not a
+    // silently-accepted no-op.
+    let src = "rule t {\n while let x = opt? {\n v := x\n } else {\n v := 0\n }\n}\n";
+    let (tokens, _) = lexer::lex(src);
+    let (_, errors) = parser::parse(src, &tokens);
+    assert!(
+        !errors.is_empty(),
+        "expected a parse error for trailing else on while let"
+    );
+}
+
+#[test]
 fn while_with_a_bare_ident_condition_still_parses_its_body_as_a_block_not_a_struct_literal() {
     // `while`'s condition is parsed by the exact same `parse_expr(0)`
     // call `if`'s condition is (see `parse_stmt`), so it shares the

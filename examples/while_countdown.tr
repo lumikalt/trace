@@ -1,0 +1,23 @@
+-- `while COND { body }` inside a `<sequences>` rule: one iteration per
+-- cycle, the loop's own back-edge acting as the (otherwise `tick`-only)
+-- cycle boundary. See DESIGN.md's "`while`: multi-cycle loops" section.
+-- `cnt`/`acc` are module state (regs), not locals -- a `while` loop may
+-- only write module state directly in v0; a local surviving the loop
+-- boundary (an accumulator bound with `let`) is rejected with a clear
+-- error instead (see that same section).
+module WhileCountdown {
+    in x : [8]
+    out iters : [8] = 0
+    reg cnt : [8] = 0
+    reg acc : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        acc := 0
+        while logic cnt <> 0 {
+            cnt := cnt - 1
+            acc := acc + 1
+        }
+        iters := acc
+    }
+}

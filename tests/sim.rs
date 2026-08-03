@@ -210,6 +210,72 @@ fn subleq_runs_and_computes_the_right_answer() {
     );
 }
 
+/// Proves `while`'s multi-cycle lowering end to end: sim/while_
+/// countdown_tb.v holds `x` at 5, 0, then 12 in turn and checks `iters`
+/// settles at exactly `x` each time — real per-cycle iteration, not
+/// just FIRRTL firtool happens to accept. `x=0` pins the zero-iteration
+/// edge case (the loop's own condition already false the first time
+/// it's checked).
+#[test]
+fn while_countdown_runs_through_real_cycles() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/while_countdown.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/while_countdown_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: iters=12"),
+        "iters did not settle at the last driven x value:\n{output}"
+    );
+}
+
+/// Proves `while let`'s multi-cycle lowering end to end: sim/while_let_
+/// drain_tb.v holds `x` at 5, 0, then 12 in turn and checks `iters`
+/// settles at exactly `x` each time, the same shape `while_countdown`
+/// pins for plain `while` — except the loop here is gated on a real
+/// `opt_valid` register (`while let v = opt?`), not a comparison,
+/// proving the rendered `if let`-as-self-loop text (`while_loop_header`,
+/// lower.rs) actually re-enters `if let`'s own emission machinery
+/// correctly, not just that firtool accepts the text.
+#[test]
+fn while_let_drain_runs_through_real_cycles() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/while_let_drain.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/while_let_drain_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: iters=12"),
+        "iters did not settle at the last driven x value:\n{output}"
+    );
+}
+
 /// Proves fifo synthesis end to end: sim/fifo_bridge_tb.v checks both
 /// the forward path (a value placed in `input` reaches `output`
 /// unchanged) and backpressure (`transfer` stalls while `output` is

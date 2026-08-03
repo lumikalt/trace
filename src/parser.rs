@@ -807,13 +807,7 @@ impl<'a> Parser<'a> {
                 Stmt::Return(value)
             }
             Some(If) => self.parse_if()?,
-            Some(While) => {
-                self.bump();
-                let cond = self.parse_expr(0)?;
-                let body = self.parse_block()?;
-                self.expect_terminator();
-                Stmt::While { cond, body }
-            }
+            Some(While) => self.parse_while()?,
             _ => {
                 let lhs = self.parse_expr(0)?;
                 if self.eat(ColonEq) {
@@ -1056,6 +1050,38 @@ impl<'a> Parser<'a> {
             then_body,
             else_body,
         })
+    }
+
+    fn parse_while(&mut self) -> Option<Stmt> {
+        self.bump(); // while
+        if self.at(TokenKind::Let) {
+            return self.parse_while_let();
+        }
+        let cond = self.parse_expr(0)?;
+        let body = self.parse_block()?;
+        self.expect_terminator();
+        Some(Stmt::While { cond, body })
+    }
+
+    /// `while let NAME = EXPR { ... }` — the loop-shaped sibling of `if
+    /// let` (DESIGN.md's "`while`: multi-cycle loops"). `while` has
+    /// already been consumed; `self` is sitting on `let`. Mirrors
+    /// `parse_if_let`'s `let NAME =` prefix parsing exactly, but with no
+    /// `else`/`else if` handling — a loop has nothing to run once
+    /// instead of looping.
+    fn parse_while_let(&mut self) -> Option<Stmt> {
+        self.bump(); // let
+        let name = self.expect_ident("binding name")?;
+        self.expect(TokenKind::Eq, "`=` after `let` name")
+            .ok()
+            .or_else(|| {
+                self.sync();
+                None
+            })?;
+        let init = self.parse_expr(0)?;
+        let body = self.parse_block()?;
+        self.expect_terminator();
+        Some(Stmt::WhileLet { name, init, body })
     }
 
     // --- expressions (Pratt) ---

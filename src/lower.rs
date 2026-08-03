@@ -76,7 +76,26 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub struct Segment {
     pub index: u64,
     /// Statements belonging to this segment, contiguous, `Tick` excluded.
+    /// For a `while`/`while let` loop segment (`is_while_loop` is
+    /// `true`), this is exactly one statement: the `Stmt::While`/`Stmt::
+    /// WhileLet` itself, unwrapped only at render time (`render_rule`/
+    /// `render_spawn_segments`) — kept intact rather than flattened to
+    /// its own body so every existing recursive scan (`find_returns`,
+    /// capture tracking, ...) that already handles `Stmt::While`/`Stmt::
+    /// WhileLet` correctly (rejecting an early `return`, requiring a
+    /// concrete width to capture, etc.) keeps working unchanged.
     pub stmts: Vec<StmtId>,
+    /// `true` marks this segment as a `while COND { ... }`/`while let
+    /// NAME = EXPR { ... }` loop's own self-looping segment (one
+    /// iteration per cycle): render as `if COND { <body>; cont := SELF }
+    /// else { cont := NEXT }` (plain `while`) or `if let NAME = EXPR {
+    /// <body>; cont := SELF } else { cont := NEXT }` (`while let`)
+    /// instead of straight-line-then-advance. `false` for an ordinary
+    /// tick-cut segment. Just a marker, not `Option<ExprId>` — render
+    /// time re-derives `cond`/`name`/`init`/`body` by matching `ast.
+    /// stmt(stmts[0])` directly, since which shape applies depends on
+    /// which of the two statements it is anyway.
+    pub is_while_loop: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -189,7 +208,17 @@ pub fn plan(
                 if !fx.sigs.get(&id).is_some_and(|s| s.sequences) {
                     continue;
                 }
-                if !body.iter().any(|s| matches!(ast.stmt(*s), Stmt::Tick)) {
+                // A `tick`/`while` ANYWHERE (not just top-level) has to
+                // route through `plan_rule`, even one that turns out to
+                // be nested (and therefore rejected) — `find_nested_
+                // tick`/`find_nested_while`'s own clear errors live
+                // there, and skipping straight past this gate would
+                // leave a nested one to fail some other, more confusing
+                // way once the untouched `<sequences>` rule reaches a
+                // later pass instead.
+                if find_tick_anywhere(ast, &body).is_none()
+                    && find_while_anywhere(ast, &body).is_none()
+                {
                     continue; // nothing to cut; leave as an ordinary rule
                 }
                 match plan_rule(ast, res, types, &def_items, id, &name.text, &body) {
@@ -229,6 +258,14 @@ fn plan_rule(
             span,
             message: "`spawn` must be at the top level of a sequences rule, not nested in \
                       if/while (v0 restriction, same as `tick`)"
+                .to_string(),
+        }]);
+    }
+    if let Some(span) = find_nested_while(ast, body) {
+        return Err(vec![LowerError {
+            span,
+            message: "`while` must be at the top level of a sequences rule, not nested in \
+                      if/while (v0 restriction, same as `tick`/`spawn`)"
                 .to_string(),
         }]);
     }
@@ -381,6 +418,35 @@ fn find_returns(ast: &Ast, stmt: StmtId) -> Vec<StmtId> {
                 out.extend(find_returns(ast, *s));
             }
         }
+        // Pre-existing gap, self-caught while extending this exact
+        // function family for `while`: every other recursive scan below
+        // (`find_nested_tick`, `find_tick_anywhere`, `find_nested_spawn`,
+        // `find_spawn_anywhere`, `find_unsupported_construct`) had the
+        // same missing arm, silently exempting an `if let`'s branches
+        // from a check meant to apply uniformly to every branch shape —
+        // confirmed live by direct probe: `tick` nested inside `if let`
+        // surfaced as "a spawned fn's last segment must end with
+        // `return`" instead of the clear "must be at the top level, not
+        // nested in if/while" message `if`/`while` already get.
+        Stmt::IfLet {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for s in then_body {
+                out.extend(find_returns(ast, *s));
+            }
+            if let Some(else_body) = else_body {
+                for s in else_body {
+                    out.extend(find_returns(ast, *s));
+                }
+            }
+        }
+        Stmt::WhileLet { body, .. } => {
+            for s in body {
+                out.extend(find_returns(ast, *s));
+            }
+        }
         _ => {}
     }
     out
@@ -390,16 +456,48 @@ fn split_into_segments(ast: &Ast, body: &[StmtId]) -> Vec<Segment> {
     let mut segments: Vec<Segment> = vec![Segment {
         index: 0,
         stmts: Vec::new(),
+        is_while_loop: false,
     }];
     for stmt in body {
-        if matches!(ast.stmt(*stmt), Stmt::Tick) {
-            let next = segments.len() as u64;
-            segments.push(Segment {
-                index: next,
-                stmts: Vec::new(),
-            });
-        } else {
-            segments.last_mut().unwrap().stmts.push(*stmt);
+        match ast.stmt(*stmt) {
+            Stmt::Tick => {
+                let next = segments.len() as u64;
+                segments.push(Segment {
+                    index: next,
+                    stmts: Vec::new(),
+                    is_while_loop: false,
+                });
+            }
+            // A top-level `while`/`while let` cuts the SAME way `tick`
+            // does, but unlike `tick` (a pure separator with no content
+            // of its own) it gets a dedicated segment holding exactly
+            // itself -- `render_rule`/`render_spawn_segments` unwrap
+            // `cond`/`body` (or `name`/`init`/`body`) from this one
+            // statement at render time, wrapping `body` in `if COND {
+            // ...; cont := SELF } else { cont := NEXT }` (or `if let
+            // NAME = EXPR { ... }`) instead of the ordinary
+            // straight-line-then-advance shape. `find_nested_while`
+            // (called before this fn ever runs) already confirmed
+            // neither hides deeper than the top level, so every `Stmt::
+            // While`/`Stmt::WhileLet` reaching this loop is one of these
+            // dedicated segments, never folded into a straight-line one.
+            Stmt::While { .. } | Stmt::WhileLet { .. } => {
+                let while_idx = segments.len() as u64;
+                segments.push(Segment {
+                    index: while_idx,
+                    stmts: vec![*stmt],
+                    is_while_loop: true,
+                });
+                let next_idx = segments.len() as u64;
+                segments.push(Segment {
+                    index: next_idx,
+                    stmts: Vec::new(),
+                    is_while_loop: false,
+                });
+            }
+            _ => {
+                segments.last_mut().unwrap().stmts.push(*stmt);
+            }
         }
     }
     segments
@@ -599,6 +697,14 @@ fn plan_spawn(
             span: s,
             message: "a spawned fn cannot itself `spawn` (v0 restriction: no nested \
                       parallelism)"
+                .to_string(),
+        }]);
+    }
+    if let Some(s) = find_nested_while(ast, &callee_body) {
+        return Err(vec![LowerError {
+            span: s,
+            message: "`while` must be at the top level of a spawned fn's body, not nested in \
+                      if/while (v0 restriction, same as `tick`)"
                 .to_string(),
         }]);
     }
@@ -810,6 +916,27 @@ fn compute_captures(
     assigns.retain(|d, _| !exclude.contains(d));
     reads.retain(|d, _| !exclude.contains(d));
 
+    // A local written inside a `while` loop's own segment — an
+    // accumulator (`acc := acc + n`) or anything else surviving past the
+    // loop — needs genuinely different capture semantics than an
+    // ordinary tick-crossing value: multiple writes (one per iteration)
+    // to the SAME segment index, plus a same-segment self-referential
+    // read that's semantically sound (a register read sees last cycle's
+    // value) but indistinguishable, from `assign_segs`/`read_segs`
+    // alone, from the read-before-write hazard the checks below exist to
+    // catch. Not attempted this pass (DESIGN.md's "`while`: multi-cycle
+    // loops" section) — a `while` loop may only write module state
+    // (regs/mem/outputs) directly, never a local that would need
+    // capturing. The checks below are unchanged; only their error
+    // messages are sharpened when a `while` segment is involved, so this
+    // restriction reads as an intentional boundary instead of the
+    // generic capture-machinery text.
+    let while_segments: HashSet<usize> = segments
+        .iter()
+        .filter(|s| s.is_while_loop)
+        .map(|s| s.index as usize)
+        .collect();
+
     let mut errors = Vec::new();
     let mut captures = Vec::new();
     let mut capture_names: HashMap<String, DefId> = Default::default();
@@ -821,28 +948,51 @@ fn compute_captures(
         }
         let name = res.def(*def).name.clone();
         let let_prefix_span = let_bound.get(def).cloned();
+        let touches_while = touched.iter().any(|s| while_segments.contains(s));
         if assign_segs.len() != 1 {
             let segs: Vec<String> = assign_segs.iter().map(|s| s.to_string()).collect();
-            errors.push(LowerError {
-                span: res.def(*def).span.clone(),
-                message: format!(
+            let message = if touches_while {
+                format!(
+                    "`{name}` is written across a `while` loop boundary ({}); a value \
+                     carried across `while` iterations, or surviving past the loop, isn't \
+                     supported yet (v0 restriction: a `while` loop may only write module \
+                     state — a reg/mem/output — directly, not a local)",
+                    segs.join(", ")
+                )
+            } else {
+                format!(
                     "`{name}` is assigned in multiple segments ({}); sequences lowering \
                      requires a single assignment per captured value (v0 restriction)",
                     segs.join(", ")
-                ),
+                )
+            };
+            errors.push(LowerError {
+                span: res.def(*def).span.clone(),
+                message,
             });
             continue;
         }
         let assign_segment = *assign_segs.iter().next().unwrap();
         if let Some(&bad) = read_segs.iter().find(|&&s| s <= assign_segment) {
-            errors.push(LowerError {
-                span: res.def(*def).span.clone(),
-                message: format!(
+            let message = if while_segments.contains(&assign_segment) {
+                format!(
+                    "`{name}` is read in segment {bad}, at or before its assignment inside a \
+                     `while` loop's own segment ({assign_segment}); a value carried across \
+                     `while` iterations, or surviving past the loop, isn't supported yet (v0 \
+                     restriction: a `while` loop may only write module state — a reg/mem/\
+                     output — directly, not a local)"
+                )
+            } else {
+                format!(
                     "`{name}` is read in segment {bad} at or before its assignment in \
                      segment {assign_segment}; a captured value must be write-once and \
                      read only in later segments (v0 restriction: promoting it to a \
                      register would change same-cycle read-after-write semantics)"
-                ),
+                )
+            };
+            errors.push(LowerError {
+                span: res.def(*def).span.clone(),
+                message,
             });
             continue;
         }
@@ -913,6 +1063,9 @@ fn collect_handle_field_rewrites(
             Stmt::While { body, .. } => {
                 edits.extend(collect_handle_field_rewrites(ast, res, body, handles));
             }
+            Stmt::WhileLet { body, .. } => {
+                edits.extend(collect_handle_field_rewrites(ast, res, body, handles));
+            }
             _ => {}
         }
     }
@@ -963,7 +1116,31 @@ fn find_nested_tick(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
                     return Some(span);
                 }
             }
+            // Self-caught while extending this function family for
+            // `while`: missing before now, so a `tick` nested inside an
+            // `if let` silently escaped this check (see `find_returns`'s
+            // own doc comment on this same gap, found the same way).
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_tick_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_tick_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
             Stmt::While { body, .. } => {
+                if let Some(span) = find_tick_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            Stmt::WhileLet { body, .. } => {
                 if let Some(span) = find_tick_anywhere(ast, body) {
                     return Some(span);
                 }
@@ -993,7 +1170,27 @@ fn find_tick_anywhere(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
                     return Some(span);
                 }
             }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_tick_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_tick_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
             Stmt::While { body, .. } => {
+                if let Some(span) = find_tick_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            Stmt::WhileLet { body, .. } => {
                 if let Some(span) = find_tick_anywhere(ast, body) {
                     return Some(span);
                 }
@@ -1024,7 +1221,27 @@ fn find_nested_spawn(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
                     return Some(span);
                 }
             }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_spawn_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_spawn_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
             Stmt::While { body, .. } => {
+                if let Some(span) = find_spawn_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            Stmt::WhileLet { body, .. } => {
                 if let Some(span) = find_spawn_anywhere(ast, body) {
                     return Some(span);
                 }
@@ -1058,8 +1275,126 @@ fn find_spawn_anywhere(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
                     return Some(span);
                 }
             }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_spawn_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_spawn_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
             Stmt::While { body, .. } => {
                 if let Some(span) = find_spawn_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            Stmt::WhileLet { body, .. } => {
+                if let Some(span) = find_spawn_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Same shape as `find_nested_tick`, for `while` itself: a v0-scope
+/// restriction matching `tick`/`spawn`'s own — `while` must sit at a
+/// sequences rule's (or a spawned fn body's) top level, not nested
+/// inside `if`/`if let`/another `while`. Segment-cutting
+/// (`split_into_segments`) only ever looks at the top level for exactly
+/// this reason: a nested `while` would otherwise silently fold into
+/// whichever segment it landed in as ordinary, un-lowered text.
+fn find_nested_while(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
+    for stmt in stmts {
+        match ast.stmt(*stmt) {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_while_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_while_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_while_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_while_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
+            Stmt::While { body, .. } => {
+                if let Some(span) = find_while_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            Stmt::WhileLet { body, .. } => {
+                if let Some(span) = find_while_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_while_anywhere(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
+    for stmt in stmts {
+        match ast.stmt(*stmt) {
+            Stmt::While { .. } | Stmt::WhileLet { .. } => {
+                return Some(ast.stmt_spans[stmt.0 as usize].clone());
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_while_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_while_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_while_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_while_anywhere(ast, b))
+                {
                     return Some(span);
                 }
             }
@@ -1157,7 +1492,17 @@ fn find_unsupported_construct(
                     .as_deref()
                     .and_then(|b| find_unsupported_construct(ast, res, b, false))
             }),
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => find_unsupported_construct(ast, res, then_body, false).or_else(|| {
+                else_body
+                    .as_deref()
+                    .and_then(|b| find_unsupported_construct(ast, res, b, false))
+            }),
             Stmt::While { body, .. } => find_unsupported_construct(ast, res, body, false),
+            Stmt::WhileLet { body, .. } => find_unsupported_construct(ast, res, body, false),
             _ => None,
         };
         if nested.is_some() {
@@ -1230,6 +1575,7 @@ fn stmt_exprs(ast: &Ast, id: StmtId) -> Vec<ExprId> {
         Stmt::If { cond, .. } => vec![cond],
         Stmt::IfLet { init, .. } => vec![init],
         Stmt::While { cond, .. } => vec![cond],
+        Stmt::WhileLet { init, .. } => vec![init],
     }
 }
 
@@ -1333,6 +1679,17 @@ fn scan_stmts(
                 scan_expr(ast, res, cond, segment, reads);
                 scan_stmts(ast, res, &body, segment, assigns, reads, let_bound);
             }
+            // Same exemption `IfLet`'s arm above has, for the identical
+            // reason: `name` isn't registered in `assigns`/`let_bound`
+            // (no rewrite exists for `while let`'s surrounding loop
+            // structure either), and `init` is scanned for reads only.
+            // `body` scans at the SAME segment index as this `while
+            // let` itself, same as `While`'s own arm — the loop's own
+            // body executes as part of this one self-looping segment.
+            Stmt::WhileLet { init, body, .. } => {
+                scan_expr(ast, res, init, segment, reads);
+                scan_stmts(ast, res, &body, segment, assigns, reads, let_bound);
+            }
         }
     }
 }
@@ -1379,7 +1736,33 @@ fn collect_renames(
                     edits.extend(collect_renames(ast, res, else_body, renames));
                 }
             }
+            // Self-caught while extending this same function for
+            // `WhileLet`: this arm was missing for `IfLet` too, a real
+            // pre-existing gap (not just an unreachable defensive case
+            // the others in this file mostly are) — a captured param
+            // referenced inside `if let`'s own branches, in a spawned
+            // callee, never got renamed to its private register name,
+            // since nothing recursed into `then_body`/`else_body` to
+            // find that reference at all. Confirmed live by direct
+            // probe: silently left the ORIGINAL param name in the
+            // rendered text, which then failed to resolve on the
+            // second pass (`emit_from_source`'s own resolve-errors
+            // assert) rather than compiling wrong — a hard failure, not
+            // a silent miscompile, but a real gap all the same.
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                edits.extend(collect_renames(ast, res, then_body, renames));
+                if let Some(else_body) = else_body {
+                    edits.extend(collect_renames(ast, res, else_body, renames));
+                }
+            }
             Stmt::While { body, .. } => {
+                edits.extend(collect_renames(ast, res, body, renames));
+            }
+            Stmt::WhileLet { body, .. } => {
                 edits.extend(collect_renames(ast, res, body, renames));
             }
             _ => {}
@@ -1564,6 +1947,43 @@ fn expand(
 /// same outcome as any other race, no double-completion. Verified via
 /// `--explain-schedule` on a hand-lowered two-spawn example before this
 /// was implemented, not assumed.
+/// An `is_while_loop` segment's own `if` header text — `if COND {` for
+/// `Stmt::While`, `if let NAME = EXPR {` for `Stmt::WhileLet` — alongside
+/// the loop's own body. Shared between `render_rule` and `render_spawn_
+/// segments`, the two places a self-looping segment gets rendered:
+/// `while let`'s header reuses `if let`'s OWN existing syntax verbatim,
+/// so the rendered text re-enters the pipeline as an ordinary `if let`
+/// and gets its mux synthesis, `if_let_binds`, and every write-threading
+/// arm for free — the identical "reuse `if`'s machinery" move plain
+/// `while` already makes (DESIGN.md's "`while` lowering").
+fn while_loop_header<'a>(
+    ast: &'a Ast,
+    src: &str,
+    stmt: StmtId,
+    rewrites: &[(Span, String)],
+) -> (String, &'a [StmtId]) {
+    match ast.stmt(stmt) {
+        Stmt::While { cond, body } => {
+            let cond_span = ast.expr_spans[cond.0 as usize].clone();
+            (
+                format!("if {} {{\n", splice(src, &cond_span, rewrites).trim_end()),
+                body.as_slice(),
+            )
+        }
+        Stmt::WhileLet { name, init, body } => {
+            let init_span = ast.expr_spans[init.0 as usize].clone();
+            (
+                format!(
+                    "if let {name} = {} {{\n",
+                    splice(src, &init_span, rewrites).trim_end()
+                ),
+                body.as_slice(),
+            )
+        }
+        _ => unreachable!("an is_while_loop segment's own statement is always While/WhileLet"),
+    }
+}
+
 fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
     let mut out = String::new();
     for cap in &lr.captures {
@@ -1611,6 +2031,35 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
     for seg in &lr.segments {
         out.push_str(&format!("rule {}_s{} {{\n", lr.rule_name, seg.index));
         out.push_str(&format!("    ({} = {})?\n", lr.cont_name, seg.index));
+        let next = if seg.index + 1 < nsegs {
+            seg.index + 1
+        } else {
+            0
+        };
+        if seg.is_while_loop {
+            // `seg.stmts` is exactly `[the Stmt::While/WhileLet itself]`
+            // (see `Segment::is_while_loop`'s own doc comment) --
+            // `find_nested_spawn`/`find_unsupported_construct` (called
+            // before this rule was ever planned) already confirmed no
+            // spawn trigger/sync/race hides inside a loop's body, so --
+            // unlike the ordinary segment loop below -- every statement
+            // here is plain splice, no per-shape dispatch needed.
+            let (header, body) =
+                while_loop_header(ast, src, seg.stmts[0], &lr.handle_field_rewrites);
+            out.push_str("    ");
+            out.push_str(&header);
+            for stmt in body {
+                let span = ast.stmt_spans[stmt.0 as usize].clone();
+                out.push_str("    ");
+                out.push_str(&splice(src, &span, &lr.handle_field_rewrites));
+            }
+            out.push_str(&format!("        {} := {}\n", lr.cont_name, seg.index));
+            out.push_str("    } else {\n");
+            out.push_str(&format!("        {} := {next}\n", lr.cont_name));
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
+            continue;
+        }
         for stmt in &seg.stmts {
             if let Some(spawn) = spawn_by_trigger.get(stmt) {
                 render_spawn_trigger(&mut out, src, ast, spawn, &lr.handle_field_rewrites);
@@ -1675,11 +2124,6 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
                 out.push_str(&splice(src, &span, &lr.handle_field_rewrites));
             }
         }
-        let next = if seg.index + 1 < nsegs {
-            seg.index + 1
-        } else {
-            0
-        };
         out.push_str(&format!("    {} := {next}\n", lr.cont_name));
         out.push_str("}\n\n");
     }
@@ -1760,6 +2204,32 @@ fn render_spawn_segments(
             out.push_str(&format!("    {guard}\n"));
         }
         let is_last = seg.index + 1 == nsegs;
+        if seg.is_while_loop {
+            // Mirrors `render_rule`'s own `is_while_loop` branch exactly
+            // — see its doc comment and `while_loop_header`'s. `is_last`
+            // is always false here: a `return` can never be nested
+            // inside a loop's body (`find_returns`'s early-return
+            // rejection in `plan_spawn` already confirmed that), so a
+            // while segment is never the spawned fn's own final segment.
+            let (header, body) = while_loop_header(ast, src, seg.stmts[0], &spawn.rename_edits);
+            out.push_str("    ");
+            out.push_str(&header);
+            for stmt in body {
+                let span = ast.stmt_spans[stmt.0 as usize].clone();
+                out.push_str("    ");
+                out.push_str(&splice(src, &span, &spawn.rename_edits));
+            }
+            out.push_str(&format!("        {} := {}\n", spawn.cont_name, seg.index));
+            out.push_str("    } else {\n");
+            out.push_str(&format!(
+                "        {} := {}\n",
+                spawn.cont_name,
+                seg.index + 1
+            ));
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
+            continue;
+        }
         for stmt in &seg.stmts {
             if is_last && matches!(ast.stmt(*stmt), Stmt::Return(_)) {
                 let rspan = ast.expr_spans[spawn.return_expr.0 as usize].clone();

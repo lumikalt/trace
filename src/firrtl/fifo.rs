@@ -300,6 +300,7 @@ pub(crate) fn contains_fifo_op(ast: &Ast, res: &Resolution, stmt: StmtId) -> boo
                     .is_some_and(|b| b.iter().any(|s| contains_fifo_op(ast, res, *s)))
         }
         Stmt::While { body, .. } => body.iter().any(|s| contains_fifo_op(ast, res, *s)),
+        Stmt::WhileLet { body, .. } => body.iter().any(|s| contains_fifo_op(ast, res, *s)),
         _ => false,
     }
 }

@@ -282,6 +282,22 @@ pub enum Stmt {
         cond: ExprId,
         body: Vec<StmtId>,
     },
+    /// `while let NAME = EXPR { body }` — the loop-shaped sibling of
+    /// `Stmt::IfLet` (DESIGN.md's "`while`: multi-cycle loops"): each
+    /// iteration re-checks `EXPR`'s presence, binding `NAME` to the
+    /// unwrapped value for that iteration only — visible ONLY within
+    /// `body`, never after the loop, same new-scoping-rule shape
+    /// `IfLet`'s `then_body` already has. No `else` (a loop has nothing
+    /// to run once instead of looping — absence just ends the loop, the
+    /// same way `while`'s own condition going false does). `init`
+    /// carries the identical v0 restriction `IfLet`'s does: types.rs
+    /// requires `Expr::Guard(inner)` with `inner : Ty::Option(T)`, never
+    /// a fifo op/failing call/comparison.
+    WhileLet {
+        name: Name,
+        init: ExprId,
+        body: Vec<StmtId>,
+    },
 }
 
 /// One effect atom from an `<...>` list: `sequences`, `reads {pc, mem}`.
@@ -716,6 +732,15 @@ impl Ast {
             }
             Stmt::While { cond, body } => {
                 out.push_str(&format!("{pad}while {}\n", self.expr_sexpr(*cond)));
+                for stmt in body {
+                    self.dump_stmt(*stmt, depth + 1, out);
+                }
+            }
+            Stmt::WhileLet { name, init, body } => {
+                out.push_str(&format!(
+                    "{pad}(while let {name} {})\n",
+                    self.expr_sexpr(*init)
+                ));
                 for stmt in body {
                     self.dump_stmt(*stmt, depth + 1, out);
                 }

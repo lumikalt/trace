@@ -623,6 +623,28 @@ module M {
     run_ok(src);
 }
 
+/// `while let v = opt? { ... }`'s own `v` is scoped to the loop body only
+/// -- mirrors `if let`'s branch-scoping above, just with no `else` to
+/// isolate it from (a loop has nothing to run once instead of looping).
+#[test]
+fn while_let_bound_name_is_not_visible_after_the_loop() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    out result : [8] = 0
+    rule r <sequences> {
+        while let v = opt? {
+            result := v
+        }
+        result := v
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot find `v`"));
+}
+
 #[test]
 fn all_examples_resolve() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");

@@ -226,7 +226,10 @@ impl<'a> Emitter<'a> {
                         );
                     }
                 }
-                Stmt::If { .. } | Stmt::While { .. } | Stmt::IfLet { .. } => {
+                Stmt::If { .. }
+                | Stmt::While { .. }
+                | Stmt::IfLet { .. }
+                | Stmt::WhileLet { .. } => {
                     if contains_guard(self.ast, self.res, *stmt) {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -464,6 +467,10 @@ impl<'a> Emitter<'a> {
                         out.push(cond);
                         roots_of(ast, &body, out);
                     }
+                    Stmt::WhileLet { init, body, .. } => {
+                        out.push(init);
+                        roots_of(ast, &body, out);
+                    }
                     Stmt::Return(None) | Stmt::Tick => {}
                 }
             }
@@ -616,6 +623,10 @@ impl<'a> Emitter<'a> {
                     }
                     Stmt::While { cond, body } => {
                         out.push(cond);
+                        roots_of(ast, &body, out);
+                    }
+                    Stmt::WhileLet { init, body, .. } => {
+                        out.push(init);
                         roots_of(ast, &body, out);
                     }
                     Stmt::Return(None) | Stmt::Tick => {}
@@ -856,6 +867,12 @@ impl<'a> Emitter<'a> {
                 Stmt::IfLet { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
                     Some(init)
                 }
+                // `while let x = opt?`'s own `init` is `Expr::Guard(opt)`
+                // by construction too, the identical reasoning as
+                // `IfLet`'s arm just above.
+                Stmt::WhileLet { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
+                    Some(init)
+                }
                 _ => None,
             };
             let mut roots: Vec<ExprId> = Vec::new();
@@ -894,6 +911,10 @@ impl<'a> Emitter<'a> {
                     roots.push(cond);
                     self.guards_outside_allowed_positions(&body, out);
                 }
+                Stmt::WhileLet { init, body, .. } => {
+                    roots.push(init);
+                    self.guards_outside_allowed_positions(&body, out);
+                }
                 Stmt::Return(None) | Stmt::Tick => {}
             }
             for root in roots {
@@ -923,6 +944,7 @@ impl<'a> Emitter<'a> {
                 Stmt::Assign { rhs, .. } if is_fifo_op(self.ast, self.res, rhs) => Some(rhs),
                 Stmt::Let { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
                 Stmt::IfLet { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
+                Stmt::WhileLet { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
                 _ => None,
             };
             let mut roots: Vec<ExprId> = Vec::new();
@@ -959,6 +981,10 @@ impl<'a> Emitter<'a> {
                 }
                 Stmt::While { cond, body } => {
                     roots.push(cond);
+                    self.fifo_ops_outside_allowed_positions(&body, out);
+                }
+                Stmt::WhileLet { init, body, .. } => {
+                    roots.push(init);
                     self.fifo_ops_outside_allowed_positions(&body, out);
                 }
                 Stmt::Return(None) | Stmt::Tick => {}
@@ -1013,6 +1039,11 @@ impl<'a> Emitter<'a> {
                 {
                     Some(init)
                 }
+                Stmt::WhileLet { init, .. }
+                    if allow_let && matches!(self.ast.expr(init), Expr::Call { .. }) =>
+                {
+                    Some(init)
+                }
                 _ => None,
             };
             let mut roots: Vec<ExprId> = Vec::new();
@@ -1049,6 +1080,10 @@ impl<'a> Emitter<'a> {
                 }
                 Stmt::While { cond, body } => {
                     roots.push(cond);
+                    self.calls_outside_allowed_positions(&body, allow_let, out);
+                }
+                Stmt::WhileLet { init, body, .. } => {
+                    roots.push(init);
                     self.calls_outside_allowed_positions(&body, allow_let, out);
                 }
                 Stmt::Return(None) | Stmt::Tick => {}
@@ -1222,6 +1257,10 @@ pub(crate) fn collect_all_calls_in(ast: &Ast, stmts: &[StmtId], out: &mut Vec<Ex
                 roots.push(cond);
                 collect_all_calls_in(ast, &body, out);
             }
+            Stmt::WhileLet { init, body, .. } => {
+                roots.push(init);
+                collect_all_calls_in(ast, &body, out);
+            }
             Stmt::Return(None) | Stmt::Tick => {}
         }
         for root in roots {
@@ -1272,6 +1311,11 @@ pub(crate) fn contains_guard(ast: &Ast, res: &Resolution, stmt: StmtId) -> bool 
                     .is_some_and(|b| b.iter().any(|s| contains_guard(ast, res, *s)))
         }
         Stmt::While { body, .. } => body.iter().any(|s| contains_guard(ast, res, *s)),
+        // Same exemption `IfLet`'s arm above has: `init` itself IS a
+        // guard by construction (the whole point of the syntax), not a
+        // NESTED one this check exists to catch — only `body` is
+        // checked, mirroring `IfLet`'s `then_body`/`else_body`.
+        Stmt::WhileLet { body, .. } => body.iter().any(|s| contains_guard(ast, res, *s)),
         _ => false,
     }
 }
@@ -1340,6 +1384,9 @@ pub(crate) fn contains_comparison(ast: &Ast, stmt: StmtId) -> bool {
                     .is_some_and(|b| b.iter().any(|s| contains_comparison(ast, *s)))
         }
         Stmt::While { body, .. } => body.iter().any(|s| contains_comparison(ast, *s)),
+        Stmt::WhileLet { init, body, .. } => {
+            expr_has_comparison(ast, *init) || body.iter().any(|s| contains_comparison(ast, *s))
+        }
         _ => false,
     }
 }
