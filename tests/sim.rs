@@ -1817,6 +1817,110 @@ fn if_let_failing_call_tracks_the_callees_own_guard_under_verilator() {
     );
 }
 
+/// Proves `if f.Deq[] { ... }` end to end -- a fifo op used DIRECTLY as
+/// a bare `if`'s own condition, no bound name: `examples/if_bare_fifo.tr`'s
+/// `consumer` fires every cycle, but `was_present` tracks the fifo's own
+/// occupancy exactly, the same shape `if_let_fifo_deq_drives_a_real_
+/// dequeue_exactly_when_present` proves for the bound-name form. See
+/// sim/if_bare_fifo_tb.v.
+#[test]
+fn if_bare_fifo_deq_condition_drives_a_real_dequeue_exactly_when_present() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_bare_fifo.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_bare_fifo_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of
+/// `if_bare_fifo_deq_condition_drives_a_real_dequeue_exactly_when_present`.
+#[test]
+fn if_bare_fifo_deq_condition_drives_a_real_dequeue_exactly_when_present_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_bare_fifo.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_bare_fifo_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// Proves `if Classify(a) { ... }` end to end -- a failing call used
+/// DIRECTLY as a bare `if`'s own condition, no bound name:
+/// `examples/if_bare_failing_call.tr`'s `was_present` tracks `Classify`'s
+/// own guard exactly, the same shape `if_let_failing_call_tracks_the_
+/// callees_own_guard` proves for the bound-name form. See
+/// sim/if_bare_failing_call_tb.v.
+#[test]
+fn if_bare_failing_call_condition_tracks_the_callees_own_guard() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_bare_failing_call.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_bare_failing_call_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of
+/// `if_bare_failing_call_condition_tracks_the_callees_own_guard`.
+#[test]
+fn if_bare_failing_call_condition_tracks_the_callees_own_guard_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_bare_failing_call.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/if_bare_failing_call_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves general structs end to end: `examples/struct_pair.tr`'s
 /// struct-typed reg `p` and struct-typed output `result` both flatten
 /// to per-field registers/ports, a struct literal write (`p :=

@@ -342,14 +342,16 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        // A fifo used as an `or` alternative may not ALSO be touched
-        // directly (or via a different `or` chain) elsewhere in the same
-        // rule: an alternative's state transition is conditionally gated
-        // (`RuleFifoOp::select`), but the combined pass-through guard
-        // `rule_fifo_guard_cond` computes assumes every op on a fifo is
-        // unconditional — composing the two has not been verified, so
-        // it's rejected outright (v0 restriction) rather than silently
-        // assumed to compose.
+        // A fifo touched with a conditional `select` (an `or` alternative,
+        // an `if let`'s presence check, or a bare `if`'s own condition —
+        // `fifo.rs`'s `rule_fifo_ops`, the three producers of `RuleFifoOp::
+        // select: Some(..)`) may not ALSO be touched unconditionally
+        // elsewhere in the same rule: the conditional op's state
+        // transition is gated on its own `select`, but the combined
+        // pass-through guard `rule_fifo_guard_cond` computes assumes
+        // every op on a fifo is unconditional — composing the two has
+        // not been verified, so it's rejected outright (v0 restriction)
+        // rather than silently assumed to compose.
         let mut by_fifo: HashMap<String, (bool, bool)> = HashMap::new();
         for op in &ops {
             let entry = by_fifo.entry(op.fifo.clone()).or_default();
@@ -362,8 +364,8 @@ impl<'a> Emitter<'a> {
         let mut fifos: Vec<&String> = by_fifo.keys().collect();
         fifos.sort();
         for fifo in fifos {
-            let (unconditional, or_alt) = by_fifo[fifo];
-            if unconditional && or_alt {
+            let (unconditional, conditional) = by_fifo[fifo];
+            if unconditional && conditional {
                 let stmt = ops
                     .iter()
                     .find(|o| &o.fifo == fifo && o.select.is_some())
@@ -372,10 +374,11 @@ impl<'a> Emitter<'a> {
                     self.error(
                         self.ast.stmt_spans[stmt.0 as usize].clone(),
                         format!(
-                            "`{fifo}` is used as an `or` alternative here but is also \
-                             touched directly elsewhere in this rule (v0 restriction): \
-                             a fifo used as an `or` alternative may only be touched \
-                             through that `or` chain"
+                            "`{fifo}` is touched conditionally here (an `or` alternative, \
+                             an `if let`'s presence check, or a bare `if`'s own condition) \
+                             but is also touched unconditionally elsewhere in this rule \
+                             (v0 restriction): a conditionally-touched fifo may only be \
+                             touched through that one conditional position"
                         ),
                     );
                 }
@@ -1060,6 +1063,7 @@ impl<'a> Emitter<'a> {
                 Stmt::Expr(e) if is_fifo_op(self.ast, self.res, e) => Some(e),
                 Stmt::Assign { rhs, .. } if is_fifo_op(self.ast, self.res, rhs) => Some(rhs),
                 Stmt::Let { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
+                Stmt::If { cond, .. } if is_fifo_op(self.ast, self.res, cond) => Some(cond),
                 Stmt::IfLet { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
                 Stmt::WhileLet { init, .. } if is_fifo_op(self.ast, self.res, init) => Some(init),
                 _ => None,
@@ -1170,6 +1174,15 @@ impl<'a> Emitter<'a> {
                 {
                     Some(init)
                 }
+                // Same `allow_if_let` flag, extended to a BARE `if`'s own
+                // condition (`if Classify(a) { ... }`, types.rs's `check_
+                // cond` widening) -- the identical reasoning as the
+                // `IfLet` arm just above applies verbatim.
+                Stmt::If { cond, .. }
+                    if allow_if_let && matches!(self.ast.expr(cond), Expr::Call { .. }) =>
+                {
+                    Some(cond)
+                }
                 Stmt::WhileLet { init, .. }
                     if allow_let && matches!(self.ast.expr(init), Expr::Call { .. }) =>
                 {
@@ -1268,15 +1281,23 @@ impl<'a> Emitter<'a> {
     /// same exemption `check_failing_call_positions`/`check_fifo_op_
     /// positions`/`check_writing_call_positions_in` already apply,
     /// `check_guard_placement`'s own if/while sub-check had simply never
-    /// been taught about it), and excluding `IfLet`/`WhileLet`'s own
-    /// `init` — a failing call there IS one by construction (`if let x =
-    /// Classify(a) { ... }`, types.rs's `is_failing_call` check), not a
-    /// NESTED one this scan exists to catch, mirroring `contains_guard`/
-    /// `contains_fifo_op`'s identical init-exemption for their own
-    /// sibling features.
+    /// been taught about it), and excluding `If`/`IfLet`/`WhileLet`'s own
+    /// `cond`/`init` — a failing call there IS one by construction (`if
+    /// Classify(a) { ... }`/`if let x = Classify(a) { ... }`, types.rs's
+    /// `is_failing_call` check), not a NESTED one this scan exists to
+    /// catch, mirroring `contains_guard`/`contains_fifo_op`'s identical
+    /// init-exemption for their own sibling features (`contains_guard`/
+    /// `contains_fifo_op` don't need an `If`-cond arm here since a bare
+    /// `if`'s comparison/fifo condition was never routed through THIS
+    /// generic call-collecting walk to begin with).
     fn contains_failing_call(&self, stmt: StmtId) -> bool {
         let scanned: Vec<StmtId> = match self.ast.stmt(stmt).clone() {
-            Stmt::IfLet {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | Stmt::IfLet {
                 then_body,
                 else_body,
                 ..

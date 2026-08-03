@@ -1602,35 +1602,74 @@ Speculative, bigger, not committed to:
     check become branch-aware (track mutual exclusion through the
     if/else tree), or does the blanket restriction stay and this
     pattern remains rejected even once branch-scoping otherwise works?
-    This is the sharpest concrete sub-question of the four.
+    This is the sharpest concrete sub-question of the four. **STILL
+    OPEN** — the ACHIEVED bullet below builds a bare `if`'s condition
+    as the ONE fifo op (not a second, independent op inside a branch
+    body), so this exact question — a Deq in `then` AND a DIFFERENT
+    Deq in `else` — never had to be answered; `check_fifo_op_counts`
+    stays exactly as unconditional/blanket as before.
   - **Interaction with "a guard must appear before any state write."**
     That restriction (`check_guard_placement`) is rule-wide today. Does
     it become per-branch (a state write before the branch's OWN
     fallible condition is still restricted, but a write in a SIBLING
     branch or after the whole `if` is fine), or does introducing any
     fallible condition inside an `if` still close the guard window for
-    the rest of the rule the same way a top-level one does?
+    the rest of the rule the same way a top-level one does? **Moot for
+    the ACHIEVED bullet below**, same reasoning `if let` already
+    established: a bare `if`'s own fifo-op/failing-call CONDITION
+    never participates in `check_guard_placement`'s seen-write tracking
+    at all (that block treats the whole `If`/`IfLet`/`While`/`WhileLet`
+    statement as a single unit, unconditionally, regardless of what's
+    inside) — there was nothing new to decide here.
   - **`while` with a fallible condition** — out of scope unless named
     in. Verse's own construct is `if`-shaped only; nothing here argues
     for extending to `while`, so treat this as staying restricted
     (today's "guard nested in if/while" error) unless a concrete need
-    for a fallible loop condition shows up. **Resolved for the
-    comparison case (see the ACHIEVED bullet above): took exactly this
-    already-argued default, `while` stays restricted, `logic` still the
-    discharge.** Still open for fifo ops/failing calls, same as ever.
+    for a fallible loop condition shows up. **Resolved for all three
+    shapes now** (comparison, fifo op, failing call — see the ACHIEVED
+    bullet below): took exactly this already-argued default in every
+    case, `while` stays restricted, `logic` still the discharge for
+    comparisons.
   - **What `fires_rule` becomes for an `if`-WITH-else fallible
     condition.** Per the no-else/with-else split above, the with-else
     case should contribute NOTHING to the whole-rule guard (matching
     `or`-with-default) — confirm this is actually achievable for a
     fifo-occupancy-gated branch, not just an Option-presence one, once
-    the dequeue-enable question above is answered. **Confirmed for the
-    comparison case (ACHIEVED bullet above), WITH one addition beyond
-    what this question originally asked: the same "contributes
-    nothing" answer was extended to the NO-else shape too, not just
-    with-else — `compile_guard`'s statement loop never looked inside
-    `Stmt::If` at all, with or without an `else`, so this fell out for
-    free once `check_cond` accepted the shape. Still unconfirmed for a
-    fifo-occupancy-gated branch.**
+    the dequeue-enable question above is answered. **RESOLVED — but not
+    the way this question assumed.** Confirmed by direct probe before
+    writing any code (see the ACHIEVED bullet below): the no-else/with-
+    else split this question presupposes DOESN'T EXIST for a fifo op or
+    failing call at all — `compile_guard`'s statement loop never looks
+    inside `Stmt::If`, with or without an `else`, REGARDLESS of what
+    the condition is, so a fifo/call condition contributes nothing to
+    `fires_rule` in BOTH shapes, not just with-else. The no-else-gates/
+    with-else-doesn't ASYMMETRY only exists for comparisons, and it's
+    `comparison_conds`'s own artifact (a position-blind scan with no
+    fifo/call equivalent), not a language-level convention every
+    fallible condition shares — a real, documented semantic difference
+    between `if <comparison>` and `if <fifo-op-or-failing-call>` now
+    (DESIGN.md's "`if`: a fifo op's own bare condition").
+
+  **UPDATE — ACHIEVED, both remaining shapes (fifo op, failing call).**
+  `if f.Deq[] { ... } [else]` / `if Classify(a) { ... } [else]` — bare,
+  no bound name, built directly on top of `if let`'s own fifo-Deq/
+  failing-call features above rather than as a separate mechanism:
+  `Stmt::If`'s existing mux-select machinery already called `compile_
+  guard_unwrap_cond(cond)` for the ACHIEVED comparison case, and that
+  function's fifo-Deq/Call branches (built for `if let`) needed zero
+  changes to also serve a bare `if`'s condition. The only genuinely new
+  code: `types.rs`'s `check_cond` gained the `is_fifo_deq`/`is_failing_
+  call` exemption (`if`-only); `fifo.rs`'s `rule_fifo_ops` gained a
+  `Stmt::If` case mirroring its `Stmt::IfLet` one (`checks.rs`'s
+  position exemption for THIS shape was genuine new work, unlike `if
+  let`'s — no pre-existing dead-code groundwork this time); `effects.
+  rs`/`checks.rs` gained matching `Stmt::If` arms mirroring their
+  `Stmt::IfLet` ones. See DESIGN.md's "`if`: a fifo op's own bare
+  condition" and "`if`: a failing call's own bare condition" for the
+  full write-up, `examples/if_bare_fifo.tr` + `sim/if_bare_fifo_tb.v`
+  and `examples/if_bare_failing_call.tr` + `sim/if_bare_failing_call_tb.v`
+  for real firtool+Icarus+Verilator-proven examples. This closes the
+  ORIGINAL literal ask this whole page section started from.
 
   One dead-code note this decision revives rather than resolves:
   `check_cond`'s early-return for `Expr::Guard` over a `Ty::Option`

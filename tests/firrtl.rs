@@ -4052,7 +4052,7 @@ module M {
     let err = emit_from_source(src).unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.message.contains("also touched directly elsewhere"))
+            .any(|e| e.message.contains("touched unconditionally elsewhere"))
     );
 }
 
@@ -6001,13 +6001,44 @@ module M {
     run_firtool(&fir, &[]);
 }
 
-/// A fifo op as a bare if-condition stays a v0 restriction, completely
-/// unaffected by this feature — only a comparison gets the new bare
-/// discharge; `check_cond`'s `allow_bare_comparison` exemption only ever
-/// matches `Expr::Binary` with `is_comparison()`, never a fifo op's own
-/// `Ty::Bits(width)` (the fifo element's type, not `[1]`).
+/// `if f.Deq[] { ... } [else { ... }]` -- a fifo op used directly as a
+/// BARE `if`'s own condition, no `let`/bound name at all (this used to
+/// be a v0 restriction; see DESIGN.md's "`if`: a fifo op's own bare
+/// condition" for the full write-up of what closed it). Same policy
+/// regardless of `else`: never gates `fires_r`, confirmed by direct
+/// probe before writing this test that `compile_guard`'s whole-rule
+/// fold treats a no-else bare `if` identically to a with-else one for a
+/// fifo condition -- unlike a bare comparison, which DOES gate a no-else
+/// `if` via `comparison_conds`'s own unrelated, position-blind scan.
 #[test]
-fn a_fifo_op_as_a_bare_if_condition_is_still_a_type_error() {
+fn a_bare_fifo_deq_if_condition_gates_the_dequeue_but_not_the_rule() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg v : [8] = 0
+    rule r {
+        if f.Deq[] {
+            v := 1
+        } else {
+            v := 0
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("when __fifo_f_valid :\n        connect __fifo_f_valid, UInt<1>(0)"));
+    assert!(fir.contains("connect v, mux(__fifo_f_valid, UInt<8>(1), UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+/// The no-else twin of the test above: `compile_guard`'s whole-rule fold
+/// STILL doesn't gate on the fifo's occupancy -- `fires_r = UInt<1>(1)`
+/// either way, and `v` holds its own prior value on absence (the
+/// ordinary "hold" fallback), same shape `if let`'s own no-else case
+/// already has.
+#[test]
+fn a_bare_fifo_deq_if_condition_with_no_else_still_does_not_gate_the_rule() {
     let src = "\
 module M {
     fifo f : [8]
@@ -6019,13 +6050,74 @@ module M {
     }
 }
 ";
-    let (tokens, _) = lexer::lex(src);
-    let (ast, _) = parser::parse(src, &tokens);
-    let (res, _) = resolve::resolve(&ast);
-    let (fx, _) = effects::check(&ast, &res);
-    let (_, type_errors) = types::check(&ast, &res, &fx);
-    assert_eq!(type_errors.len(), 1);
-    assert!(type_errors[0].message.contains("condition must be [1]"));
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(__fifo_f_valid, UInt<8>(1), v)"));
+    run_firtool(&fir, &[]);
+}
+
+/// `if Classify(a) { ... } [else { ... }]` -- a failing call used
+/// directly as a bare `if`'s own condition. Reuses `writes.rs`'s
+/// `compile_guard_unwrap_cond` Call branch (task: "`if let`: a failing
+/// call's own presence") completely unchanged -- `Stmt::If`'s own
+/// existing mux-select machinery already called that same function for
+/// its condition, so this needed no new emission code at all, only the
+/// position/type-checking exemptions.
+#[test]
+fn a_bare_failing_call_if_condition_gates_the_call_but_not_the_rule() {
+    let src = "\
+Classify(x : [8]) : [8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    rule r {
+        if Classify(a) {
+            v := 1
+        } else {
+            v := 2
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("connect v, mux(neq(a, UInt<8>(0)), UInt<8>(1), UInt<8>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// Two `Deq[]`s on the same fifo -- one as a bare `if`'s own condition,
+/// one as an ordinary top-level statement -- are still caught as a
+/// collision, not silently allowed to compose: `check_fifo_op_counts`'s
+/// existing conditional-vs-unconditional check (generalized from its
+/// former `or`-alternative-only wording when this feature landed) fires
+/// on the SAME fifo touched both ways.
+#[test]
+fn a_bare_if_fifo_deq_condition_and_a_top_level_deq_on_the_same_fifo_still_collide() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg v : [8] = 0
+    reg w : [8] = 0
+    rule r {
+        if f.Deq[] {
+            v := 1
+        } else {
+            v := 0
+        }
+        w := f.Deq[]
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("touched conditionally")
+                && e.message.contains("touched unconditionally")),
+        "expected the conditional/unconditional collision rejection, got: {err:?}"
+    );
 }
 
 /// The write-threading walk this feature's mux-select fix touches isn't

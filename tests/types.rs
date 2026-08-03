@@ -1738,6 +1738,28 @@ fn if_condition_accepts_a_bare_comparison_but_while_still_rejects_it() {
     assert!(errors[0].message.contains("wrap it with `logic`"));
 }
 
+/// The same `if`-only widening extended to a bare fifo `Deq[]`/failing
+/// call directly as an `if`'s own condition -- both fallible by default,
+/// same reasoning as the comparison case just above, and same `while`
+/// exclusion (Verse's construct is `if`-shaped only).
+#[test]
+fn if_condition_accepts_a_bare_fifo_deq_or_failing_call_but_while_still_rejects_them() {
+    run_ok(
+        "module M {\n fifo f : [8]\n reg v : [8] = 0\n \
+         rule r {\n if f.Deq[] {\n v := 1\n } else {\n v := 0\n }\n }\n}\n",
+    );
+    run_ok(
+        "Classify(x : [8]) : [8] <combines, fails> {\n (x <> 0)?\n return x\n }\n\
+         module M {\n reg v : [8] = 0\n in a : [8]\n \
+         rule r {\n if Classify(a) {\n v := 1\n } else {\n v := 2\n }\n }\n}\n",
+    );
+
+    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [8] = 0\n \
+         rule r <sequences> {\n while f.Deq[] {\n v := 1\n tick\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("condition must be"));
+}
+
 /// Advisor-caught while reviewing the `if`-only exemption above: a
 /// comparison's own TYPE is its left operand's type (`type_binop`), so
 /// once that operand happens to be exactly 1 bit wide, a comparison

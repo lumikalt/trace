@@ -1241,6 +1241,15 @@ impl<'a> TypeChecker<'a> {
         {
             return;
         }
+        // A bare fifo `Deq[]` or failing call directly as an `if`'s own
+        // condition -- the same `if`-only discharge the bare-comparison
+        // exemption just above gets, extended to the two OTHER fallible-
+        // by-default shapes `if let`'s own arm already accepts (`is_fifo_
+        // deq`/`is_failing_call`, defined below/above). `while` never
+        // sets `allow_bare_comparison`, so stays restricted here too.
+        if allow_bare_comparison && (self.is_fifo_deq(cond) || self.is_failing_call(cond)) {
+            return;
+        }
         // Advisor-caught, twice, while building the exemption just above:
         // a comparison's own type is its LHS's type (`type_binop`), so
         // once that LHS happens to be exactly 1 bit wide, a comparison

@@ -288,6 +288,29 @@ impl<'a> Checker<'a> {
                 {
                     self.infer_expr(*lhs, sig);
                     self.infer_expr(*rhs, sig);
+                } else if let Expr::Bracket { callee, args } = self.ast.expr(*cond)
+                    && let Some(fifo) = self.fifo_op_target(*callee)
+                {
+                    // `if fifo.Deq[] { ... }`: same reasoning as the
+                    // comparison case just above, mirrored from `Stmt::
+                    // IfLet`'s own identical branch below -- reads+writes
+                    // the fifo but does NOT set `sig.fails`.
+                    sig.reads.insert(fifo);
+                    sig.writes.insert(fifo);
+                    for arg in args {
+                        self.infer_expr(*arg, sig);
+                    }
+                } else if let Expr::Call { callee, args } = self.ast.expr(*cond) {
+                    // `if Classify(a) { ... }`: same reasoning, mirrored
+                    // from `Stmt::IfLet`'s own identical branch below.
+                    if let Some(callee_sig) = self.callee_sig(*callee) {
+                        sig.reads.extend(callee_sig.reads.iter().copied());
+                        sig.writes.extend(callee_sig.writes.iter().copied());
+                    }
+                    self.infer_expr(*callee, sig);
+                    for arg in args {
+                        self.infer_expr(*arg, sig);
+                    }
                 } else {
                     self.infer_expr(*cond, sig);
                 }

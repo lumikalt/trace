@@ -1681,6 +1681,119 @@ machinery almost entirely:**
   fifo feature above) gained one more arm: `_ if ... || matches!(Expr::
   Call { .. }) => init`.
 
+### `if`: a fifo op's own bare condition
+
+`if f.Deq[] { then_body } [else { else_body }]` — the ORIGINAL literal ask
+behind this whole run of features (TODO.md's four open questions: "a fifo
+op or failing call as a branch-scoped `if`'s condition"), finally built
+directly rather than only through `if let`'s bound-name form. Bare, no
+`let`, no `x` to read the dequeued value — for when only "did this
+happen" matters, not the value itself; `if let x = f.Deq[] { ... }`
+(above) is strictly more general (nothing stops leaving `x` unused), so
+this is syntactic convenience, not new expressive power.
+
+```trace
+rule consumer {
+    if f.Deq[] {
+        count := count + 1   -- a dequeue happened; the value itself is unused
+    } else {
+        count := count
+    }
+}
+```
+
+**The no-else/with-else split that governs the bare-comparison `if`
+feature does NOT apply here — confirmed by direct probe, not assumed,
+before writing the `rule_fifo_ops` case below.** For a bare comparison,
+a no-else `if` gates the whole rule (`comparison_conds`'s own position-
+blind scan finds it regardless of where it sits) while a with-else `if`
+doesn't. For a fifo op, NEITHER shape gates the rule: `compile_guard`'s
+whole-rule fold never looks inside `Stmt::If` at all (writes.rs), with
+or without an `else` — the asymmetry for comparisons is `comparison_
+conds`'s own artifact, and fifo ops have no equivalent blanket scan. So
+this feature uses ONE policy unconditionally: `select: Some(fifo_guard_
+cond(...))`, the identical mechanism `if let`'s own fifo-Deq case uses,
+regardless of whether `else` is present. A no-else bare `if f.Deq[]` is
+therefore branch-scoped, same as with an `else` — a genuine, documented
+semantic difference from the comparison case, not an oversight.
+
+**Implementation — almost entirely reused from `if let`'s fifo-Deq
+feature above, with zero new value-compilation code:** `Stmt::If`'s
+own mux-select machinery already called `compile_guard_unwrap_cond
+(cond)` for the bare-comparison feature — that function's existing
+fifo-Deq branch (built for `if let`) already handles a `Stmt::If`
+condition identically, no changes needed there at all. The genuinely
+new pieces:
+- `types.rs`'s `check_cond` gained one more `if`-only exemption
+  (`allow_bare_comparison`-gated, same as the comparison case):
+  `is_fifo_deq(cond) || is_failing_call(cond)`.
+- `checks.rs`'s `fifo_ops_outside_allowed_positions` gained a `Stmt::If
+  { cond, .. } if is_fifo_op(cond) => Some(cond)` arm — genuinely NEW,
+  unlike `if let`'s equivalent (which turned out to already be dead-code
+  groundwork); a bare `if`'s own condition was never a pre-anticipated
+  position here.
+- `fifo.rs`'s `rule_fifo_ops` gained a matching `Stmt::If` case, pushing
+  a `RuleFifoOp` with `select: Some(fifo_guard_cond(...))` — structurally
+  identical to `if let`'s own case just above it.
+- `checks.rs`'s fifo/call collision check (formerly `or`-alternative-
+  specific wording, in `check_fifo_op_counts`) was generalized to name
+  all three conditional-`select` producers (`or`, `if let`'s presence
+  check, a bare `if`'s own condition) rather than just `or`, since a bare
+  `if`-condition Deq is now a third way to reach the exact same
+  conditional/unconditional collision it already caught.
+
+Verified through real firtool + Icarus AND Verilator simulation, not
+just structurally: `examples/if_bare_fifo.tr` + `sim/if_bare_fifo_tb.v`
+(`tests/sim.rs`'s `if_bare_fifo_deq_condition_drives_a_real_dequeue_
+exactly_when_present`), the un-bound twin of `if_let_fifo.tr` — same
+push-then-check-one-cycle-later shape, `was_present` (not a dequeued
+value, since there's no name to bind) tracking the fifo's own occupancy
+exactly.
+
+### `if`: a failing call's own bare condition
+
+`if Classify(a) { then_body } [else { else_body }]` — the failing-call
+half of the same original ask, built the identical way: bare, no `let`,
+for when only success/failure matters, not the callee's return value.
+Same "no-else/with-else split doesn't apply" finding as the fifo case
+(confirmed the same way, by direct probe before writing any `select`-
+threading code): `compile_guard_unwrap_cond`'s Call branch (built for
+`if let`'s failing-call feature above) already handles a `Stmt::If`
+condition identically, no new value-compilation code needed.
+
+```trace
+rule compute {
+    if Classify(a) {
+        count := count + 1   -- Classify succeeded; its return value is unused
+    } else {
+        count := count
+    }
+}
+```
+
+**Implementation, even smaller than the fifo case since a failing call
+has no `fifo.rs`-style state-transition to additionally wire:**
+- `effects.rs`'s `Stmt::If` condition-inference arm gained a matching
+  `Expr::Call` branch beside its existing comparison one: merges
+  reads/writes from the callee's own `EffectSig`, doesn't set `sig.
+  fails` — mirrors `Stmt::IfLet`'s identical branch.
+- `checks.rs`'s `calls_outside_allowed_positions` gained a `Stmt::If
+  { cond, .. } if allow_if_let && matches!(Expr::Call) => Some(cond)`
+  arm, reusing the SAME `allow_if_let` flag `if let`'s failing-call
+  feature introduced (both flow through `check_failing_call_positions`
+  only, `check_writing_call_positions_in` unaffected — the writing-and-
+  failing-callee rejection this flag was built to preserve holds for
+  the bare-`if` shape too, confirmed by direct probe the same way).
+- `checks.rs`'s `contains_failing_call` gained a `Stmt::If` arm to its
+  existing init-exemption (previously `IfLet`/`WhileLet` only), sharing
+  the match arm with `IfLet` since both only need `then_body`/
+  `else_body` scanned, not their own condition/init.
+
+Verified through real firtool + Icarus AND Verilator simulation:
+`examples/if_bare_failing_call.tr` + `sim/if_bare_failing_call_tb.v`
+(`tests/sim.rs`'s `if_bare_failing_call_condition_tracks_the_callees_
+own_guard`), the un-bound twin of `if_let_failing_call.tr`.
+
 ### `?.` safe navigation
 
 `opt?.field?.next` — Verse's own multi-hop chained unwrap-and-field-access

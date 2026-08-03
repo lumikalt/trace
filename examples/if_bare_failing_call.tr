@@ -1,0 +1,25 @@
+-- `if Classify(a) { ... } [else { ... }]`: a failing call used DIRECTLY
+-- as a bare `if`'s own condition -- no `let`, no bound name at all.
+-- Where `if let x = Classify(a) { ... }`
+-- (examples/if_let_failing_call.tr) is for when you want the callee's
+-- own return VALUE, this is for when you only care whether it
+-- succeeded. Same branch-scoped semantics: `compute` fires every cycle
+-- regardless of whether `Classify` succeeds. See DESIGN.md's "`if`: a
+-- failing call's own bare condition".
+Classify(x : [8]) : [8] <combines, fails> {
+    (x <> 0)?
+    return x
+}
+
+module Top {
+    in a : [8]
+    out was_present : [1] = 0
+
+    rule compute {
+        if Classify(a) {
+            was_present := 1
+        } else {
+            was_present := 0
+        }
+    }
+}

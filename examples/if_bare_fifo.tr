@@ -1,0 +1,27 @@
+-- `if f.Deq[] { ... } [else { ... }]`: a fifo op used DIRECTLY as a
+-- bare `if`'s own condition -- no `let`, no bound name at all. Where
+-- `if let x = f.Deq[] { ... }` (examples/if_let_fifo.tr) is for when you
+-- want the dequeued VALUE, this is for when you only care whether the
+-- dequeue happened. Same branch-scoped semantics: `consumer` fires
+-- every cycle regardless of `f`'s occupancy, and the dequeue itself is
+-- real and conditional. See DESIGN.md's "`if`: a fifo op's own bare
+-- condition".
+module Top {
+    fifo f : [8]
+    in push : [1]
+    in push_val : [8]
+    out was_present : [1] = 0
+
+    rule producer {
+        push = 1
+        f.Enq[push_val]
+    }
+
+    rule consumer {
+        if f.Deq[] {
+            was_present := 1
+        } else {
+            was_present := 0
+        }
+    }
+}

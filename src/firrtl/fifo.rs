@@ -406,6 +406,33 @@ impl<'a> Emitter<'a> {
                 });
                 continue;
             }
+            // `if fifo.Deq[] { ... } [else { ... }]` -- a Deq used as a
+            // BARE `if`'s own condition (types.rs's `is_fifo_deq`, `if`-
+            // only via `allow_bare_comparison`). Same `select` shape as
+            // the `if let` case just above, and deliberately the SAME
+            // policy regardless of `else` presence -- confirmed by direct
+            // probe before writing this: `compile_guard`'s whole-rule
+            // fold never looks inside `Stmt::If` at all (writes.rs), with
+            // or without an `else`, so a no-else bare `if` here is just
+            // as branch-scoped as the with-else form, unlike the
+            // comparison case (whose no-else form gates the rule via
+            // `comparison_conds`'s own, unrelated, position-blind scan —
+            // fifo ops have no equivalent).
+            if let Stmt::If { cond, .. } = self.ast.stmt(*stmt)
+                && let Some((fifo, depth, false, _)) = self.fifo_op(*cond)
+            {
+                let select = fifo_guard_cond(&fifo, false, depth);
+                out.push(RuleFifoOp {
+                    stmt: *stmt,
+                    fifo,
+                    depth,
+                    is_enq: false,
+                    value: None,
+                    callee_ctx: None,
+                    select: Some(select),
+                });
+                continue;
+            }
             let call_expr = match self.ast.stmt(*stmt) {
                 Stmt::Expr(e) if matches!(self.ast.expr(*e), Expr::Call { .. }) => Some(*e),
                 Stmt::Assign { rhs, .. } if matches!(self.ast.expr(*rhs), Expr::Call { .. }) => {
