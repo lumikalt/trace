@@ -63,6 +63,13 @@ pub enum TokenKind {
     Struct,
     #[token("tick")]
     Tick,
+    /// `break` -- exits the enclosing `while`/`while let` loop early,
+    /// independent of the loop's own condition (DESIGN.md's "`while`:
+    /// multi-cycle loops"). v0-restricted to the tail position of the
+    /// loop body (or of a tail `if`/`if let`'s own branch) -- see
+    /// `lower.rs`'s `find_break_misplaced`.
+    #[token("break")]
+    Break,
     #[token("sync")]
     Sync,
     #[token("race")]

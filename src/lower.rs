@@ -208,16 +208,19 @@ pub fn plan(
                 if !fx.sigs.get(&id).is_some_and(|s| s.sequences) {
                     continue;
                 }
-                // A `tick`/`while` ANYWHERE (not just top-level) has to
-                // route through `plan_rule`, even one that turns out to
-                // be nested (and therefore rejected) — `find_nested_
-                // tick`/`find_nested_while`'s own clear errors live
-                // there, and skipping straight past this gate would
-                // leave a nested one to fail some other, more confusing
-                // way once the untouched `<sequences>` rule reaches a
-                // later pass instead.
+                // A `tick`/`while`/`break` ANYWHERE (not just top-level)
+                // has to route through `plan_rule`, even one that turns
+                // out to be nested/misplaced (and therefore rejected) —
+                // `find_nested_tick`/`find_nested_while`/`find_break_
+                // misplaced`'s own clear errors live there, and skipping
+                // straight past this gate would leave a nested/misplaced
+                // one to fail some other, more confusing way (or, for a
+                // stray `break` with no `tick`/`while` alongside it,
+                // silently compile away to nothing) once the untouched
+                // `<sequences>` rule reaches a later pass instead.
                 if find_tick_anywhere(ast, &body).is_none()
                     && find_while_anywhere(ast, &body).is_none()
+                    && find_break_anywhere(ast, &body).is_none()
                 {
                     continue; // nothing to cut; leave as an ordinary rule
                 }
@@ -267,6 +270,12 @@ fn plan_rule(
             message: "`while` must be at the top level of a sequences rule, not nested in \
                       if/while (v0 restriction, same as `tick`/`spawn`)"
                 .to_string(),
+        }]);
+    }
+    if let Some((span, message)) = find_break_misplaced(ast, body, false) {
+        return Err(vec![LowerError {
+            span,
+            message: message.to_string(),
         }]);
     }
     if let Some(span) = find_unsupported_construct(ast, res, body, true) {
@@ -706,6 +715,12 @@ fn plan_spawn(
             message: "`while` must be at the top level of a spawned fn's body, not nested in \
                       if/while (v0 restriction, same as `tick`)"
                 .to_string(),
+        }]);
+    }
+    if let Some((s, message)) = find_break_misplaced(ast, &callee_body, false) {
+        return Err(vec![LowerError {
+            span: s,
+            message: message.to_string(),
         }]);
     }
     if let Some(s) = find_unsupported_construct(ast, res, &callee_body, true) {
@@ -1404,6 +1419,157 @@ fn find_while_anywhere(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
     None
 }
 
+/// True iff `break` appears ANYWHERE in `stmts`, any nesting depth --
+/// used by `plan()`'s own top-level gate (mirroring `find_tick_
+/// anywhere`/`find_while_anywhere`'s identical role) so a rule with a
+/// stray `break` but no `tick`/`while` anywhere ALSO routes through
+/// `plan_rule` (and therefore `find_break_misplaced`'s own rejection)
+/// instead of silently skipping lowering entirely -- left unchecked, a
+/// misplaced `break` with nothing else to trigger lowering would reach
+/// firrtl.rs as a bare `Stmt::Break` that nothing there recognizes,
+/// compiling away to nothing rather than erroring.
+fn find_break_anywhere(ast: &Ast, stmts: &[StmtId]) -> Option<Span> {
+    for stmt in stmts {
+        match ast.stmt(*stmt) {
+            Stmt::Break => return Some(ast.stmt_spans[stmt.0 as usize].clone()),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_break_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_break_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(span) = find_break_anywhere(ast, then_body) {
+                    return Some(span);
+                }
+                if let Some(span) = else_body
+                    .as_deref()
+                    .and_then(|b| find_break_anywhere(ast, b))
+                {
+                    return Some(span);
+                }
+            }
+            Stmt::While { body, .. } => {
+                if let Some(span) = find_break_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            Stmt::WhileLet { body, .. } => {
+                if let Some(span) = find_break_anywhere(ast, body) {
+                    return Some(span);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `break` may only sit in TAIL position within a `while`/`while let`'s
+/// own loop body: as the body's own last statement, or nested inside an
+/// `if`/`if let` (however deep, as long as EVERY enclosing level is
+/// itself in tail position — Verse's canonical `if (Cond[]) { ... } else
+/// { break }` idiom, DESIGN.md's "`while`: multi-cycle loops") as the
+/// last statement of a `then`/`else` branch. `render_loop_body` (used by
+/// `render_rule`/`render_spawn_segments`) recurses the identical way, so
+/// every position this accepts is one it can actually render — a
+/// position accepted here that render couldn't handle would silently
+/// drop the `break`'s effect rather than erroring on it, exactly the
+/// failure mode this whole file's other `find_*` checks exist to close
+/// off. `in_loop_tail`: whether `stmts` is itself sitting in an
+/// already-tail-eligible position relative to SOME enclosing loop --
+/// `false` at the top of a rule/callee body (no loop yet), `true` when
+/// recursing into a `While`/`WhileLet`'s own body, and (for an `If`/
+/// `IfLet`'s branches) inherited only when the `If`/`IfLet` itself is
+/// both already tail-eligible AND the last statement of its own list.
+fn find_break_misplaced(
+    ast: &Ast,
+    stmts: &[StmtId],
+    in_loop_tail: bool,
+) -> Option<(Span, &'static str)> {
+    let last_idx = stmts.len().checked_sub(1);
+    for (i, stmt) in stmts.iter().enumerate() {
+        let is_last = Some(i) == last_idx;
+        match ast.stmt(*stmt) {
+            Stmt::Break => {
+                let span = ast.stmt_spans[stmt.0 as usize].clone();
+                if !in_loop_tail {
+                    return Some((
+                        span,
+                        "`break` may only appear as the last statement of a `while`/`while \
+                         let`'s own body, or of a `then`/`else` branch nested directly in \
+                         one -- either it isn't inside a loop at all, or an enclosing `if`/ \
+                         `if let` isn't itself in that tail position (v0 restriction)",
+                    ));
+                }
+                if !is_last {
+                    return Some((
+                        span,
+                        "`break` must be the last statement of its own block -- a `while`'s \
+                         own body, or a `then`/`else` branch nested directly in one (v0 \
+                         restriction: nothing may follow it)",
+                    ));
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let branch_tail = in_loop_tail && is_last;
+                if let Some(v) = find_break_misplaced(ast, then_body, branch_tail) {
+                    return Some(v);
+                }
+                if let Some(b) = else_body
+                    && let Some(v) = find_break_misplaced(ast, b, branch_tail)
+                {
+                    return Some(v);
+                }
+            }
+            Stmt::IfLet {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let branch_tail = in_loop_tail && is_last;
+                if let Some(v) = find_break_misplaced(ast, then_body, branch_tail) {
+                    return Some(v);
+                }
+                if let Some(b) = else_body
+                    && let Some(v) = find_break_misplaced(ast, b, branch_tail)
+                {
+                    return Some(v);
+                }
+            }
+            Stmt::While { body, .. } => {
+                if let Some(v) = find_break_misplaced(ast, body, true) {
+                    return Some(v);
+                }
+            }
+            Stmt::WhileLet { body, .. } => {
+                if let Some(v) = find_break_misplaced(ast, body, true) {
+                    return Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn find_spawn_in_expr(ast: &Ast, id: ExprId) -> Option<Span> {
     if let Expr::Spawn(_) = ast.expr(id) {
         return Some(ast.expr_spans[id.0 as usize].clone());
@@ -1596,6 +1762,7 @@ fn stmt_exprs(ast: &Ast, id: StmtId) -> Vec<ExprId> {
         Stmt::Assign { lhs, rhs } => vec![lhs, rhs],
         Stmt::Let { init, .. } => vec![init],
         Stmt::Tick => vec![],
+        Stmt::Break => vec![],
         Stmt::Return(e) => e.into_iter().collect(),
         Stmt::If { cond, .. } => vec![cond],
         Stmt::IfLet { init, .. } => vec![init],
@@ -1664,6 +1831,7 @@ fn scan_stmts(
             }
             Stmt::Expr(e) => scan_expr(ast, res, e, segment, reads),
             Stmt::Tick => {}
+            Stmt::Break => {}
             Stmt::Return(Some(e)) => scan_expr(ast, res, e, segment, reads),
             Stmt::Return(None) => {}
             Stmt::If {
@@ -2009,6 +2177,134 @@ fn while_loop_header<'a>(
     }
 }
 
+/// Renders `stmts` — a `while`/`while let`'s own body, or a `then`/
+/// `else` branch nested directly within one — into `out`. When NO
+/// `break` is reachable anywhere in `stmts` (`find_break_anywhere`),
+/// this reproduces EXACTLY the pre-`break` behavior byte for byte: every
+/// statement, including the last, spliced verbatim, then `{cont} :=
+/// {stay}` appended once at the end — the common case, and the ONLY
+/// case before `break` existed, left completely undisturbed rather than
+/// unconditionally restructured into an equivalent-but-more-deeply-
+/// nested form.
+///
+/// When a `break` IS reachable, every statement except the list's own
+/// last one still splices verbatim; the last one gets special handling
+/// based on its shape. A trailing `break` is OMITTED — nothing of it
+/// reaches the rendered text — and `{cont} := {advance}` is appended
+/// instead (exits the loop this cycle). A trailing `if`/`if let`
+/// recurses into EACH of its own branches with this SAME function,
+/// synthesizing an empty branch (just `{cont} := {stay}`) when no `else`
+/// is written — so a `break` buried arbitrarily deep in tail position
+/// (Verse's own `if (Cond[]) { ... } else { break }` idiom, nested as
+/// deep as the user likes as long as every enclosing level stays in
+/// tail position) renders correctly at every level, not just one hop
+/// in. Any OTHER trailing statement (no break in this branch's own
+/// subtree, but a sibling branch elsewhere in the same tail `if` does
+/// have one) splices verbatim too, then `{cont} := {stay}`, same as the
+/// no-break case above — just emitted one level deeper, inside this
+/// branch rather than after the whole `if` closes.
+///
+/// `find_break_misplaced` (this file) validates every `break` reachable
+/// from a loop's body sits in exactly one of the positions this
+/// function knows how to render — kept in sync deliberately: a shape
+/// accepted there that this function couldn't render would silently
+/// drop the `break`'s effect rather than erroring on it, exactly the
+/// failure mode this whole file's `find_*` checks exist to close off.
+#[allow(clippy::too_many_arguments)]
+fn render_loop_body(
+    out: &mut String,
+    ast: &Ast,
+    src: &str,
+    stmts: &[StmtId],
+    rewrites: &[(Span, String)],
+    cont_name: &str,
+    stay: u64,
+    advance: u64,
+) {
+    if find_break_anywhere(ast, stmts).is_none() {
+        for stmt in stmts {
+            let span = ast.stmt_spans[stmt.0 as usize].clone();
+            out.push_str("    ");
+            out.push_str(&splice(src, &span, rewrites));
+        }
+        out.push_str(&format!("        {cont_name} := {stay}\n"));
+        return;
+    }
+    // `stmts` is non-empty here: `find_break_anywhere` only ever returns
+    // `Some` by finding a `Stmt::Break` inside it, which requires at
+    // least one statement to exist.
+    let (last, init) = stmts.split_last().expect("break implies a statement");
+    for stmt in init {
+        let span = ast.stmt_spans[stmt.0 as usize].clone();
+        out.push_str("    ");
+        out.push_str(&splice(src, &span, rewrites));
+    }
+    match ast.stmt(*last).clone() {
+        Stmt::Break => {
+            out.push_str(&format!("        {cont_name} := {advance}\n"));
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let cond_span = ast.expr_spans[cond.0 as usize].clone();
+            out.push_str(&format!(
+                "        if {} {{\n",
+                splice(src, &cond_span, rewrites).trim_end()
+            ));
+            render_loop_body(
+                out, ast, src, &then_body, rewrites, cont_name, stay, advance,
+            );
+            out.push_str("        } else {\n");
+            render_loop_body(
+                out,
+                ast,
+                src,
+                &else_body.unwrap_or_default(),
+                rewrites,
+                cont_name,
+                stay,
+                advance,
+            );
+            out.push_str("        }\n");
+        }
+        Stmt::IfLet {
+            name,
+            init,
+            then_body,
+            else_body,
+        } => {
+            let init_span = ast.expr_spans[init.0 as usize].clone();
+            out.push_str(&format!(
+                "        if let {name} = {} {{\n",
+                splice(src, &init_span, rewrites).trim_end()
+            ));
+            render_loop_body(
+                out, ast, src, &then_body, rewrites, cont_name, stay, advance,
+            );
+            out.push_str("        } else {\n");
+            render_loop_body(
+                out,
+                ast,
+                src,
+                &else_body.unwrap_or_default(),
+                rewrites,
+                cont_name,
+                stay,
+                advance,
+            );
+            out.push_str("        }\n");
+        }
+        _ => {
+            let span = ast.stmt_spans[last.0 as usize].clone();
+            out.push_str("    ");
+            out.push_str(&splice(src, &span, rewrites));
+            out.push_str(&format!("        {cont_name} := {stay}\n"));
+        }
+    }
+}
+
 fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
     let mut out = String::new();
     for cap in &lr.captures {
@@ -2068,17 +2364,23 @@ fn render_rule(ast: &Ast, src: &str, lr: &LoweredRule) -> String {
             // before this rule was ever planned) already confirmed no
             // spawn trigger/sync/race hides inside a loop's body, so --
             // unlike the ordinary segment loop below -- every statement
-            // here is plain splice, no per-shape dispatch needed.
+            // here is plain splice (`render_loop_body`'s own recursion
+            // into a tail `if`/`if let` handles `break`; nothing else
+            // needs per-shape dispatch).
             let (header, body) =
                 while_loop_header(ast, src, seg.stmts[0], &lr.handle_field_rewrites);
             out.push_str("    ");
             out.push_str(&header);
-            for stmt in body {
-                let span = ast.stmt_spans[stmt.0 as usize].clone();
-                out.push_str("    ");
-                out.push_str(&splice(src, &span, &lr.handle_field_rewrites));
-            }
-            out.push_str(&format!("        {} := {}\n", lr.cont_name, seg.index));
+            render_loop_body(
+                &mut out,
+                ast,
+                src,
+                body,
+                &lr.handle_field_rewrites,
+                &lr.cont_name,
+                seg.index,
+                next,
+            );
             out.push_str("    } else {\n");
             out.push_str(&format!("        {} := {next}\n", lr.cont_name));
             out.push_str("    }\n");
@@ -2239,12 +2541,16 @@ fn render_spawn_segments(
             let (header, body) = while_loop_header(ast, src, seg.stmts[0], &spawn.rename_edits);
             out.push_str("    ");
             out.push_str(&header);
-            for stmt in body {
-                let span = ast.stmt_spans[stmt.0 as usize].clone();
-                out.push_str("    ");
-                out.push_str(&splice(src, &span, &spawn.rename_edits));
-            }
-            out.push_str(&format!("        {} := {}\n", spawn.cont_name, seg.index));
+            render_loop_body(
+                out,
+                ast,
+                src,
+                body,
+                &spawn.rename_edits,
+                &spawn.cont_name,
+                seg.index,
+                seg.index + 1,
+            );
             out.push_str("    } else {\n");
             out.push_str(&format!(
                 "        {} := {}\n",

@@ -264,6 +264,7 @@ impl<'a> Checker<'a> {
             }
             Stmt::Let { init, .. } => self.infer_expr(*init, sig),
             Stmt::Tick => {}
+            Stmt::Break => {}
             Stmt::Return(e) => {
                 if let Some(e) = e {
                     self.infer_expr(*e, sig);
@@ -716,6 +717,26 @@ impl<'a> Checker<'a> {
                     self.error(
                         span,
                         "`tick` requires `<sequences>` on the enclosing item".to_string(),
+                    );
+                }
+            }
+            // `break`'s own tail-position-within-a-loop placement is a
+            // STRUCTURAL check, not an effects one -- `lower.rs`'s `find_
+            // break_misplaced` handles that (it needs to know whether
+            // this statement sits inside a `while`/`while let` body,
+            // information this pass doesn't track). This only checks the
+            // declared-effects half, mirroring `tick`'s identical check
+            // just above -- NOT extended to `<elaborates>` the way
+            // `while` itself is: an elaboration-time loop is evaluated by
+            // a separate const-eval interpreter (elaborate.rs) that has
+            // no `break` semantics built in (v0 restriction).
+            Stmt::Break => {
+                if !sig.sequences {
+                    self.error(
+                        span,
+                        "`break` requires `<sequences>` on the enclosing item (v0 \
+                         restriction: not supported inside an `<elaborates>` loop)"
+                            .to_string(),
                     );
                 }
             }

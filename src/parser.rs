@@ -1031,6 +1031,11 @@ impl<'a> Parser<'a> {
                 self.expect_terminator();
                 Stmt::Tick
             }
+            Some(Break) => {
+                self.bump();
+                self.expect_terminator();
+                Stmt::Break
+            }
             // `let {field, field: bind, ...} = source` — struct/`?T`
             // destructuring, sugar for one `let bind = source.field` per
             // item (`parse_let_destructure`, below). Bare-brace, not

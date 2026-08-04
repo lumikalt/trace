@@ -1,0 +1,28 @@
+-- `break` inside a `while` loop's own body: exits the loop early,
+-- independent of the loop's own condition (DESIGN.md's "`while`:
+-- multi-cycle loops"). v0-restricted to tail position -- here, the
+-- last statement of the loop body is an `if` with no `else`, whose
+-- `then` branch's own last statement is `break`; the missing `else`
+-- is synthesized (keep looping) at render time. This is trace's
+-- spelling of Verse's canonical `loop: if (Cond[]) { ... } else {
+-- break }` idiom, minus the need to spell an explicit `else`.
+module WhileBreak {
+    in limit : [8]
+    in go : [1]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+    reg acc : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := 0
+        acc := 0
+        while go = 1 {
+            acc := acc + 1
+            cnt := cnt + 1
+            if cnt >= limit {
+                break
+            }
+        }
+        result := acc
+    }
+}

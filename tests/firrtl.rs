@@ -1,6 +1,41 @@
 use trace::firrtl::{EmitError, emit};
 use trace::{effects, lexer, lower, parser, resolve, schedule, types};
 
+/// Runs the pipeline up through whichever stage first reports an error
+/// (lex, parse, resolve, effects, or lower — the same order `emit_from_
+/// source` runs them, but returning messages instead of panicking via
+/// `assert!`). `emit_from_source` treats any of these as a fatal test-
+/// harness failure, since every OTHER test in this file expects its own
+/// rejection to come from firrtl.rs's checks, reached only once every
+/// earlier stage passes clean — but `break`'s placement checks
+/// (`<sequences>` in effects.rs, tail-position in lower.rs) fire
+/// earlier than that, so this is the helper anything testing THOSE
+/// needs instead.
+fn pipeline_error_messages(src: &str) -> Vec<String> {
+    let (tokens, lex_errors) = lexer::lex(src);
+    if !lex_errors.is_empty() {
+        return vec!["lex error".to_string(); lex_errors.len()];
+    }
+    let (ast, parse_errors) = parser::parse(src, &tokens);
+    if !parse_errors.is_empty() {
+        return parse_errors.iter().map(|e| e.message.clone()).collect();
+    }
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    if !resolve_errors.is_empty() {
+        return resolve_errors.iter().map(|e| e.message.clone()).collect();
+    }
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    if !effect_errors.is_empty() {
+        return effect_errors.iter().map(|e| e.message.clone()).collect();
+    }
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
+    if !type_errors.is_empty() {
+        return type_errors.iter().map(|e| e.message.clone()).collect();
+    }
+    let (_, lower_errors) = lower::plan(&ast, &res, &fx, &ty);
+    lower_errors.iter().map(|e| e.message.clone()).collect()
+}
+
 /// Full pipeline including sequences lowering (re-lexed/parsed once the
 /// lowered text exists), matching what the CLI does for `--firrtl`.
 fn emit_from_source(src: &str) -> Result<String, Vec<EmitError>> {
@@ -7195,4 +7230,195 @@ module M {
 ";
     let err = emit_from_source(src).unwrap_err();
     assert!(err.iter().any(|e| e.message.contains("nested in if/while")));
+}
+
+/// `break` sitting as the last statement of a `then` branch with no
+/// `else` written — `render_loop_body` (lower.rs) synthesizes the
+/// missing `else` (keep looping) at render time. Verse's own canonical
+/// `loop: if (Cond[]) { ... } else { break }` idiom, minus the need to
+/// spell an explicit `else`. Hand-verified against real firtool+Icarus
+/// simulation before this was written — see `examples/while_break.tr`
+/// + `sim/while_break_tb.v`.
+#[test]
+fn break_in_a_tail_if_with_no_else_exits_the_loop() {
+    let src = "\
+module M {
+    in go : [1]
+    in limit : [8]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+
+    rule r <sequences> {
+        cnt := 0
+        while go = 1 {
+            cnt := cnt + 1
+            if cnt >= limit {
+                break
+            }
+        }
+        result := cnt
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __cont_r, mux(eq(go, UInt<1>(1)), mux(geq(cnt, limit), UInt<2>(2), UInt<2>(1)), \
+         UInt<2>(2))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+/// `break` nested two levels deep — an `if` inside an `if`, both in
+/// tail position — renders correctly at every level, not just one hop
+/// in: `render_loop_body` recurses generically, with no depth limit
+/// (unlike several OTHER v0-scoped constructs in this file that cap
+/// nesting at one level). Hand-verified structurally (this test) and
+/// via a settle-and-hold real simulation before this was written.
+#[test]
+fn break_nested_two_levels_deep_in_tail_ifs_still_renders_correctly() {
+    let src = "\
+module M {
+    in go : [1]
+    in a : [1]
+    in b : [1]
+    reg v : [8] = 0
+
+    rule r <sequences> {
+        while go = 1 {
+            v := v + 1
+            if a = 1 {
+                if b = 1 {
+                    break
+                }
+            }
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __cont_r, mux(eq(go, UInt<1>(1)), mux(eq(a, UInt<1>(1)), \
+         mux(eq(b, UInt<1>(1)), UInt<2>(2), UInt<2>(1)), UInt<2>(1)), UInt<2>(2))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+/// `break` inside a `while let` body works identically to plain
+/// `while` — `render_loop_body` doesn't care which loop shape called
+/// it, only the body's own statement structure.
+#[test]
+fn break_inside_a_while_let_body_exits_the_loop() {
+    let src = "\
+module M {
+    reg opt : ?[8] = false
+    in limit : [8]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := 0
+        while let v = opt? {
+            cnt := cnt + v
+            opt := false
+            if cnt >= limit {
+                break
+            }
+        }
+        result := cnt
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("mux(opt_valid,"));
+    assert!(fir.contains("UInt<2>(2)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A bare `break` with no enclosing `while`/`while let` anywhere is
+/// rejected outright — `find_break_misplaced` (lower.rs) requires
+/// `in_loop_tail` to be established by an enclosing loop first.
+#[test]
+fn break_outside_any_loop_is_rejected() {
+    let src = "\
+module M {
+    reg v : [8] = 0
+    rule r <sequences> {
+        break
+    }
+}
+";
+    let messages = pipeline_error_messages(src);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("last statement") && m.contains("while"))
+    );
+}
+
+/// `break` followed by another statement in the SAME block is rejected
+/// — it must be the last statement of its own block (v0 restriction:
+/// nothing may follow it), so `render_loop_body` never needs to hoist
+/// trailing statements into a synthesized branch.
+#[test]
+fn break_not_in_tail_position_is_rejected() {
+    let src = "\
+module M {
+    in go : [1]
+    reg v : [8] = 0
+    rule r <sequences> {
+        while go = 1 {
+            break
+            v := v + 1
+        }
+    }
+}
+";
+    let messages = pipeline_error_messages(src);
+    assert!(messages.iter().any(|m| m.contains("last statement")));
+}
+
+/// `break` inside an `if` that ISN'T itself the loop body's own tail
+/// (something follows the `if`) is rejected — `in_loop_tail` only
+/// propagates into a branch when the enclosing `if`/`if let` is BOTH
+/// already tail-eligible AND the last statement of its own list.
+#[test]
+fn break_in_an_if_not_itself_in_tail_position_is_rejected() {
+    let src = "\
+module M {
+    in go : [1]
+    in c : [1]
+    reg v : [8] = 0
+    rule r <sequences> {
+        while go = 1 {
+            if c = 1 {
+                break
+            }
+            v := v + 1
+        }
+    }
+}
+";
+    let messages = pipeline_error_messages(src);
+    assert!(messages.iter().any(|m| m.contains("while")));
+}
+
+/// `break` requires `<sequences>` on the enclosing item, mirroring
+/// `tick`'s identical requirement — a bare `if { break }` with no
+/// surrounding loop at all in a plain rule hits this before ever
+/// reaching the loop-tail-position question.
+#[test]
+fn break_without_sequences_declared_is_rejected() {
+    let src = "\
+module M {
+    in go : [1]
+    reg v : [8] = 0
+    rule r {
+        if go = 1 {
+            break
+        }
+    }
+}
+";
+    let messages = pipeline_error_messages(src);
+    assert!(messages.iter().any(|m| m.contains("<sequences>")));
 }

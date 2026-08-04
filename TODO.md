@@ -1721,9 +1721,71 @@ Speculative, bigger, not committed to:
     2. A standalone `break` keyword, usable inside a loop body for early
        exit independent of the loop's own guard — the actual mechanism
        Verse's `loop`+`if`+`break` idiom uses, which trace's `while` is
-       now built to match structurally, not just semantically. **Not
-       yet built as of this note** — a separate commit, tracked in a
-       new TODO.md bullet once work on it starts.
+       now built to match structurally, not just semantically.
+       **ACHIEVED — see this section's own `break` bullet below.**
+
+- **`break`: exiting a loop early ACHIEVED.** New `Stmt::Break` AST node
+  (a new keyword, not sugar for anything pre-existing), v0-restricted to
+  TAIL position: the last statement of a `while`/`while let`'s own body,
+  or of a `then`/`else` branch of an `if`/`if let` that is ITSELF in that
+  tail position — nested as deep as the user likes, as long as every
+  enclosing level stays in tail position (no artificial one-level cap,
+  unlike several other v0-scoped constructs in this codebase — the SAME
+  recursive rendering applies identically at every depth, so there was
+  no extra risk per level to cap against). An `if` with no `else` and a
+  tail `break` in `then` gets its missing `else` synthesized (keep
+  looping) at render time, so `if cond { break }` alone is legal —
+  trace's spelling of Verse's own `loop: if (Cond[]) { ... } else {
+  break }` idiom (confirmed against the "Book of Verse" the same way the
+  `while`-reversal above was), minus the need to spell an explicit
+  `else` when it would just be "keep going" anyway.
+
+  Every exhaustive `Stmt` match across the compiler needed a `Stmt::
+  Break` arm (found via the Rust compiler's own exhaustiveness checking,
+  not a memory sweep) — almost all a pure no-op leaf mirroring `Stmt::
+  Tick`'s treatment (`break` has no sub-expressions/reads/writes/calls of
+  its own). Three sites hold the real logic: `effects.rs`'s `check_stmt`
+  requires `<sequences>` on the enclosing item (mirroring `tick`'s
+  identical check, deliberately not extended to `<elaborates>` — that
+  interpreter already rejects `while` itself outright, so `break` there
+  is moot, but this check catches it explicitly and earlier); `lower.rs`
+  gained `find_break_misplaced` (the placement check, mirroring `find_
+  nested_tick`'s shape but the opposite question) and `find_break_
+  anywhere` (mirrors `find_tick_anywhere`/`find_while_anywhere`'s role in
+  `plan()`'s own top-level gate, so a stray misplaced `break` with no
+  `tick`/`while` alongside it still routes through the placement check
+  rather than silently reaching firrtl.rs as an unrejected no-op);
+  `lower.rs`'s `render_loop_body` replaces the old "splice every
+  statement verbatim, then unconditionally append `cont := stay`" with a
+  function that recurses into a tail `if`/`if let` ONLY when a `break` is
+  actually reachable inside it — when there's none, it reproduces the
+  OLD rendering byte for byte, so every pre-existing `while`/`while let`
+  test kept its exact original FIRRTL assertions, not a restructured-
+  but-equivalent one that would have needed updating for no functional
+  reason. `find_break_misplaced` and `render_loop_body` are deliberately
+  kept in sync on what counts as a legal position.
+
+  A real, documented (not glossed-over) semantic point flagged by
+  `advisor`'s review before implementation: statements before a `break`
+  in its own branch still commit (`break` means "advance past the loop
+  starting NEXT cycle," not "nothing this iteration happened") — and
+  `break`'s own condition, like any other read in the loop body, sees a
+  register's OLD (pre-edge) value, so a threshold-based break lands one
+  iteration "later" than a naive read suggests (worked out precisely,
+  cycle by cycle, in `sim/while_break_tb.v`'s own doc comment, after a
+  first testbench draft got exactly this wrong and had to be corrected
+  before the simulation could pass).
+
+  Hand-verified end to end against real firtool + Icarus AND Verilator
+  simulation before any structural test was written: `examples/while_
+  break.tr` + `sim/while_break_tb.v` (`tests/sim.rs`'s `while_break_
+  exits_the_loop_early_through_real_cycles`) covers a mid-loop break, an
+  immediate break on the very first iteration, and the loop never even
+  being entered. A separate probe confirmed two-level nested `if`-break
+  (both in tail position) settles correctly and holds, not just compiles
+  — structurally captured in `tests/firrtl.rs`'s `break_nested_two_
+  levels_deep_in_tail_ifs_still_renders_correctly`. See DESIGN.md's
+  "`break`: exiting a loop early" for the full write-up.
   - **What `fires_rule` becomes for an `if`-WITH-else fallible
     condition.** Per the no-else/with-else split above, the with-else
     case should contribute NOTHING to the whole-rule guard (matching

@@ -1039,6 +1039,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::Tick => {}
+            Stmt::Break => {}
             Stmt::Return(Some(e)) => {
                 let ty = self.type_expr(e, locals);
                 if let Some(ret) = ret {

@@ -603,7 +603,7 @@ impl<'a> Emitter<'a> {
                         out.push(init);
                         roots_of(ast, &body, out);
                     }
-                    Stmt::Return(None) | Stmt::Tick => {}
+                    Stmt::Return(None) | Stmt::Tick | Stmt::Break => {}
                 }
             }
         }
@@ -761,7 +761,7 @@ impl<'a> Emitter<'a> {
                         out.push(init);
                         roots_of(ast, &body, out);
                     }
-                    Stmt::Return(None) | Stmt::Tick => {}
+                    Stmt::Return(None) | Stmt::Tick | Stmt::Break => {}
                 }
             }
         }
@@ -1138,7 +1138,7 @@ impl<'a> Emitter<'a> {
                     roots.push(init);
                     self.guards_outside_allowed_positions(&body, out);
                 }
-                Stmt::Return(None) | Stmt::Tick => {}
+                Stmt::Return(None) | Stmt::Tick | Stmt::Break => {}
             }
             for root in roots {
                 let mut guards = Vec::new();
@@ -1211,7 +1211,7 @@ impl<'a> Emitter<'a> {
                     roots.push(init);
                     self.fifo_ops_outside_allowed_positions(&body, out);
                 }
-                Stmt::Return(None) | Stmt::Tick => {}
+                Stmt::Return(None) | Stmt::Tick | Stmt::Break => {}
             }
             for root in roots {
                 let mut ops = Vec::new();
@@ -1333,7 +1333,7 @@ impl<'a> Emitter<'a> {
                     roots.push(init);
                     self.calls_outside_allowed_positions(&body, allow_let, allow_if_let, out);
                 }
-                Stmt::Return(None) | Stmt::Tick => {}
+                Stmt::Return(None) | Stmt::Tick | Stmt::Break => {}
             }
             for root in roots {
                 let mut calls = Vec::new();
@@ -1536,7 +1536,7 @@ pub(crate) fn collect_all_calls_in(ast: &Ast, stmts: &[StmtId], out: &mut Vec<Ex
                 roots.push(init);
                 collect_all_calls_in(ast, &body, out);
             }
-            Stmt::Return(None) | Stmt::Tick => {}
+            Stmt::Return(None) | Stmt::Tick | Stmt::Break => {}
         }
         for root in roots {
             collect_calls(ast, root, out);

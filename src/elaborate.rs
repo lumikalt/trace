@@ -209,6 +209,7 @@ fn stmt_exprs(ast: &Ast, id: StmtId) -> Vec<ExprId> {
         Stmt::Assign { lhs, rhs } => vec![lhs, rhs],
         Stmt::Let { init, .. } => vec![init],
         Stmt::Tick => vec![],
+        Stmt::Break => vec![],
         Stmt::Return(e) => e.into_iter().collect(),
         Stmt::If { cond, .. } => vec![cond],
         Stmt::IfLet { init, .. } => vec![init],
@@ -527,6 +528,23 @@ impl<'a> Interp<'a> {
                         span,
                         "`tick` is not valid in `<elaborates>` code (elaboration \
                          time has no cycles)"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                // Same defensive status as `IfLet`/`WhileLet`'s own arms
+                // above: a loop is already rejected outright by `Stmt::
+                // While`'s arm, so `break` (only ever meaningful inside
+                // one) would already be unreachable via that path;
+                // `effects.rs`'s own `<sequences>`-only check on `Stmt::
+                // Break` catches it even earlier. Kept explicit anyway,
+                // for a clearer message and so this match stays
+                // exhaustive without a wildcard.
+                Stmt::Break => {
+                    self.error(
+                        span,
+                        "`break` is not valid in `<elaborates>` code (elaboration \
+                         time has no loops to break out of)"
                             .to_string(),
                     );
                     return Err(());

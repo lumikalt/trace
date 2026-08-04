@@ -256,6 +256,11 @@ pub enum Stmt {
         init: ExprId,
     },
     Tick,
+    /// `break` — exits the enclosing `while`/`while let` loop early. v0-
+    /// restricted to tail position (lower.rs's `find_break_misplaced`);
+    /// fully consumed by sequences lowering (lower.rs's `render_loop_
+    /// body`), never reaches firrtl.rs.
+    Break,
     Return(Option<ExprId>),
     If {
         cond: ExprId,
@@ -779,6 +784,7 @@ impl Ast {
                 out.push_str(&format!("{pad}(let {name} {})\n", self.expr_sexpr(*init)));
             }
             Stmt::Tick => out.push_str(&format!("{pad}tick\n")),
+            Stmt::Break => out.push_str(&format!("{pad}break\n")),
             Stmt::Return(expr) => match expr {
                 Some(expr) => {
                     out.push_str(&format!("{pad}(return {})\n", self.expr_sexpr(*expr)));

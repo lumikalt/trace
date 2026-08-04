@@ -781,6 +781,7 @@ impl<'a> Resolver<'a> {
                 self.declared_locals.push((def, name));
             }
             Stmt::Tick => {}
+            Stmt::Break => {}
             Stmt::Return(expr) => {
                 if let Some(expr) = expr {
                     self.resolve_expr(expr, false);

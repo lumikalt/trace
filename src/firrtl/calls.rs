@@ -48,7 +48,7 @@ fn direct_callees(ast: &Ast, res: &Resolution, stmts: &[StmtId]) -> Vec<(ItemId,
                     collect_calls(ast, *rhs, out);
                 }
                 Stmt::Return(Some(e)) => collect_calls(ast, *e, out),
-                Stmt::Return(None) | Stmt::Tick => {}
+                Stmt::Return(None) | Stmt::Tick | Stmt::Break => {}
                 Stmt::Expr(e) => collect_calls(ast, *e, out),
                 Stmt::If {
                     cond,

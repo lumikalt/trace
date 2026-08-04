@@ -401,6 +401,60 @@ fn while_countdown_bare_comparison_runs_through_real_cycles() {
     );
 }
 
+/// Proves `break` genuinely exits a `while` loop early in real
+/// hardware: `examples/while_break.tr` + `sim/while_break_tb.v` cover a
+/// mid-loop break, an immediate break on the very first iteration, and
+/// the loop never even being entered (the loop's OWN condition false
+/// from the start, unrelated to `break`) — see `sim/while_break_tb.v`'s
+/// own doc comment for the exact expected values and why one of them
+/// isn't the naively-expected one (`break`'s own condition reads a
+/// register's OLD value, same as any other read).
+#[test]
+fn while_break_exits_the_loop_early_through_real_cycles() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/while_break.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/while_break_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of
+/// `while_break_exits_the_loop_early_through_real_cycles`.
+#[test]
+fn while_break_exits_the_loop_early_through_real_cycles_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/while_break.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/while_break_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves `while let`'s multi-cycle lowering end to end: sim/while_let_
 /// drain_tb.v holds `x` at 5, 0, then 12 in turn and checks `iters`
 /// settles at exactly `x` each time, the same shape `while_countdown`
