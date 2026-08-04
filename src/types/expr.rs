@@ -1,0 +1,971 @@
+//! Expression-level type checking: `type_expr`'s per-`Expr`-variant
+//! dispatch (`type_expr_inner`, populating `expr_tys` for every
+//! expression it types), solver-2's width-combining rules for binary
+//! operators (`type_binop`), the `Stmt::IfLet`/`check_cond` helpers that
+//! recognize a bare fallible shape (`is_failing_call`, `is_fifo_deq`),
+//! bracket dispatch — memory read, bit/slice select, fifo op, or a
+//! bracketed builtin (`type_bracket`) — and solver-1's call
+//! instantiation (`type_call`, `type_builtin_call`).
+
+use super::{OPTION_FIELDS, Ty, TypeChecker, Width, bits_needed, clog2};
+use crate::ast::{BinOp, Expr, ExprId, Item, UnOp};
+use crate::resolve::{DefId, DefKind};
+use std::collections::HashMap;
+
+impl<'a> TypeChecker<'a> {
+    pub(crate) fn type_expr(&mut self, id: ExprId, locals: &mut HashMap<DefId, Ty>) -> Ty {
+        let ty = self.type_expr_inner(id, locals);
+        self.types.expr_tys.insert(id, ty.clone());
+        ty
+    }
+
+    fn type_expr_inner(&mut self, id: ExprId, locals: &mut HashMap<DefId, Ty>) -> Ty {
+        match self.ast.expr(id).clone() {
+            Expr::Int(_) => Ty::Int,
+            // Unlike a bare `Int`, a sized literal has its own definite
+            // width, so it types directly as `Bits(Known(width))` — no
+            // "absorb from context" — and is range-checked right here,
+            // against ITS OWN declared width, rather than deferred to
+            // `check_literal_fits` at whatever coercion site it's later
+            // used in (matches the same `bits_needed` helper that uses).
+            Expr::SizedInt { width, value } => {
+                if bits_needed(value) > width {
+                    self.error(
+                        self.expr_span(id),
+                        format!("{value} does not fit in [{width}]"),
+                    );
+                }
+                Ty::Bits(Width::Known(width))
+            }
+            Expr::Wildcard => Ty::Unknown,
+            Expr::Ident(_) => {
+                let Some(def) = self.res.expr_defs.get(&id).copied() else {
+                    return Ty::Unknown;
+                };
+                // Bare state idents carry their state type; indexing and
+                // fifo ops peel Mem/Fifo wrappers at the use site.
+                if let Some(state) = self.state_tys.get(&def) {
+                    return state.clone();
+                }
+                if let Some(local) = locals.get(&def) {
+                    return local.clone();
+                }
+                match self.res.def(def).kind {
+                    DefKind::ImplicitParam => Ty::Int,
+                    DefKind::Inst => {
+                        self.error(
+                            self.expr_span(id),
+                            format!(
+                                "cannot use instance `{}` as a value; access one of its \
+                                 ports (`{}.port`)",
+                                self.res.def(def).name,
+                                self.res.def(def).name
+                            ),
+                        );
+                        Ty::Unknown
+                    }
+                    _ => Ty::Unknown,
+                }
+            }
+            Expr::Unary { op, operand } => {
+                let t = self.type_expr(operand, locals);
+                match t {
+                    Ty::Bits(_) | Ty::Int | Ty::Unknown => {}
+                    other => {
+                        self.error(
+                            self.expr_span(id),
+                            format!("unary operator needs bits, got {other}"),
+                        );
+                        return Ty::Unknown;
+                    }
+                }
+                // `not` is a real, distinct operator from `~`, not pure
+                // sugar for it: both compile to the identical FIRRTL
+                // `not` primop (see firrtl/expr.rs), but `not` additionally
+                // requires its operand already be `bits[1]` — a
+                // guardrail against accidentally bitwise-negating a
+                // wider value (`not x` on a `bits[8]` almost certainly
+                // means "did you mean a comparison, or `~`?", not "flip
+                // every bit"), since `check_cond` (stmt.rs) already requires
+                // every condition position to be exactly `bits[1]`
+                // anyway — there is no implicit "nonzero is true"
+                // coercion anywhere in this language for `not` to
+                // usefully mean something wider.
+                if op == UnOp::Not
+                    && !matches!(
+                        t,
+                        Ty::Bits(Width::Known(1))
+                            | Ty::Bits(Width::Unknown)
+                            | Ty::Unknown
+                            | Ty::Int
+                    )
+                {
+                    self.error(
+                        self.expr_span(id),
+                        format!(
+                            "`not` needs a [1] operand, got {t}; use `~` for a \
+                             bitwise complement of a wider value, or compare \
+                             explicitly"
+                        ),
+                    );
+                    return Ty::Unknown;
+                }
+                t
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                let l = self.type_expr(lhs, locals);
+                let r = self.type_expr(rhs, locals);
+                self.type_binop(op, l, r, lhs, rhs, id)
+            }
+            // `(cond)?` ordinarily just passes `inner`'s own type
+            // through (its "must be bits[1]" side is `check_cond`'s
+            // job, not this fn's). `opt?`, `opt : ?T`, is different: the
+            // WHOLE point is unwrapping, so the guard's own type becomes
+            // `T`, not `?T` — generalizing `?` from "fails unless
+            // bits[1]-true" to "fails unless present, yielding T",
+            // reusing the exact same `fails`-folding machinery `f.Deq[]`
+            // already has (see `effects.rs`'s `Expr::Guard` handling).
+            Expr::Guard(inner) => match self.type_expr(inner, locals) {
+                Ty::Option(t) => *t,
+                other => other,
+            },
+            Expr::Field { base, name } => {
+                if let Some(module_def) = self.instance_module_of(base) {
+                    self.types.expr_tys.insert(base, Ty::Unknown);
+                    match self.find_port(module_def, &name) {
+                        Some((DefKind::Output, port_ty)) => port_ty,
+                        Some((DefKind::Io, _)) => {
+                            self.error(
+                                self.expr_span(id),
+                                format!(
+                                    "cannot read `{name}`: it is an io port on this instance \
+                                     (io ports carry no value — the only legal use is \
+                                     `attach`ing it to another io port)"
+                                ),
+                            );
+                            Ty::Unknown
+                        }
+                        Some((_, _)) => {
+                            self.error(
+                                self.expr_span(id),
+                                format!(
+                                    "cannot read `{name}`: it is an input port on this \
+                                     instance (only output ports can be read)"
+                                ),
+                            );
+                            Ty::Unknown
+                        }
+                        None => {
+                            self.error(
+                                self.expr_span(id),
+                                format!("this instance has no port `{name}`"),
+                            );
+                            Ty::Unknown
+                        }
+                    }
+                } else {
+                    match self.type_expr(base, locals) {
+                        Ty::Handle(inner) => match name.as_str() {
+                            "result" => *inner,
+                            "done" => Ty::Bits(Width::Known(1)),
+                            _ => {
+                                self.error(
+                                    self.expr_span(id),
+                                    format!(
+                                        "a handle has no field `{name}`; only `.result` and \
+                                         `.done` are readable"
+                                    ),
+                                );
+                                Ty::Unknown
+                            }
+                        },
+                        Ty::Struct { def, name: sname } => {
+                            let fields = self.types.struct_fields.get(&def).cloned();
+                            match fields
+                                .as_ref()
+                                .and_then(|fs| fs.iter().find(|(fname, _)| fname == &name))
+                            {
+                                Some((_, fty)) => fty.clone(),
+                                None => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        format!("struct `{sname}` has no field `{name}`"),
+                                    );
+                                    Ty::Unknown
+                                }
+                            }
+                        }
+                        // `?T`'s two synthetic fields, same escape hatch
+                        // a `spawn` handle's `.result`/`.done` already
+                        // has: `.valid`/`.data` read WITHOUT unwrap-or-
+                        // fail (`opt?`'s job) — the non-failing
+                        // alternative `if opt.valid { ...opt.data... }
+                        // else { ... }` gives.
+                        Ty::Option(inner) => {
+                            if !OPTION_FIELDS.contains(&name.as_str()) {
+                                self.error(
+                                    self.expr_span(id),
+                                    format!(
+                                        "a `?T` value only has `.valid`/`.data` fields, \
+                                         not `.{name}`"
+                                    ),
+                                );
+                                Ty::Unknown
+                            } else if name == "valid" {
+                                Ty::Bits(Width::Known(1))
+                            } else {
+                                *inner
+                            }
+                        }
+                        Ty::Unknown => Ty::Unknown,
+                        other => {
+                            self.error(
+                                self.expr_span(id),
+                                format!("cannot access field `{name}` on {other}"),
+                            );
+                            Ty::Unknown
+                        }
+                    }
+                }
+            }
+            Expr::Spawn(inner) => {
+                let ret = self.type_expr(inner, locals);
+                Ty::Handle(Box::new(ret))
+            }
+            Expr::Bracket { callee, args } => self.type_bracket(id, callee, &args, locals),
+            Expr::Call { callee, args } => self.type_call(id, callee, &args, locals),
+            Expr::ListLit(items) => {
+                let Some((&first, rest)) = items.split_first() else {
+                    self.error(
+                        self.expr_span(id),
+                        "a list literal cannot be empty (its element type would be \
+                         unknowable)"
+                            .to_string(),
+                    );
+                    return Ty::Unknown;
+                };
+                let elem = self.type_expr(first, locals);
+                for &item in rest {
+                    let t = self.type_expr(item, locals);
+                    self.check_assignable(&t, &elem, self.expr_span(item), "list element");
+                }
+                Ty::List(Box::new(elem))
+            }
+            // Only meaningful as a list-slice `Bracket` argument
+            // (`type_bracket` re-matches the raw AST shape there for the
+            // real element-type/slice rule); reached here only via the
+            // generic per-subexpression walk `type_bracket` already does
+            // first, or if used somewhere illegal — `Unknown`, the same
+            // treatment the existing two-sided `BinOp::Range` gets in
+            // `type_binop` when it shows up outside a bracket.
+            Expr::Range { lo, hi } => {
+                if let Some(lo) = lo {
+                    self.type_expr(lo, locals);
+                }
+                if let Some(hi) = hi {
+                    self.type_expr(hi, locals);
+                }
+                Ty::Unknown
+            }
+            // `A or B or C` types like `ListLit`'s element unification:
+            // every alternative (a fifo op's element type, or a plain
+            // default value) must agree with the first's type. Shape
+            // rules (which alts must be fifo ops) are firrtl/checks.rs's
+            // job, same division as everywhere else in this module.
+            Expr::Or(alts) => {
+                let Some((&first, rest)) = alts.split_first() else {
+                    self.error(
+                        self.expr_span(id),
+                        "`or` needs at least two alternatives, e.g. `a.Deq[] or b.Deq[]`"
+                            .to_string(),
+                    );
+                    return Ty::Unknown;
+                };
+                let elem = self.type_expr(first, locals);
+                for &alt in rest {
+                    let t = self.type_expr(alt, locals);
+                    self.check_assignable(&t, &elem, self.expr_span(alt), "`or` alternative");
+                }
+                elem
+            }
+            // `Name { field: expr, ..., ..base }` — v0 requires either an
+            // EXHAUSTIVE, one-shot field list (matching Rust's own
+            // struct-literal rule: no defaults for a field this literal
+            // doesn't mention) or a trailing `..base` supplying every
+            // field this literal DOESN'T name — never both partially:
+            // `base` fills whatever's absent from THIS literal's own
+            // list, it does not recurse into a nested struct/Option
+            // field that's itself only partially given. A duplicate
+            // field is almost certainly a typo, not a deliberate "last
+            // one wins" overwrite. A bad struct NAME (unresolved, or
+            // resolved to something that isn't `DefKind::Struct`) is
+            // already reported by resolve.rs — this stays defensive
+            // (`Ty::Unknown`, no second error) rather than re-checking
+            // the same thing.
+            Expr::StructLit { name, fields, base } => {
+                let Some(&struct_def) = self.res.expr_defs.get(&name) else {
+                    for (_, value) in &fields {
+                        self.type_expr(*value, locals);
+                    }
+                    if let Some(base) = base {
+                        self.type_expr(base, locals);
+                    }
+                    return Ty::Unknown;
+                };
+                let struct_name = match self.ast.expr(name) {
+                    Expr::Ident(n) => n.clone(),
+                    _ => String::new(),
+                };
+                let Some(declared) = self.types.struct_fields.get(&struct_def).cloned() else {
+                    for (_, value) in &fields {
+                        self.type_expr(*value, locals);
+                    }
+                    if let Some(base) = base {
+                        self.type_expr(base, locals);
+                    }
+                    return Ty::Unknown;
+                };
+                let mut seen: HashMap<String, ExprId> = HashMap::new();
+                for (fname, value) in &fields {
+                    let vty = self.type_expr(*value, locals);
+                    if seen.contains_key(fname) {
+                        self.error(
+                            self.expr_span(*value),
+                            format!("field `{fname}` is given more than once"),
+                        );
+                        continue;
+                    }
+                    seen.insert(fname.clone(), *value);
+                    match declared.iter().find(|(dname, _)| dname == fname) {
+                        Some((_, dty)) => {
+                            self.check_assignable(
+                                &vty,
+                                dty,
+                                self.expr_span(*value),
+                                "struct field",
+                            );
+                            self.check_literal_fits(*value, dty);
+                        }
+                        None => {
+                            self.error(
+                                self.expr_span(*value),
+                                format!("struct `{struct_name}` has no field `{fname}`"),
+                            );
+                        }
+                    }
+                }
+                let result = Ty::Struct {
+                    def: struct_def,
+                    name: struct_name.clone(),
+                };
+                match base {
+                    Some(base) => {
+                        let base_ty = self.type_expr(base, locals);
+                        self.check_assignable(&base_ty, &result, self.expr_span(base), "`..` base");
+                    }
+                    None => {
+                        let missing: Vec<&str> = declared
+                            .iter()
+                            .map(|(dname, _)| dname.as_str())
+                            .filter(|dname| !seen.contains_key(*dname))
+                            .collect();
+                        if !missing.is_empty() {
+                            self.error(
+                                self.expr_span(id),
+                                format!(
+                                    "struct `{struct_name}` literal is missing field(s): {} \
+                                     -- give them explicitly, or add `..base`",
+                                    missing.join(", ")
+                                ),
+                            );
+                        }
+                    }
+                }
+                result
+            }
+            // `?T` has no meaning as a VALUE expression, only a type
+            // (`eval_ty`'s own `Expr::OptionTy` arm handles it there) —
+            // reachable here only if `?T` shows up somewhere that isn't
+            // actually a type position (e.g. `x := ?bits[8]`).
+            Expr::OptionTy(_) => {
+                self.error(
+                    self.expr_span(id),
+                    "`?T` is a type, not a value".to_string(),
+                );
+                Ty::Unknown
+            }
+            Expr::Absent => Ty::AbsentLit,
+            // Type-checks `inner` for its own sake (effects, diagnostics,
+            // populating `expr_tys` for `check_assignable`'s later
+            // lookup) but deliberately does NOT wrap `inner`'s `Ty` here
+            // — see `Ty::Optional`'s own doc comment for why unification
+            // needs to stay lazy, recursing through `check_assignable`
+            // against the eventual TARGET's inner instead of a type this
+            // arm precomputed.
+            Expr::Optional(inner) => {
+                self.type_expr(inner, locals);
+                Ty::Optional(inner)
+            }
+            // `logic <expr>`: converts a fallible expression into a
+            // plain boolean, always `bits[1]` regardless of `expr`'s own
+            // type — `expr` is still type-checked normally (populating
+            // `expr_tys`, running ordinary diagnostics), just its
+            // resulting Ty is discarded here. Whether `expr` is actually
+            // a fallible SHAPE (a fifo op, or a call to a guard-only
+            // `<fails>` fn/impl) isn't a width/type question — checked
+            // later in firrtl/checks.rs's `check_logic_args`, once
+            // effects.rs's inferred signatures exist to consult,
+            // matching where `check_failing_call_positions`/`check_
+            // fifo_op_positions` already live for the same reason.
+            Expr::Logic(inner) => {
+                self.type_expr(inner, locals);
+                Ty::Bits(Width::Known(1))
+            }
+        }
+    }
+
+    /// Solver-2 width rules. Modular arithmetic: `+`/`-`/bitwise keep the
+    /// max width; `*` sums; shifts keep the left width; comparisons give
+    /// bits[1]. `Int` absorbs into the other side.
+    fn type_binop(&mut self, op: BinOp, l: Ty, r: Ty, lhs: ExprId, rhs: ExprId, at: ExprId) -> Ty {
+        use BinOp::*;
+        let span = self.expr_span(at);
+        if matches!(op, Range | PlusColon | MinusColon) {
+            // Only meaningful as a `Bracket`'s own argument (`type_bracket`
+            // re-matches the raw AST shape there for the real width rule);
+            // reached here only via the generic per-subexpression walk
+            // `type_bracket` already does before that re-match, or if
+            // used somewhere illegal (e.g. a bare `x := a +: b` statement)
+            // — silently `Unknown` either way, same treatment `Range` has
+            // always had. Emission's own generic `compile_binop` catch-all
+            // still rejects an illegal bare use explicitly, so nothing
+            // silently miscompiles.
+            return Ty::Unknown;
+        }
+        // A comparison yields `l`'s own type/value on success (fails
+        // otherwise) — Verse's `X > 0` semantics (TODO.md's "Comparisons
+        // returning their left operand" design), the same "unwrap-or-
+        // fail" shape `opt?`/`f.Deq[]` already have, NOT a standalone
+        // `bits[1]` value anymore. Routed through the SAME `match (l, r)`
+        // compatibility check every other operator gets below (so `a >
+        // b` on incompatible types still errors, same as `a + b` would)
+        // rather than short-circuiting before it the way this used to —
+        // only the RESULT differs (`l`'s type, not the computed common
+        // width). `l`'s original value is captured before the match
+        // moves it in, since which arm actually matches doesn't change
+        // what a comparison yields.
+        let is_comparison = op.is_comparison();
+        let l_ty = l.clone();
+        // `a >>.! 300` (ast.rs's `lossy` set, populated by the parser
+        // right where `.!` is written) — an explicit, per-application
+        // opt-out of exactly the two checks below, `check_literal_fits`/
+        // `check_shift_amount`. Computed once here rather than re-
+        // queried per arm.
+        let lossy = self.ast.lossy.contains(&at);
+        match (l, r) {
+            (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
+            (Ty::Int, Ty::Int) => {
+                if is_comparison {
+                    l_ty
+                } else {
+                    Ty::Int
+                }
+            }
+            (Ty::Bits(w), Ty::Int) => {
+                // The `Int` side absorbs `w` from its sibling (this arm's
+                // whole point), but absorbing silently is exactly the gap
+                // `check_assignable`'s own `(Ty::Int, Ty::Bits(_))` comment
+                // promises is "range-checked at coercion" — this IS that
+                // coercion site for a binary operand, the same way a
+                // state write or port default is for an assignment. Without
+                // this, `a + 100000000` (`a : [8]`) unified silently to
+                // `[8]` with no diagnostic at all, not even at emission.
+                //
+                // EXCEPT for a shift: `Shl|Shr|AShr => Ty::Bits(a)` below
+                // already says the shift AMOUNT'S width never enters the
+                // result at all — it's a count, not a value bounded by
+                // the shifted operand's own domain, so `check_literal_
+                // fits` (a "does this VALUE fit" check) doesn't apply.
+                // `check_shift_amount` (a differently-shaped "is this
+                // COUNT too large" check) does.
+                if !lossy {
+                    if matches!(op, Shl | Shr | AShr) {
+                        self.check_shift_amount(rhs, &Ty::Bits(w));
+                    } else {
+                        self.check_literal_fits(rhs, &Ty::Bits(w));
+                    }
+                }
+                if is_comparison { l_ty } else { Ty::Bits(w) }
+            }
+            (Ty::Int, Ty::Bits(w)) => {
+                if !lossy && !matches!(op, Shl | Shr | AShr) {
+                    self.check_literal_fits(lhs, &Ty::Bits(w));
+                }
+                if is_comparison { l_ty } else { Ty::Bits(w) }
+            }
+            (Ty::Bits(a), Ty::Bits(b)) => {
+                if is_comparison {
+                    l_ty
+                } else {
+                    match op {
+                        Mul => Ty::Bits(match (a, b) {
+                            (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
+                            _ => Width::Unknown,
+                        }),
+                        Shl | Shr | AShr => {
+                            // A real `Bits` shift amount (a sized literal
+                            // like `8'd20`, say, or any constant-foldable
+                            // expression) is just as checkable as a bare
+                            // `Int` one (`type_binop`'s `(Bits, Int)` arm,
+                            // above) — `check_shift_amount` itself only
+                            // needs a compile-time-constant VALUE, which
+                            // `const_eval` finds the same way regardless
+                            // of which `Ty` the amount's own expression
+                            // happens to carry.
+                            if !lossy {
+                                self.check_shift_amount(rhs, &Ty::Bits(a));
+                            }
+                            Ty::Bits(a)
+                        }
+                        _ => Ty::Bits(match (a, b) {
+                            (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y)),
+                            _ => Width::Unknown,
+                        }),
+                    }
+                }
+            }
+            (l, r) => {
+                self.error(
+                    span,
+                    format!("operator needs bits operands, got {l} and {r}"),
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Whether `id` is a call to a function whose computed effect
+    /// signature can fail -- the `Stmt::IfLet` sibling of `checks.rs`'s
+    /// identical `is_failing_call`/`call_target_fn` (that copy lives on
+    /// `Emitter`, which can't see `TypeChecker`, hence the duplicate
+    /// rather than a shared helper).
+    pub(crate) fn is_failing_call(&self, id: ExprId) -> bool {
+        let Expr::Call { callee, .. } = self.ast.expr(id) else {
+            return false;
+        };
+        let Some(def) = self.res.expr_defs.get(callee) else {
+            return false;
+        };
+        if !matches!(self.res.def(*def).kind, DefKind::Fn | DefKind::Impl) {
+            return false;
+        }
+        self.res
+            .item_defs
+            .iter()
+            .find(|(_, d)| *d == def)
+            .is_some_and(|(item, _)| self.fx.sigs.get(item).is_some_and(|s| s.fails))
+    }
+
+    /// Brackets: memory read, bit/slice select, or fifo op.
+    /// Whether `id` is a bare `fifo.Deq[]` -- the exact shape `type_
+    /// bracket` recognizes as a fifo op, checked independently here
+    /// since `Stmt::IfLet`'s arm needs to know this BEFORE deciding
+    /// whether to call `type_expr` (which would otherwise just report
+    /// `elem`'s type with no way to tell "a real fifo op" apart from any
+    /// other `[N]`-typed expression). `Enq` is deliberately excluded --
+    /// there is no value to bind an if-let's name to.
+    pub(crate) fn is_fifo_deq(&self, id: ExprId) -> bool {
+        let Expr::Bracket { callee, .. } = self.ast.expr(id) else {
+            return false;
+        };
+        let Expr::Field { base, name } = self.ast.expr(*callee) else {
+            return false;
+        };
+        if name != "Deq" {
+            return false;
+        }
+        self.res
+            .expr_defs
+            .get(base)
+            .is_some_and(|def| matches!(self.state_tys.get(def), Some(Ty::Fifo { .. })))
+    }
+
+    fn type_bracket(
+        &mut self,
+        id: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        locals: &mut HashMap<DefId, Ty>,
+    ) -> Ty {
+        // Fifo op: `f.Deq[]` / `f.Enq[x]`.
+        if let Expr::Field { base, name } = self.ast.expr(callee).clone()
+            && let Some(def) = self.res.expr_defs.get(&base).copied()
+            && let Some(Ty::Fifo { elem, depth }) = self.state_tys.get(&def).cloned()
+        {
+            self.types.expr_tys.insert(
+                callee,
+                Ty::Fifo {
+                    elem: elem.clone(),
+                    depth,
+                },
+            );
+            return match name.as_str() {
+                "Deq" => {
+                    if !args.is_empty() {
+                        self.error(self.expr_span(id), "`Deq[]` takes no arguments".to_string());
+                    }
+                    *elem
+                }
+                "Enq" => {
+                    if args.len() != 1 {
+                        self.error(
+                            self.expr_span(id),
+                            "`Enq[x]` takes one argument".to_string(),
+                        );
+                        return Ty::Unit;
+                    }
+                    let arg = self.type_expr(args[0], locals);
+                    self.check_assignable(&arg, &elem, self.expr_span(args[0]), "enqueue");
+                    Ty::Unit
+                }
+                other => {
+                    self.error(
+                        self.expr_span(id),
+                        format!("unknown fifo operation `{other}` (Deq or Enq)"),
+                    );
+                    Ty::Unknown
+                }
+            };
+        }
+
+        // A builtin used with brackets (`sync[h1, h2]`, `race[h1, h2]`) —
+        // brackets mark fallibility, matching `f.Deq[]`/`f.Enq[x]`, so a
+        // fallible builtin is called this way rather than with parens.
+        // Dispatches through the same per-builtin type rule an ordinary
+        // (infallible) `name(args)` call already uses.
+        if let Some(def) = self.res.expr_defs.get(&callee).copied()
+            && self.res.def(def).kind == DefKind::Builtin
+        {
+            let name = self.res.def(def).name.clone();
+            let arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(*a, locals)).collect();
+            return self.type_builtin_call(id, &name, args, &arg_tys);
+        }
+
+        let base = self.type_expr(callee, locals);
+        for a in args {
+            self.type_expr(*a, locals);
+        }
+        match base {
+            Ty::Mem { elem, .. } => {
+                if args.len() != 1 {
+                    self.error(
+                        self.expr_span(id),
+                        "memory read takes one index".to_string(),
+                    );
+                }
+                *elem
+            }
+            Ty::Bits(w) => {
+                let _ = w;
+                // Bit select (`x[i]`), slice (`x[hi..lo]`), or indexed
+                // part-select (`x[base +: width]`/`x[base -: width]`) —
+                // three shapes, each with a genuinely different width
+                // rule, distinguished by the argument's own AST shape.
+                if let Some(&arg) = args.first()
+                    && let Expr::Binary { op, lhs, rhs } = self.ast.expr(arg).clone()
+                {
+                    match op {
+                        // A slice's width can ONLY be known if BOTH
+                        // bounds are compile-time constants — FIRRTL's
+                        // `bits` primop needs static bounds, and there's
+                        // no way to express a dynamically-SIZED result
+                        // in this language's type system at all (unlike
+                        // a single index, whose width is always exactly
+                        // 1 regardless of whether it's dynamic). A
+                        // non-const bound here used to silently fall
+                        // through to the `Ty::Bits(Width::Known(1))`
+                        // fallback below — a real latent mistyping bug
+                        // (a narrower-than-declared value passes
+                        // `check_assignable` without complaint) — now an
+                        // explicit error instead.
+                        BinOp::Range => {
+                            return match (
+                                self.const_eval(lhs, &HashMap::new()),
+                                self.const_eval(rhs, &HashMap::new()),
+                            ) {
+                                (Some(hi), Some(lo)) => Ty::Bits(Width::Known(hi.abs_diff(lo) + 1)),
+                                _ => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        "a slice's bounds (`x[hi..lo]`) must both be \
+                                         compile-time constants (this language has no \
+                                         way to express a dynamically-sized result); \
+                                         use indexed part-select for a dynamic start \
+                                         with a fixed width instead — `x[base +: \
+                                         width]`/`x[base -: width]`"
+                                            .to_string(),
+                                    );
+                                    Ty::Unknown
+                                }
+                            };
+                        }
+                        // Indexed part-select: `base` may be anything —
+                        // its own width is irrelevant to the RESULT's
+                        // width, which is fixed entirely by `width`, so
+                        // (unlike a slice) this only ever needs ONE side
+                        // to be a compile-time constant.
+                        BinOp::PlusColon | BinOp::MinusColon => {
+                            return match self.const_eval(rhs, &HashMap::new()) {
+                                Some(width) if width >= 1 => Ty::Bits(Width::Known(width)),
+                                Some(_) => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        format!(
+                                            "indexed part-select (`{}`) width must be \
+                                             at least 1",
+                                            op.symbol()
+                                        ),
+                                    );
+                                    Ty::Unknown
+                                }
+                                None => {
+                                    self.error(
+                                        self.expr_span(id),
+                                        format!(
+                                            "indexed part-select (`{}`) needs a \
+                                             compile-time constant width",
+                                            op.symbol()
+                                        ),
+                                    );
+                                    Ty::Unknown
+                                }
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                // A single index — `x[i]` — is always exactly 1 bit,
+                // whether `i` is a compile-time constant or a genuine
+                // runtime value; unlike a slice, there's no ambiguity
+                // about the result's width to resolve either way.
+                Ty::Bits(Width::Known(1))
+            }
+            // `xs[i]` (an element) or `xs[..mid]`/`xs[mid..]` (a
+            // sub-list, `Expr::Range` — the one-sided form, exclusively
+            // used for list slicing, never `BinOp::Range`'s two-sided
+            // bit-slice shape). Both bounds/the index are checked for
+            // being elaboration-time constants by the interpreter
+            // (`firrtl/elaborate.rs`) once a real call site exists, not
+            // here — this pass only needs the SHAPE, since a `list[T]`
+            // body is checked once, generically, independent of any
+            // call site's actual length (exactly like a generic
+            // `bits[N]` body).
+            Ty::List(elem) => {
+                if args.len() != 1 {
+                    self.error(
+                        self.expr_span(id),
+                        "list index takes one argument".to_string(),
+                    );
+                    return Ty::Unknown;
+                }
+                if matches!(self.ast.expr(args[0]), Expr::Range { .. }) {
+                    Ty::List(elem)
+                } else {
+                    *elem
+                }
+            }
+            Ty::Unknown => Ty::Unknown,
+            other => {
+                self.error(self.expr_span(id), format!("cannot index {other}"));
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Solver-1 instantiation: builtins by signature; user fns match
+    /// implicit width params against concrete argument widths, then the
+    /// return type evaluates under that solution.
+    fn type_call(
+        &mut self,
+        id: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        locals: &mut HashMap<DefId, Ty>,
+    ) -> Ty {
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(*a, locals)).collect();
+        let Some(def) = self.res.expr_defs.get(&callee).copied() else {
+            return Ty::Unknown;
+        };
+        let def_info = self.res.def(def).clone();
+        match def_info.kind {
+            DefKind::Builtin => self.type_builtin_call(id, &def_info.name, args, &arg_tys),
+            DefKind::Fn | DefKind::Impl | DefKind::Spec => {
+                let Some(item) = self.def_items.get(&def).copied() else {
+                    return Ty::Unknown;
+                };
+                let Item::Fn { params, ret, .. } = self.ast.item(item).clone() else {
+                    return Ty::Unknown;
+                };
+                if params.len() != args.len() {
+                    self.error(
+                        self.expr_span(id),
+                        format!(
+                            "`{}` takes {} argument(s), got {}",
+                            def_info.name,
+                            params.len(),
+                            args.len()
+                        ),
+                    );
+                    return Ty::Unknown;
+                }
+                // Match `bits[N]` params against known arg widths.
+                let mut env: HashMap<DefId, u64> = HashMap::new();
+                for (param, arg_ty) in params.iter().zip(&arg_tys) {
+                    if let Some(pdef) = self.implicit_width_param(param.ty)
+                        && let Ty::Bits(Width::Known(w)) = arg_ty
+                        && let Some(prev) = env.insert(pdef, *w)
+                        && prev != *w
+                    {
+                        self.error(
+                            self.expr_span(id),
+                            format!("conflicting widths for implicit parameter: {prev} vs {w}"),
+                        );
+                    }
+                }
+                // Check each arg against its (instantiated) param type.
+                for (param, (arg_ty, arg)) in params.iter().zip(arg_tys.iter().zip(args)) {
+                    let pty = self.eval_ty(param.ty, &env);
+                    self.check_assignable(arg_ty, &pty, self.expr_span(*arg), "argument");
+                }
+                match ret {
+                    Some(r) => self.eval_ty(r, &env),
+                    None => Ty::Unit,
+                }
+            }
+            // No `DefKind::Rule` arm: a rule name lives in resolve.rs's
+            // own separate `rule_scopes` namespace now, never `expr_defs`
+            // (see that field's doc comment) — this callee can never
+            // resolve to one, so there's nothing to reject here.
+            DefKind::Reg
+            | DefKind::Mem
+            | DefKind::Fifo
+            | DefKind::Input
+            | DefKind::Output
+            | DefKind::Module => {
+                self.error(
+                    self.expr_span(id),
+                    format!(
+                        "`{}` is {}, not callable",
+                        def_info.name,
+                        def_info.kind.describe()
+                    ),
+                );
+                Ty::Unknown
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
+    fn type_builtin_call(&mut self, id: ExprId, name: &str, args: &[ExprId], arg_tys: &[Ty]) -> Ty {
+        match name {
+            "clog2" | "len" => Ty::Int,
+            // `trunc(value, width)`: the ordinary explicit form, typed
+            // directly from the const-evaluated `width` argument, same
+            // as always.
+            //
+            // `trunc(value)`, ONE argument: width INFERRED from wherever
+            // this call's own result is used, not spelled out here. Bottom-
+            // up type-checking (this whole pass) has no way to know that
+            // yet — `Ty::Bits(Width::Unknown)` is the honest answer at
+            // this point, not a placeholder to fill in later. Two existing
+            // mechanisms pick up from there without any new machinery:
+            // `check_assignable`/`check_literal_fits` only ever compare
+            // `Width::Known` widths, so `Unknown` here already means
+            // "don't flag a mismatch, not enough information" everywhere
+            // they're called — a real width IS still enforced, just later
+            // and elsewhere: FIRRTL emission's `compile_trunc`
+            // (src/firrtl/calls.rs) resolves the width from `hint`, its
+            // OWN top-down "what does this expression's result need to be"
+            // parameter, threaded through the emitter from every write
+            // target/return type/etc. already — the concrete counterpart
+            // to this type-checking pass's own top-down blind spot. No
+            // hint reaching that call site is `compile_trunc`'s own clean,
+            // separate error, not this function's.
+            "trunc" => match args.len() {
+                1 => Ty::Bits(Width::Unknown),
+                2 => match self.const_eval(args[1], &HashMap::new()) {
+                    Some(w) => Ty::Bits(Width::Known(w)),
+                    None => Ty::Bits(Width::Unknown),
+                },
+                _ => {
+                    self.error(
+                        self.expr_span(id),
+                        "`trunc` takes (value) or (value, width)".to_string(),
+                    );
+                    Ty::Unknown
+                }
+            },
+            "pack" => {
+                let mut total = 0u64;
+                for t in arg_tys {
+                    match t {
+                        Ty::Bits(Width::Known(w)) => total += w,
+                        _ => return Ty::Bits(Width::Unknown),
+                    }
+                }
+                Ty::Bits(Width::Known(total))
+            }
+            "prio" => match arg_tys.first() {
+                Some(Ty::Bits(Width::Known(w))) => Ty::Bits(Width::Known(clog2(*w).max(1))),
+                _ => Ty::Bits(Width::Unknown),
+            },
+            "sync" => Ty::Unit,
+            // Guard-only (`race[...]` as its own statement) never reads
+            // this type; value-producing (`value := race[...]`) does —
+            // the winner's own result type, once every named handle is
+            // confirmed to share one. Args are handles (`Ty::Handle(T)`),
+            // never the flattened internal form below (that's a DIFFERENT
+            // builtin name, `__race_value`, never spelled `race`).
+            "race" => {
+                let mut result: Option<Ty> = None;
+                for (arg, ty) in args.iter().zip(arg_tys) {
+                    match ty {
+                        Ty::Handle(inner) => match &result {
+                            None => result = Some((**inner).clone()),
+                            Some(prev) if prev != inner.as_ref() => {
+                                self.error(
+                                    self.expr_span(*arg),
+                                    format!(
+                                        "`race`'s handles must all share the same result \
+                                         type; this one is {inner}, an earlier one was {prev}"
+                                    ),
+                                );
+                            }
+                            _ => {}
+                        },
+                        Ty::Unknown => {}
+                        other => {
+                            self.error(
+                                self.expr_span(*arg),
+                                format!("`race` needs a spawned handle, not {other}"),
+                            );
+                        }
+                    }
+                }
+                result.unwrap_or(Ty::Unit)
+            }
+            // `__race_value[d1, r1, d2, r2, ...]` — lower.rs's own
+            // rewrite of a value-producing `race[...]` at render time:
+            // alternating done-flag/result-value pairs, already-renamed
+            // real registers, never written by a user. `race`'s own
+            // dispatch above already confirmed every result shares one
+            // type before this was ever generated, so this just reads it
+            // back off the first result arg — no arity/shape validation
+            // a real source mistake could ever trigger here.
+            "__race_value" => arg_tys.get(1).cloned().unwrap_or(Ty::Unknown),
+            // any(range) is a model-checker free variable.
+            "any" => Ty::Bits(Width::Unknown),
+            _ => Ty::Unknown,
+        }
+    }
+}
