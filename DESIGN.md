@@ -273,8 +273,8 @@ rule r2 {
 }
 ```
 
-The value side was already solved before this feature existed: `if opt.valid
-{ result := opt.data } else { result := 2 }` already compiled to a plain
+The value side was already solved before this feature existed: `if
+opt.valid? { result := opt.data } else { result := 2 }` compiles to a plain
 `mux(opt_valid, opt_data, 2)`, ordinary conditional-write muxing
 (`writes.rs`) with no rule-level guard at all. A bare comparison's own
 condition-position compilation reuses this unchanged — only the SELECT
@@ -287,7 +287,9 @@ prior value (`reg_value_in_stmts`'s existing "hold" fallback); the whole-
 rule guard already never looked inside `Stmt::If` at all (`compile_guard`'s
 statement loop only matches `Stmt::Expr`/`Stmt::Assign`/`Stmt::Let`), so an
 if-condition contributing nothing to `fires_rule` needed no new code, only
-the type checker (`check_cond`, types.rs) accepting the shape.
+the type checker (`check_cond`, types.rs) accepting the shape. (`opt.valid`
+needs the trailing `?` under the stricter rule below — see "An if/while
+condition must itself be fallible".)
 
 v0 restrictions: only a comparison discharges this way — a fifo op or a
 failing call as an if's condition remains a type error (unchanged, no new
@@ -323,6 +325,70 @@ wrapped in `logic`. A future guard-fold call site that reaches
 `compile_guard_unwrap_cond` WITHOUT going through `check_cond` first would
 reintroduce this exact gap with no test catching it — the fix is a
 front-gate, not a fix to the shallow check itself.
+
+#### An if/while condition must itself be fallible
+
+A plain `[1]` value is no longer accepted bare as an `if`/`while`
+condition (Lumi's call) — in a rule body OR a callee (`fn`/`impl`)
+body alike. The condition must be one of: a bare comparison/fifo
+op/failing call as the WHOLE condition (the exemptions above), an
+explicit `<expr>?`, or a boolean combination of already-`logic`-
+discharged fallibles (`(logic A) & (logic B)`, the very next section's
+`and` idiom). Anything else — an ordinary state read (`opt.valid`, a
+`[1]` port used bare) or a bare `logic <expr>` with nothing else
+combining it — is a type error with a hint.
+
+```trace
+rule r {
+    if opt.valid { ... }        -- error: needs an explicit `?`
+    if opt.valid? { ... }       -- fine
+    if logic a > b { ... }      -- error: `logic` alone discharges nothing
+                                 --   left to test; drop it or wrap: (logic a > b)?
+    if a > b { ... }            -- fine (the bare-comparison exemption above)
+    if (logic a > b)? { ... }   -- fine (explicit round trip)
+}
+```
+
+The `logic <expr>` case gets its own hint, not the generic one: `logic`
+converts a fallible expression into a plain, already-discharged boolean
+(its own entry above) — using THAT bare as a condition just becomes an
+ordinary (always-taken) mux select, not a real guard, which is exactly
+the confusion this closes. `(logic A) & (logic B)` stays legal despite
+also typing as plain `[1]`: an `Expr::Logic` node reachable anywhere in
+the condition's own subtree (not just at the top) marks every component
+as deliberately discharged, the same `sub_exprs` walk `expr_has_
+undischarged_comparison` above already uses for the identical shape of
+question — `contains_logic_expr` (types/stmt.rs).
+
+**Callee (`fn`/`impl`) bodies needed one more piece to reach parity,
+not a carve-out.** A first pass applied the strict rule to rule bodies
+only, exempting callees entirely: `if c?` inside a callee's own body is
+a real `Expr::Guard`, and `effects.rs`'s ORDINARY `Expr::Guard` arm
+unconditionally sets `sig.fails = true` — so naively enabling `?` there
+made the ENCLOSING CALLEE fallible, forcing `<fails>` onto a function
+whose only "fallibility" was a boolean mux parameter, and that `<fails>`
+cascades to every call site (a failing call folds into the CALLER's own
+guard — an entirely different, much bigger change than "be explicit
+about a boolean"). Confirmed empirically before either version shipped:
+`struct_typed_fn_return_if_else_muxes_per_leaf` (tests/firrtl.rs) —
+`Pick(c : [1]) : Pair <combines> { if c? { ... } else { ... } }` — broke
+exactly this way.
+
+Lumi's own insight resolved it properly instead of leaving the
+carve-out standing: an explicit `?` sitting directly in an if/while's
+own condition position is the SAME SHAPE as a bare failing call there —
+both are "test something fallible, right here, branch-scoped" — and a
+bare failing call in that exact position was ALREADY exempt from
+forcing `<fails>` (the three-way `if`-condition discharge above). So
+`effects.rs` needed a fourth case, not a type-checker carve-out: `Stmt::
+If`/`Stmt::While`'s own condition-inference now routes through a shared
+`infer_branch_scoped_cond`, which unwraps one leading `Expr::Guard` and
+re-dispatches on ITS inner using the identical comparison/fifo-op/
+failing-call/plain-value cases the bare-condition discharge already
+had — never falling through to the ordinary `Expr::Guard` arm that sets
+`fails`. Once that existed, the type-checker rule needed no `in_rule`
+distinction at all: a callee's `if c?` now stays exactly as inert as a
+callee's `if Classify(a) { ... }` already was.
 
 ### `or`: fallback chains
 

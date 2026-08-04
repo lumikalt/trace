@@ -8,7 +8,10 @@
 -- so never commits any of its writes) if `opt` is absent, or evaluates
 -- to the unwrapped `T` if present — see DESIGN.md's "Option types"
 -- section. `.valid`/`.data` stay directly readable too, for a
--- non-failing presence check via plain `if`/`else`.
+-- non-failing presence check via `if opt.valid? { ... } else { ... }`
+-- (an if/while condition must itself be a fallible shape -- a plain
+-- `[1]` field read needs its own explicit `?`, distinct from `opt?`'s
+-- whole-value unwrap-or-fail).
 module Option {
     fifo input : [8]
     reg opt : ?[8] = false
@@ -48,7 +51,7 @@ module Option {
     }
 
     rule check {
-        if opt.valid {
+        if opt.valid? {
             was_present := 1
         } else {
             was_present := 0
@@ -58,12 +61,12 @@ module Option {
         -- (`__out_{port}_{field}` internal registers, `struct_reg_
         -- source` keyed by the PORT name) -- exercised here directly,
         -- not just inferred from the reg case.
-        if opt.valid {
+        if opt.valid? {
             relayed := opt.data
         } else {
             relayed := false
         }
-        if flag.valid {
+        if flag.valid? {
             flag_present := 1
             flag_value := flag.data
         } else {

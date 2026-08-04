@@ -213,7 +213,7 @@ fn rejects_nested_tick() {
 module M {
     reg x : [8] = 0
     rule r <sequences> {
-        if logic x = 0 {
+        if x = 0 {
             tick
         }
         tick
@@ -281,7 +281,7 @@ module M {
 
     rule r <sequences, fails> {
         cnt := x
-        while logic cnt <> 0 {
+        while cnt <> 0 {
             cnt := cnt - 1
         }
         result := cnt
@@ -304,7 +304,7 @@ module M {
 
     let rendered = render(&c.ast, src, &c.lowered);
     assert_round_trips(&rendered);
-    assert!(rendered.contains("if logic cnt <> 0 {"));
+    assert!(rendered.contains("if cnt <> 0 {"));
     assert!(rendered.contains(&format!("{} := 1\n    }} else {{", lr.cont_name)));
     assert!(rendered.contains(&format!("{} := 2\n    }}", lr.cont_name)));
 }
@@ -327,7 +327,7 @@ module M {
     rule r <sequences, fails> {
         let acc = 0
         let n = x
-        while logic n <> 0 {
+        while n <> 0 {
             acc := acc + n
             n := n - 1
         }
@@ -357,8 +357,8 @@ module M {
     reg flag : [1] = 0
 
     rule r <sequences, fails> {
-        if logic flag = 1 {
-            while logic cnt <> 0 {
+        if flag = 1 {
+            while cnt <> 0 {
                 cnt := cnt - 1
             }
         }
@@ -458,7 +458,7 @@ module M {
     out result : [8] = 0
 
     rule r <sequences, fails> {
-        if logic flag = 1 {
+        if flag = 1 {
             while let v = opt? {
                 result := v
                 opt := false
@@ -958,7 +958,7 @@ module M {
 fn spawn_callee_early_return_is_rejected() {
     let src = "\
 Slow(x : [8]) : [8] <sequences> {
-    if logic x = 0 {
+    if x = 0 {
         return x
     }
     tick

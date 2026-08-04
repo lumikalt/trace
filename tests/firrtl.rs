@@ -671,7 +671,7 @@ module M {
     fifo f : [8]
     reg cond : [1] = 0
     rule r {
-        if logic cond = 1 {
+        if cond = 1 {
             f.Enq[cond]
         }
     }
@@ -787,21 +787,19 @@ fn a_fifo_op_in_an_if_condition_is_an_error_not_a_dropped_dequeue() {
     // walks a branch's own STATEMENTS, never the `if`/`while`'s own
     // condition expression -- so a fifo op sitting directly in the
     // condition used to slip past both that check and `fifo_op_stmt`'s
-    // exact-shape match entirely.
-    // `logic` around the comparison keeps this type-checking (a bare
-    // comparison no longer types as [1] at all, see TODO.md's
-    // comparisons-as-fallible design) without changing what this test
-    // is actually about: the fifo op is nested TWO levels deep now
-    // (inside the comparison, inside `logic`), and `logic_arg_exprs`'s
-    // exemption only covers the comparison itself, not what's nested
-    // inside it -- confirmed the fifo op is still caught, not silently
-    // exempted along with its wrapper.
+    // exact-shape match entirely. A bare comparison is legal directly as
+    // an if's whole condition (DESIGN.md's "if: branch-scoped fallible
+    // conditions"), so this test is what this is actually about: the
+    // fifo op is nested ONE level deep, inside the comparison, and the
+    // comparison itself being the WHOLE condition doesn't exempt what's
+    // nested inside it -- confirmed the fifo op is still caught, not
+    // silently exempted along with its enclosing comparison.
     let src = "\
 module M {
     fifo input : [8]
     out result : [8] = 0
     rule compute {
-        if logic input.Deq[] = 1 {
+        if input.Deq[] = 1 {
             result := 5
         } else {
             result := 6
@@ -956,7 +954,7 @@ module M {
     reg v : [8] = 0
 
     rule r {
-        if logic cond = 1 {
+        if cond = 1 {
             m[addr] := v
         }
     }
@@ -991,7 +989,7 @@ module M {
     reg vb : [8] = 0
 
     rule r {
-        if logic cond = 1 {
+        if cond = 1 {
             m[addr_a] := va
         } else {
             m[addr_b] := vb
@@ -1048,7 +1046,7 @@ module M {
     in addr1 : [8]
 
     rule r {
-        if logic cond = 1 {
+        if cond = 1 {
             m[addr0] := 8'd11
         }
         m[addr1] := 8'd22
@@ -1078,10 +1076,10 @@ module M {
     in addrB : [8]
 
     rule r {
-        if logic condA = 1 {
+        if condA = 1 {
             m[addrA] := 8'd11
         }
-        if logic condB = 1 {
+        if condB = 1 {
             m[addrB] := 8'd22
         }
     }
@@ -1110,7 +1108,7 @@ module M {
 
     rule r {
         m[addr0] := 8'd11
-        if logic cond = 1 {
+        if cond = 1 {
             m[addr1] := 8'd22
         }
     }
@@ -1219,7 +1217,7 @@ module Top {
     reg cond : [1] = 0
     reg v : [8] = 0
     rule r {
-        if logic cond = 1 {
+        if cond = 1 {
             c.a := v
         } else {
             c.a := 1
@@ -1250,7 +1248,7 @@ module Top {
     reg cond : [1] = 0
     reg v : [8] = 0
     rule r {
-        if logic cond = 1 {
+        if cond = 1 {
             c.a := v
         }
     }
@@ -2228,7 +2226,7 @@ module M {
     in a : [8]
 
     Bump(x : [8]) : [8] <combines> {
-        if logic x > 10 {
+        if x > 10 {
             v := x
         } else {
             v := 0
@@ -2265,7 +2263,7 @@ module M {
     out result : [8] = 0
 
     Bump(x : [8]) : [8] <combines> {
-        if logic x > 10 {
+        if x > 10 {
             v := x
         } else {
             v := 0
@@ -2579,7 +2577,7 @@ module M {
     in b : [8]
     in c : [1]
     rule r {
-        if logic c = 1 {
+        if c = 1 {
             v := a + (a > b)
         }
     }
@@ -2952,7 +2950,7 @@ module Top {
     in cond : [1]
     out result : [8] = 0
     rule compute {
-        if logic cond = 1 {
+        if cond = 1 {
             result := Classify(a)
         } else {
             result := 0
@@ -3034,7 +3032,7 @@ fn call_to_a_function_with_a_non_tail_if_is_still_too_complex_to_inline() {
     // statement.
     let src = "\
 Pick(x : [8]) : [8] <combines> {
-    if logic x > 10 {
+    if x > 10 {
         return x
     }
     return 0
@@ -3058,7 +3056,7 @@ module M {
 fn call_inlines_a_function_with_an_if_else_branching_return() {
     let src = "\
 Max(a : [8], b : [8]) : [8] <combines> {
-    if logic a > b {
+    if a > b {
         return a
     } else {
         return b
@@ -3082,7 +3080,7 @@ module M {
 fn call_to_a_function_with_a_tail_if_and_no_else_is_an_error() {
     let src = "\
 Pick(x : [8]) : [8] <combines> {
-    if logic x > 10 {
+    if x > 10 {
         return x
     }
 }
@@ -3111,7 +3109,7 @@ fn call_inlines_a_function_with_lets_inside_branches_that_do_not_leak_out() {
     // branch's local still bound.
     let src = "\
 Pick(a : [8], b : [8]) : [8] <combines> {
-    if logic a > b {
+    if a > b {
         let winner = a
         return winner
     } else {
@@ -3702,7 +3700,7 @@ module M {
     in b : [8]
     in c : [1]
     rule r {
-        if logic c = 1 {
+        if c = 1 {
             v := logic a > b
         }
     }
@@ -3896,6 +3894,15 @@ fn logic_wrapped_call_is_allowed_inside_an_if_condition() {
     // side`, tests/parser.rs) — a bare `logic f.Deq[] & logic Check(a)`
     // would parse as one `logic` wrapping the whole `&` expression
     // instead of two separately-discharged values.
+    //
+    // Also now the regression test for `check_cond`'s (types/stmt.rs)
+    // `contains_logic_expr` exemption: once a BARE `logic <expr>` if-
+    // condition became its own hard error (Lumi's call — see `a_bare_
+    // logic_wrapped_if_condition_comparison_is_now_rejected_with_a_hint`
+    // below), a boolean COMBINATION of `logic`-discharged fallibles like
+    // this one needed its own explicit carve-out to keep compiling at
+    // all, not just at the position-check layer this test originally
+    // targeted.
     let src = "\
 Check(x : [8]) : [8] <combines, fails> {
     (x <> 0)?
@@ -4134,7 +4141,7 @@ module M {
     in cond : [1]
     out result : [8] = 0
     rule r {
-        if cond {
+        if cond? {
             result := a.Deq[] or b.Deq[]
         }
     }
@@ -4290,7 +4297,7 @@ module M {
     in c : [1]
     Bump(a : [8], c : [1]) <combines, writes {r}> {
         let x = a
-        if c { x := x + 1 } else { x := x + 2 }
+        if c? { x := x + 1 } else { x := x + 2 }
         r := x
     }
     rule go {
@@ -4405,7 +4412,7 @@ module M {
     in go : [1]
 
     rule r {
-        if logic go = 1 {
+        if go = 1 {
             p := Pair{ valid: 1, data: 8'd7 }
         } else {
             p := Pair{ valid: 0, data: 8'd9 }
@@ -4432,7 +4439,7 @@ module M {
     in go : [1]
 
     rule r {
-        if logic go = 1 {
+        if go = 1 {
             p := Pair{ valid: 1, data: 8'd7 }
         }
     }
@@ -4601,7 +4608,7 @@ module M {
     in go : [1]
 
     rule r {
-        if logic go = 1 {
+        if go = 1 {
             f := Frame{ header: Header{ valid: 1, seq: 4'd3 }, data: 8'd7 }
         }
     }
@@ -4637,7 +4644,7 @@ module M {
     in go : [1]
 
     rule r {
-        if logic go = 1 {
+        if go = 1 {
             p := Pair{
                 valid: 1,
                 data: 8'd7
@@ -4656,7 +4663,15 @@ module M {
 /// checked against when this session's struct feature first landed:
 /// `if cond { x := 1 }`, with the assignment on its own line, must
 /// still parse as an ordinary if/block, not get misread as a struct
-/// literal now that the lookahead skips newlines.
+/// literal now that the lookahead skips newlines. Deliberately kept as
+/// the exact bare-ident-then-newline-then-`{` shape the original bug
+/// needed (appending `?` here, now required for a plain `[1]` condition
+/// to type-check, would also trivially disambiguate the `{` from a
+/// struct literal's own opener and stop exercising the parser ambiguity
+/// this test exists to catch) -- so this only checks PARSING, via
+/// `pipeline_error_messages` reaching the (now expected) fallible-
+/// condition type error and nothing struct-shaped, rather than full
+/// emission.
 #[test]
 fn if_with_a_bare_ident_condition_and_a_newline_before_its_body_still_parses_as_a_block() {
     let src = "\
@@ -4671,9 +4686,9 @@ module M {
     }
 }
 ";
-    let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect x, mux(cond, UInt<8>(1), x)"));
-    run_firtool(&fir, &[]);
+    let messages = pipeline_error_messages(src);
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("condition must be a fallible expression"));
 }
 
 /// `?T` never emits a real FIRRTL bundle either, same as a plain
@@ -4749,7 +4764,7 @@ module M {
 
     rule fill {
         go?
-        if present {
+        if present? {
             opt := 1
         } else {
             opt := false
@@ -4787,7 +4802,7 @@ module M {
     out val : [8] = 0
 
     rule r {
-        if fr.maybe.valid {
+        if fr.maybe.valid? {
             ok := 1
             val := fr.maybe.data
         } else {
@@ -5124,7 +5139,7 @@ module M {
     out relayed : ?[8] = false
     in go : [1]
     rule r {
-        if go {
+        if go? {
             relayed := opt.data
         }
     }
@@ -5184,7 +5199,7 @@ module M {
 
     rule fill {
         go?
-        if present {
+        if present? {
             oo := 8'd7
         } else {
             oo := false
@@ -5816,6 +5831,18 @@ module M {
 /// `p_data` each get their own `mux(c, ...)`, not the same value copied
 /// to both (advisor-flagged gap: written but never actually exercised
 /// until this test).
+///
+/// Doubles as the regression test for a callee body's own `if <expr>?`
+/// staying branch-scoped: `Pick` declares only `<combines>`, no
+/// `<fails>` -- `emit_from_source`'s own `assert!(effect_errors.is_
+/// empty())` would panic if `effects.rs`'s `infer_branch_scoped_cond`
+/// ever regressed to treating the explicit `?` on `c` the same as an
+/// ordinary top-level guard (which WOULD force `<fails>` here). See
+/// DESIGN.md's "An if/while condition must itself be fallible" for why
+/// this matters: `c?` in this exact position is Lumi's own insight --
+/// the same shape as a bare failing call directly in an if's condition,
+/// which was already exempt from forcing `<fails>` before this test
+/// existed.
 #[test]
 fn struct_typed_fn_return_if_else_muxes_per_leaf() {
     let src = "\
@@ -5825,7 +5852,7 @@ struct Pair {
 }
 
 Pick(c : [1]) : Pair <combines> {
-    if c {
+    if c? {
         return Pair{ valid: 1, data: 8'd1 }
     } else {
         return Pair{ valid: 0, data: 8'd2 }
@@ -5859,7 +5886,7 @@ struct Pair {
 }
 
 PickPassthrough(p : Pair, c : [1]) : Pair <combines> {
-    if c {
+    if c? {
         return p
     } else {
         return Pair{ valid: 0, data: 8'd2 }
@@ -6017,12 +6044,19 @@ module M {
     run_firtool(&fir, &[]);
 }
 
-/// `logic`-wrapping an if-condition comparison still works exactly as it
-/// did before this feature (compiles to the identical FIRRTL) — a bare
-/// comparison is a newly ADDED shape, not a replacement, so the existing
-/// `logic a > b` spelling stays valid.
+/// `logic`-wrapping a bare if-condition comparison, alone with nothing
+/// else combining it, is now a hard error (Lumi's call, reversing the
+/// PREVIOUS version of this test, which pinned the opposite): once a bare
+/// comparison became legal directly as an if's own condition (`if a > b`,
+/// no `logic` needed), `if logic a > b` just discharges the comparison
+/// into an ordinary, no-longer-fallible `[1]` and re-accepts it as a
+/// plain value -- correct-looking hardware for the WRONG reason, so it's
+/// rejected outright rather than silently kept working. `(logic A) &
+/// (logic B)`, the genuine "AND two fallibles" idiom, is UNAFFECTED --
+/// see `a_boolean_combination_of_logic_discharged_fallibles_is_still_a_
+/// legal_if_condition` below.
 #[test]
-fn logic_wrapped_if_condition_comparison_is_unaffected_by_the_bare_comparison_addition() {
+fn a_bare_logic_wrapped_if_condition_comparison_is_now_rejected_with_a_hint() {
     let src = "\
 module M {
     reg v : [8] = 0
@@ -6037,10 +6071,13 @@ module M {
     }
 }
 ";
-    let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("node fires_r = UInt<1>(1)"));
-    assert!(fir.contains("connect v, mux(gt(a, b), UInt<8>(1), UInt<8>(2))"));
-    run_firtool(&fir, &[]);
+    let messages = pipeline_error_messages(src);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("already discharges its operand"))
+    );
+    assert!(messages.iter().any(|m| m.contains("(logic <expr>)?")));
 }
 
 /// `if f.Deq[] { ... } [else { ... }]` -- a fifo op used directly as a
@@ -6732,7 +6769,7 @@ module M {
 
     rule r <sequences, fails> {
         cnt := x
-        while logic cnt <> 0 {
+        while cnt <> 0 {
             cnt := cnt - 1
         }
         result := cnt
@@ -6780,6 +6817,40 @@ module M {
         fir.contains("connect cnt, mux(neq(cnt, UInt<8>(0)), tail(sub(cnt, UInt<8>(1)), 1), cnt)")
     );
     assert!(fir.contains("connect __cont_r, mux(neq(cnt, UInt<8>(0)), UInt<2>(1), UInt<2>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// An explicit `<expr>?` also works as `while`'s own condition, same as
+/// `if`'s (`check_cond`'s general `Expr::Guard` exemption, types/stmt.rs)
+/// -- the ONE path where this exemption's new position-check arm
+/// (`guards_outside_allowed_positions`, firrtl/checks.rs) and the re-
+/// parse `<sequences>` splice actually interact: `while_loop_header`
+/// (lower.rs) renders `while go? { ... }` as literal `if go? { ...;
+/// __cont_r := 1 } else { __cont_r := 2 }` source text, and THAT
+/// `Stmt::If`'s own `cond` (still `Expr::Guard(go)` after the round trip
+/// through re-lex/re-parse) has to survive the position check a second
+/// time, not just the original `while`'s.
+#[test]
+fn while_condition_accepts_an_explicit_guard() {
+    let src = "\
+module M {
+    in x : [8]
+    in go : [1]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        while go? {
+            cnt := cnt - 1
+        }
+        result := cnt
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect cnt, mux(go, tail(sub(cnt, UInt<8>(1)), 1), cnt)"));
+    assert!(fir.contains("connect __cont_r, mux(go, UInt<2>(1), UInt<2>(2))"));
     run_firtool(&fir, &[]);
 }
 
@@ -6838,7 +6909,7 @@ module M {
     rule r <sequences, fails> {
         let limit = bound
         cnt := 0
-        while logic cnt <> limit {
+        while cnt <> limit {
             cnt := cnt + 1
         }
         result := cnt
@@ -6908,7 +6979,7 @@ module M {
     rule r <sequences, fails> {
         cnt := x
         acc := 0
-        if logic x <> 0 {
+        if x <> 0 {
             opt := x
         } else {
             opt := false
@@ -6916,7 +6987,7 @@ module M {
         while let v = opt? {
             acc := acc + 1
             cnt := cnt - 1
-            if logic (cnt - 1) <> 0 {
+            if (cnt - 1) <> 0 {
                 opt := cnt - 1
             } else {
                 opt := false

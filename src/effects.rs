@@ -244,6 +244,55 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The branch-scoped discharge shared by `if`/`while`'s own bare
+    /// condition and (once unwrapped) an explicit `<expr>?` in that same
+    /// position: none of comparison/fifo-op/failing-call/a plain value
+    /// should force the enclosing rule/fn to declare `<fails>` merely
+    /// because the condition governing ONE branch happens to be
+    /// fallible-shaped -- it never gates the whole item the way a
+    /// top-level bare comparison or explicit `?` does (DESIGN.md's "`if`:
+    /// branch-scoped fallible conditions"). A leading `Expr::Guard` is
+    /// unwrapped and re-dispatched on its own inner exactly once (the `?`
+    /// marker itself is what makes this position legal, per types.rs's
+    /// `check_cond` -- not a shape this dispatch needs to special-case
+    /// beyond unwrapping it) rather than falling through to `infer_expr`'s
+    /// ordinary `Expr::Guard` arm, which unconditionally sets `sig.fails`.
+    /// Lumi's insight: an explicit `?` sitting in this exact position is
+    /// no different from a bare failing call there (already exempt below)
+    /// -- both are "call something fallible, right here, branch-scoped"
+    /// -- so it deserves the identical treatment, not a stricter one.
+    fn infer_branch_scoped_cond(&self, id: ExprId, sig: &mut EffectSig) {
+        if let Expr::Guard(inner) = self.ast.expr(id) {
+            self.infer_branch_scoped_cond(*inner, sig);
+            return;
+        }
+        if let Expr::Binary { op, lhs, rhs } = self.ast.expr(id)
+            && op.is_comparison()
+        {
+            self.infer_expr(*lhs, sig);
+            self.infer_expr(*rhs, sig);
+        } else if let Expr::Bracket { callee, args } = self.ast.expr(id)
+            && let Some(fifo) = self.fifo_op_target(*callee)
+        {
+            sig.reads.insert(fifo);
+            sig.writes.insert(fifo);
+            for arg in args {
+                self.infer_expr(*arg, sig);
+            }
+        } else if let Expr::Call { callee, args } = self.ast.expr(id) {
+            if let Some(callee_sig) = self.callee_sig(*callee) {
+                sig.reads.extend(callee_sig.reads.iter().copied());
+                sig.writes.extend(callee_sig.writes.iter().copied());
+            }
+            self.infer_expr(*callee, sig);
+            for arg in args {
+                self.infer_expr(*arg, sig);
+            }
+        } else {
+            self.infer_expr(id, sig);
+        }
+    }
+
     fn infer_stmt(&self, id: StmtId, sig: &mut EffectSig) {
         match self.ast.stmt(id) {
             Stmt::Expr(e) => {
@@ -275,46 +324,16 @@ impl<'a> Checker<'a> {
                 then_body,
                 else_body,
             } => {
-                // A BARE comparison directly as an `if`'s own condition is
+                // A BARE comparison/fifo-op/failing-call, or an explicit
+                // `<expr>?`, directly as an `if`'s own condition is
                 // branch-scoped and discharged right here (types.rs's
-                // `check_cond` is what actually allows this shape) --
-                // mirrors `Expr::Logic`'s arm below: merge the operands'
-                // `reads`, but not the ordinary `Expr::Binary` comparison
-                // arm's `fails = true`, or every such `if` would need
-                // `<fails>` declared for a condition that never gates
-                // anything (see DESIGN.md's "`if`: branch-scoped fallible
-                // conditions").
-                if let Expr::Binary { op, lhs, rhs } = self.ast.expr(*cond)
-                    && op.is_comparison()
-                {
-                    self.infer_expr(*lhs, sig);
-                    self.infer_expr(*rhs, sig);
-                } else if let Expr::Bracket { callee, args } = self.ast.expr(*cond)
-                    && let Some(fifo) = self.fifo_op_target(*callee)
-                {
-                    // `if fifo.Deq[] { ... }`: same reasoning as the
-                    // comparison case just above, mirrored from `Stmt::
-                    // IfLet`'s own identical branch below -- reads+writes
-                    // the fifo but does NOT set `sig.fails`.
-                    sig.reads.insert(fifo);
-                    sig.writes.insert(fifo);
-                    for arg in args {
-                        self.infer_expr(*arg, sig);
-                    }
-                } else if let Expr::Call { callee, args } = self.ast.expr(*cond) {
-                    // `if Classify(a) { ... }`: same reasoning, mirrored
-                    // from `Stmt::IfLet`'s own identical branch below.
-                    if let Some(callee_sig) = self.callee_sig(*callee) {
-                        sig.reads.extend(callee_sig.reads.iter().copied());
-                        sig.writes.extend(callee_sig.writes.iter().copied());
-                    }
-                    self.infer_expr(*callee, sig);
-                    for arg in args {
-                        self.infer_expr(*arg, sig);
-                    }
-                } else {
-                    self.infer_expr(*cond, sig);
-                }
+                // `check_cond` is what actually allows each shape) --
+                // none of them force `<fails>` onto the enclosing item,
+                // since this condition never gates the whole item the way
+                // a top-level bare comparison/explicit `?` does (see
+                // DESIGN.md's "`if`: branch-scoped fallible conditions"
+                // and "An if/while condition must itself be fallible").
+                self.infer_branch_scoped_cond(*cond, sig);
                 for s in then_body {
                     self.infer_stmt(*s, sig);
                 }
@@ -384,40 +403,16 @@ impl<'a> Checker<'a> {
             }
             Stmt::While { cond, body } => {
                 // `while COND { ... }`'s own condition is now allowed to
-                // be a bare fallible comparison/fifo-Deq/failing-call too
-                // (Lumi's call: "while [should] work like if"), and
-                // renders (lower.rs) as literal `if COND { ... } else {
-                // ... }` text re-fed through the whole pipeline -- so this
-                // mirrors `Stmt::If`'s own three-way discharge arm above
-                // exactly, for the identical reason: none of the three
-                // shapes should force the enclosing rule/fn to declare
-                // `<fails>` just because `while`'s OWN governing condition
-                // happens to be fallible-shaped.
-                if let Expr::Binary { op, lhs, rhs } = self.ast.expr(*cond)
-                    && op.is_comparison()
-                {
-                    self.infer_expr(*lhs, sig);
-                    self.infer_expr(*rhs, sig);
-                } else if let Expr::Bracket { callee, args } = self.ast.expr(*cond)
-                    && let Some(fifo) = self.fifo_op_target(*callee)
-                {
-                    sig.reads.insert(fifo);
-                    sig.writes.insert(fifo);
-                    for arg in args {
-                        self.infer_expr(*arg, sig);
-                    }
-                } else if let Expr::Call { callee, args } = self.ast.expr(*cond) {
-                    if let Some(callee_sig) = self.callee_sig(*callee) {
-                        sig.reads.extend(callee_sig.reads.iter().copied());
-                        sig.writes.extend(callee_sig.writes.iter().copied());
-                    }
-                    self.infer_expr(*callee, sig);
-                    for arg in args {
-                        self.infer_expr(*arg, sig);
-                    }
-                } else {
-                    self.infer_expr(*cond, sig);
-                }
+                // be a bare fallible comparison/fifo-Deq/failing-call, or
+                // an explicit `<expr>?`, too (Lumi's call: "while [should]
+                // work like if"), and renders (lower.rs) as literal `if
+                // COND { ... } else { ... }` text re-fed through the whole
+                // pipeline -- so this mirrors `Stmt::If`'s own discharge
+                // arm above exactly, for the identical reason: none of
+                // these shapes should force the enclosing rule/fn to
+                // declare `<fails>` just because `while`'s OWN governing
+                // condition happens to be fallible-shaped.
+                self.infer_branch_scoped_cond(*cond, sig);
                 for s in body {
                     self.infer_stmt(*s, sig);
                 }

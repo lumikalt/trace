@@ -1071,22 +1071,19 @@ impl<'a> Emitter<'a> {
                 Stmt::Let { init, .. } => crate::lower::guard_chain_spine(self.ast, init),
                 // `if let x = opt?`'s own `init` IS `Expr::Guard(opt)` by
                 // construction (types.rs requires this shape) -- the
-                // WHOLE POINT of the syntax, not a misplaced guard the
-                // way an explicit `(a > b)?` if-CONDITION still is (see
-                // `Stmt::If`'s own comment above: that stays unlisted
-                // here on purpose). Deliberately single-hop only, NOT
-                // `guard_chain_spine` the way the three cases above are:
-                // every `Stmt::IfLet`'s own mux-select site (writes.rs/
-                // calls.rs, ~a dozen call sites) reads `init`'s immediate
-                // `inner` alone (`compile_guard_unwrap_cond(opt)`) as the
-                // presence check, never folding an intermediate hop's OWN
-                // presence in too -- so `if let x = a?.b?` would silently
-                // read `a.data.b.valid` without also gating on `a.valid`,
-                // wrong hardware that still passes a structural FIRRTL
-                // check. Rejecting the chain here, not building the
-                // (much larger) fix across every one of those sites, is
-                // the deliberate v0 scope boundary -- see TODO.md's `?.`
-                // bullet and DESIGN.md's "Option types".
+                // WHOLE POINT of the syntax. Deliberately single-hop
+                // only, NOT `guard_chain_spine` the way the three cases
+                // above are: every `Stmt::IfLet`'s own mux-select site
+                // (writes.rs/calls.rs, ~a dozen call sites) reads `init`'s
+                // immediate `inner` alone (`compile_guard_unwrap_cond
+                // (opt)`) as the presence check, never folding an
+                // intermediate hop's OWN presence in too -- so `if let x =
+                // a?.b?` would silently read `a.data.b.valid` without also
+                // gating on `a.valid`, wrong hardware that still passes a
+                // structural FIRRTL check. Rejecting the chain here, not
+                // building the (much larger) fix across every one of
+                // those sites, is the deliberate v0 scope boundary -- see
+                // TODO.md's `?.` bullet and DESIGN.md's "Option types".
                 Stmt::IfLet { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
                     vec![init]
                 }
@@ -1095,6 +1092,20 @@ impl<'a> Emitter<'a> {
                 // `IfLet`'s arm just above.
                 Stmt::WhileLet { init, .. } if matches!(self.ast.expr(init), Expr::Guard(_)) => {
                     vec![init]
+                }
+                // An explicit `<expr>?` as an `if`/`while`'s own WHOLE
+                // condition (types.rs's `check_cond` already type-checks
+                // this shape -- see its two `Expr::Guard` exemptions,
+                // unblocked here). Same single-hop-only reasoning as
+                // `IfLet`/`WhileLet` just above: `compile_guard_unwrap_
+                // cond` (writes.rs) reads `cond`'s own immediate inner,
+                // recursing through at most one leading `Guard` node, not
+                // a whole `?.` chain.
+                Stmt::If { cond, .. } if matches!(self.ast.expr(cond), Expr::Guard(_)) => {
+                    vec![cond]
+                }
+                Stmt::While { cond, .. } if matches!(self.ast.expr(cond), Expr::Guard(_)) => {
+                    vec![cond]
                 }
                 _ => Vec::new(),
             };

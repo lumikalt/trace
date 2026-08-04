@@ -331,7 +331,7 @@ module M {
     assert!(errors[0].message.contains("[1]"));
 
     run_ok(
-        "module M {\n reg a : [8] = 0\n reg b : [8] = 0\n rule r {\n if logic a <> 0 { b := 1 }\n }\n}\n",
+        "module M {\n reg a : [8] = 0\n reg b : [8] = 0\n rule r {\n if a <> 0 { b := 1 }\n }\n}\n",
     );
 }
 
@@ -1714,26 +1714,21 @@ fn all_examples_type_check() {
     }
 }
 
-/// `if`'s new `allow_bare_comparison` exemption (`check_cond`) is
-/// deliberately `if`-only: Verse's own construct is `if`-shaped, and
-/// TODO.md explicitly keeps `while`'s own fallible condition out of
-/// scope. A bare comparison directly as `while`'s condition must stay a
-/// type error, `logic` still the discharge, completely unaffected by
-/// this feature.
+/// `if`'s `allow_bare_comparison` exemption (`check_cond`), and `while`'s
+/// own identical one added later (Lumi's call: "while [should] work like
+/// if") — both accept a bare comparison directly as their own condition.
 #[test]
 fn if_and_while_both_accept_a_bare_comparison_as_their_own_condition() {
     run_ok(
         "module M {\n reg v : [8] = 0\n in a : [8]\n in b : [8]\n \
          rule r {\n if a > b {\n v := 1\n } else {\n v := 2\n }\n }\n}\n",
     );
-    run_ok(
-        "Sum(x : [8]) : [8] <sequences, fails> {\n while logic x <> 0 {\n x := x >> 1\n }\n \
-         return x\n}\n",
-    );
-    // `while`'s own condition now gets the identical `allow_bare_
-    // comparison` exemption `if`'s already had (Lumi's call: "while
-    // [should] work like if") -- `logic` is no longer required, though
-    // still accepted (just above) for anyone who prefers it.
+    // `while`'s own condition gets the identical `allow_bare_comparison`
+    // exemption `if`'s already had (Lumi's call: "while [should] work
+    // like if"). A bare `logic x <> 0` here is no longer legal either
+    // (Lumi's later, stricter call — see `a_bare_logic_wrapped_if_
+    // condition_comparison_is_now_rejected_with_a_hint`, tests/firrtl.rs,
+    // for the `if` version of the same rejection).
     run_ok(
         "Sum(x : [8]) : [8] <sequences, fails> {\n while x <> 0 {\n x := x >> 1\n }\n \
          return x\n}\n",

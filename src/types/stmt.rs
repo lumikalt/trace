@@ -315,7 +315,73 @@ impl<'a> TypeChecker<'a> {
             );
             return;
         }
+        // Anything reaching here didn't match any of the recognized
+        // fallible shapes above (an explicit `<expr>?`, or -- if/while
+        // only -- a bare comparison/fifo-op/failing-call as the WHOLE
+        // condition). For an if/while condition specifically
+        // (`allow_bare_comparison`), a plain `[1]` value is no longer
+        // silently accepted here: Lumi's call, closing the gap where
+        // `logic <fallible>` (already discharged into an ordinary,
+        // no-longer-fallible bool) or a plain state read (`opt.valid`)
+        // could sit in a guard-shaped position looking like a real guard
+        // while actually just being an unconditional mux select. Applies
+        // uniformly to rule AND callee (`fn`/`impl`) bodies alike --
+        // `effects.rs`'s `infer_branch_scoped_cond` is what makes this
+        // safe in a callee: an explicit `<expr>?` sitting in this exact
+        // branch-scoped position is treated identically to a bare
+        // failing call there (already exempt from forcing `<fails>`),
+        // per Lumi's own insight that the two are the same shape of
+        // thing. A bare rule-top-level guard STATEMENT (`allow_bare_
+        // comparison: false`, `Stmt::Expr`'s own call site above) is
+        // deliberately unaffected -- a different, pre-existing feature
+        // (an ordinary `bits[1]` value already legitimately enables/
+        // disables the whole rule there), not what this restriction
+        // targets.
+        //
+        // A boolean COMBINATION of already-discharged fallibles -- `(logic
+        // A) & (logic B)`, Verse's own `and` idiom (DESIGN.md's "`or`:
+        // fallback chains") -- is a real, intentional escape hatch, not a
+        // plain value read: an `Expr::Logic` reachable anywhere in
+        // `cond`'s own subtree (but NOT `cond` itself, that bare shape is
+        // the one this restriction specifically targets, see the hint
+        // below) marks every component as deliberately discharged, same
+        // `sub_exprs` walk `expr_has_undischarged_comparison` above
+        // already uses for the identical reason.
+        let contains_logic =
+            !matches!(self.ast.expr(cond), Expr::Logic(_)) && contains_logic_expr(self.ast, cond);
         match ty {
+            // `cond` itself being `Expr::Guard(_)` -- an explicit `<expr>?`
+            // -- is the general fallible-marker escape hatch, regardless
+            // of what's inside: the two exemptions above already `return`
+            // early for the Option/comparison inner shapes (where `ty`
+            // itself wouldn't even BE `[1]`), so reaching here with a
+            // top-level `Guard` and a `[1]` `ty` means `?` wrapped
+            // something whose own type already happens to be `[1]` (a
+            // plain bit, a fifo op/failing call with a `[1]` element, an
+            // already-`logic`-discharged bool) -- explicitly marked
+            // fallible by the user, not silently inferred, so it's exempt
+            // from the same reasoning as the two `return`s above, just
+            // needing the ordinary width check instead of skipping it.
+            Ty::Bits(Width::Known(1))
+                if allow_bare_comparison
+                    && !matches!(self.ast.expr(cond), Expr::Guard(_))
+                    && !contains_logic =>
+            {
+                let hint = if matches!(self.ast.expr(cond), Expr::Logic(_)) {
+                    "`logic` already discharges its operand into a plain boolean, \
+                     which isn't a fallible expression on its own -- a bare `logic \
+                     <expr>` condition here just becomes an ordinary (always-taken) \
+                     mux select, not a real guard; drop `logic` if `<expr>` is \
+                     itself a comparison/fifo op/failing call (already legal bare \
+                     here), or keep `logic` and wrap the whole thing with `?` to \
+                     make it fallible again; use `(logic <expr>)?`"
+                } else {
+                    "condition must be a fallible expression here -- a comparison, \
+                     fifo op, failing call, or an explicit `<expr>?` -- not a plain \
+                     `[1]` value; use `<expr>?`"
+                };
+                self.error(self.expr_span(cond), hint.to_string());
+            }
             Ty::Bits(Width::Known(1)) | Ty::Bits(Width::Unknown) | Ty::Unknown | Ty::Int => {}
             other => self.error(
                 self.expr_span(cond),
@@ -704,4 +770,20 @@ impl<'a> TypeChecker<'a> {
             _ => self.error(span, format!("{what}: expected {target}, got {value}")),
         }
     }
+}
+
+/// Whether an `Expr::Logic` node is reachable anywhere within `id`'s own
+/// subexpression tree (`id` itself included) -- used by `check_cond` to
+/// recognize a boolean COMBINATION of already-discharged fallibles
+/// (`(logic A) & (logic B)`) as a legitimate if/while condition, not a
+/// plain, un-provenanced `[1]` value. A free fn, not a `TypeChecker`
+/// method, since it needs only `ast` -- mirrors `sub_exprs` (lower.rs)
+/// itself in that respect.
+fn contains_logic_expr(ast: &crate::ast::Ast, id: ExprId) -> bool {
+    if matches!(ast.expr(id), Expr::Logic(_)) {
+        return true;
+    }
+    crate::lower::sub_exprs(ast, id)
+        .into_iter()
+        .any(|child| contains_logic_expr(ast, child))
 }

@@ -314,7 +314,23 @@ impl<'a> Emitter<'a> {
     /// use does, and every other condition shape (a plain bits[1] value,
     /// a `logic`-wrapped one) already falls through to the ordinary
     /// `compile_expr` arm unchanged.
+    ///
+    /// A third job, added once an explicit `<expr>?` became legal as an
+    /// if/while's own WHOLE condition (types.rs's `check_cond`, its two
+    /// `Expr::Guard` exemptions): unlike every OTHER call site, which
+    /// pre-unwraps a leading `Guard` node by hand before calling (`if let
+    /// x = opt? {...}`'s own arms, both here and in calls.rs), a bare
+    /// `if opt? {...}`/`while opt? {...}` hands `cond` straight through
+    /// from `Stmt::If`/`Stmt::While` with the `Guard` node still on top —
+    /// so this recurses through exactly one leading `Guard` itself, first,
+    /// before any of the shape checks below ever run. Purely additive:
+    /// every pre-existing caller already passes an already-unwrapped
+    /// `inner`, which is never itself a `Guard` node, so this arm simply
+    /// never fires for them.
     pub(crate) fn compile_guard_unwrap_cond(&mut self, inner: ExprId) -> String {
+        if let Expr::Guard(g) = self.ast.expr(inner).clone() {
+            return self.compile_guard_unwrap_cond(g);
+        }
         if matches!(self.types.expr_tys.get(&inner), Some(Ty::Option(_))) {
             let (root, mut path) = self.struct_field_path(inner);
             path.push("valid".to_string());

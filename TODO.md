@@ -1827,14 +1827,24 @@ Speculative, bigger, not committed to:
   for real firtool+Icarus+Verilator-proven examples. This closes the
   ORIGINAL literal ask this whole page section started from.
 
-  One dead-code note this decision revives rather than resolves:
-  `check_cond`'s early-return for `Expr::Guard` over a `Ty::Option`
-  (types.rs:896) is unreachable today — the guard-position check in
-  `firrtl/checks.rs` rejects a guard in an if-condition before
-  `check_cond` ever gets a chance to allow it. Under the closed
-  alternative this would have been dead code to delete; under this
-  decision it becomes the live path once building starts, not a
-  leftover to clean up.
+  **UPDATE — the predicted dead code went live, exactly as this entry
+  said it would.** An explicit `<expr>?` is now legal directly as an
+  `if`/`while`'s own WHOLE condition (`guards_outside_allowed_positions`,
+  firrtl/checks.rs, gained `Stmt::If`/`Stmt::While` arms mirroring `Stmt::
+  IfLet`/`Stmt::WhileLet`'s single-hop exemption; `compile_guard_unwrap_
+  cond`, firrtl/writes.rs, gained a leading-`Guard`-unwrap-and-recurse
+  arm, since every OTHER call site pre-unwraps by hand before calling
+  but a bare `if`/`while` hands `cond` straight through with the `Guard`
+  node still on top). Driven by a SEPARATE, larger decision this made
+  necessary, not by this note alone: a plain `[1]` value is no longer
+  accepted bare as an if/while condition in a RULE body at all (Lumi's
+  call) — see DESIGN.md's "An if/while condition must itself be
+  fallible" for the full rule (the `logic`-bare-condition footgun this
+  closes, the `(logic A) & (logic B)` carve-out, and why callee bodies
+  keep the old lenient behavior). `check_cond`'s two `Expr::Guard`
+  exemptions (Option-inner, comparison-inner) were already live before
+  this — only the POSITION check was the blocker this note originally
+  flagged.
 
 Explicitly considered and NOT being ported, so a future session doesn't
 re-propose these from a fresh read of the same chapters:
