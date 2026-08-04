@@ -27,7 +27,7 @@ module WhileLetDrain {
     rule r <sequences, fails> {
         cnt := x
         acc := 0
-        if logic x <> 0 {
+        if x <> 0 {
             opt := x
         } else {
             opt := false
@@ -36,7 +36,7 @@ module WhileLetDrain {
             acc := acc + 1
             let new_cnt = cnt - 1
             cnt := new_cnt
-            if logic new_cnt <> 0 {
+            if new_cnt <> 0 {
                 opt := new_cnt
             } else {
                 opt := false

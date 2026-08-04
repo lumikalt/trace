@@ -21,7 +21,7 @@ module Race {
         let hs = spawn Slow(1)
         tick
         race[hf, hs]
-        if logic hf.done = 1 {
+        if hf.done = 1 {
             result := hf.result
         } else {
             result := hs.result

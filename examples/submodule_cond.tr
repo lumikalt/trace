@@ -15,7 +15,7 @@ module Top {
     out result : [8] = 0
 
     rule wire {
-        if logic sel = 1 {
+        if sel = 1 {
             c.a := x
         } else {
             c.a := 0
