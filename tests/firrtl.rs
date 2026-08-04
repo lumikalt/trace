@@ -339,6 +339,24 @@ fn port_ram_emits_addressable_memory_through_ports() {
 }
 
 #[test]
+fn every_mem_pins_read_under_write_to_old() {
+    // A read and a write to the SAME address the SAME cycle must see the
+    // mem's PRE-EDGE contents, not the write landing mid-cycle -- the
+    // same pre-edge-read invariant every register already has, stated
+    // for mems rather than left to firtool's own `undefined` default
+    // (see firrtl/mod.rs's own doc comment and DESIGN.md's "Arrays: one
+    // resource each"). Pinning the emitted FIRRTL text is the whole
+    // point here: firtool's actual Verilog output is confirmed
+    // byte-identical against the old `undefined` setting at
+    // `read-latency => 0` (every mem in v0), so a sim-level test
+    // couldn't discriminate this change at all -- the FIRRTL text is the
+    // only place the guarantee is actually visible today.
+    let fir = emit_from_source(&read_example("port_ram.tr")).expect("emission should succeed");
+    assert!(fir.contains("read-under-write => old"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn mem_disjoint_rw_needs_no_conflict_free_annotation() {
     // examples/mem_disjoint_rw.tr has NO `schedule { conflict_free ... }`
     // directive at all -- unlike port_ram.tr just above (a real derived

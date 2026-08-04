@@ -89,9 +89,22 @@
 //! Memories get one reader port per static read site (not one shared
 //! port): the scheduler treats read-read as free, which is only sound
 //! in hardware if reads never contend for a port. Writers share one
-//! port, since the scheduler already serializes all writers (and every
-//! writer conflicts with every reader of the same array in v0), so
-//! `read-under-write` is never exercised — it is set to `undefined`.
+//! port, since the scheduler already serializes all writers.
+//!
+//! `read-under-write => old`: a read and a write to the SAME address the
+//! SAME cycle must see the mem's PRE-EDGE contents, not the write landing
+//! mid-cycle — this is exactly the pre-edge-read invariant every register
+//! already has (DESIGN.md's "Scheduling"), stated for mems rather than
+//! left to a tool's own default. This IS exercised by ordinary,
+//! unexempted designs, not just a `conflict_free` claim turning out
+//! wrong: two independent-address accesses in the SAME rule
+//! (`examples/mem_write_branch.tr`'s `m[addr] := data` / `m[read_addr]`)
+//! can coincide at runtime with no conflict pair and no annotation
+//! involved at all. Costs nothing at `read-latency => 0` (firtool already
+//! lowers same-cycle read/write here to a combinational read against the
+//! write's own nonblocking assign — confirmed byte-identical Verilog
+//! against `undefined`); becomes load-bearing only if `read-latency` is
+//! ever raised above 0 (`module.rs`'s own mem-emission site).
 
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, StmtId};
 use crate::effects::Effects;

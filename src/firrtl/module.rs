@@ -1174,7 +1174,20 @@ pub(crate) fn module_block(
         }
         let _ = writeln!(out, "      read-latency => 0");
         let _ = writeln!(out, "      write-latency => 1");
-        let _ = writeln!(out, "      read-under-write => undefined");
+        // `old`, not `undefined`: a read must see the mem's PRE-EDGE
+        // contents on a same-address same-cycle write, exactly the
+        // pre-edge-read invariant every register already has (see
+        // firrtl/mod.rs's own doc comment for why this can be exercised
+        // by ordinary, unexempted designs — not just a `conflict_free`
+        // claim turning out wrong). Free at `read-latency => 0`: firtool
+        // already lowers a same-cycle read/write here to a combinational
+        // read against the write's own nonblocking assign (confirmed
+        // byte-identical Verilog output against `undefined`, both before
+        // and after this change), so pinning `old` costs nothing today —
+        // it becomes load-bearing (and worth re-checking against real
+        // firtool output) only if `read-latency` above is ever raised
+        // above 0.
+        let _ = writeln!(out, "      read-under-write => old");
     }
     out.push('\n');
     out.push_str(body);

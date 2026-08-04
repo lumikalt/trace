@@ -2982,6 +2982,23 @@ it would be a false alarm on a correct design, not a caught hazard. For any
 non-mem shared state, `conflict_free` still emits no assertion: there is
 nothing sound to check on a plain register or fifo the same way.
 
+Every mem's `read-under-write` is set to `old`: a read and a write to the SAME
+address the SAME cycle sees the mem's PRE-EDGE contents, never the write
+landing mid-cycle — exactly the pre-edge-read invariant every register already
+has, stated for mems too rather than left to a tool's own default. This is a
+DIFFERENT, complementary guarantee from the assertion just above, not a smaller
+version of it: the assertion checks a stated PRECONDITION (do these two
+addresses actually differ), while `old` defines what happens on the cycle that
+precondition is violated, OR on an ordinary, unexempted design where two
+independent addresses simply happen to coincide at runtime with no annotation
+or conflict pair involved at all (`examples/mem_write_branch.tr`'s
+conditional `m[addr] := data` against its own `m[read_addr]`, same rule). Costs
+nothing today: firtool already lowers a same-cycle read/write to a
+combinational read against the write's own nonblocking assign at
+`read-latency => 0` (every mem in v0), confirmed byte-identical Verilog output
+against the previous `undefined` setting — this only becomes load-bearing if
+`read-latency` is ever raised above 0.
+
 `mutually_exclusive` and `conflict_free` are named to match Bluespec's own
 vocabulary for these two ideas, rather than inventing new terms bsc already has
 words for.
