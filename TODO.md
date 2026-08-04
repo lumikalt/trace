@@ -2473,6 +2473,95 @@ manually in the meantime.
   byte-identical. Explicitly still NOT done: `Stmt::Return`/condition
   positions, return-bound propagation, and whether the interval-set
   domain (v11's own open item) is worth building all remain undecided.
+- **RESOLVED (v13) — return-bound propagation: a fn/impl's return type
+  can carry a `where result < N` postcondition, checked against every
+  `Stmt::Return` in the fn's own body and trusted at every CALL site so
+  a caller can compose with the call's own result**
+  (`examples/return_bound_check.tr`). Lumi picked this over widening
+  v12's checked positions (no new capability) and over revisiting the
+  v11-deferred interval-set domain (still assessed as inert). This is
+  v12's own mirror in the OTHER direction: v12 checks an argument
+  against the callee's declared precondition; this checks the callee's
+  own return value against its declared postcondition, then lets that
+  provable range flow OUT to the caller (`Expr::Call` returns
+  `Some((lower, upper))` instead of unconditionally `None` when the
+  callee opted in) — e.g. `total := Bump(3) + Bump(4)` composes cleanly
+  when `Bump`'s declared `result < 20` matches `total`'s own bound,
+  impossible before this feature.
+
+  No synthetic `DefId` needed for "the return value": unlike a reg/out/
+  param's self-reference (compared by `DefId` equality against an
+  existing declaration), a return value is never a named binding
+  anywhere in scope. Instead the bound's self-reference position must
+  be the literal placeholder identifier `result` (already idiomatic in
+  this codebase — a spawned fn's own handle exposes its return value
+  via `.result`), checked by TEXT in a new `check_ret_bound_shape`
+  (resolve.rs), not passed through ordinary `resolve_expr` (which would
+  otherwise error "cannot find `result`"). `bounds.rs` keys the
+  postcondition in a SEPARATE map (`fn_ret_bound: HashMap<DefId,
+  BoundedDef>`, by the fn's own `DefId`) rather than folding it into
+  `self.bounded` (which a return value has no `DefId` to key by); a new
+  `ret_width` free fn reads the `[N]`-desugared `bits[N]` shape of the
+  `ret` type expression directly (mirroring `const_fold`'s own self-
+  contained approach) since there's no `DefId` to look a width up
+  through `base_width`. A new `current_ret_bound` field, set once per
+  item at the top of `check_item`, lets `Stmt::Return`'s own arm check
+  each return site independently — the same way every write site is
+  independently checked against a reg's bound. Opt-in, not blanket
+  inference: a fn with no declared postcondition still composes to
+  `None`, confirmed by a dedicated test.
+
+  **A real soundness hole, caught by an advisor pass before committing,
+  not by any test written up front.** The first implementation created
+  a `fn_ret_bound` entry purely from the DECLARATION at collection
+  time, with no coupling to whether `check_stmt` ever actually reached
+  a `Stmt::Return` to check it against — a fn with a declared
+  postcondition and an EMPTY body (no `return` at all, which nothing
+  upstream requires) compiled clean, and its undischarged postcondition
+  was trusted at every call site with zero obligations ever verified.
+  Confirmed empirically (a scratch module matching exactly this shape
+  produced 0 errors) before being closed by a new `found_returns:
+  HashSet<DefId>` + `check_return_site_exhaustiveness`, the same
+  defense-in-depth shape `found_writes`/`check_write_site_
+  exhaustiveness` already established for regs — except this one is a
+  real user-facing compile error, not an internal-invariant panic,
+  since there's no independent oracle (unlike `effects.rs` confirming a
+  write site exists) proving a return site should be there. The
+  reusable lesson: any future declared-contract feature in this arc
+  should ask "can this table gain an entry whose corresponding check
+  site never actually executes?" before considering itself done.
+  Separately confirmed (not assumed) that `Stmt::Return` inside an `if
+  let`/`while let` body IS reached by the existing `check_body`
+  recursion — no gap there.
+
+  The advisor pass also found the ORIGINAL bug-reintroduction test
+  insufficient: it only proved the composition logic was WIRED (swap to
+  the wrong map), not that its fencepost was right. An accept-direction
+  test structurally can't catch an under-reporting (narrowing) bug,
+  since narrowing a propagated range only ever makes an `Add`
+  composition easier to satisfy, never harder — a REJECT-direction test
+  is needed instead, one whose correct outcome is the error. Added
+  `return_bound_composition_uses_the_full_declared_width_not_narrower`
+  (tight enough that subtracting 1 from the propagated upper flips it
+  from a correct 1-error rejection to a wrongly-accepted 0), and
+  confirmed the ORIGINAL composition test's own tight boundary already
+  caught the opposite, more dangerous over-widening direction (adding 1
+  to the propagated upper flips IT from correct acceptance to rejection)
+  — both fencepost directions now pinned, not just one.
+
+  11 new/updated tests across `tests/parser.rs`/`tests/resolve.rs`/
+  `tests/bounds.rs` (parse, placeholder resolve/reject, return-value
+  accept/reject, composition accept, the fencepost-sensitive reject
+  above, the no-return-statement reject above, unbounded-fn no-
+  propagation, two-sided return bound). A `--firrtl` sanity check on a
+  passing scratch variant confirmed zero codegen impact (`ret_bound`/
+  `ret_lower` are consumed only by `bounds.rs`). A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical. Explicitly still NOT done: a call inside an
+  `if`/`while` condition or as a bare argument to another call remains
+  unchecked as an argument position (v12's own remaining scope gap,
+  untouched by this pass), and whether the interval-set domain is worth
+  building remains undecided.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

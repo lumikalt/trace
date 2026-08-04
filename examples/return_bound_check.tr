@@ -1,0 +1,15 @@
+module RetBoundCheck {
+    reg total : [8] where total < 40 = 0
+
+    Bump(i : [8] where i < 10) : [8] where result < 20 {
+        return i + 5
+    }
+
+    BadBump(i : [8] where i < 10) : [8] where result < 20 {
+        return i + 100
+    }
+
+    rule step {
+        total := Bump(3) + Bump(4)
+    }
+}

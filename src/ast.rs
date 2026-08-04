@@ -484,6 +484,19 @@ pub enum Item {
         kind: FnKind,
         params: Vec<Param>,
         ret: Option<ExprId>,
+        /// `where result < N` / `where L <= result < N` (v13): a
+        /// postcondition on the fn's own return value, checked against
+        /// every `Stmt::Return` in this fn's body (bounds.rs) and
+        /// trusted at every call site so a caller can compose with the
+        /// call's own result — the mirror of `Param`'s `bound`/`lower`
+        /// (v12), which checks the opposite direction (an argument
+        /// against the callee's declared precondition). `result` is a
+        /// textual placeholder, not a real scoped binding: unlike a
+        /// reg/out/param's self-reference (an existing `DefId`), a
+        /// return value is never a named binding anywhere in scope, so
+        /// there's nothing to declare it against (resolve.rs).
+        ret_bound: Option<ExprId>,
+        ret_lower: Option<ExprId>,
         effects: Vec<Effect>,
         body: Vec<StmtId>,
     },
@@ -772,6 +785,8 @@ impl Ast {
                 kind,
                 params,
                 ret,
+                ret_bound,
+                ret_lower,
                 effects,
                 body,
             } => {
@@ -801,6 +816,16 @@ impl Ast {
                 out.push_str(&format!("{pad}{keyword} {name}({params})"));
                 if let Some(ret) = ret {
                     out.push_str(&format!(" : {}", self.expr_sexpr(*ret)));
+                }
+                if let Some(ret_bound) = ret_bound {
+                    match ret_lower {
+                        Some(lower) => out.push_str(&format!(
+                            " where {} <= {}",
+                            self.expr_sexpr(*lower),
+                            self.expr_sexpr(*ret_bound)
+                        )),
+                        None => out.push_str(&format!(" where {}", self.expr_sexpr(*ret_bound))),
+                    }
                 }
                 out.push_str(&effects_str(effects));
                 if let FnKind::Impl { refines } = kind {

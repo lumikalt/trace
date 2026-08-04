@@ -3015,10 +3015,38 @@ v0 restrictions, all deliberate scope cuts:
   effect — is actually invoked; the realistic shape for this feature),
   or a call nested inside an `Add`/`Sub`/`Mul` operand. NOT checked in
   v1: a call inside `return` or an `if`/`while` condition (needs a
-  genuinely generic expression-tree walk, a separable follow-up), and
-  NO return-bound propagation (a callee's own return value carrying a
-  provable bound a caller's composition could use) — a call's own
-  provable range is always `None` for composition purposes in v1.
+  genuinely generic expression-tree walk, a separable follow-up).
+- **Return-bound propagation (v13): a fn/impl's return TYPE can carry a
+  `where result < N` postcondition too, checked against every
+  `Stmt::Return` in the fn's own body and trusted at every CALL site so
+  a caller can compose with the call's own result** (`examples/
+  return_bound_check.tr`). This is v12's own mirror in the OTHER
+  direction: v12 checks an argument against the callee's declared
+  precondition; this checks the callee's own return value against its
+  declared postcondition, then lets that provable range flow OUT to the
+  caller (`Expr::Call` returns `Some((lower, upper))` when the callee
+  opted in, instead of unconditionally `None`) — e.g. `total := Bump(3)
+  + Bump(4)` composes cleanly when `Bump`'s declared `result < 20`
+  matches `total`'s own bound, impossible before this feature. `result`
+  is a textual placeholder for the return value, not a real scoped
+  binding (checked by matching the literal identifier `result`, not by
+  `DefId` — unlike a reg/out/param's self-reference, a return value is
+  never a named binding anywhere in scope to compare against). Kept as
+  a SEPARATE map (`fn_ret_bound`, keyed by the fn's own `DefId`) rather
+  than folded into the same map a reg/out/param populates, since a
+  return value has no `DefId` of its own to key `self.bounded` by. Opt-
+  in, not blanket inference: a fn with no declared postcondition still
+  composes to `None`, exactly as before v13. **A declared postcondition
+  requires at least one `return <expr>` in the fn's own body to check
+  it against** — a real user-facing rule, not an implementation detail:
+  without it, the postcondition would be trusted at every call site
+  with zero obligations ever verified (caught by an advisor pass during
+  this feature's own development, confirmed empirically before being
+  closed — see `check_return_site_exhaustiveness`). Still NOT checked: a
+  call inside an `if`/`while` condition or as a bare argument to another
+  call
+  remains unchecked as an ARGUMENT position — v12's own remaining scope
+  gap, untouched by this pass.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"

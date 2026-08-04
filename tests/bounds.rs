@@ -819,3 +819,163 @@ module M {
 ";
     assert!(run(src).is_empty(), "{:?}", run(src));
 }
+
+#[test]
+fn return_value_within_the_declared_bound_is_proven() {
+    // v13: the mirror of v12 in the OTHER direction. `i + 5` under
+    // `i < 10` has range `[5,15)`, well within the declared
+    // postcondition `result < 20` -- a NEW checked position
+    // (`Stmt::Return`) that didn't exist before this feature.
+    let src = "\
+module M {
+    Bump(i : [8] where i < 10) : [8] where result < 20 {
+        return i + 5
+    }
+    rule step {
+        Bump(3)
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn return_value_exceeding_the_declared_bound_is_rejected() {
+    // `i + 100` under `i < 10` can reach 109, violating the declared
+    // postcondition `result < 20` -- caught at the `return` statement
+    // itself, regardless of whether `BadBump` is ever called (this
+    // pass checks every fn's own body unconditionally, matching the
+    // existing per-item induction).
+    let src = "\
+module M {
+    BadBump(i : [8] where i < 10) : [8] where result < 20 {
+        return i + 100
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("return value"));
+}
+
+#[test]
+fn call_result_composes_into_a_bounded_write_via_declared_ret_bound() {
+    // The key new-capability proof: before v13, `Expr::Call` always
+    // composed to `None`, so `Bump(3) + Bump(4)` would be "unsupported
+    // expression shape" regardless of either call's own provable
+    // range. With `Bump`'s declared postcondition (`result < 20`)
+    // propagated, each call's own range is `[0,20)`, composing to
+    // `[0,39]` -- exactly fitting `total`'s own `< 40` bound.
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] where result < 20 {
+        return i + 5
+    }
+    rule step {
+        total := Bump(3) + Bump(4)
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn return_bound_composition_uses_the_full_declared_width_not_narrower() {
+    // A fencepost-sensitive companion to the test above: `Bump`'s
+    // declared postcondition here is `result < 21` (not `< 20`), so the
+    // TRUE composed range (`[0,41)`) just barely EXCEEDS `total`'s own
+    // `< 40` bound -- correctly rejected. If the propagated upper were
+    // ever narrower than what's actually declared (e.g. an off-by-one
+    // at the `Expr::Call` arm's own lookup), the composed range would
+    // shrink to fit under 40 and this would be wrongly ACCEPTED instead
+    // -- caught via bug-reintroduction (temporarily subtracting 1 from
+    // the propagated upper flips this from 1 error to 0, confirmed then
+    // reverted). Unlike the test above (whose own tight boundary
+    // already happens to catch the OTHER, more dangerous over-widening
+    // direction), this one specifically pins under-reporting.
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] where result < 21 {
+        return i + 5
+    }
+    rule step {
+        total := Bump(3) + Bump(4)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify this write"));
+}
+
+#[test]
+fn return_bound_with_no_return_statement_is_rejected() {
+    // A real soundness hole, caught by advisor before committing: the
+    // `fn_ret_bound` entry is created purely from the DECLARATION at
+    // collection time, with no coupling to whether any `Stmt::Return`
+    // ever actually got checked against it. Without this check, `Bump`
+    // here would trust `result < 20` at every call site with ZERO
+    // obligations verified -- confirmed empirically (this exact source
+    // compiled clean with 0 errors before `check_return_site_
+    // exhaustiveness` existed).
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8]) : [8] where result < 20 {
+    }
+    rule step {
+        total := Bump(3) + Bump(4)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("never checked against an actual `return` statement")
+    );
+}
+
+#[test]
+fn unbounded_fn_call_result_is_still_unprovable() {
+    // A fn with NO declared postcondition still composes to `None` --
+    // return-bound propagation is opt-in, not blanket inference. `i`'s
+    // own declared range would make `i + 5` provable if `Bump` composed
+    // its return value automatically, but it must not.
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i + 5
+    }
+    rule step {
+        total := Bump(3) + Bump(4)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify this write"));
+}
+
+#[test]
+fn two_sided_return_bound_is_recognized() {
+    // The v6 two-sided surface form (`where L <= result < K`) works
+    // identically on a return bound -- same parse path
+    // (`parse_where_bound`), same collection path
+    // (`collect_one_ret_bound`).
+    let src = "\
+module M {
+    Bump(i : [8] where 5 <= i < 10) : [8] where 5 <= result < 15 {
+        return i
+    }
+    rule step {
+        Bump(7)
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}

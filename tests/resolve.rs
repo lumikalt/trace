@@ -895,6 +895,39 @@ module M {
 }
 
 #[test]
+fn result_placeholder_resolves_in_a_return_bound() {
+    // v13: `result` is a textual placeholder for the return value, not
+    // a real scoped binding -- resolved specially (check_ret_bound_
+    // shape), not via ordinary identifier lookup.
+    let src = "\
+module M {
+    Bump(i : [8]) : [8] where result < 20 {
+        return i
+    }
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn return_bound_referencing_a_param_is_an_error() {
+    let src = "\
+module M {
+    Bump(i : [8]) : [8] where i < 20 {
+        return i
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("must reference the return value via the placeholder `result`")
+    );
+}
+
+#[test]
 fn where_bound_referencing_the_same_output_resolves() {
     let src = "\
 module M {

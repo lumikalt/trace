@@ -87,19 +87,40 @@
 //!   narrowing/composition logic needed there. The NEW work is entirely
 //!   at the call site: `Expr::Call`'s own `expr_bound` arm checks each
 //!   argument's provable range against the callee's declared param
-//!   bound, always returning `None` itself (no RETURN-bound propagation
-//!   in v1 — a fn's own return value carrying a provable bound a
-//!   caller's composition could use is a real, separable follow-up).
-//!   Checked at three expression positions: a `Stmt::Assign`'s RHS, a
-//!   bare `Stmt::Expr` call statement (how a VOID fn/impl — no return
-//!   value, called purely for its `writes` effect — is actually invoked
-//!   in this language; the realistic shape, not an edge case), and any
-//!   position `expr_bound`'s own `Add`/`Sub`/`Mul` recursion already
-//!   reaches (a call nested inside an argument or operand). NOT checked
-//!   in v1: `Stmt::Return`'s expr, or a call inside an `if`/`while`
-//!   condition — reaching those needs a genuinely generic expression-
-//!   tree walk, a real but separable follow-up, not bundled into this
-//!   pass.
+//!   bound. Checked at three expression positions: a `Stmt::Assign`'s
+//!   RHS, a bare `Stmt::Expr` call statement (how a VOID fn/impl — no
+//!   return value, called purely for its `writes` effect — is actually
+//!   invoked in this language; the realistic shape, not an edge case),
+//!   and any position `expr_bound`'s own `Add`/`Sub`/`Mul` recursion
+//!   already reaches (a call nested inside an argument or operand). NOT
+//!   checked: a call inside an `if`/`while` condition — reaching that
+//!   needs a genuinely generic expression-tree walk, a real but
+//!   separable follow-up, not bundled into this pass.
+//! - **Return-bound propagation (v13): a fn/impl's return type can
+//!   carry a `where result < N` postcondition too** — the mirror of
+//!   v12 in the OTHER direction. Checked against every `Stmt::Return`
+//!   in the fn's own body (a NEW checked position — `current_ret_
+//!   bound`, set once per item at the top of `check_item`), then
+//!   trusted at every call site: `Expr::Call` returns `Some((lower,
+//!   upper))` from the callee's own `fn_ret_bound` entry instead of
+//!   unconditionally `None`, letting a caller compose with the call's
+//!   own result (`total := Bump(3) + Bump(4)`). `result` is a textual
+//!   placeholder, not a real scoped binding — a return value has no
+//!   `DefId` of its own (unlike a reg/out/param's self-reference,
+//!   checked by `DefId` equality against an existing declaration), so
+//!   `resolve.rs`'s `check_ret_bound_shape` checks it by matching the
+//!   literal identifier text instead, and this module keys its own
+//!   postcondition table (`fn_ret_bound`) by the FN's own `DefId`
+//!   rather than folding it into `self.bounded`. Opt-in, not blanket
+//!   inference: a fn with no declared postcondition still composes to
+//!   `None`, exactly as before this feature. Trust at the call site is
+//!   NOT unconditional on the declaration alone: `check_return_site_
+//!   exhaustiveness` requires at least one actual `Stmt::Return` to
+//!   have been checked against a declared postcondition, or it's a
+//!   compile error — an advisor pass caught that a fn with a declared
+//!   postcondition and an empty body would otherwise let every caller
+//!   trust it with ZERO obligations ever verified (confirmed
+//!   empirically before being closed).
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -191,7 +212,12 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         ty,
         bounded: HashMap::new(),
         fn_params: HashMap::new(),
+        fn_ret_bound: HashMap::new(),
+        ret_bound_span: HashMap::new(),
+        current_ret_bound: None,
+        current_fn_def: None,
         found_writes: HashSet::new(),
+        found_returns: HashSet::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
@@ -201,6 +227,7 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         checker.check_item(*id);
     }
     checker.check_write_site_exhaustiveness();
+    checker.check_return_site_exhaustiveness();
     let bounds = Bounds {
         ranges: checker
             .bounded
@@ -223,6 +250,32 @@ struct Checker<'a> {
     /// against a bounded param's declared bound. Cheap to clone once
     /// per fn during collection rather than re-deriving per call site.
     fn_params: HashMap<DefId, Vec<Param>>,
+    /// Every `Item::Fn`'s own `DefId` mapped to its declared return
+    /// postcondition (v13) — the mirror of a bounded param, but keyed
+    /// by the FN's own def rather than a param's (a return value has
+    /// no `DefId` of its own; nothing to key `self.bounded` by).
+    /// Consulted at each `Expr::Call` site to let a caller compose with
+    /// the call's own provable range, and at the top of `check_item` to
+    /// check every `Stmt::Return` in the callee's OWN body against it.
+    fn_ret_bound: HashMap<DefId, BoundedDef>,
+    /// Every `fn_ret_bound` entry's own declaration span — kept
+    /// separate from `BoundedDef` (which has no span field, and is
+    /// shared with reg/out/param bounds that don't need one) purely so
+    /// `check_return_site_exhaustiveness` has somewhere to point an
+    /// error at a declared postcondition with no `return` to check it
+    /// against.
+    ret_bound_span: HashMap<DefId, Span>,
+    /// The CURRENT item's own declared return postcondition, if any —
+    /// set once at the top of `check_item` (from `fn_ret_bound`, via
+    /// the item's own `DefId`) and consulted by every `Stmt::Return` in
+    /// that one body. `None` for a `rule` (no return value at all) or a
+    /// `fn`/`impl` with no declared postcondition (nothing to check).
+    current_ret_bound: Option<BoundedDef>,
+    /// The CURRENT item's own `DefId`, set alongside `current_ret_
+    /// bound` — lets `Stmt::Return`'s own arm record into `found_
+    /// returns` WHICH fn actually had a checked return site, not just
+    /// that some `Stmt::Return` was seen somewhere.
+    current_fn_def: Option<DefId>,
     /// Every bounded def this pass found an ACTUAL `Stmt::Assign` for,
     /// anywhere in the program — cross-checked against `fx`'s own
     /// per-item write sets once the whole walk finishes (defense in
@@ -230,6 +283,19 @@ struct Checker<'a> {
     /// write site, rather than trusting-by-construction that it never
     /// would).
     found_writes: HashSet<DefId>,
+    /// Every fn `DefId` this pass found an ACTUAL `Stmt::Return(Some(_))`
+    /// for, checked against its OWN declared postcondition — cross-
+    /// checked against `fn_ret_bound`'s own keys once the whole walk
+    /// finishes (v13). Unlike `found_writes` (defense in depth against
+    /// this pass's own walk missing a site that `effects.rs`
+    /// independently confirms exists), there's no independent oracle
+    /// here — a fn with a declared postcondition and literally no
+    /// `return` statement in its body is possible to WRITE (nothing
+    /// upstream requires one), and without this check its postcondition
+    /// would be trusted at every call site with ZERO obligations ever
+    /// verified: a real fail-open soundness hole, not just an internal
+    /// invariant.
+    found_returns: HashSet<DefId>,
     errors: Vec<BoundsError>,
 }
 
@@ -284,7 +350,13 @@ impl<'a> Checker<'a> {
         while let Some(id) = stack.pop() {
             match self.ast.item(id) {
                 Item::Module { items, .. } => stack.extend(items.iter().copied()),
-                Item::Fn { params, .. } => {
+                Item::Fn {
+                    params,
+                    ret,
+                    ret_bound,
+                    ret_lower,
+                    ..
+                } => {
                     for param in params {
                         if let Some(bound) = param.bound {
                             let def = def_of_name(self.res, &param.name);
@@ -293,6 +365,18 @@ impl<'a> Checker<'a> {
                     }
                     if let Some(&fn_def) = self.res.item_defs.get(&id) {
                         self.fn_params.insert(fn_def, params.clone());
+                        // v13: the mirror of the param loop above, but
+                        // for the fn's own declared return postcondition.
+                        // `ret.is_none()` here means resolve.rs already
+                        // reported "a return bound needs a declared
+                        // return type" -- nothing to check the width
+                        // against, so silently skip (same convention
+                        // `collect_one_bounded_def` already follows for
+                        // an unfoldable bound: "types.rs already
+                        // reported this").
+                        if let (Some(bound), Some(ret)) = (*ret_bound, *ret) {
+                            self.collect_one_ret_bound(fn_def, ret, bound, *ret_lower);
+                        }
                     }
                 }
                 _ => {}
@@ -345,6 +429,60 @@ impl<'a> Checker<'a> {
         );
     }
 
+    /// The return-bound sibling of `collect_one_bounded_def` (v13) —
+    /// same const-fold-and-report shape, but keyed by the FN's own
+    /// `DefId` into `fn_ret_bound` rather than by a state/param def
+    /// into `self.bounded` (a return value has no `DefId` of its own),
+    /// and sourcing its width from `ret_width` (the raw `ret` type
+    /// expression) rather than `base_width` (a `DefId`'s entry in
+    /// `state_tys`/`local_tys`, which doesn't exist for a return
+    /// value). Kept separate rather than forcing a shared abstraction:
+    /// the two width sources are genuinely different, and this file
+    /// only extracts a shared helper once near-identical branches
+    /// exist WITHIN one function (see `check_against_bound`'s own doc
+    /// comment), not across two top-level collectors like these.
+    fn collect_one_ret_bound(
+        &mut self,
+        fn_def: DefId,
+        ret_ty: ExprId,
+        bound: ExprId,
+        lower: Option<ExprId>,
+    ) {
+        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
+            return;
+        };
+        let Some(upper) = const_fold(self.ast, *rhs) else {
+            return; // types.rs already reported this
+        };
+        let lower_val = match lower {
+            Some(l) => match const_fold(self.ast, l) {
+                Some(v) => v,
+                None => return, // types.rs already reported this
+            },
+            None => 0,
+        };
+        let Some(width) = ret_width(self.ast, ret_ty) else {
+            let span = self.ast.expr_spans[bound.0 as usize].clone();
+            self.error(
+                span,
+                "a return bound needs a concretely-known `bits[N]` return type to check \
+                 against (v0 restriction)"
+                    .to_string(),
+            );
+            return;
+        };
+        self.fn_ret_bound.insert(
+            fn_def,
+            BoundedDef {
+                lower: lower_val,
+                upper,
+                width,
+            },
+        );
+        self.ret_bound_span
+            .insert(fn_def, self.ast.expr_spans[bound.0 as usize].clone());
+    }
+
     /// All rule/fn items, recursively through modules — the same
     /// exhaustive walk `types/collect.rs`'s `check_all` and
     /// `effects.rs`'s `collect_bodied_items` both already do; callees
@@ -366,7 +504,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_item(&mut self, id: ItemId) {
-        if self.bounded.is_empty() {
+        if self.bounded.is_empty() && self.fn_ret_bound.is_empty() {
             return; // nothing to check anywhere in the program
         }
         let body = match self.ast.item(id) {
@@ -380,6 +518,14 @@ impl<'a> Checker<'a> {
             .map(|(d, b)| (*d, (b.lower, b.upper)))
             .collect();
         let mut locals: HashMap<DefId, Option<(u64, u64)>> = HashMap::new();
+        // v13: this item's own declared return postcondition, if any --
+        // `None` for a `rule` (`item_defs` has no entry for one) or a
+        // fn with no `where result < N` (no `fn_ret_bound` entry).
+        let item_def = self.res.item_defs.get(&id).copied();
+        self.current_ret_bound = item_def
+            .and_then(|def| self.fn_ret_bound.get(&def))
+            .copied();
+        self.current_fn_def = item_def;
         self.check_body(&body, &mut state, &mut locals);
     }
 
@@ -480,7 +626,24 @@ impl<'a> Checker<'a> {
             Stmt::Expr(e) => {
                 self.expr_bound(e, state, locals);
             }
-            Stmt::Tick | Stmt::Break | Stmt::Return(_) => {}
+            // v13: only meaningful when the ENCLOSING fn declared a
+            // postcondition (`current_ret_bound`, set once per item at
+            // the top of `check_item`) — every `return` in that body is
+            // an independent obligation against it, the same way every
+            // write site is independently checked against a reg's own
+            // bound. A fn with no declared postcondition still has
+            // nothing to check here, same as before this feature.
+            Stmt::Return(Some(e)) => {
+                if let Some(bounded) = self.current_ret_bound {
+                    let computed = self.expr_bound(e, state, locals);
+                    let span = self.ast.expr_spans[e.0 as usize].clone();
+                    self.check_against_bound(computed, bounded, span, "return value");
+                    if let Some(fn_def) = self.current_fn_def {
+                        self.found_returns.insert(fn_def);
+                    }
+                }
+            }
+            Stmt::Tick | Stmt::Break | Stmt::Return(None) => {}
         }
     }
 
@@ -730,12 +893,17 @@ impl<'a> Checker<'a> {
                 // (checked, like a reg/out, by `check_item`'s own walk
                 // of `Item::Fn` — that trust is unconditional there);
                 // THIS is what makes that trust sound system-wide,
-                // verifying every actual caller upholds it. Always
-                // returns `None` for compositional purposes — no
-                // return-bound propagation in v1 (a fn's own return
-                // value carrying a provable bound a caller's
-                // composition could use is a real, separable
-                // follow-up, not bundled into this pass).
+                // verifying every actual caller upholds it.
+                //
+                // v13: the mirror in the OTHER direction — if the
+                // callee ALSO declared a return postcondition (checked
+                // against every `Stmt::Return` in ITS OWN body, the
+                // same way `check_item` trusts `i < 10` unconditionally
+                // for the callee's own params), this call's result now
+                // has a provable range too, returned below instead of
+                // unconditionally `None`. A callee with no declared
+                // postcondition still composes to `None`, unchanged —
+                // this is opt-in propagation, not blanket inference.
                 //
                 // `Expr::Bracket` (the OTHER `{callee, args}` shape) is
                 // deliberately not given a twin arm here. `resolve.rs`
@@ -755,9 +923,8 @@ impl<'a> Checker<'a> {
                 // codegen regardless of whether its argument obeys the
                 // callee's declared bound.
                 let (callee, args) = (*callee, args.clone());
-                if let Some(&fn_def) = self.res.expr_defs.get(&callee)
-                    && let Some(params) = self.fn_params.get(&fn_def).cloned()
-                {
+                let &fn_def = self.res.expr_defs.get(&callee)?;
+                if let Some(params) = self.fn_params.get(&fn_def).cloned() {
                     for (param, arg) in params.iter().zip(&args) {
                         if param.bound.is_none() {
                             continue;
@@ -772,7 +939,9 @@ impl<'a> Checker<'a> {
                         self.check_against_bound(computed, bounded, span, &context);
                     }
                 }
-                None
+                self.fn_ret_bound
+                    .get(&fn_def)
+                    .map(|bounded| (bounded.lower, bounded.upper))
             }
             _ => None,
         }
@@ -810,6 +979,37 @@ impl<'a> Checker<'a> {
             }
         }
     }
+
+    /// A real user-facing check, not an internal invariant (unlike
+    /// `check_write_site_exhaustiveness` above, which panics — that one
+    /// has an independent oracle, `effects.rs`, confirming a write site
+    /// must exist somewhere; there's no such oracle here). A fn CAN be
+    /// written with a declared postcondition and literally no `return`
+    /// statement in its body — nothing upstream requires one — and
+    /// without this check that postcondition would be trusted at every
+    /// call site (`Expr::Call`'s own arm) with ZERO obligations ever
+    /// verified against it: the entry in `fn_ret_bound` is created
+    /// purely from the DECLARATION at collection time, with no
+    /// coupling to whether `check_stmt` ever actually reached a
+    /// `Stmt::Return` to check. Caught by an advisor pass before
+    /// committing, confirmed empirically (a fn with an empty body and a
+    /// declared `where result < 20` let a caller's composition through
+    /// with zero errors).
+    fn check_return_site_exhaustiveness(&mut self) {
+        for fn_def in self.fn_ret_bound.keys().copied().collect::<Vec<_>>() {
+            if !self.found_returns.contains(&fn_def) {
+                let span = self.ret_bound_span[&fn_def].clone();
+                self.error(
+                    span,
+                    "this return bound is never checked against an actual `return` statement \
+                     in the fn's own body -- a declared postcondition needs at least one \
+                     `return <expr>` to prove it against, or callers would trust it with \
+                     nothing actually verified"
+                        .to_string(),
+                );
+            }
+        }
+    }
 }
 
 /// Fold a bare literal to a compile-time constant — deliberately NOT
@@ -840,6 +1040,28 @@ fn base_width(ty: &Types, def: DefId) -> Option<u64> {
         Ty::Bits(Width::Known(w)) => Some(*w),
         _ => None,
     }
+}
+
+/// A type ANNOTATION expression's own declared bit width, if it's the
+/// plain `bits[N]` shape with a literal width (v13) — `base_width`
+/// looks a bound's width up via a `DefId`'s own entry in `state_tys`/
+/// `local_tys`, but a fn's RETURN type has no such def to key off (the
+/// return value is never a named binding); this reads the raw AST
+/// shape directly instead, self-contained like `const_fold`'s own
+/// narrow approach rather than reusing `types/eval.rs`'s fuller
+/// `eval_ty`. `[N]` type sugar desugars at parse time to exactly
+/// `Bracket { callee: Ident("bits"), args: [width] }` (`parser.rs`).
+fn ret_width(ast: &Ast, ty_expr: ExprId) -> Option<u64> {
+    let Expr::Bracket { callee, args } = ast.expr(ty_expr) else {
+        return None;
+    };
+    let Expr::Ident(name) = ast.expr(*callee) else {
+        return None;
+    };
+    if name != "bits" || args.len() != 1 {
+        return None;
+    }
+    const_fold(ast, args[0])
 }
 
 /// A `Stmt::Let`-bound name's own `DefId` — `firrtl/writes.rs` has an

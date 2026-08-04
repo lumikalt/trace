@@ -588,6 +588,8 @@ impl<'a> Resolver<'a> {
                 kind,
                 params,
                 ret,
+                ret_bound,
+                ret_lower,
                 effects,
                 body,
                 ..
@@ -613,6 +615,8 @@ impl<'a> Resolver<'a> {
                 }
                 let params = params.clone();
                 let ret = *ret;
+                let ret_bound = *ret_bound;
+                let ret_lower = *ret_lower;
                 let effects = effects.clone();
                 let body = body.clone();
                 self.scopes.push(HashMap::new());
@@ -638,6 +642,34 @@ impl<'a> Resolver<'a> {
                 }
                 if let Some(ret) = ret {
                     self.resolve_expr(ret, true);
+                }
+                // v13: a return bound's self-reference position is
+                // never a real scoped binding (there's no `DefId` for
+                // "the return value" the way a param/reg/out already
+                // has one) -- only its constant side(s) are resolved
+                // normally; the placeholder `result` is checked by
+                // TEXT in `check_ret_bound_shape`, not passed through
+                // `resolve_expr` (which would otherwise error "cannot
+                // find `result`"). A bound with no declared `ret` type
+                // has nothing to check its own width against (bounds.rs
+                // needs `ret`'s own type expression) -- caught here so
+                // it's a real diagnostic, not an internal panic later.
+                if let Some(ret_bound) = ret_bound {
+                    if ret.is_none() {
+                        self.error(
+                            self.ast.expr_spans[ret_bound.0 as usize].clone(),
+                            "a return bound needs a declared return type to check against (e.g. \
+                             `: [8] where result < 20`)"
+                                .to_string(),
+                        );
+                    }
+                    self.check_ret_bound_shape(ret_bound);
+                    if let Expr::Binary { rhs, .. } = self.ast.expr(ret_bound).clone() {
+                        self.resolve_expr(rhs, false);
+                    }
+                }
+                if let Some(ret_lower) = ret_lower {
+                    self.resolve_expr(ret_lower, false);
                 }
                 self.check_effect_args(&effects);
                 let locals_before = self.declared_locals.len();
@@ -1098,6 +1130,32 @@ impl<'a> Resolver<'a> {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
                 "a `where` bound must reference the same reg/out/param it's declared on"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// v13's own self-reference check, but for a fn's return bound --
+    /// unlike `check_bound_self_reference`, there's no existing `DefId`
+    /// to compare against (a return value is never a named binding
+    /// anywhere in scope), so this checks the bound's self-reference
+    /// position by TEXT instead: it must be the literal placeholder
+    /// identifier `result` (already idiomatic in this codebase -- a
+    /// spawned fn's own handle exposes its return value via `.result`,
+    /// `lower/plan.rs`). Same fallthrough reasoning as `check_bound_
+    /// self_reference`: a malformed shape (LHS not even an `Ident`)
+    /// falls through to the same "doesn't match" error; `bounds.rs`
+    /// reports the precise shape complaint separately.
+    fn check_ret_bound_shape(&mut self, bound: ExprId) {
+        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+            return;
+        };
+        let is_result = matches!(self.ast.expr(lhs), Expr::Ident(name) if name == "result");
+        if !is_result {
+            self.error(
+                self.ast.expr_spans[lhs.0 as usize].clone(),
+                "a return bound must reference the return value via the placeholder `result` \
+                 (e.g. `where result < 20`)"
                     .to_string(),
             );
         }

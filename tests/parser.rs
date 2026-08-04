@@ -384,6 +384,7 @@ fn function_with_signature() {
         ret,
         effects,
         body,
+        ..
     } = ast.item(ast.roots[0])
     else {
         panic!("expected fn");
@@ -1226,6 +1227,21 @@ fn where_clause_parses_on_a_fn_param() {
         .bound
         .expect("where clause should have parsed on the param");
     assert_eq!(ast.expr_sexpr(bound), "(< i 10)");
+}
+
+#[test]
+fn where_clause_parses_on_a_fn_return_type() {
+    // v13: `where result < N` on a fn's return type -- checked against
+    // every `Stmt::Return` in the body, then trusted at call sites.
+    let ast = parse_ok("module M {\n Bump(i : [8]) : [8] where result < 20 {\n return i\n }\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Fn { ret_bound, .. } = ast.item(items[0]) else {
+        panic!("expected a fn");
+    };
+    let bound = ret_bound.expect("where clause should have parsed on the return type");
+    assert_eq!(ast.expr_sexpr(bound), "(< result 20)");
 }
 
 #[test]
