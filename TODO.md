@@ -2075,20 +2075,30 @@ manually in the meantime.
 
 ## Scheduler / arrays
 
-- **RESOLVED (scoped v1) — a read/write pair whose mem indices are ALL
-  compile-time-constant integers is now auto-proven disjoint and dropped
-  from the conflict matrix, no `conflict_free` annotation needed**
-  (`schedule.rs`'s `Exemption::Disjoint`, `examples/mem_disjoint_rw.tr`).
-  Still fully conservative for: any non-constant (runtime-valued) index
-  on either side; a variable or affine index (`m[i]` vs `m[j]`, `m[i]`
-  vs `m[i+1]`) even if provably distinct in principle — needs tracking
-  a variable's possible values plus a side condition (neither rule
-  writes it that cycle), deliberately not bundled with the constants-
-  only proof; and every write/write pair regardless of index shape (v0
-  has one shared, priority-muxed write port per mem — see DESIGN.md's
-  "Arrays: one resource each" — so two "disjoint" writers would still
-  race on it). Dahlia-style banking for the runtime-value case is still
-  tier 3, explicitly deferred in DESIGN.md.
+- **RESOLVED (scoped v1+v2) — a read/write pair whose mem indices are
+  either both compile-time-constant integers, or an affine expression of
+  the SAME base register/input with the mem's own depth a power of two,
+  is now auto-proven disjoint and dropped from the conflict matrix, no
+  `conflict_free` annotation needed** (`schedule.rs`'s `Exemption::
+  Disjoint`, `examples/mem_disjoint_rw.tr` (v1, constants) and `examples/
+  mem_disjoint_affine.tr` (v2, `m[i]` vs `m[i+1]`)). v2's own two real
+  restrictions, not oversights: the base is never chased through a
+  rule-local (reopens the reassigned-local/`Avg(Avg(x,y),z)` bug class),
+  and the power-of-two-depth requirement is load-bearing — v0 has no
+  bounds check on an index against a non-power-of-two depth at all (an
+  out-of-range index is undefined, left to firtool), so the modular
+  disjointness argument simply never depends on that undefined behavior.
+  Still fully conservative for: two DIFFERENT bases (`m[i]` vs `m[j]`,
+  distinct registers — their runtime values could coincide, and proving
+  otherwise needs real range tracking, not a syntactic check — this is
+  the actual remaining tier-3 gap, not the same-base case); a mem sharing
+  even one unrecognized index; and every write/write pair regardless of
+  index shape (v0 has one shared, priority-muxed write port per mem — see
+  DESIGN.md's "Arrays: one resource each" — so two "disjoint" writers
+  would still race on it). Dahlia-style banking for the different-base
+  case is still tier 3, explicitly deferred in DESIGN.md. Explicitly NOT
+  dependent/refinement types: a syntactic affine-offset check in
+  schedule.rs, no new types or propositions.
 - `combines` combinational-loop checking delegates entirely to firtool's
   `CheckCombLoops`, run only by `devenv.nix`'s `simulate` script and
   `tests/sim.rs` — never by `trace` itself, and its diagnostics are never

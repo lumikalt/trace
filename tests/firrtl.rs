@@ -87,7 +87,7 @@ fn emit_from_source(src: &str) -> Result<String, Vec<EmitError>> {
     );
     let (ty2, type_errors2) = types::check(&ast2, &res2, &fx2);
     assert!(type_errors2.is_empty(), "{type_errors2:?}\n{lowered_src}");
-    let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2);
+    let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2, &ty2);
     assert!(
         schedule_errors2.is_empty(),
         "{schedule_errors2:?}\n{lowered_src}"
@@ -351,6 +351,27 @@ fn mem_disjoint_rw_needs_no_conflict_free_annotation() {
         emit_from_source(&read_example("mem_disjoint_rw.tr")).expect("emission should succeed");
     assert!(fir.contains("connect m.w_m.addr, UInt<4>(3)"));
     assert!(fir.contains("connect m.r0.addr, UInt<4>(7)"));
+    assert!(fir.contains("node fires_write = UInt<1>(1)"));
+    assert!(fir.contains("node fires_read = UInt<1>(1)"));
+    assert!(!fir.contains("not(fires_write)"));
+    assert!(!fir.contains("not(fires_read)"));
+    assert!(!fir.contains("assert("));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn mem_disjoint_affine_needs_no_conflict_free_annotation() {
+    // v2 of the test above: examples/mem_disjoint_affine.tr's `write`/
+    // `read` share `i`/`i+1` -- a RUNTIME value, not a literal constant
+    // -- and still get NO derived stall, with no annotation anywhere in
+    // the source. `read`'s address must compile to the actual `i+1`
+    // arithmetic (proving the affine form was recognized, not silently
+    // downgraded to something else), and `fires_write`/`fires_read` must
+    // both be unconditional exactly like the constants-only case.
+    let fir =
+        emit_from_source(&read_example("mem_disjoint_affine.tr")).expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, i"));
+    assert!(fir.contains("connect m.r0.addr, tail(add(i, UInt<4>(1)), 1)"));
     assert!(fir.contains("node fires_write = UInt<1>(1)"));
     assert!(fir.contains("node fires_read = UInt<1>(1)"));
     assert!(!fir.contains("not(fires_write)"));

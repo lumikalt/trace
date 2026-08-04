@@ -124,7 +124,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
     for err in &schedule_errors {
         report(&path, &src, err.span.clone(), &err.message);
     }

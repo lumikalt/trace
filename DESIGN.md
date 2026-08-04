@@ -2751,29 +2751,68 @@ claim turns out false.
 ## Arrays: one resource each
 
 In v0, a whole array (`mem`) is one conflict resource: any two accesses to the
-same array conflict unless both are reads. The one exception is a **read/write**
-pair whose indices are BOTH compile-time-constant integers and provably
-different — the scheduler proves this on its own, automatically, no annotation
-needed:
+same array conflict unless both are reads. Two exceptions exist, both scoped to
+**read/write** pairs only, both a syntactic check living entirely in
+`schedule.rs` — NOT dependent or refinement types, no new types or
+propositions, just one more index shape the same proof recognizes:
 
 ```trace
 rule a { x := m[3] }      -- reads {m}
 rule b { m[7] := y }      -- writes {m}
--- v0: proven disjoint (3 <> 7, both constants) -- a and b do not conflict.
+-- v0: proven disjoint (3 <> 7, both compile-time constants).
+
+rule e { x := m[i] }      -- reads {m}, i a plain register/input
+rule f { m[i+1] := y }    -- writes {m}, same base def i, constant offset 1
+-- v0: proven disjoint (i <> i+1 always, given m's depth is a power of two —
+-- see below) even though i is a RUNTIME value neither rule's own source
+-- states as a literal.
 
 rule c { x := m[i] }      -- reads {m}, i a runtime value
-rule d { m[j] := y }      -- writes {m}, j a runtime value
--- v0: c conflicts with d -- neither index is a compile-time constant, so
--- there is nothing to prove; this is the general, still-conservative case.
+rule d { m[j] := y }      -- writes {m}, j a DIFFERENT runtime value
+-- v0: c conflicts with d -- i and j could coincide at runtime, and proving
+-- otherwise needs real range tracking, not a syntactic check; this stays the
+-- general, conservative case.
 ```
 
-Any non-constant index on either side, or the two constants being equal, falls
-back to the ordinary conservative conflict. A **write/write** pair is never
-exempted this way even when both addresses are constant and distinct: v0 emits
-one shared, priority-muxed write port per mem (see "The schedule block" and
-Part 2's FIRRTL emission), so two "safe" writers would still race on that one
-port — proving their addresses disjoint doesn't change that there's only one
-write port to land on. A design with one memory otherwise serializes on it, one
+The first case (both indices literal constants) needs only the constants to
+differ. The second (an affine expression of a shared base — `m[i]`, `m[i+1]`,
+`m[i-1]`) needs: the SAME base def on both sides (a different register's value
+could coincide — `m[i]` vs `m[j]` for two distinct registers is deliberately
+`c`/`d` above, not provable), AND the mem's own depth to be exactly a power of
+two. That second condition is load-bearing, not caution for its own sake: index
+arithmetic wraps modulo the base's own width, and that modular argument is only
+sound when every representable address is a real, distinct memory cell — v0 has
+no bounds check on an index against a non-power-of-two depth at all (an
+out-of-range index is currently undefined, left entirely to firtool), so the
+proof simply never depends on that undefined behavior rather than guessing at
+it. Offsets are actually compared modulo 2^(the SMALLER of the mem's own
+address width and the base's own declared width): `i + k` wraps at the base's
+own width first, which can be narrower than the address width connected to the
+mem port, and two offsets differing mod the wider width can still alias mod the
+narrower one — the base's width must be a concretely-known `bits[N]` or the
+comparison fails closed. A base is never chased through a rule-local (a local
+can be reassigned mid-rule; resolving through the wrong binding would be the
+exact reassigned-local/`Avg(Avg(x,y),z)` bug class already shipped and fixed
+twice in this codebase) — only a bare register/input reference counts.
+
+The soundness argument above rests on both rules reading the IDENTICAL
+pre-edge value of the shared base within one cycle — true regardless of which
+rule writes it, since registers are speculatively written and read pre-edge
+(this scheduler's own core invariant). This never needs checking as a separate
+side condition: if either rule also writes the base, that register becomes
+shared state between the pair alongside the mem, and the scheduler's
+requirement that EVERY shared def be this one mem rejects the whole pair
+outright — the case where the invariant would matter cannot reach this proof
+at all.
+
+Any index that isn't a bare constant or an affine expression of a shared base
+(or the two bases differing, or the depth not being a power of two) falls back
+to the ordinary conservative conflict. A **write/write** pair is never
+exempted this way even when both addresses are provably distinct: v0 emits one
+shared, priority-muxed write port per mem (see "The schedule block" and Part
+2's FIRRTL emission), so two "safe" writers would still race on that one port
+— proving their addresses disjoint doesn't change that there's only one write
+port to land on. A design with one memory otherwise serializes on it, one
 access per cycle. That is honest behavior for a single unbanked, single-port
 memory.
 
@@ -2925,30 +2964,35 @@ words for.
 
 **A third, auto-derived exemption needs no annotation and no assertion
 either: a proven disjointness claim.** A read/write pair sharing only mem
-accesses whose indices are ALL compile-time-constant integers, and provably
-different, is dropped from the conflict matrix on its own — the scheduler
-found the proof itself, so there is nothing left to trust OR to check.
+accesses that recognize as compile-time constants, or as an affine expression
+of the SAME base def (register/input) with the mem's own depth a power of two,
+and are provably different, is dropped from the conflict matrix on its own —
+the scheduler found the proof itself, so there is nothing left to trust OR to
+check (see "Arrays: one resource each" for exactly what's recognized and why).
 `--explain-schedule` reports it distinctly from both other exemptions:
 
 ```
 rule write conflicts with rule read: write meets read on {m}
-    index sites proven disjoint (compile-time constants): no stall derived (no annotation needed)
+    index sites proven disjoint (constant addresses, or the same base plus a constant offset): no stall derived (no annotation needed)
 ```
 
 Deliberately narrow, matching v0's existing bar of failing closed rather than
-guessing: a mem sharing even ONE non-constant index anywhere, or a write/write
-pair (v0's single shared write port makes two "disjoint" writers meaningless —
-see "Arrays: one resource each"), stays fully conservative, exactly as if this
+guessing: a mem sharing even ONE index that doesn't recognize as either shape,
+two DIFFERENT bases, a non-power-of-two depth, or a write/write pair (v0's
+single shared write port makes two "disjoint" writers meaningless — see
+"Arrays: one resource each"), all stay fully conservative, exactly as if this
 proof did not exist. A user's own `conflict_free`/`mutually_exclusive` on a
 pair this already clears is legal, harmless overstatement, same as claiming
 either on a pair that never conflicted at all.
 
-**Tier 3, not v0: provable disjointness over RUNTIME values.** Dahlia-style
+**Tier 3, not v0: provable disjointness across DIFFERENT bases.** Dahlia-style
 banked and affine array types would let the compiler prove two accesses
-disjoint from a variable index (`m[i]` against `m[j]`, or an affine offset of
-one like `m[i]` against `m[i+1]`) rather than only from literal constants.
-This is a real type-system feature on its own, out of scope for v0 so the
-scheduler work stays bounded.
+disjoint from genuinely different variables (`m[i]` against `m[j]`, two
+distinct registers whose values happen never to coincide) via real range
+tracking — a whole type-system feature on its own, out of scope for v0 so the
+scheduler work stays bounded. The same-base affine case (`m[i]` against
+`m[i+1]`) is NOT this; it's a syntactic check that needs no range tracking at
+all, since a shared base's value is identical on both sides by construction.
 
 ## Combinational loops: what the checker does
 
@@ -4187,9 +4231,11 @@ noted:
 - The `schedule` block: `urgency`, `mutually_exclusive` (checked simulation
   assertion), `conflict_free` (trusted, unchecked; rejected outright on a
   write/write conflict), plus an auto-derived third exemption needing no
-  annotation at all: a read/write pair whose mem indices are ALL
-  compile-time-constant integers and provably different (`examples/
-  mem_disjoint_rw.tr`).
+  annotation at all: a read/write pair whose mem indices are either ALL
+  compile-time-constant integers (`examples/mem_disjoint_rw.tr`) or an affine
+  expression of the SAME base register/input with the mem's own depth a power
+  of two (`m[i]` vs `m[i+1]`, `examples/mem_disjoint_affine.tr`), and provably
+  different either way.
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/
@@ -4225,12 +4271,15 @@ Not yet implemented:
 - **Combinational-only (stateless) modules.** `out` is register-backed by
   design, so a pure function of inputs cannot be expressed without a cycle of
   delay.
-- **Array banking / provable disjointness over runtime values (tier 3).** v0
-  arrays are one conflict resource each, except that a read/write pair whose
-  indices are ALL compile-time-constant integers is auto-proven disjoint (see
-  "Arrays: one resource each"/"The schedule block"). A variable or affine
-  index (`m[i]` vs `m[j]`, `m[i]` vs `m[i+1]`), and any write/write pair, stay
-  fully conservative.
+- **Array banking / provable disjointness across DIFFERENT bases (tier 3).**
+  v0 arrays are one conflict resource each, except that a read/write pair is
+  auto-proven disjoint when its indices are either both compile-time-constant
+  integers, or an affine expression of the SAME base register/input with the
+  mem's own depth a power of two (see "Arrays: one resource each"/"The
+  schedule block"). Two DIFFERENT bases (`m[i]` vs `m[j]`, distinct registers)
+  stay fully conservative — this is the real tier-3 gap, needing range
+  tracking, not a syntactic check — as does any write/write pair regardless
+  of index shape.
 - **A Verilator simulation path.** Icarus only today.
 
 ## Prior art

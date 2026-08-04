@@ -1,7 +1,7 @@
 use trace::ast::{Ast, Item};
 use trace::resolve::Resolution;
 use trace::schedule::{ConflictKind, Exemption, Schedule, ScheduleError, schedule};
-use trace::{effects, lexer, parser, resolve};
+use trace::{effects, lexer, parser, resolve, types};
 
 fn run(src: &str) -> (Ast, Resolution, Schedule, Vec<ScheduleError>) {
     let (tokens, lex_errors) = lexer::lex(src);
@@ -15,7 +15,9 @@ fn run(src: &str) -> (Ast, Resolution, Schedule, Vec<ScheduleError>) {
     );
     let (fx, effect_errors) = effects::check(&ast, &res);
     assert!(effect_errors.is_empty(), "effect errors: {effect_errors:?}");
-    let (sched, errors) = schedule(&ast, &res, &fx);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
+    assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
+    let (sched, errors) = schedule(&ast, &res, &fx, &ty);
     (ast, res, sched, errors)
 }
 
@@ -392,6 +394,81 @@ module M {
 }
 
 #[test]
+fn mem_disjoint_v2_offsets_wrap_at_the_narrower_of_addr_or_base_width() {
+    // A real bug advisor caught before this shipped: `i + k` wraps at
+    // the BASE's own declared width, which can be narrower than the
+    // mem's address width -- comparing offsets modulo the address width
+    // alone is unsound then. Here `m`'s depth is 256 (addr width 8) but
+    // `i` is only `[4]` wide: offsets 1 and 17 differ mod 256, but
+    // `(i+1) mod 16` and `(i+17) mod 16` are the SAME actual address
+    // (17 mod 16 == 1). `.!` is needed here only because `17` doesn't
+    // fit `i`'s own `[4]` width otherwise (an unrelated, pre-existing
+    // literal-fits check) -- not because of anything this proof does.
+    let src = "\
+module M {
+    mem m : [8][256]
+    reg i : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i +.! 1] := x
+    }
+    rule q {
+        y := m[i +.! 17]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(
+        group.conflicts[0].exemption,
+        Exemption::None,
+        "offsets 1 and 17 alias mod the base's own 4-bit width (17 mod 16 == 1); must stay \
+         conservative, not incorrectly proven disjoint"
+    );
+}
+
+#[test]
+fn mem_disjoint_v2_field_base_does_not_recognize_asymmetrically_with_a_bare_ident() {
+    // `state_base` requires the `Expr::Ident` shape explicitly: without
+    // that, an inst-port `Expr::Field` base (`c.a`) would resolve via
+    // `res.expr_defs` just like a bare register would, recognizing
+    // `m[c.a + 1]` while a bare `m[c.a]` (the `Expr::Ident`-only match
+    // arm in `index_form`) does not -- an accidental asymmetry, not a
+    // soundness bug (a port's value is just as pre-edge-stable within a
+    // cycle as a register's), but real: this pins that a Field-based
+    // index stays unrecognized on BOTH sides, consistently.
+    let src = "\
+module Child {
+    out a : [4] = 0
+}
+module M {
+    mem m : [8][16]
+    inst c : Child
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[c.a] := x
+    }
+    rule q {
+        y := m[c.a + 1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = sched
+        .groups
+        .iter()
+        .find(|g| g.order.len() == 2)
+        .expect("M's group");
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
 fn explain_names_a_proven_disjoint_mem_pair() {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -403,8 +480,8 @@ fn explain_names_a_proven_disjoint_mem_pair() {
     let text = sched.explain(&ast, &res);
     assert!(text.contains("rule write conflicts with rule read"));
     assert!(text.contains(
-        "index sites proven disjoint (compile-time constants): no stall derived (no annotation \
-         needed)"
+        "index sites proven disjoint (constant addresses, or the same base plus a constant \
+         offset): no stall derived (no annotation needed)"
     ));
 }
 
@@ -650,6 +727,194 @@ module M {
     rule q {
         y := m[1]
         z := shared
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v2_same_base_different_offset_is_proven() {
+    // `m[i]` vs `m[i+1]`, SAME register `i`, power-of-two depth (16):
+    // within one cycle both rules read the identical pre-edge value of
+    // `i` (registers are speculatively written, read pre-edge -- the
+    // scheduler's own core invariant), so `i` and `i+1` are unconditionally
+    // different addresses. No side condition on `i` being written is
+    // needed (an earlier, mistaken caution about that got corrected).
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[i+1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v2_same_base_minus_offset_is_proven() {
+    // The `Sub` arm: `m[i]` vs `m[i-1]` -- deliberately tested as its own
+    // shape, not assumed to fall out of the `Add` arm for free.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[i-1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v2_commuted_offset_is_proven() {
+    // `k + base`, not just `base + k` -- both operand orders must
+    // recognize as the same affine shape.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[1+i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v2_same_base_same_offset_still_conflicts() {
+    // `m[i]` vs `m[i]` -- literally the same address every cycle. Being
+    // "the same base" must not by itself be treated as license to
+    // exempt; the offsets have to differ too.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v2_different_bases_stay_unprovable() {
+    // `m[i]` vs `m[j]` for two DISTINCT registers -- this is the case
+    // Lumi's own phrasing named directly, and it is deliberately NOT
+    // handled: `i` and `j`'s runtime values could coincide, and proving
+    // otherwise needs real range tracking, not a syntactic check.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    reg j : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[j]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v2_non_power_of_two_depth_stays_unprovable() {
+    // Same shape as the proven case above, but depth 10 (not a power of
+    // two): `clog2(10) == 4`, so addresses 10..16 are representable but
+    // not real cells, and v0 has no bounds check against that at all --
+    // an out-of-range address's behavior is undefined, left to firtool.
+    // The affine proof must not depend on that undefined behavior, so it
+    // simply never fires here.
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg i : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[i+1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v2_constant_against_affine_stays_unprovable() {
+    // `m[3]` vs `m[i]` -- a fixed number says nothing about a variable's
+    // possible runtime values, so a constant can never be proven
+    // disjoint from an affine form (or the reverse).
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[3] := x
+    }
+    rule q {
+        y := m[i]
     }
 }
 ";

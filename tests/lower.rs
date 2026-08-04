@@ -54,12 +54,12 @@ fn assert_round_trips(src: &str) -> String {
         effect_errors.is_empty(),
         "effect errors in lowered output: {effect_errors:?}\n---\n{src}"
     );
-    let (_ty, type_errors) = types::check(&ast, &res, &fx);
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(
         type_errors.is_empty(),
         "type errors in lowered output: {type_errors:?}\n---\n{src}"
     );
-    let (_, schedule_errors) = schedule::schedule(&ast, &res, &fx);
+    let (_, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
     assert!(
         schedule_errors.is_empty(),
         "schedule errors in lowered output: {schedule_errors:?}\n---\n{src}"
@@ -162,7 +162,9 @@ fn subleq_schedule_directive_rewrites_and_only_s5_conflicts() {
     assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
     let (fx2, effect_errors) = effects::check(&ast2, &res2);
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast2, &res2, &fx2);
+    let (ty2, type_errors) = types::check(&ast2, &res2, &fx2);
+    assert!(type_errors.is_empty(), "{type_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast2, &res2, &fx2, &ty2);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
 
     // Every segment writes the shared continuation register, so all

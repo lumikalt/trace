@@ -21,19 +21,60 @@
 //!
 //! A third case is neither user-directed nor trusted: a read/write pair
 //! that both touch the same `mem` is auto-checked for address
-//! disjointness (`Exemption::Disjoint`, `mem_disjoint` below) whenever
-//! EVERY index expression on both sides folds to a compile-time
-//! constant and every such constant differs — e.g. `m[0] := x` and `y :=
-//! m[1]`. This is the scoped v1 of DESIGN.md's "Arrays: one resource
-//! each" tier-3 proof: sound only for read/write pairs (a mem's write
-//! port is still one shared, priority-muxed port in emission — see
+//! disjointness (`Exemption::Disjoint`, `mem_disjoint` below). This is
+//! the scoped v1+v2 of DESIGN.md's "Arrays: one resource each" tier-3
+//! proof — a syntactic affine-offset check living entirely in this
+//! module, deliberately NOT a dependent/refinement type system: no new
+//! types, no propositions, just one more index shape the same proof
+//! recognizes. Sound only for read/write pairs (a mem's write port is
+//! still one shared, priority-muxed port in emission — see
 //! firrtl/module.rs — so two PROVEN-disjoint writers would still race on
-//! it; write/write pairs stay fully conservative, unaffected by this),
-//! and only for indices that are literal integers, never a variable or
-//! an affine expression of one (`m[i]` vs `m[i+1]` is a real, sound v2
-//! but needs a side condition — neither rule may write `i` that cycle —
-//! deliberately not bundled here). Any single non-constant index on
-//! either side fails the whole proof closed: unknown, not "assumed
+//! it; write/write pairs stay fully conservative, unaffected by this).
+//!
+//! Two index shapes are recognized (`IndexForm` below); every index on
+//! BOTH sides of a pair must recognize as one of them or the whole
+//! proof fails closed:
+//! - A bare compile-time-constant integer (`m[0]`) — two of these are
+//!   provably different iff the constants themselves differ, e.g.
+//!   `m[0] := x` and `y := m[1]` (v1).
+//! - A plain state def (register/input/...) plus a compile-time-
+//!   constant offset (`m[i]`, `m[i+1]`, `m[i-1]`) — never chased through
+//!   a rule-local: a local can be reassigned mid-rule, and resolving
+//!   through the wrong binding would be the exact reassigned-local/
+//!   `Avg(Avg(x,y),z)` bug class this codebase has already shipped and
+//!   fixed twice. Two of these are provably different only when BOTH
+//!   name the SAME base def (a different register's value could
+//!   coincide at runtime — `m[i]` vs `m[j]` for two distinct registers
+//!   stays unprovable, by design, not an oversight) AND the mem's own
+//!   depth is exactly a power of two. The latter is load-bearing, not
+//!   caution for its own sake: address arithmetic wraps modulo the
+//!   base's own width, and that modular argument is only sound when
+//!   every representable address is a real, distinct memory cell — v0
+//!   has no bounds check on an index against a non-power-of-two depth
+//!   at all (an out-of-range index is currently undefined, left
+//!   entirely to firtool), so this proof simply never depends on that
+//!   undefined behavior rather than guessing at it (v2). Given both
+//!   conditions, offsets are compared modulo 2^(the SMALLER of the
+//!   mem's own address width and the base's own declared width) — `i +
+//!   k` wraps at the base's own width (types.rs's modular-add rule),
+//!   which can be narrower than the address width connected to the mem
+//!   port, and two offsets differing mod the wider width can still
+//!   alias mod the narrower one. The base's width must be a
+//!   concretely-known `bits[N]` or the whole comparison fails closed.
+//!
+//!   The pre-edge-read invariant this whole affine argument leans on
+//!   (both rules see the SAME value of a shared base within one cycle,
+//!   regardless of which rule writes it) never needs a side condition
+//!   checked here: if either rule also WRITES the base register, that
+//!   register lands in the pair's own shared-state set alongside the
+//!   mem, and `mem_disjoint`'s "every shared def must be this one mem"
+//!   requirement rejects the whole pair outright — the case where the
+//!   invariant would matter cannot reach this proof at all.
+//!
+//! A CONSTANT compared against an AFFINE form (or the reverse) is never
+//! provable either way — a fixed number says nothing about a variable's
+//! possible runtime values. Any single index that doesn't recognize as
+//! either shape fails the whole proof closed: unknown, not "assumed
 //! disjoint." Claiming `mutually_exclusive`/`conflict_free` on a pair
 //! that does not conflict (whether because it never did, or because
 //! this proof now clears it) is legal overstatement.
@@ -41,10 +82,11 @@
 //! Rules conflict only within their own scope (module body or top level):
 //! state is scope-local, so cross-scope conflicts cannot exist.
 
-use crate::ast::{Ast, Expr, ExprId, Item, ItemId, ScheduleDirective};
+use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, ScheduleDirective};
 use crate::effects::{EffectSig, Effects};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
+use crate::types::{Ty, Types, Width};
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,10 +107,10 @@ pub enum Exemption {
     /// `conflict_free { a, b }` — trusted, unchecked in v0.
     ConflictFree,
     /// Auto-derived, not user-written: every shared mem access site on
-    /// this read/write pair provably touches a different compile-time-
-    /// constant address — see this module's own doc comment. Proven, so
-    /// unlike `ConflictFree` it needs no simulation check either (there
-    /// is nothing left to trust).
+    /// this read/write pair provably touches a different address — see
+    /// this module's own doc comment for exactly which index shapes
+    /// that covers. Proven, so unlike `ConflictFree` it needs no
+    /// simulation check either (there is nothing left to trust).
     Disjoint,
 }
 
@@ -123,11 +165,17 @@ fn directive_span(names: &[crate::ast::Name]) -> Span {
     start..end
 }
 
-pub fn schedule(ast: &Ast, res: &Resolution, fx: &Effects) -> (Schedule, Vec<ScheduleError>) {
+pub fn schedule(
+    ast: &Ast,
+    res: &Resolution,
+    fx: &Effects,
+    ty: &Types,
+) -> (Schedule, Vec<ScheduleError>) {
     let mut scheduler = Scheduler {
         ast,
         res,
         fx,
+        ty,
         out: Schedule::default(),
         errors: Vec::new(),
     };
@@ -139,6 +187,7 @@ struct Scheduler<'a> {
     ast: &'a Ast,
     res: &'a Resolution,
     fx: &'a Effects,
+    ty: &'a Types,
     out: Schedule,
     errors: Vec<ScheduleError>,
 }
@@ -324,9 +373,9 @@ impl<'a> Scheduler<'a> {
     /// Whether every def in `rw` (a pure read/write set — the caller
     /// only calls this when the pair's overall `ww` is empty, so no def
     /// here is written by both sides) is a `mem` whose access sites in
-    /// `sa`/`sb` provably touch different compile-time-constant
-    /// addresses. A single non-mem def, or a mem def the proof can't
-    /// close, fails the whole set — see this module's own doc comment.
+    /// `sa`/`sb` provably touch different addresses. A single non-mem
+    /// def, or a mem def the proof can't close, fails the whole set —
+    /// see this module's own doc comment.
     fn mem_disjoint(&self, rw: &BTreeSet<DefId>, sa: &EffectSig, sb: &EffectSig) -> bool {
         !rw.is_empty()
             && rw.iter().all(|def| {
@@ -352,7 +401,18 @@ impl<'a> Scheduler<'a> {
         let Some(r_idx) = reader.mem_read_idx.get(&def) else {
             return false;
         };
-        mem_accesses_disjoint(self.ast, w_idx, r_idx)
+        let pow2_width = self.pow2_addr_width(def);
+        mem_accesses_disjoint(self.ast, self.res, self.ty, pow2_width, w_idx, r_idx)
+    }
+
+    /// This mem's address width, but ONLY when its depth is exactly a
+    /// power of two — see this module's own doc comment for why the
+    /// affine-offset proof needs that, not just a defensive check.
+    fn pow2_addr_width(&self, mem: DefId) -> Option<u64> {
+        match self.ty.state_tys.get(&mem) {
+            Some(Ty::Mem { len, .. }) if len.is_power_of_two() => Some(len.trailing_zeros() as u64),
+            _ => None,
+        }
     }
 
     /// Kahn's algorithm over urgency edges; declaration order breaks
@@ -447,8 +507,8 @@ impl Schedule {
                         "    claimed conflict_free: no stall derived (trusted, not checked)\n",
                     ),
                     Exemption::Disjoint => out.push_str(
-                        "    index sites proven disjoint (compile-time constants): no stall \
-                         derived (no annotation needed)\n",
+                        "    index sites proven disjoint (constant addresses, or the same base \
+                         plus a constant offset): no stall derived (no annotation needed)\n",
                     ),
                     Exemption::None => {
                         let loser = if c.winner == c.a { b } else { a };
@@ -472,12 +532,86 @@ fn rule_name(ast: &Ast, id: ItemId) -> &str {
     }
 }
 
+/// The shape a mem-index expression is recognized as, for the
+/// disjointness proof — see this module's own doc comment for exactly
+/// what each variant means and when two of them are provably different.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexForm {
+    /// A bare compile-time-constant integer.
+    Const(u64),
+    /// A plain state def (register/input/...) plus a compile-time
+    /// constant offset — `m[i]` is `Affine(i, 0)`, `m[i+1]` is
+    /// `Affine(i, 1)`, `m[i-1]` is `Affine(i, u64::MAX)` (the offset is
+    /// already reduced modulo 2^64; the disjointness check reduces it
+    /// again modulo the mem's own address width).
+    Affine(DefId, u64),
+}
+
+/// Recognize an index expression as one of `IndexForm`'s two shapes, or
+/// `None` if it's neither — never chases through a rule-local (a local
+/// can be reassigned mid-rule; resolving through the wrong binding
+/// would be the exact reassigned-local/`Avg(Avg(x,y),z)` bug class this
+/// codebase has already shipped and fixed twice).
+fn index_form(ast: &Ast, res: &Resolution, id: ExprId) -> Option<IndexForm> {
+    match ast.expr(id) {
+        Expr::Int(v) => Some(IndexForm::Const(*v)),
+        Expr::SizedInt { value, .. } => Some(IndexForm::Const(*value)),
+        Expr::Ident(_) => state_base(ast, res, id).map(|def| IndexForm::Affine(def, 0)),
+        Expr::Binary {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => affine_operand(ast, res, *lhs, *rhs).or_else(|| affine_operand(ast, res, *rhs, *lhs)),
+        // Only `base - k`, never `k - base`: the latter negates the
+        // base itself, not a translation of it, and isn't the same
+        // "same runtime value, shifted by a known amount" shape at all.
+        Expr::Binary {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        } => {
+            let base = state_base(ast, res, *lhs)?;
+            let k = const_index(ast, *rhs)?;
+            Some(IndexForm::Affine(base, 0u64.wrapping_sub(k)))
+        }
+        _ => None,
+    }
+}
+
+/// `base_expr + offset_expr` (either operand order) -> `Affine(base
+/// def, k)`, if `base_expr` is a bare state-def reference and
+/// `offset_expr` folds to a constant.
+fn affine_operand(
+    ast: &Ast,
+    res: &Resolution,
+    base_expr: ExprId,
+    offset_expr: ExprId,
+) -> Option<IndexForm> {
+    let base = state_base(ast, res, base_expr)?;
+    let k = const_index(ast, offset_expr)?;
+    Some(IndexForm::Affine(base, k))
+}
+
+/// The state def a bare `Expr::Ident` resolves to, if any — the
+/// disjointness proof's only notion of "the same runtime value."
+/// Deliberately requires the `Ident` shape explicitly (unlike
+/// `effects.rs`'s own `state_def`, which doesn't need to since every
+/// caller there already only reaches it from an Ident position): without
+/// this check, `res.expr_defs` would also resolve an inst-port `Expr::
+/// Field` base (e.g. `m[c.a + 1]`), which is sound on its own (a port's
+/// value is just as pre-edge-stable within a cycle) but would recognize
+/// asymmetrically — `m[c.a + 1]` matching while a bare `m[c.a]` (offset
+/// 0, the `Expr::Ident` match arm in `index_form`) does not.
+fn state_base(ast: &Ast, res: &Resolution, id: ExprId) -> Option<DefId> {
+    if !matches!(ast.expr(id), Expr::Ident(_)) {
+        return None;
+    }
+    let def = res.expr_defs.get(&id)?;
+    res.def(*def).kind.is_state().then_some(*def)
+}
+
 /// Fold a mem-index expression to a compile-time constant, if it is
-/// one. v1 deliberately recognizes only bare integer literals — a
-/// variable, or an affine expression of one (`m[i]`/`m[i+1]`), is a
-/// real, sound proof but needs a side condition (neither rule may write
-/// the variable that cycle) this module's own doc comment explicitly
-/// defers rather than bundling in here.
+/// one.
 fn const_index(ast: &Ast, id: ExprId) -> Option<u64> {
     match ast.expr(id) {
         Expr::Int(v) => Some(*v),
@@ -486,16 +620,79 @@ fn const_index(ast: &Ast, id: ExprId) -> Option<u64> {
     }
 }
 
-/// Every index in `a` is provably different from every index in `b` —
-/// sound only when EVERY index on both sides folds to a known
-/// constant; a single non-constant index anywhere fails the whole
-/// proof closed (unknown, not "assumed disjoint").
-fn mem_accesses_disjoint(ast: &Ast, a: &BTreeSet<ExprId>, b: &BTreeSet<ExprId>) -> bool {
-    let fold = |set: &BTreeSet<ExprId>| -> Option<Vec<u64>> {
-        set.iter().map(|e| const_index(ast, *e)).collect()
+/// The declared bit width of a state def, if it's a plain `bits[N]`
+/// (concretely known) — a register/input/output's own width. Anything
+/// else (unknown width, or a non-scalar state kind like `Mem`/`Fifo`,
+/// which can't legally be a bare index expression's base anyway) is
+/// `None`, so the affine proof fails closed rather than guessing.
+fn base_width(ty: &Types, def: DefId) -> Option<u64> {
+    match ty.state_tys.get(&def) {
+        Some(Ty::Bits(Width::Known(w))) => Some(*w),
+        _ => None,
+    }
+}
+
+/// Whether two recognized index forms are provably different. A
+/// constant differs from another constant iff the values themselves
+/// differ. An affine form differs from another only when BOTH name the
+/// same base def (a different register's value could coincide at
+/// runtime), `pow2_width` is available (the mem's depth is a power of
+/// two — see this module's own doc comment for why that's required, not
+/// just cautious), AND the offsets differ modulo 2^width. That last
+/// width is NOT simply the mem's own address width: `i + k` wraps at
+/// the BASE's own declared width (types.rs's modular-add rule), which
+/// can be narrower than the address width connected to the mem port —
+/// two offsets differing mod the (wider) address width can still be
+/// congruent, and therefore the same real address, mod the (narrower)
+/// base width. Using `min(addr width, base width)` is sound either way:
+/// congruence in the smaller modulus implies congruence in the larger
+/// one it divides. The base's own width must be concretely known or the
+/// whole comparison fails closed — a constant compared against an
+/// affine form (or the reverse) is never provable.
+fn forms_differ(ty: &Types, a: IndexForm, b: IndexForm, pow2_width: Option<u64>) -> bool {
+    match (a, b) {
+        (IndexForm::Const(x), IndexForm::Const(y)) => x != y,
+        (IndexForm::Affine(da, ka), IndexForm::Affine(db, kb)) => {
+            da == db
+                && pow2_width.is_some_and(|addr_w| {
+                    base_width(ty, da)
+                        .is_some_and(|base_w| offsets_differ(ka, kb, addr_w.min(base_w)))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `ka != kb` modulo 2^`width` (both already reduced modulo 2^64 by
+/// `index_form`'s own wrapping arithmetic).
+fn offsets_differ(ka: u64, kb: u64, width: u64) -> bool {
+    let mask = if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
     };
-    let (Some(a_vals), Some(b_vals)) = (fold(a), fold(b)) else {
+    (ka.wrapping_sub(kb)) & mask != 0
+}
+
+/// Every index in `a` is provably different from every index in `b` —
+/// sound only when EVERY index on both sides recognizes as one of
+/// `IndexForm`'s two shapes; a single unrecognized index anywhere fails
+/// the whole proof closed (unknown, not "assumed disjoint").
+fn mem_accesses_disjoint(
+    ast: &Ast,
+    res: &Resolution,
+    ty: &Types,
+    pow2_width: Option<u64>,
+    a: &BTreeSet<ExprId>,
+    b: &BTreeSet<ExprId>,
+) -> bool {
+    let fold = |set: &BTreeSet<ExprId>| -> Option<Vec<IndexForm>> {
+        set.iter().map(|e| index_form(ast, res, *e)).collect()
+    };
+    let (Some(a_forms), Some(b_forms)) = (fold(a), fold(b)) else {
         return false;
     };
-    a_vals.iter().all(|x| b_vals.iter().all(|y| x != y))
+    a_forms
+        .iter()
+        .all(|x| b_forms.iter().all(|y| forms_differ(ty, *x, *y, pow2_width)))
 }

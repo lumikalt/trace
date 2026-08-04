@@ -1,0 +1,31 @@
+-- The v2 of examples/mem_disjoint_rw.tr: `write` and `read` touch the
+-- SAME mem at `i` and `i+1` -- a RUNTIME value, not a literal constant
+-- -- with NO `conflict_free` annotation, and the scheduler still proves
+-- them disjoint on its own (schedule.rs's `Exemption::Disjoint`, the
+-- affine-offset case: same base def `i`, constant offset 1, and `m`'s
+-- depth (16) is exactly a power of two, so `i` and `i+1` are
+-- unconditionally different addresses regardless of `i`'s value --
+-- including at the wraparound boundary, `i = 15` -> `i+1 = 0`).
+--
+-- This is a syntactic affine-offset check, not dependent types: no new
+-- types, no propositions, just one more index shape the same
+-- constants-only proof (mem_disjoint_rw.tr) now also recognizes.
+module MemDisjointAffine {
+    mem m : [8][16]
+
+    in i : [4]
+    in x : [8]
+    out y : [8] = 0
+
+    rule write {
+        m[i] := x
+    }
+
+    rule read {
+        y := m[i+1]
+    }
+
+    schedule {
+        urgency write > read
+    }
+}
