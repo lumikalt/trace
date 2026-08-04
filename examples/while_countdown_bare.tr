@@ -1,0 +1,25 @@
+-- Same loop as while_countdown.tr, but the condition is a BARE
+-- comparison -- no `logic` needed. `while`'s own condition now accepts
+-- the identical `allow_bare_comparison` exemption `if`'s condition
+-- already had (Lumi's call: "while [should] work like if"): the
+-- rendered `if COND { ...; cont := 1 } else { cont := 2 }` text hits
+-- `if`'s already-built comparison-discharge branch on re-entry to the
+-- pipeline. Reuses sim/while_countdown_tb.v verbatim (same module/port
+-- names) -- if the bare form is truly equivalent, the identical
+-- testbench should pass unchanged.
+module WhileCountdown {
+    in x : [8]
+    out iters : [8] = 0
+    reg cnt : [8] = 0
+    reg acc : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        acc := 0
+        while cnt <> 0 {
+            cnt := cnt - 1
+            acc := acc + 1
+        }
+        iters := acc
+    }
+}

@@ -382,7 +382,41 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::While { cond, body } => {
-                self.infer_expr(*cond, sig);
+                // `while COND { ... }`'s own condition is now allowed to
+                // be a bare fallible comparison/fifo-Deq/failing-call too
+                // (Lumi's call: "while [should] work like if"), and
+                // renders (lower.rs) as literal `if COND { ... } else {
+                // ... }` text re-fed through the whole pipeline -- so this
+                // mirrors `Stmt::If`'s own three-way discharge arm above
+                // exactly, for the identical reason: none of the three
+                // shapes should force the enclosing rule/fn to declare
+                // `<fails>` just because `while`'s OWN governing condition
+                // happens to be fallible-shaped.
+                if let Expr::Binary { op, lhs, rhs } = self.ast.expr(*cond)
+                    && op.is_comparison()
+                {
+                    self.infer_expr(*lhs, sig);
+                    self.infer_expr(*rhs, sig);
+                } else if let Expr::Bracket { callee, args } = self.ast.expr(*cond)
+                    && let Some(fifo) = self.fifo_op_target(*callee)
+                {
+                    sig.reads.insert(fifo);
+                    sig.writes.insert(fifo);
+                    for arg in args {
+                        self.infer_expr(*arg, sig);
+                    }
+                } else if let Expr::Call { callee, args } = self.ast.expr(*cond) {
+                    if let Some(callee_sig) = self.callee_sig(*callee) {
+                        sig.reads.extend(callee_sig.reads.iter().copied());
+                        sig.writes.extend(callee_sig.writes.iter().copied());
+                    }
+                    self.infer_expr(*callee, sig);
+                    for arg in args {
+                        self.infer_expr(*arg, sig);
+                    }
+                } else {
+                    self.infer_expr(*cond, sig);
+                }
                 for s in body {
                     self.infer_stmt(*s, sig);
                 }

@@ -367,6 +367,40 @@ fn while_countdown_runs_through_real_cycles() {
     );
 }
 
+/// Proves `while`'s newly-relaxed BARE-comparison condition (no `logic`
+/// needed, TODO.md's "four open questions" question 3) is truly
+/// equivalent to the `logic`-wrapped form above, not just structurally
+/// similar FIRRTL: `examples/while_countdown_bare.tr` is `while_
+/// countdown.tr` with `logic` dropped, reusing the SAME testbench
+/// (`sim/while_countdown_tb.v`, same module/port names) unchanged —
+/// if the two forms compile to genuinely identical hardware, the
+/// identical testbench passes with zero changes.
+#[test]
+fn while_countdown_bare_comparison_runs_through_real_cycles() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/while_countdown_bare.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, true);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/while_countdown_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: iters=12"),
+        "iters did not settle at the last driven x value:\n{output}"
+    );
+}
+
 /// Proves `while let`'s multi-cycle lowering end to end: sim/while_let_
 /// drain_tb.v holds `x` at 5, 0, then 12 in turn and checks `iters`
 /// settles at exactly `x` each time, the same shape `while_countdown`

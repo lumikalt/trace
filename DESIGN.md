@@ -250,9 +250,11 @@ condition, the ergonomic gap the previous section's migration deliberately
 left open. Verse-faithful branch-scoping, applied uniformly regardless of
 whether an `else` is present (Lumi's call): failure only skips the `then`
 branch; it never gates the whole rule the way a top-level bare comparison
-(or an explicit `?`) does. `while`'s own condition stays out of scope —
-Verse's own construct is `if`-shaped only — so a bare comparison there is
-still a type error, `logic` still the discharge.
+(or an explicit `?`) does. `while`'s own condition originally stayed out of
+scope here (Verse turned out to have no native `while` at all — see
+"`while`: multi-cycle loops" below for the reversal once that was
+confirmed) — a bare comparison there now works identically, `logic` still
+accepted but no longer required.
 
 ```trace
 rule r {
@@ -425,21 +427,66 @@ race[h1, h2]`, just spelled on one line.
 the loop's own back-edge acts as a cycle boundary, the same role `tick` plays
 between straight-line segments, which is exactly why an explicit `tick` still
 can't nest inside one (a conditional cycle boundary would be a second,
-overlapping way to cut the same segment). `COND` follows the same
-`logic`-discharge rule as `if`'s own bare-comparison exemption does NOT
-extend to: a bare comparison there is a type error, `logic COND` the
-discharge, unaffected by anything `if` gained (see "Comparisons: fallible by
-default" above).
+overlapping way to cut the same segment).
+
+**`COND` now accepts a bare fallible comparison/fifo-Deq/failing-call
+directly, no `logic` needed — reversing this section's original call.**
+The original reasoning ("Verse's own construct is `if`-shaped only, so
+`while` stays restricted the way `if`'s bare-comparison exemption doesn't
+extend to it") turned out to rest on a wrong premise: Verse has no native
+`while` at all — only `loop` (unconditional, exited via `break`) and `for`
+(each iteration its own failure context, a failed filter clause skips to
+the next item, doesn't end the loop). Lumi's call once that was confirmed:
+"I still want while to work like if, so it takes a fallible as a guard" —
+so `check_cond` (types.rs) now passes `allow_bare_comparison: true` for
+`Stmt::While` too, identical to `if`'s own flag, and `effects.rs`'s
+`Stmt::While` arm gained the matching three-way discharge (comparison/
+fifo-Deq/failing-call, none of which set `sig.fails`) mirroring `Stmt::
+If`'s arm exactly. `logic COND` is still accepted (unlike `if`, `while`
+has always required loops to fit at a `<sequences>` rule's top level,
+so there was never an ergonomic reason to drop it entirely) but no longer
+required:
 
 ```trace
 rule r <sequences, fails> {
     cnt := x
-    while logic cnt <> 0 {
+    while cnt <> 0 {        -- bare, no logic needed
         cnt := cnt - 1
     }
     result := cnt
 }
 ```
+
+**Why this needed almost no new machinery — the SAME reuse story `if`'s
+own bare-condition feature had.** `while COND { body }` lowers (see
+"`while` lowering" below) by literally rendering `if COND { <body>; cont
+:= 1 } else { cont := 2 }` as SOURCE TEXT and re-running the entire
+pipeline on it (re-parse, re-resolve, re-effects, re-types, re-emit) — so
+once `COND` itself survives `check_cond` a first time (on the ORIGINAL,
+un-rendered `Stmt::While`), the RENDERED text hits `if`'s own, already-
+built comparison/fifo-Deq/failing-call discharge on re-entry, with ZERO
+new value-compilation or emission code. Confirmed by direct probe against
+real emitted FIRRTL before this was written (the discriminating question,
+per `advisor`'s review: does the bare guard leak into the whole segment's
+`fires_r_sN`, wrongly gating the loop's own re-firing?) — it doesn't:
+`node fires_r_s1 = and(eq(__cont_r, UInt<2>(1)), not(fires_r_s0))`, gated
+purely on the schedule, with `cnt <> 0` only ever appearing inside the
+mux selects (`connect cnt, mux(neq(cnt, UInt<8>(0)), ...)`, `connect
+__cont_r, mux(neq(cnt, UInt<8>(0)), UInt<2>(1), UInt<2>(2))`) — exactly
+the branch-scoped shape wanted. Verified further with a real firtool +
+Icarus simulation reusing the EXISTING `while_countdown_tb.v` testbench
+unchanged against a bare-comparison twin of its `.tr` source
+(`examples/while_countdown_bare.tr`, `tests/sim.rs`'s `while_countdown_
+bare_comparison_runs_through_real_cycles`) — if the bare and `logic`-
+wrapped forms are genuinely equivalent hardware, the identical testbench
+should pass with no changes, and it does.
+
+A comparison nested inside a larger boolean combination (`while (a > b)
+& c { ... }`) is still rejected exactly like `if`'s identical case —
+`expr_has_undischarged_comparison` runs unconditionally in `check_cond`,
+regardless of `allow_bare_comparison`, so gaining the WHOLE-condition
+exemption didn't widen the nested-comparison gap too. Confirmed by direct
+probe, not assumed from the structural similarity to `if` alone.
 
 v0 scope: `while` must sit at a sequences rule's (or a spawned fn's) top
 level, the same restriction `tick`/`spawn` already have — not nested inside

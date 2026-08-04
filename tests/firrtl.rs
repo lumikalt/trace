@@ -6713,6 +6713,78 @@ module M {
     run_firtool(&fir, &[]);
 }
 
+/// `while`'s own condition now accepts a BARE comparison directly, no
+/// `logic` needed -- the identical `allow_bare_comparison` exemption
+/// `if` already had (Lumi's call: "while [should] work like if"). The
+/// rendered `if COND { ...; __cont_r := 1 } else { __cont_r := 2 }`
+/// (lower.rs's `while_loop_header`) re-enters the pipeline and hits
+/// `if`'s already-built comparison-discharge branch, so `fires_r_s1`
+/// stays completely clean (gated on `__cont_r` alone, per the schedule)
+/// -- confirmed by direct probe against real emitted FIRRTL before this
+/// was written, not assumed from the structural claim alone.
+#[test]
+fn while_condition_accepts_a_bare_comparison_no_logic_needed() {
+    let src = "\
+module M {
+    in x : [8]
+    out result : [8] = 0
+    reg cnt : [8] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        while cnt <> 0 {
+            cnt := cnt - 1
+        }
+        result := cnt
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r_s1 = and(eq(__cont_r, UInt<2>(1)), not(fires_r_s0))"));
+    assert!(
+        fir.contains("connect cnt, mux(neq(cnt, UInt<8>(0)), tail(sub(cnt, UInt<8>(1)), 1), cnt)")
+    );
+    assert!(fir.contains("connect __cont_r, mux(neq(cnt, UInt<8>(0)), UInt<2>(1), UInt<2>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+/// The same widening extended to a bare fifo `Deq[]` directly as
+/// `while`'s own condition -- the loop keeps draining `f` each iteration
+/// until it's empty, then advances. Same reuse story as `if`'s own bare-
+/// fifo-condition feature: `compile_guard_unwrap_cond`'s existing fifo-
+/// Deq branch needed zero changes.
+#[test]
+fn while_condition_accepts_a_bare_fifo_deq_no_bound_name_needed() {
+    let src = "\
+module M {
+    fifo f : [8]
+    out result : [8] = 0
+    reg acc : [8] = 0
+
+    rule r <sequences, fails> {
+        while f.Deq[] {
+            acc := acc + 1
+        }
+        result := acc
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r_s1 = and(eq(__cont_r, UInt<2>(1)), not(fires_r_s0))"));
+    assert!(fir.contains("when __fifo_f_valid :\n        connect __fifo_f_valid, UInt<1>(0)"));
+    assert!(fir.contains("connect acc, mux(__fifo_f_valid, tail(add(acc, UInt<8>(1)), 1), acc)"));
+    assert!(fir.contains("connect __cont_r, mux(__fifo_f_valid, UInt<2>(1), UInt<2>(2))"));
+    run_firtool(&fir, &[]);
+}
+
+// A comparison nested inside `&`/`|`/`^` as `while`'s own condition is
+// still rejected -- covered at the type-check level, tests/types.rs's
+// `a_comparison_nested_inside_a_larger_if_or_while_condition_is_
+// rejected_not_silently_miscompiled` (that error surfaces before
+// firrtl.rs's own checks ever run, so a firrtl.rs-level test using
+// `emit_from_source` -- which panics eagerly on any type error rather
+// than returning it -- can't exercise it; belongs in types.rs, not here).
+
 /// A local computed BEFORE a `while` loop, only READ inside it (never
 /// reassigned there), composes fine with the ordinary capture machinery
 /// — the write-once-then-read-later invariant already holds (its single

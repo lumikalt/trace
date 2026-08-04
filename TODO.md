@@ -1170,7 +1170,11 @@ Speculative, bigger, not committed to:
   full write-up (semantics, examples, why the value side needed almost
   no new code). `while`'s own condition stays out of scope, unaffected
   — resolves the "while with a fallible condition" open question below
-  by taking its already-argued default. A fifo op or failing call as an
+  by taking its already-argued default. **UPDATE, much later: this call
+  got REVERSED — see the four open questions' own "while with a
+  fallible condition" entry below for why (Verse turned out to have no
+  native `while` at all) and DESIGN.md's "`while`: multi-cycle loops"
+  for the shipped feature.** A fifo op or failing call as an
   `if`'s condition remains a type error, same as ever — this ships only
   the comparison case; the harder branch-scoped-fifo/failing-call
   question the open-questions list below still owes stays fully open,
@@ -1683,6 +1687,43 @@ Speculative, bigger, not committed to:
     bullet below): took exactly this already-argued default in every
     case, `while` stays restricted, `logic` still the discharge for
     comparisons.
+
+    **UPDATE — REVERSED, on a corrected premise.** The "Verse's own
+    construct is `if`-shaped only" premise this whole resolution rested
+    on was checked directly against Verse's own docs (the "Book of
+    Verse" this repo already cites for `or`'s semantics, `verselang.
+    github.io/book/`) when Lumi pushed back on it, and turned out to be
+    wrong in a more specific way than assumed: Verse has no native
+    `while` AT ALL, not an `if`-shaped-only one — only `loop`
+    (unconditional, exited via an explicit `break`) and `for` (each
+    iteration gets its OWN failure context; a failed filter clause skips
+    to the next item rather than ending the loop, per `08_failure`).
+    Lumi's call once that was confirmed: "I still want while to work
+    like if, so it takes a fallible as a guard and breaks on a break
+    keyword" — two separate asks, landed as two commits:
+    1. `while`'s own condition now takes the identical `allow_bare_
+       comparison`/`is_fifo_deq`/`is_failing_call` exemption `if`'s
+       condition already had (`types.rs`'s `check_cond`, `effects.rs`'s
+       `Stmt::While` arm mirroring `Stmt::If`'s three-way discharge) —
+       `logic COND` still works, just no longer required. Needed almost
+       no new machinery: `while COND { body }` already lowers by
+       rendering literal `if COND { ...; cont := 1 } else { cont := 2 }`
+       SOURCE TEXT and re-running the WHOLE pipeline on it (lower.rs),
+       so once the ORIGINAL `Stmt::While`'s `cond` survives `check_cond`
+       once, the RENDERED text hits `if`'s already-built discharge on
+       re-entry for free. Confirmed by direct probe against real
+       emitted FIRRTL (does the bare guard leak into `fires_r_sN`,
+       wrongly gating the loop's own re-firing? — no) and a real
+       firtool+Icarus simulation reusing the EXISTING `while_countdown_
+       tb.v` testbench unchanged against a bare-comparison twin source
+       file. See DESIGN.md's "`while`: multi-cycle loops" for the full
+       write-up.
+    2. A standalone `break` keyword, usable inside a loop body for early
+       exit independent of the loop's own guard — the actual mechanism
+       Verse's `loop`+`if`+`break` idiom uses, which trace's `while` is
+       now built to match structurally, not just semantically. **Not
+       yet built as of this note** — a separate commit, tracked in a
+       new TODO.md bullet once work on it starts.
   - **What `fires_rule` becomes for an `if`-WITH-else fallible
     condition.** Per the no-else/with-else split above, the with-else
     case should contribute NOTHING to the whole-rule guard (matching

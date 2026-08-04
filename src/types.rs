@@ -1140,11 +1140,17 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::While { cond, body } => {
-                // `while`'s fallible condition stays out of scope (TODO.md
-                // -- Verse's own construct is `if`-shaped only): a bare
-                // comparison here is still a type error, `logic` still the
-                // discharge.
-                self.check_cond(cond, locals, false);
+                // `while COND { body }` renders (lower.rs's `while_loop_
+                // header`) as literal `if COND { body; cont := 1 } else {
+                // cont := 2 }` source text, re-fed through this ENTIRE
+                // pipeline -- so a bare comparison/fifo-Deq/failing-call
+                // here just needs to survive THIS check once, and the
+                // rendered `if`'s own (already-built) exemption takes it
+                // from there with zero new value-compilation code. `true`
+                // here mirrors `if`'s own `allow_bare_comparison: true`
+                // exactly (Lumi's call: "I still want while to work like
+                // if, so it takes a fallible as a guard").
+                self.check_cond(cond, locals, true);
                 for s in body {
                     self.type_stmt(s, locals, ret);
                 }

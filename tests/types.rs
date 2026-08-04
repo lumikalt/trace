@@ -1721,7 +1721,7 @@ fn all_examples_type_check() {
 /// type error, `logic` still the discharge, completely unaffected by
 /// this feature.
 #[test]
-fn if_condition_accepts_a_bare_comparison_but_while_still_rejects_it() {
+fn if_and_while_both_accept_a_bare_comparison_as_their_own_condition() {
     run_ok(
         "module M {\n reg v : [8] = 0\n in a : [8]\n in b : [8]\n \
          rule r {\n if a > b {\n v := 1\n } else {\n v := 2\n }\n }\n}\n",
@@ -1730,20 +1730,22 @@ fn if_condition_accepts_a_bare_comparison_but_while_still_rejects_it() {
         "Sum(x : [8]) : [8] <sequences, fails> {\n while logic x <> 0 {\n x := x >> 1\n }\n \
          return x\n}\n",
     );
-    let (_, _, errors) = run(
+    // `while`'s own condition now gets the identical `allow_bare_
+    // comparison` exemption `if`'s already had (Lumi's call: "while
+    // [should] work like if") -- `logic` is no longer required, though
+    // still accepted (just above) for anyone who prefers it.
+    run_ok(
         "Sum(x : [8]) : [8] <sequences, fails> {\n while x <> 0 {\n x := x >> 1\n }\n \
          return x\n}\n",
     );
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("wrap it with `logic`"));
 }
 
-/// The same `if`-only widening extended to a bare fifo `Deq[]`/failing
-/// call directly as an `if`'s own condition -- both fallible by default,
-/// same reasoning as the comparison case just above, and same `while`
-/// exclusion (Verse's construct is `if`-shaped only).
+/// The same widening extended to a bare fifo `Deq[]`/failing call
+/// directly as a condition -- both fallible by default, same reasoning
+/// as the comparison case just above, and now accepted by BOTH `if` and
+/// `while` (Lumi's call: "while [should] work like if").
 #[test]
-fn if_condition_accepts_a_bare_fifo_deq_or_failing_call_but_while_still_rejects_them() {
+fn if_and_while_both_accept_a_bare_fifo_deq_or_failing_call_as_their_own_condition() {
     run_ok(
         "module M {\n fifo f : [8]\n reg v : [8] = 0\n \
          rule r {\n if f.Deq[] {\n v := 1\n } else {\n v := 0\n }\n }\n}\n",
@@ -1753,11 +1755,10 @@ fn if_condition_accepts_a_bare_fifo_deq_or_failing_call_but_while_still_rejects_
          module M {\n reg v : [8] = 0\n in a : [8]\n \
          rule r {\n if Classify(a) {\n v := 1\n } else {\n v := 2\n }\n }\n}\n",
     );
-
-    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [8] = 0\n \
-         rule r <sequences> {\n while f.Deq[] {\n v := 1\n tick\n }\n }\n}\n");
-    assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(errors[0].message.contains("condition must be"));
+    run_ok(
+        "module M {\n fifo f : [8]\n reg v : [8] = 0\n \
+         rule r <sequences> {\n while f.Deq[] {\n v := 1\n }\n }\n}\n",
+    );
 }
 
 /// Advisor-caught while reviewing the `if`-only exemption above: a
@@ -1790,14 +1791,22 @@ fn a_comparison_nested_inside_a_larger_if_or_while_condition_is_rejected_not_sil
          rule r {\n if (logic a > b) & c {\n v := 1\n }\n }\n}\n",
     );
 
-    // `while` had the identical gap, with no `allow_bare_comparison`
-    // needed to trigger it: `while x <> 0` with a 1-bit `x` used to pass
-    // `check_cond`'s width check silently (a comparison's own type IS
-    // [1] whenever its LHS is), never even reaching the "must be [1]"
-    // error `while`'s own restriction is supposed to enforce.
-    let (_, _, errors) = run(
+    // `while` now shares `if`'s `allow_bare_comparison` exemption too
+    // (Lumi's call: "while [should] work like if"), so `while x <> 0`
+    // with a 1-bit `x` is legitimately accepted now -- it's the WHOLE
+    // condition, the exact shape the exemption covers, not the nested-
+    // inside-a-larger-expression gap this test is about. That gap is
+    // still very much alive for `while` too, though: a comparison
+    // nested inside `&`/`|`/`^` is unconditionally rejected by `expr_
+    // has_undischarged_comparison`, regardless of `allow_bare_
+    // comparison` -- confirmed by direct probe before writing this.
+    run_ok(
         "Sum(x : [1]) : [1] <sequences, fails> {\n while x <> 0 {\n x := 0\n }\n \
          return x\n}\n",
+    );
+    let (_, _, errors) = run(
+        "module M {\n reg v : [8] = 0\n in a : [1]\n in b : [1]\n in c : [1]\n \
+         rule r <sequences> {\n while (a > b) & c {\n v := 1\n }\n }\n}\n",
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("wrap it with `logic`"));
