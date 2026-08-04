@@ -71,9 +71,10 @@
 //!   differ wherever that returned value is consumed). `Lt`/`Gt`/`Ge`
 //!   stay single-order — `k < x`/`x < k` are different claims even as
 //!   bare predicates. The `else` branch of an `if <>` (a provable
-//!   singleton, `<reg> == <const>`) is also left unnarrowed,
-//!   conservative but costless since no example needs the extra
-//!   precision there.
+//!   singleton, `<reg> == <const>`) was ALSO left unnarrowed through
+//!   v14, conservative but costless since no example needed the extra
+//!   precision there — v15 below closes this: the `else` branch is now
+//!   narrowed to the exact singleton.
 //! - **Cross-boundary bound propagation (v12): a `fn`/`impl` PARAMETER
 //!   can carry a `where` bound too**, checked as an obligation at every
 //!   CALL site — the one thing this module's own per-item induction
@@ -167,6 +168,56 @@
 //!   shape": a grep only finds calls that exist and are merely gated;
 //!   it can't find a position never wired to `expr_bound` at all —
 //!   that needs a distinct "what's never reached" pass, not a grep.
+//! - **`else`-branch negated-condition narrowing (v15): the `else`
+//!   branch of an `if` is now narrowed on the NEGATED condition**
+//!   (`examples/else_branch_narrowing.tr`), instead of inheriting the
+//!   raw, unnarrowed entry state as it did through v14. Before writing
+//!   any code, checked (per this arc's own "don't build an inert
+//!   feature" discipline, first established at v11) whether the
+//!   v11/v13/v14-deferred interval-set domain was finally worth building
+//!   now that `Mul` exists — and found it's PROVABLY inert, doubly so:
+//!   every check in this file (write-bound, width-clamp, `Sub`'s own
+//!   fail-closed condition) reads only a range's EXTREMES, and `Add`/
+//!   `Sub`/`Mul` are all monotonic given unsigned operands, so punching
+//!   an interior hole in a range can never move a downstream min/max —
+//!   this generalizes v11's "Mul specifically" finding to ANY monotonic
+//!   composition, present or future. Separately, `schedule.rs`'s own
+//!   disjointness proofs (the consumer this module's own doc names as
+//!   the whole point of a proven bound) only ever read a def's FLAT,
+//!   whole-program declared range (`Bounds.ranges`, populated straight
+//!   from `self.bounded`) — no per-branch narrowing, edge OR hole, ever
+//!   reaches that consumer at all, so an interval-set wouldn't even
+//!   change what `schedule.rs` sees. `narrow_for_else` is the real,
+//!   non-inert alternative found instead: `Lt`/`Ge`/`Gt` each mirror an
+//!   existing `narrow_for_condition` formula in the opposite direction
+//!   (`else` of `i < k` is `i >= k`, etc.); `Ne`'s own negation is
+//!   genuinely new — `else` of `i <> k` is the EXACT singleton `i == k`,
+//!   sound for ANY `k`, mid-range included, unlike `narrow_for_condition`
+//!   own `Ne` arm (which only narrows a THEN branch's edge case). A
+//!   singleton needs no interval-set at all — it's just an ordinary
+//!   one-piece interval — so this is the actual non-inert capture of
+//!   the same underlying idea the interval-set domain was chasing, using
+//!   the representation already in place. Every arm's raw result is
+//!   CLAMPED against the def's own current `(lo, hi)` and only inserted
+//!   when non-empty — a single uniform rule, not a per-arm guard: an
+//!   advisor pass found that `Lt`/`Gt`/`Ge`, not just `Ne`, can each
+//!   produce a degenerate EMPTY range when their condition is always
+//!   true for the current bound (`cnt >= 0` on an unsigned `cnt`), and
+//!   inserting that unclamped let an unrelated write vacuously accept
+//!   rather than conservatively fail; the clamp is a no-op for those
+//!   three (their raw results already derive from `lo`/`hi`) but is
+//!   exactly what keeps `Ne`'s own raw `(k, k+1)` — which does NOT
+//!   derive from `lo`/`hi` at all — from being inserted for a `k`
+//!   nowhere near the def's actual proven range. Either way, an
+//!   unreachable `else` branch left on the raw entry state stays sound:
+//!   a false premise proves anything, and `else_state` is discarded at
+//!   the end of the branch regardless. This clamp is `narrow_for_else`'s
+//!   OWN rule, deliberately not backported to `narrow_for_condition`
+//!   above: that function has the identical unclamped hazard (`if i <
+//!   0` inserts the empty `(0, 0)`; `if i >= 20` on `i < 10` inserts the
+//!   inverted `(20, 10)`), pre-existing since v9, but the same dead-
+//!   branch/false-premise argument makes it just as harmless there, and
+//!   no example depends on tightening it.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -647,7 +698,10 @@ impl<'a> Checker<'a> {
                 let mut then_locals = locals.clone();
                 self.check_body(&then_body, &mut then_state, &mut then_locals);
                 if let Some(else_body) = else_body {
-                    let mut else_state = state.clone();
+                    // v15: narrowed on the NEGATED condition, not the raw
+                    // entry state -- see `narrow_for_else`'s own doc
+                    // comment.
+                    let mut else_state = self.narrow_for_else(cond, state);
                     let mut else_locals = locals.clone();
                     self.check_body(&else_body, &mut else_state, &mut else_locals);
                 }
@@ -883,6 +937,89 @@ impl<'a> Checker<'a> {
                     }
                 }
                 _ => {}
+            }
+        }
+        narrowed
+    }
+
+    /// The ELSE-branch mirror of `narrow_for_condition` above: narrows
+    /// `state` on the NEGATED condition, instead of leaving the `else`
+    /// branch on the raw, unnarrowed entry state as it did before v15.
+    /// The negated condition is just as real a proven fact as the
+    /// condition itself — `if i < k`'s `else` branch is exactly `i >=
+    /// k`, the identical fact `narrow_for_condition` already proves for
+    /// an actual `if i >= k`'s own THEN branch, just reached from the
+    /// opposite operator, so `Lt`/`Ge` and `Gt`/`Le`-shaped narrowing
+    /// below reuse those same formulas in the mirrored direction. `Ne`'s
+    /// own negation is the one genuinely NEW capability here, not just
+    /// a mirrored existing formula: `else` of `i <> k` is the exact
+    /// singleton `i == k`, sound for ANY `k` — mid-range included,
+    /// unlike `narrow_for_condition`'s own `Ne` arm, which only narrows
+    /// a THEN branch's EDGE case (v9's documented interior-exclusion
+    /// no-op — the same "interval-set domain" question v11/v13/v14 left
+    /// open turned out to be provably inert everywhere it was checked;
+    /// this singleton is the actual non-inert capture of that same
+    /// underlying idea, and it needs no interval-set at all since a
+    /// singleton is just an ordinary one-piece interval).
+    ///
+    /// Every arm's raw result is CLAMPED against the def's own current
+    /// `(lo, hi)` before being inserted, and only inserted at all when
+    /// that clamp leaves a non-empty range (`clamped_lo < clamped_hi`)
+    /// — caught by an advisor pass before committing. A condition that's
+    /// always true for the def's current range (`cnt >= 0` on an
+    /// unsigned `cnt`, or `i < 20` when `i`'s declared ceiling is 10)
+    /// makes the ELSE branch unreachable dead code, and three of the
+    /// four raw formulas below (`Lt`/`Gt`/`Ge`, each already built from
+    /// `*lo`/`*hi` via `max`/`min`) degrade gracefully to an EMPTY
+    /// range in that case, not an incorrect one — but inserting an
+    /// empty range unclamped is still the wrong move: it either gets
+    /// read back as if it were a real, narrow proof (a coincidental
+    /// vacuous accept downstream, not a deliberate one) or, for a
+    /// hand-rolled range comparison elsewhere, could misbehave on lo >
+    /// hi. `Ne`'s own raw `(k, k+1)` is the one arm that does NOT derive
+    /// from `lo`/`hi` at all, so without this clamp it would insert a
+    /// singleton for ANY `k`, even one nowhere near the def's actual
+    /// proven range (exactly the hazard the dedicated `..._stays_
+    /// unnarrowed` test below pins) — clamping against `(lo, hi)` first
+    /// closes that the same uniform way the other three arms are
+    /// already closed, rather than needing its own separate ad hoc
+    /// guard. Either way, leaving an unreachable else branch on the
+    /// raw, unnarrowed entry state is trivially still sound: a false
+    /// premise (the condition can never actually be false) proves
+    /// anything, and `else_state` is cloned and discarded at the end of
+    /// the branch, so nothing about a missed narrowing opportunity here
+    /// ever escapes into the surrounding walk.
+    fn narrow_for_else(
+        &self,
+        cond: ExprId,
+        state: &HashMap<DefId, (u64, u64)>,
+    ) -> HashMap<DefId, (u64, u64)> {
+        let mut narrowed = state.clone();
+        if let Expr::Binary { op, lhs, rhs } = self.ast.expr(cond)
+            && let Some((def, k)) = self.ident_const_operands(*lhs, *rhs).or_else(|| {
+                matches!(op, BinOp::Ne)
+                    .then(|| self.ident_const_operands(*rhs, *lhs))
+                    .flatten()
+            })
+            && let Some((lo, hi)) = narrowed.get(&def)
+        {
+            let raw = match op {
+                // else of `i < k` is `i >= k`.
+                BinOp::Lt => Some((k.max(*lo), *hi)),
+                // else of `i > k` is `i <= k`, i.e. `i < k + 1`.
+                BinOp::Gt => k.checked_add(1).map(|ceil| (*lo, ceil.min(*hi))),
+                // else of `i >= k` is `i < k`.
+                BinOp::Ge => Some((*lo, k.min(*hi))),
+                // else of `i <> k` is the exact singleton `i == k`.
+                BinOp::Ne => k.checked_add(1).map(|ceil| (k, ceil)),
+                _ => None,
+            };
+            if let Some((raw_lo, raw_hi)) = raw {
+                let clamped_lo = raw_lo.max(*lo);
+                let clamped_hi = raw_hi.min(*hi);
+                if clamped_lo < clamped_hi {
+                    narrowed.insert(def, (clamped_lo, clamped_hi));
+                }
             }
         }
         narrowed

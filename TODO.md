@@ -2697,7 +2697,103 @@ manually in the meantime.
   proves a grep for the gating shape isn't exhaustive by construction),
   just every one this file's grep sweep plus one further advisor probe
   surfaced. Whether the interval-set domain is worth building remains
-  the one open item left in this whole arc.
+  open — resolved next, by v15 below.
+- **RESOLVED (v15) — `else`-branch negated-condition narrowing, in
+  place of the interval-set domain** (`examples/
+  else_branch_narrowing.tr`). Before writing any code, checked (this
+  arc's own standing discipline since v11) whether the v11/v13/v14-
+  deferred interval-set domain was finally worth building now that
+  `Mul` exists — found it's PROVABLY inert, and MORE broadly than v11's
+  own finding: every check in `bounds.rs` (write-bound, width-clamp,
+  `Sub`'s own fail-closed condition) reads only a range's EXTREMES, and
+  `Add`/`Sub`/`Mul` are all monotonic given unsigned operands, so
+  punching an interior hole in a range can never move a downstream
+  min/max — true for ANY monotonic composition, not just the ones that
+  happen to exist today. A second, independent reason it's inert:
+  `schedule.rs`'s own mem-disjointness proofs (the consumer `bounds.rs`'s
+  own module doc names as the whole point of a proven bound) only ever
+  read a def's FLAT, whole-program declared range (`Bounds.ranges`,
+  populated straight from the declared `where` clause) — no per-branch
+  narrowing, edge or hole, ever reaches that consumer at all, so an
+  interval-set wouldn't change what `schedule.rs` sees either, without a
+  separate (much bigger) feature to export narrowed per-site ranges in
+  the first place. Confirmed with advisor before presenting it back,
+  same shape as v11's own "is this inert" check.
+
+  Found instead: `if`'s own `else` branch inherited the RAW, unnarrowed
+  entry state through v14 — never narrowed on the NEGATED condition,
+  even though that's just as real a proven fact as the condition
+  itself. `narrow_for_else` mirrors `narrow_for_condition`'s `Lt`/`Ge`/
+  `Gt` formulas in the opposite direction (`else` of `i < k` is `i >=
+  k`, etc. — `Gt`'s own mirror needed a genuinely new formula, since
+  this language's `Le` isn't recognized by `narrow_for_condition` at
+  all); `Ne`'s own negation is the one truly NEW capability — `else` of
+  `i <> k` is the EXACT singleton `i == k`, sound for ANY `k`, mid-range
+  included, unlike `narrow_for_condition`'s own `Ne` arm (edge-only,
+  v9's documented no-op for an interior exclusion). A singleton needs
+  no interval-set at all — it's an ordinary one-piece interval — so
+  this is the actual non-inert capture of the same underlying idea the
+  interval-set domain was chasing, built entirely inside the
+  representation already in place. Guarded so the excluded `k` must lie
+  within the CURRENT `[lo,hi)`: outside it, the `else` branch is
+  unreachable dead code (the excluded value could never have been the
+  real one), so leaving it unnarrowed there stays sound rather than
+  risking a bogus out-of-declared-range interval.
+
+  An advisor pass caught a broader version of that same hazard before
+  committing: THREE of the four arms, not just `Ne`, could produce a
+  degenerate range — `Lt`/`Gt`/`Ge` all degrade to an EMPTY range
+  (`lo >= hi`) whenever the condition is always true for the def's
+  current bound (`cnt >= 0` on an unsigned `cnt` computes the empty
+  `(0, 0)`), and inserting that unclamped let a write with no real
+  relationship to the def's actual range slip through as a coincidental
+  VACUOUS accept in two of the three cases, rather than the deliberate
+  "leave dead code on the raw entry state" fallback the `Ne` guard
+  already modeled. Fixed by replacing the `Ne`-only guard with one
+  uniform rule covering all four arms: every raw result is CLAMPED
+  against the def's own current `(lo, hi)` first, then only inserted if
+  that clamp is non-empty — `Lt`/`Gt`/`Ge`'s raw results already derive
+  from `lo`/`hi` via `max`/`min` so the clamp is a no-op for them
+  (only the emptiness check bites), while `Ne`'s raw `(k, k+1)` doesn't
+  derive from `lo`/`hi` at all, so the SAME clamp is what keeps a
+  wildly out-of-range `k` from ever being inserted — subsuming the
+  original ad hoc guard instead of needing a second one. (The advisor's
+  first-pass suggestion — just check `new_lo < new_hi` with no clamp —
+  was insufficient on inspection: `Ne`'s raw `(k, k+1)` is non-empty for
+  ANY `k`, so that alone wouldn't have closed the out-of-range hazard at
+  all; the clamp-then-check version was needed to cover both.)
+
+  7 new tests (`tests/bounds.rs`, bringing the file's own total to 61):
+  one per mirrored operator (`Lt`/`Gt`/`Ge`), the `Ne` singleton
+  (deliberately using a genuinely MID-range `k`, not an edge, to
+  discriminate from `narrow_for_condition`'s own existing edge-only
+  handling), its own commuted form (`<const> <> <reg>`, a live path
+  through the `Ne`-only `or_else` fallback that had zero coverage until
+  a final advisor pass named it — the same "found a real call site with
+  no test" shape as v14's own `Stmt::WhileLet` gap), a dedicated "k
+  outside the current range stays unnarrowed" case, and (added after
+  the SECOND advisor pass) a dedicated "always-true
+  condition stays conservatively unnarrowed, not vacuously accepted"
+  case for the empty-range hazard. Bug-reintroduction on all of them:
+  temporarily reverted the whole `else`-branch call to `state.clone()`
+  (the old v14-and-earlier behavior) — flips 4 of the first 5 tests
+  from passing to a spurious rejection; separately reverted just the
+  clamp-and-emptiness-check to an unconditional insert of the raw,
+  unclamped result — flips BOTH the out-of-range-`k` test and the
+  always-true-condition test at once, confirming the single unified fix
+  covers both hazards together, not as two independent guards. Driving
+  example and its own discriminating baseline confirmed before
+  implementing (`examples/else_branch_narrowing.tr`'s write only
+  compiles given the else-narrowed range; 1 error on pre-v15 code, 0
+  after). `cargo fmt`/`clippy`/`test` all clean. A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical except the new driving example, and a `--firrtl`
+  sanity check on the driving example confirmed clean codegen. This
+  closes the last open item from the whole bounds.rs arc (v9 through
+  v14's own "still NOT done" language) — not by building the
+  interval-set domain Lumi originally asked about, but by finding and
+  building the concrete, non-inert capability sitting next to it once
+  the inertness was actually checked rather than assumed either way.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

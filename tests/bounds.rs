@@ -1260,3 +1260,190 @@ module M {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("argument for parameter"));
 }
+
+// v15: the `else` branch of an `if` used to inherit the raw, unnarrowed
+// entry state -- the negated condition (`i < k`'s `else` is exactly `i
+// >= k`) is just as real a proven fact as the condition itself, and it
+// was never applied. `Lt`/`Ge`/`Gt` below just mirror an existing
+// `narrow_for_condition` formula in the opposite direction; `Ne`'s own
+// singleton narrowing is the genuinely NEW capability -- sound for any
+// excluded `k`, mid-range included (the same "interval-set domain"
+// question left open since v9/v11/v13/v14 turned out to be provably
+// inert everywhere it was checked: every check in this file reads only
+// extremes, and Add/Sub/Mul are monotonic, so punching an interior hole
+// in a THEN-branch range can never move a downstream min/max -- but a
+// singleton *else*-branch narrowing needs no interval-set at all, since
+// a singleton is just an ordinary one-piece interval).
+
+#[test]
+fn else_branch_of_lt_is_narrowed_to_ge() {
+    // `else` of `i < 8` is `i >= 8`. Without that fact, `i - 8` is
+    // unprovable (i's raw floor is 0, and the subtrahend 8 could exceed
+    // it) -- matches examples/else_branch_narrowing.tr, the driving
+    // example for this whole feature.
+    let src = "\
+module M {
+    reg total : [8] where total < 3 = 0
+    reg i : [8] where i < 10 = 0
+    rule step {
+        if i < 8 {
+            total := 0
+        } else {
+            total := i - 8
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn else_branch_of_gt_is_narrowed_to_le() {
+    // `else` of `i > 5` is `i <= 5`, i.e. `i < 6` -- a NEW formula (this
+    // language has no separate `Le` recognized by `narrow_for_condition`
+    // itself), not just a mirrored existing one. Without it, `5 - i` is
+    // unprovable (i's raw ceiling is 10, exceeding the minuend 5).
+    let src = "\
+module M {
+    reg total : [8] where total < 6 = 0
+    reg i : [8] where i < 10 = 0
+    rule step {
+        if i > 5 {
+            total := 0
+        } else {
+            total := 5 - i
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn else_branch_of_ge_is_narrowed_to_lt() {
+    // `else` of `i >= 5` is `i < 5`. Without that fact, `total := i`
+    // can't prove `i`'s raw ceiling (10) fits `total`'s declared `< 5`.
+    let src = "\
+module M {
+    reg total : [8] where total < 5 = 0
+    reg i : [8] where i < 10 = 0
+    rule step {
+        if i >= 5 {
+            total := 0
+        } else {
+            total := i
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn else_branch_of_ne_narrows_to_the_exact_singleton_including_mid_range() {
+    // The genuinely new capability: `else` of `i <> 5` is the EXACT
+    // singleton `i == 5` -- `total`'s declared bound (`5 <= total < 6`,
+    // itself the singleton {5}) can only be proven for `total := i` if
+    // the else branch narrows `i` down to exactly 5, not just "some
+    // value in i's raw [0,10) range". 5 is genuinely mid-range (neither
+    // i's floor nor its ceiling), the exact shape v9's own THEN-branch
+    // `Ne` narrowing was documented to leave as a no-op.
+    let src = "\
+module M {
+    reg total : [8] where 5 <= total < 6 = 5
+    reg i : [8] where i < 10 = 0
+    rule step {
+        if i <> 5 {
+            total := 5
+        } else {
+            total := i
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn else_branch_of_ne_with_k_outside_the_current_range_stays_unnarrowed() {
+    // `i <> 50` when `i`'s declared range is `[0,10)`: 50 is outside
+    // i's own proven bound, so the `else` branch (real `i == 50`) is
+    // actually unreachable dead code -- narrowing to a bogus singleton
+    // `[50,51)` there would fall OUTSIDE i's own declared invariant,
+    // risking a wrong VERDICT on the (dead) branch's own writes even
+    // though no real unsoundness is possible (a false premise proves
+    // anything). `total := i` here only stays provable if the guard
+    // (`k` must be within the CURRENT `[lo,hi)`) correctly leaves `i`
+    // unnarrowed at its raw `[0,10)` instead, which exactly fits
+    // `total`'s own declared `< 10`.
+    let src = "\
+module M {
+    reg total : [8] where total < 10 = 0
+    reg i : [8] where i < 10 = 0
+    rule step {
+        if i <> 50 {
+            total := 0
+        } else {
+            total := i
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn else_branch_of_an_always_true_condition_stays_conservatively_unnarrowed() {
+    // An advisor pass caught this: `cnt >= 0` is always true for an
+    // unsigned `cnt`, so `else` is unreachable dead code -- but the
+    // RAW `Ge`-else formula (`(*lo, k.min(*hi))` with `k = 0`) computes
+    // the EMPTY range `(0, 0)`, not just "unnarrowed." Inserting that
+    // empty range unclamped let a write with no real relationship to
+    // `cnt`'s actual range (`total := cnt`, `total`'s declared bound far
+    // narrower than `cnt`'s) slip through as a coincidental VACUOUS
+    // accept, rather than the deliberate, documented "leave dead code
+    // on the raw entry state" fallback `narrow_for_else`'s own doc
+    // comment describes. `total`'s declared bound (`< 3`) is far
+    // narrower than `cnt`'s raw declared range (`< 100`), so the
+    // correct, conservative behavior here is a REJECTION.
+    let src = "\
+module M {
+    reg total : [8] where total < 3 = 0
+    reg cnt : [8] where cnt < 100 = 0
+    rule count {
+        if cnt >= 0 {
+            total := 0
+        } else {
+            total := cnt
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify"));
+}
+
+#[test]
+fn else_branch_of_a_commuted_ne_also_narrows_to_the_singleton() {
+    // The commuted form (`<const> <> <reg>`, v10's own recognized
+    // ordering) was a live path through `narrow_for_else`'s own `Ne`-
+    // only `or_else` fallback with no dedicated test -- the same
+    // "found a real call site with zero coverage" shape v14's own
+    // `Stmt::WhileLet` gap was. Same driving shape as the direct-order
+    // singleton test above, operands swapped.
+    let src = "\
+module M {
+    reg total : [8] where 5 <= total < 6 = 5
+    reg i : [8] where i < 10 = 0
+    rule step {
+        if 5 <> i {
+            total := 5
+        } else {
+            total := i
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}

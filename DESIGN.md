@@ -2975,8 +2975,10 @@ v0 restrictions, all deliberate scope cuts:
   its returned value, and `x != k`/`k != x` are the same fact about the
   same two values. `Lt`/`Gt`/`Ge` stay single-order — `k < x`/`x < k`
   are different claims even as bare predicates. The
-  `else` branch of an `if <>` (a provable singleton) is left unnarrowed
-  — conservative, not incorrect. `while_countdown.tr`'s own down-counter
+  `else` branch of an `if <>` (a provable singleton) was left unnarrowed
+  through v14 — conservative, not incorrect, but v15 below closes this
+  gap: it's now narrowed to the exact singleton. `while_countdown.tr`'s
+  own down-counter
   (`while cnt <> 0 { cnt := cnt - 1 }`) is the lower-edge shape, but that
   file specifically stays unprovable regardless of this feature: `cnt := x`
   reads an unbounded `in` port every cycle, and `cnt` there carries no
@@ -3092,6 +3094,50 @@ v0 restrictions, all deliberate scope cuts:
   it can't find a position that was never wired to `expr_bound` in the
   first place, which needs a distinct "what positions are never
   reached at all" pass.
+- **`else`-branch negated-condition narrowing (v15): an `if`'s `else`
+  branch is now narrowed on the NEGATED condition** (`examples/
+  else_branch_narrowing.tr`) instead of inheriting the raw, unnarrowed
+  entry state. Before writing code, checked whether the v11/v13/v14-
+  deferred interval-set domain was finally worth building now that
+  `Mul` exists — found it's PROVABLY inert, and doubly so: every check
+  in `bounds.rs` reads only a range's extremes, and `Add`/`Sub`/`Mul`
+  are all monotonic (unsigned operands), so an interior hole can never
+  move a downstream min/max — this generalizes v11's "Mul specifically"
+  finding to any monotonic composition, present or future. Separately,
+  `schedule.rs`'s own disjointness proofs — the consumer `bounds.rs`'s
+  own doc names as the whole point of a proven bound — only ever read a
+  def's FLAT, whole-program declared range (`Bounds.ranges`); no
+  per-branch narrowing, edge or hole, reaches that consumer at all, so
+  an interval-set wouldn't change what `schedule.rs` sees either. The
+  real, non-inert alternative found instead: `narrow_for_else` mirrors
+  `narrow_for_condition`'s `Lt`/`Ge`/`Gt` formulas in the negated
+  direction, and adds one genuinely NEW capability for `Ne` — `else` of
+  `i <> k` is the EXACT singleton `i == k`, sound for any `k` (mid-range
+  included), unlike `narrow_for_condition`'s own `Ne` arm (edge-only).
+  A singleton needs no interval-set — it's an ordinary one-piece
+  interval — so this captures the same underlying idea the interval-set
+  domain was chasing, inside the representation already in place. Every
+  arm's raw result is CLAMPED against the def's own current `(lo, hi)`
+  and only inserted when non-empty, a single uniform rule rather than a
+  per-arm guard: an advisor pass found that `Lt`/`Gt`/`Ge`, not just
+  `Ne`, can each degrade to an EMPTY range when their condition is
+  always true for the current bound (`cnt >= 0` on an unsigned `cnt`),
+  and inserting that unclamped let an unrelated write vacuously accept
+  instead of conservatively failing; the same clamp is what keeps
+  `Ne`'s own raw `(k, k+1)` — which doesn't derive from `lo`/`hi` at all
+  — from being inserted for a `k` nowhere near the def's actual proven
+  range. Either way, an unreachable `else` branch left on the raw entry
+  state stays sound (a false premise proves anything). 7 new tests
+  (including the commuted `Ne` form, `<const> <> <reg>`, which had zero
+  coverage until a final advisor pass named it — the same shape as
+  v14's own `Stmt::WhileLet` gap), each bug-reintroduction-verified (a
+  whole-feature disable flips 5; reverting just the clamp-and-
+  emptiness-check to an unconditional raw insert flips the other 2 —
+  the out-of-range-`k` case and the always-true-condition case —
+  together, confirming one fix covers both hazards). A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical except the new driving example, and
+  a `--firrtl` sanity check confirmed clean codegen.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"

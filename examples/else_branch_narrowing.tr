@@ -1,0 +1,12 @@
+module ElseBranchNarrowing {
+    reg total : [8] where total < 3 = 0
+    reg i : [8] where i < 10 = 0
+
+    rule step {
+        if i < 8 {
+            total := 0
+        } else {
+            total := i - 8
+        }
+    }
+}
