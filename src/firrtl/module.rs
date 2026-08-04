@@ -13,7 +13,7 @@ use super::writes::*;
 use crate::ast::{Ast, Expr, ExprId, Item, ItemId, Stmt, StmtId};
 use crate::effects::Effects;
 use crate::resolve::{DefId, DefKind, Resolution};
-use crate::schedule::{Exemption, Schedule};
+use crate::schedule::{ConflictKind, Exemption, Schedule};
 use crate::types::{Ty, Types, Width};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -83,6 +83,10 @@ pub(crate) fn emit_module(
     // write source — doesn't need to change.
     let mut struct_reg_source: HashMap<String, (String, Vec<String>, Ty)> = HashMap::new();
     let mut mems = Vec::new();
+    // Reverse lookup for the checked `conflict_free` mem assertion below
+    // — `conflict.on` gives `DefId`s, but every other mem-emission table
+    // here is keyed by the mem's own name string.
+    let mut mem_name_of: HashMap<DefId, String> = HashMap::new();
     // `(fifo_name, width, depth)`.
     let mut fifos: Vec<(String, u64, u64)> = Vec::new();
     // `(port_name, width)`.
@@ -332,6 +336,7 @@ pub(crate) fn emit_module(
                     );
                     continue;
                 };
+                mem_name_of.insert(def, name.text.clone());
                 mems.push((name.text.clone(), w, len));
             }
             Item::Fifo { name, .. } => {
@@ -569,17 +574,23 @@ pub(crate) fn emit_module(
     }
 
     // Both exemption kinds waive the derived stall above (loop just
-    // finished). Only `mutually_exclusive` gets a runtime check here —
-    // it claims the two rules never both fire, which is checkable by
+    // finished). `mutually_exclusive` gets a runtime check here — it
+    // claims the two rules never both fire, which is checkable by
     // asserting exactly that. `conflict_free` claims the OPPOSITE thing
-    // (safe to fire together) and stays trusted, not checked: v0 has no
-    // way to prove or check address disjointness (DESIGN.md's tier-3
-    // proof, deferred), so there is nothing sound to assert for it —
-    // see this module's own doc comment and schedule.rs's `Exemption`.
-    // `enable` is gated on `not(reset)` since a rule's own guard may
-    // read state that hasn't settled to its real reset value yet on the
-    // reset cycle itself, and a spurious fires-both during reset would
-    // be a false claim violation, not a real one.
+    // (safe to fire together): for a mem read/write pair specifically,
+    // that claim's own precondition (different addresses) is ALSO
+    // checkable, and gets its own assertion further down, once the mem
+    // read/write ports below are compiled (this loop runs before them,
+    // so their addresses aren't available yet); see that block's own
+    // comment. For any non-mem shared state a `conflict_free` pair might
+    // also touch, v0 has no way to prove or check disjointness at all
+    // (DESIGN.md's tier-3 proof, deferred), so it stays trusted, not
+    // checked, there — see this module's own doc comment and
+    // schedule.rs's `Exemption`. `enable` is gated on `not(reset)` since
+    // a rule's own guard may read state that hasn't settled to its real
+    // reset value yet on the reset cycle itself, and a spurious
+    // fires-both during reset would be a false claim violation, not a
+    // real one.
     for (i, conflict) in conflicts.iter().enumerate() {
         if conflict.exemption != Exemption::MutuallyExclusive {
             continue;
@@ -615,6 +626,15 @@ pub(crate) fn emit_module(
     // mem's own address width — a bare-literal address (`x := 5`) has
     // no width of its own to fall back on otherwise.
     let mut mem_body = String::new();
+    // Per (mem, reading rule), every read-site address compiled at a
+    // TOP-LEVEL statement of that rule — used below to emit a checked
+    // `conflict_free` disjointness assertion. A read nested inside an
+    // if/else is deliberately excluded: read ports are driven
+    // unconditionally ("reads are free" above), so a branch-local read's
+    // address is still wired up even on cycles that don't take that
+    // branch, and asserting against it would be a false positive on a
+    // correct design, not a real hazard.
+    let mut read_addrs: HashMap<(String, ItemId), Vec<String>> = HashMap::new();
     for (site_expr, (port, owning_rule, owning_stmt)) in cx.read_ports.clone() {
         let Expr::Bracket { callee, args } = ast.expr(site_expr).clone() else {
             continue;
@@ -630,6 +650,12 @@ pub(crate) fn emit_module(
         cx.enter_rule(owning_rule);
         cx.set_pos(owning_rule, owning_stmt);
         let addr = cx.compile_expr_hinted(args[0], addr_w).unwrap_or_default();
+        if rule_body(ast, owning_rule).contains(&owning_stmt) {
+            read_addrs
+                .entry((mem_name.clone(), owning_rule))
+                .or_default()
+                .push(addr.clone());
+        }
         if let Some((readers, _)) = mem_ports.get_mut(&mem_name) {
             readers.push(port.clone());
         }
@@ -645,6 +671,11 @@ pub(crate) fn emit_module(
     // because the rule fires, so `en` can no longer be a plain OR of
     // `fires` alone — each writer's own write-enable (from
     // `mem_write_in_stmts`) has to factor in too.
+    // Per (mem, writing rule): its own write-enable (branch-muxed, but
+    // not yet ANDed with the rule's own `fires`) and address — used
+    // below, alongside `read_addrs`, to emit a checked `conflict_free`
+    // disjointness assertion.
+    let mut write_info: HashMap<(String, ItemId), (String, String)> = HashMap::new();
     for (mem_name, elem_width, depth) in &mems {
         let writers = writers_of(ast, res, &rules, mem_name);
         if writers.is_empty() {
@@ -676,6 +707,9 @@ pub(crate) fn emit_module(
                 (rule, wrote, addr, data)
             })
             .collect();
+        for (rule, wrote, addr, _data) in &per_writer {
+            write_info.insert((mem_name.clone(), *rule), (wrote.clone(), addr.clone()));
+        }
         let en = per_writer
             .iter()
             .map(|(rule, wrote, ..)| format!("and({}, {wrote})", fires_name[rule]))
@@ -710,6 +744,66 @@ pub(crate) fn emit_module(
             let _ = writeln!(mem_body, "    when {f} :");
             let _ = writeln!(mem_body, "      connect {mem_name}.{port}.addr, {addr}");
             let _ = writeln!(mem_body, "      connect {mem_name}.{port}.data, {data}");
+        }
+    }
+
+    // `conflict_free { a, b }` on a mem read/write pair claims a
+    // specific, checkable precondition — see `conflict_free_mem.tr`'s
+    // own comment: "a write and a read to DIFFERENT addresses are
+    // genuinely safe to happen concurrently". Both addresses are real
+    // compiled signals (just gathered above), so unlike the general
+    // "safe to fire together" trust `conflict_free` still is for any
+    // non-mem shared state, this specific claim gets a runtime
+    // assertion, exactly like `mutually_exclusive`'s. It fires only when
+    // the reader's rule fires, the writer's rule actually writes this
+    // cycle, AND the two addresses coincide — a read nested inside an
+    // if/else that `read_addrs` excluded (see that map's own comment)
+    // simply gets no coverage, never a false alarm. Auto-`Disjoint`
+    // pairs need none of this (already proven); `mutually_exclusive`
+    // pairs need none either (they never both fire, so never collide).
+    let mut checked_asserts: usize = 0;
+    for conflict in conflicts {
+        if conflict.exemption != Exemption::ConflictFree || conflict.kind != ConflictKind::ReadWrite
+        {
+            continue;
+        }
+        for def in &conflict.on {
+            if res.def(*def).kind != DefKind::Mem {
+                continue;
+            }
+            let Some(mem_name) = mem_name_of.get(def) else {
+                continue;
+            };
+            let (reader, writer) = if fx
+                .sigs
+                .get(&conflict.a)
+                .is_some_and(|s| s.writes.contains(def))
+            {
+                (conflict.b, conflict.a)
+            } else {
+                (conflict.a, conflict.b)
+            };
+            let Some(raddrs) = read_addrs.get(&(mem_name.clone(), reader)) else {
+                continue;
+            };
+            let Some((wrote, waddr)) = write_info.get(&(mem_name.clone(), writer)) else {
+                continue;
+            };
+            let reader_fires = &fires_name[&reader];
+            let writer_active = format!("and({}, {wrote})", fires_name[&writer]);
+            let reader_name = item_name(ast, reader);
+            let writer_name = item_name(ast, writer);
+            for raddr in raddrs {
+                let collide =
+                    format!("and({reader_fires}, and({writer_active}, eq({raddr}, {waddr})))");
+                let _ = writeln!(
+                    mem_body,
+                    "    assert(clock, not({collide}), not(reset), \"conflict_free claim \
+                     violated: rule {reader_name} and rule {writer_name} accessed the same \
+                     address in `{mem_name}` the same cycle\") : conflict_free_mem_check_{checked_asserts}"
+                );
+                checked_asserts += 1;
+            }
         }
     }
 

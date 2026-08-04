@@ -15,9 +15,13 @@
 //! the same cycle — checked, `Emitter` (firrtl/module.rs) emits a
 //! FIRRTL `assert` for it. `conflict_free { a, b }` claims it's safe
 //! for both to fire the same cycle (e.g. genuinely separate ports on
-//! one resource) — trusted, NOT checked: user-directed, for cases the
-//! compiler cannot see into (an enable condition, a genuinely separate
-//! port the effect system doesn't model as such).
+//! one resource) — trusted, NOT checked, for cases the compiler cannot
+//! see into (an enable condition, a genuinely separate port the effect
+//! system doesn't model as such). The one exception: when the pair
+//! shares a `mem`, the claim's own precondition (the addresses actually
+//! differ) IS observable — both are real compiled port signals — so
+//! `Emitter` emits a checked assertion for it too, alongside the waived
+//! stall, same spirit as `mutually_exclusive`'s (see firrtl/module.rs).
 //!
 //! A third case is neither user-directed nor trusted: a read/write pair
 //! that both touch the same `mem` is auto-checked for address
@@ -104,7 +108,11 @@ pub enum Exemption {
     None,
     /// `mutually_exclusive { a, b }` — checked via a simulation assertion.
     MutuallyExclusive,
-    /// `conflict_free { a, b }` — trusted, unchecked in v0.
+    /// `conflict_free { a, b }` — trusted, unchecked in v0 for any
+    /// non-mem shared state. For a read/write pair sharing a mem, the
+    /// claim's own precondition (the two addresses actually differ) is
+    /// checkable and DOES get a simulation assertion — see
+    /// `firrtl/module.rs`'s emission of `conflict_free_mem_check_N`.
     ConflictFree,
     /// Auto-derived, not user-written: every shared mem access site on
     /// this read/write pair provably touches a different address — see
@@ -503,9 +511,25 @@ impl Schedule {
                         "    claimed mutually_exclusive: no stall derived (checked in \
                          simulation)\n",
                     ),
-                    Exemption::ConflictFree => out.push_str(
-                        "    claimed conflict_free: no stall derived (trusted, not checked)\n",
-                    ),
+                    Exemption::ConflictFree => {
+                        // Whether the emitter (firrtl/module.rs) actually
+                        // adds a runtime assertion for this pair depends
+                        // on whether any shared def is a mem — plain
+                        // registers/fifos stay fully trusted, no assert
+                        // exists for those. `on` is exactly this pair's
+                        // shared state, so it's checkable right here
+                        // without needing the emitter's own per-read-site
+                        // bookkeeping.
+                        let checked = c.on.iter().any(|d| res.def(*d).kind == DefKind::Mem);
+                        out.push_str(if checked {
+                            "    claimed conflict_free: no stall derived (mem addresses \
+                             checked in simulation; any other shared state stays trusted, \
+                             not checked)\n"
+                        } else {
+                            "    claimed conflict_free: no stall derived (trusted, not \
+                             checked)\n"
+                        });
+                    }
                     Exemption::Disjoint => out.push_str(
                         "    index sites proven disjoint (constant addresses, or the same base \
                          plus a constant offset): no stall derived (no annotation needed)\n",

@@ -2099,6 +2099,23 @@ manually in the meantime.
   case is still tier 3, explicitly deferred in DESIGN.md. Explicitly NOT
   dependent/refinement types: a syntactic affine-offset check in
   schedule.rs, no new types or propositions.
+- **RESOLVED — a `conflict_free` mem read/write pair the disjointness
+  proof above can't close now gets a checked runtime assertion, not just
+  a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,
+  `examples/conflict_free_mem.tr`). This is not the tier-3 range-tracking
+  gap above closing — it can't be, since the driving case
+  (`write_addr`/`read_addr`, module inputs) has no provable value set at
+  all for a static proof to ever bound — it's a DIFFERENT, complementary
+  answer for exactly that shape: the two addresses are real compiled
+  port signals, so the claim's own precondition (they differ) is
+  checkable in simulation even though it isn't provable at compile time.
+  Scoped to read sites that are unconditional top-level statements in
+  their rule (`read_addrs` in `module.rs`) — a branch-nested read is
+  silently excluded rather than risking a false-positive assertion on a
+  correct design, since read ports are wired up unconditionally
+  regardless of which branch a cycle actually takes. Non-mem shared
+  state in a `conflict_free` pair stays fully trusted/unchecked, as
+  before.
 - `combines` combinational-loop checking delegates entirely to firtool's
   `CheckCombLoops`, run only by `devenv.nix`'s `simulate` script and
   `tests/sim.rs` — never by `trace` itself, and its diagnostics are never

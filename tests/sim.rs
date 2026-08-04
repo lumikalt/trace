@@ -1428,6 +1428,47 @@ fn conflict_free_mem_runs_through_real_ports() {
 }
 
 #[test]
+fn conflict_free_mem_checked_assertion_catches_address_collision() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/conflict_free_mem.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sim/conflict_free_mem_collision_tb.v"
+    );
+    let output = simulate(&verilog, testbench);
+
+    // The whole point of this test: `conflict_free`'s stated precondition
+    // ("a write and a read to DIFFERENT addresses") is now a genuine
+    // runtime check, not just a trusted claim — a window where it
+    // actually holds produces no assertion failure, while a window that
+    // deliberately collides the two addresses DOES.
+    let marker = "SAFE WINDOW DONE";
+    let split = output.find(marker).unwrap_or_else(|| {
+        panic!("testbench did not print its own \"{marker}\" marker:\n{output}")
+    });
+    let (safe_window, rest) = output.split_at(split);
+    let violation_message = "conflict_free claim violated: rule read and rule write accessed \
+                              the same address in `m` the same cycle";
+    assert!(
+        !safe_window.contains(violation_message),
+        "assertion fired during the SAFE window (false positive):\n{output}"
+    );
+    assert!(
+        rest.contains(violation_message),
+        "assertion did NOT fire during the deliberately-colliding window (dead check):\n{output}"
+    );
+}
+
+#[test]
 fn fifo_passthrough_runs_through_real_ports() {
     if !tool_available("firtool") || !tool_available("iverilog") {
         eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");

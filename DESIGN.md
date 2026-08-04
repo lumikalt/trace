@@ -2732,13 +2732,19 @@ pair.
 
 `conflict_free { a, b }` claims it is safe for both rules to fire the same
 cycle — for example, a memory with independent read/write address ports, where a
-same-cycle read and write to different addresses do not hazard. This claim is
-**trusted, not checked**: for a runtime-valued index (`m[write_addr]` against
-`m[read_addr]`), v0 cannot prove or check the addresses are actually disjoint,
-so there is nothing sound to assert; only the derived stall is waived. When
-BOTH sides' indices happen to be compile-time constants instead, the scheduler
-proves disjointness on its own rather than asking for this annotation at all —
-see "Arrays: one resource each" below.
+same-cycle read and write to different addresses do not hazard. For a pair
+sharing only mem accesses, this specific precondition — the two addresses
+actually differ — is **checked**, not just trusted: both addresses are real
+compiled FIRRTL signals (the mem's independent reader/writer ports), so the
+emitter inserts a simulation assertion alongside the waived stall, exactly like
+`mutually_exclusive`'s own check (see "Scheduling" below). For any non-mem
+shared state a `conflict_free` pair might also touch, or for a runtime-valued
+index the scheduler can't observe (which is still the common case — module
+inputs like `write_addr`/`read_addr` have no provable value set at all), the
+claim stays **trusted, unchecked**. When BOTH sides' indices happen to be
+compile-time constants, or the same affine base, instead, the scheduler proves
+disjointness on its own rather than asking for this annotation, or a runtime
+check, at all — see "Arrays: one resource each" below.
 
 `conflict_free` is only meaningful for a read/write conflict, never a
 write/write one: v0 gives no meaning to two rules writing the same register or
@@ -2955,8 +2961,26 @@ those independent of firing. The assertion's own enable is gated on
 real post-reset value on the reset cycle itself, and a spurious both-fire there
 would be a false violation.
 
-`conflict_free` waives the derived stall the same way, but emits no assertion:
-there is nothing sound to check in v0.
+`conflict_free` waives the derived stall the same way. When every def the
+pair shares is a `mem`, it ALSO emits one assertion per (mem, qualifying read
+site) checking that specific def's addresses never coincide while both rules
+fire:
+
+```
+assert(clock, not(and(fires_read, and(and(fires_write, UInt<1>(1)), eq(read_addr, write_addr)))), not(reset), "conflict_free claim violated: rule read and rule write accessed the same address in `m` the same cycle") : conflict_free_mem_check_0
+```
+
+(`examples/conflict_free_mem.tr`'s own emission — `and(fires_write, UInt<1>(1))`
+is that rule's write-enable, unconditional here since the rule has no internal
+branching to mux; a branch-conditional writer's own muxed enable takes its
+place instead, see `mem_write_in_stmts`.) A read site nested inside an if/else
+is silently excluded from this check, never asserted against: read ports are
+driven unconditionally regardless of which branch a cycle actually takes (see
+"Arrays: one resource each"), so a branch-local read's wired-up address can be
+stale/irrelevant on a cycle that doesn't take that branch — asserting against
+it would be a false alarm on a correct design, not a caught hazard. For any
+non-mem shared state, `conflict_free` still emits no assertion: there is
+nothing sound to check on a plain register or fifo the same way.
 
 `mutually_exclusive` and `conflict_free` are named to match Bluespec's own
 vocabulary for these two ideas, rather than inventing new terms bsc already has
@@ -2993,6 +3017,15 @@ tracking — a whole type-system feature on its own, out of scope for v0 so the
 scheduler work stays bounded. The same-base affine case (`m[i]` against
 `m[i+1]`) is NOT this; it's a syntactic check that needs no range tracking at
 all, since a shared base's value is identical on both sides by construction.
+
+The checked `conflict_free` assertion above is not a smaller version of this
+tier, and does not retire it: it checks a runtime PRECONDITION (do these two
+addresses happen to differ THIS cycle), not a static proof (do they ALWAYS
+differ). For the driving case — `conflict_free_mem.tr`'s `write_addr`/
+`read_addr`, module inputs with no provable value set at all — no static
+range-tracking scheme could ever close this anyway; a primary input's possible
+values are unbounded by definition. A checked assertion is the correct, and
+only, mechanism for that shape, tier 3 or not.
 
 ## Combinational loops: what the checker does
 
@@ -4229,13 +4262,16 @@ noted:
 - `A or B or C`: a fallback chain over fifo `Deq[]` alternatives, with an
   optional infallible default tail (`examples/or_fifos.tr`).
 - The `schedule` block: `urgency`, `mutually_exclusive` (checked simulation
-  assertion), `conflict_free` (trusted, unchecked; rejected outright on a
-  write/write conflict), plus an auto-derived third exemption needing no
-  annotation at all: a read/write pair whose mem indices are either ALL
-  compile-time-constant integers (`examples/mem_disjoint_rw.tr`) or an affine
-  expression of the SAME base register/input with the mem's own depth a power
-  of two (`m[i]` vs `m[i+1]`, `examples/mem_disjoint_affine.tr`), and provably
-  different either way.
+  assertion), `conflict_free` (rejected outright on a write/write conflict;
+  for a read/write mem pair, its "addresses actually differ" precondition
+  gets a checked simulation assertion too — `examples/conflict_free_mem.tr`
+  — trusted/unchecked only for non-mem shared state), plus an auto-derived
+  third exemption needing no annotation at all: a read/write pair whose mem
+  indices are either ALL compile-time-constant integers
+  (`examples/mem_disjoint_rw.tr`) or an affine expression of the SAME base
+  register/input with the mem's own depth a power of two (`m[i]` vs
+  `m[i+1]`, `examples/mem_disjoint_affine.tr`), and provably different
+  either way.
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/

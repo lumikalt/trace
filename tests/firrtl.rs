@@ -381,6 +381,26 @@ fn mem_disjoint_affine_needs_no_conflict_free_annotation() {
 }
 
 #[test]
+fn conflict_free_mem_pair_gets_a_checked_disjointness_assertion() {
+    // conflict_free_mem.tr's `write_addr`/`read_addr` are module INPUTS,
+    // not registers with a provable value set -- there's no static proof
+    // available here (unlike mem_disjoint_rw.tr/mem_disjoint_affine.tr
+    // just above), so the pair stays on the user-written `conflict_free`
+    // annotation. Unlike a non-mem `conflict_free` claim, though, this
+    // one's precondition ("a write and a read to DIFFERENT addresses")
+    // is checkable: both addresses are real compiled signals, so the
+    // emitter adds a runtime assertion instead of trusting it blind.
+    let fir =
+        emit_from_source(&read_example("conflict_free_mem.tr")).expect("emission should succeed");
+    assert!(fir.contains(
+        "assert(clock, not(and(fires_read, and(and(fires_write, UInt<1>(1)), eq(read_addr, \
+         write_addr)))), not(reset), \"conflict_free claim violated: rule read and rule write \
+         accessed the same address in `m` the same cycle\") : conflict_free_mem_check_0"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn errors_on_unlowered_sequences_rule() {
     // emit_from_source lowers automatically when lowering applies, and
     // (self-caught while testing `while`'s own lowering) now correctly
