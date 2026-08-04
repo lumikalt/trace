@@ -417,10 +417,11 @@ impl<'a> Parser<'a> {
             None
         };
         // `where <ident> < <const>`, or `where <const> <= <ident> <
-        // <const>` for the two-sided form — v0 restriction: `reg` only
-        // (an `in` has no write site at all to prove anything over;
-        // `out` is register-backed and provable in principle but has no
-        // driving example yet, see DESIGN.md). Parsed BEFORE `= init`
+        // <const>` for the two-sided form — v0 restriction: `reg`/`out`
+        // only (an `in` has no write site at all to prove anything
+        // over, see DESIGN.md; `out` is register-backed and written via
+        // the same `Stmt::Assign` shape a `reg` is, so the identical
+        // induction argument applies unchanged). Parsed BEFORE `= init`
         // (`resolve.rs`/`bounds.rs` validate the actual shape, same
         // precedent as `IfLet`'s `init`). Built manually rather than via
         // `self.parse_expr(0)` on the whole clause: `=` is ALSO a
@@ -458,10 +459,10 @@ impl<'a> Parser<'a> {
         } else {
             (None, None)
         };
-        if bound.is_some() && keyword != TokenKind::Reg {
+        if bound.is_some() && keyword != TokenKind::Reg && keyword != TokenKind::Output {
             self.errors.push(ParseError {
                 span: where_span.clone(),
-                message: "`where` is only allowed on `reg` declarations (v0 restriction)"
+                message: "`where` is only allowed on `reg`/`out` declarations (v0 restriction)"
                     .to_string(),
             });
         }
@@ -503,7 +504,13 @@ impl<'a> Parser<'a> {
                         lower,
                     }
                 } else {
-                    Item::Output { name, ty, init }
+                    Item::Output {
+                        name,
+                        ty,
+                        init,
+                        bound,
+                        lower,
+                    }
                 }
             }
             TokenKind::Mem => Item::Mem {

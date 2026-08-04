@@ -540,10 +540,23 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(port.ty, false);
                 }
             }
-            Item::Output { ty, init, .. } => {
+            Item::Output {
+                ty,
+                init,
+                bound,
+                lower,
+                ..
+            } => {
                 self.resolve_expr(*ty, false);
                 if let Some(init) = init {
                     self.resolve_expr(*init, false);
+                }
+                if let Some(bound) = bound {
+                    self.resolve_expr(*bound, false);
+                    self.check_bound_self_reference(id, *bound);
+                }
+                if let Some(lower) = lower {
+                    self.resolve_expr(*lower, false);
                 }
             }
             Item::Inst { module, .. } => {
@@ -1066,7 +1079,7 @@ impl<'a> Resolver<'a> {
         if self.res.expr_defs.get(&lhs).copied() != Some(reg_def) {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
-                "a `where` bound must reference the same reg it's declared on".to_string(),
+                "a `where` bound must reference the same reg/out it's declared on".to_string(),
             );
         }
     }

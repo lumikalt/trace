@@ -408,3 +408,38 @@ module M {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("go below 5"));
 }
+
+#[test]
+fn out_guarded_increment_is_proven() {
+    // v8: `where` extended to `out` -- the identical induction argument
+    // `guarded_increment_is_proven` already pins for `reg`, now on an
+    // `out` (register-backed, same `Stmt::Assign` shape).
+    let src = "\
+module M {
+    out i : [4] where i < 9 = 0
+    rule bump {
+        if i < 8 {
+            i := i + 1
+        } else {
+            i := 0
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn out_unguarded_increment_is_rejected() {
+    let src = "\
+module M {
+    out i : [4] where i < 9 = 0
+    rule bump {
+        i := i + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify"));
+}

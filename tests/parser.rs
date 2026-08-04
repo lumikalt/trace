@@ -1190,11 +1190,23 @@ fn where_clause_is_rejected_on_an_input() {
 }
 
 #[test]
-fn where_clause_is_rejected_on_an_output() {
-    let (tokens, _) = lexer::lex("module M {\n out i : [4] where i < 10 = 0\n}\n");
-    let (_, errors) = parser::parse("module M {\n out i : [4] where i < 10 = 0\n}\n", &tokens);
-    assert!(!errors.is_empty());
-    assert!(errors[0].message.contains("only allowed on `reg`"));
+fn where_clause_parses_on_an_output() {
+    // v8: `where` extended to `out` (register-backed, same `Stmt::Assign`
+    // shape a `reg` is), mirroring `where_clause_parses_on_a_reg`.
+    let ast = parse_ok("module M {\n out i : [4] where i < 10 = 0\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Output {
+        name, bound, init, ..
+    } = ast.item(items[0])
+    else {
+        panic!("expected an output");
+    };
+    assert_eq!(name.text, "i");
+    assert!(init.is_some());
+    let bound = bound.expect("where clause should have parsed");
+    assert_eq!(ast.expr_sexpr(bound), "(< i 10)");
 }
 
 #[test]

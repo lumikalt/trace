@@ -14,11 +14,11 @@
 //! plugs in as a THIRD, independent disjointness argument).
 //!
 //! v0 restrictions, all deliberate scope cuts, not oversights:
-//! - `reg` only. An `in` has no internal write site at all — a bound on
-//!   it would be a TRUSTED external contract (this module's whole point
-//!   is proof, not trust), a different feature. An `out` is register-
-//!   backed and provable in principle, but has no motivating example
-//!   yet — parser.rs rejects `where` on either.
+//! - `reg`/`out` only (v8: `out` gained this too — see below). An `in`
+//!   has no internal write site at all — a bound on it would be a
+//!   TRUSTED external contract (this module's whole point is proof, not
+//!   trust), a different feature entirely; parser.rs still rejects
+//!   `where` on it.
 //! - A single strict upper bound against a compile-time constant,
 //!   optionally paired with an explicit LOWER end too (`where L <= i <
 //!   K`, inclusive): a bare `where i < K` is exactly `where 0 <= i < K`
@@ -71,17 +71,18 @@
 //!
 //! # Frozen reads, not forward-mutated (unlike a `Stmt::Let` local)
 //!
-//! Every read of a `reg` within a rule/fn body sees the value from the
-//! START of the cycle (DESIGN.md: "a register read... sees the OLD
+//! Every read of a `reg`/`out` within a rule/fn body sees the value from
+//! the START of the cycle (DESIGN.md: "a register read... sees the OLD
 //! (pre-edge) value... the same rule every other register read in this
-//! language follows"), never a value written earlier in the SAME body
-//! by an earlier statement. So a bounded reg's tracked bound is FROZEN
-//! at its declared limit for the whole walk of one item — narrowed only
-//! by an enclosing `if <bounded-reg> < <const>` guard's own branch, and
-//! reverted once that branch ends. Writes are CHECKED against it, never
-//! allowed to update it. Only `Stmt::Let` locals get real (blocking)
-//! forward-flow tracking, needed for the realistic `let next = i + 1; i
-//! := next` shape.
+//! language follows"; `out` "behaves like a plain `reg` inside a rule —
+//! same `:=` write, same effect row, same scheduling"), never a value
+//! written earlier in the SAME body by an earlier statement. So a
+//! bounded def's tracked bound is FROZEN at its declared limit for the
+//! whole walk of one item — narrowed only by an enclosing `if <bounded
+//! def> < <const>` guard's own branch, and reverted once that branch
+//! ends. Writes are CHECKED against it, never allowed to update it.
+//! Only `Stmt::Let` locals get real (blocking) forward-flow tracking,
+//! needed for the realistic `let next = i + 1; i := next` shape.
 //!
 //! # Branch/loop scoping (a deliberate v1 simplification)
 //!
@@ -124,8 +125,9 @@ pub struct Bounds {
     pub ranges: HashMap<DefId, (u64, u64)>,
 }
 
-/// One bounded reg's own declared facts, collected once up front.
-struct BoundedReg {
+/// One bounded def's (a `reg` or an `out`) own declared facts, collected
+/// once up front.
+struct BoundedDef {
     lower: u64,
     upper: u64,
     width: u64,
@@ -141,7 +143,7 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         found_writes: HashSet::new(),
         errors: Vec::new(),
     };
-    checker.collect_bounded_regs();
+    checker.collect_bounded_defs();
     let bodied = checker.collect_bodied_items();
     for id in &bodied {
         checker.check_item(*id);
@@ -162,7 +164,7 @@ struct Checker<'a> {
     res: &'a Resolution,
     fx: &'a Effects,
     ty: &'a Types,
-    bounded: HashMap<DefId, BoundedReg>,
+    bounded: HashMap<DefId, BoundedDef>,
     /// Every bounded def this pass found an ACTUAL `Stmt::Assign` for,
     /// anywhere in the program — cross-checked against `fx`'s own
     /// per-item write sets once the whole walk finishes (defense in
@@ -178,17 +180,17 @@ impl<'a> Checker<'a> {
         self.errors.push(BoundsError { span, message });
     }
 
-    /// Every reg with a `where` bound, keyed by its own `DefId`. The
-    /// bound's shape (`Binary { Lt, Ident(self), <const> }`) is
+    /// Every `reg`/`out` with a `where` bound, keyed by its own `DefId`.
+    /// The bound's shape (`Binary { Lt, Ident(self), <const> }`) is
     /// guaranteed by construction: the parser only ever builds a
     /// `where` clause this way (hard-requires the literal `<` token),
     /// and `resolve.rs` already requires the LHS self-reference this
-    /// same reg — so nothing left to validate here but extracting the
-    /// range and the reg's own declared width. `lower` (`None` for the
+    /// same def — so nothing left to validate here but extracting the
+    /// range and the def's own declared width. `lower` (`None` for the
     /// one-sided surface form) is trusted to already const-fold to less
     /// than the upper limit — `types/stmt.rs`'s `check_where_bound_init`
     /// already validated exactly that as this bound's base case.
-    fn collect_bounded_regs(&mut self) {
+    fn collect_bounded_defs(&mut self) {
         let mut stack: Vec<ItemId> = self.ast.roots.clone();
         while let Some(id) = stack.pop() {
             match self.ast.item(id) {
@@ -197,53 +199,62 @@ impl<'a> Checker<'a> {
                     bound: Some(bound),
                     lower,
                     ..
-                } => {
-                    let Expr::Binary { rhs, .. } = self.ast.expr(*bound) else {
-                        continue;
-                    };
-                    let Some(upper) = const_fold(self.ast, *rhs) else {
-                        continue; // types.rs already reported this
-                    };
-                    let lower_val = match lower {
-                        Some(l) => match const_fold(self.ast, *l) {
-                            Some(v) => v,
-                            None => continue, // types.rs already reported this
-                        },
-                        None => 0,
-                    };
-                    let Some(def) = self.res.item_defs.get(&id).copied() else {
-                        continue;
-                    };
-                    let Some(width) = base_width(self.ty, def) else {
-                        // A concretely-known `bits[N]` width is exactly
-                        // what every check below needs to clamp a
-                        // composed bound against — an unknown width
-                        // (e.g. a non-elaboration-constant size
-                        // expression, silently `Ty::Bits(Width::
-                        // Unknown)` per `types/eval.rs`, with no error
-                        // of its own) must not let the whole `where`
-                        // clause go unchecked with zero diagnostic.
-                        let span = self.ast.expr_spans[bound.0 as usize].clone();
-                        self.error(
-                            span,
-                            "a `where` bound needs a reg with a concretely-known `bits[N]` \
-                             width to check against (v0 restriction)"
-                                .to_string(),
-                        );
-                        continue;
-                    };
-                    self.bounded.insert(
-                        def,
-                        BoundedReg {
-                            lower: lower_val,
-                            upper,
-                            width,
-                        },
-                    );
                 }
+                | Item::Output {
+                    bound: Some(bound),
+                    lower,
+                    ..
+                } => self.collect_one_bounded_def(id, *bound, *lower),
                 _ => {}
             }
         }
+    }
+
+    /// The shared body behind both `collect_bounded_defs` match arms
+    /// (`reg` and `out` are otherwise structurally identical here — see
+    /// that function's own doc comment).
+    fn collect_one_bounded_def(&mut self, id: ItemId, bound: ExprId, lower: Option<ExprId>) {
+        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
+            return;
+        };
+        let Some(upper) = const_fold(self.ast, *rhs) else {
+            return; // types.rs already reported this
+        };
+        let lower_val = match lower {
+            Some(l) => match const_fold(self.ast, l) {
+                Some(v) => v,
+                None => return, // types.rs already reported this
+            },
+            None => 0,
+        };
+        let Some(def) = self.res.item_defs.get(&id).copied() else {
+            return;
+        };
+        let Some(width) = base_width(self.ty, def) else {
+            // A concretely-known `bits[N]` width is exactly what every
+            // check below needs to clamp a composed bound against — an
+            // unknown width (e.g. a non-elaboration-constant size
+            // expression, silently `Ty::Bits(Width::Unknown)` per
+            // `types/eval.rs`, with no error of its own) must not let
+            // the whole `where` clause go unchecked with zero
+            // diagnostic.
+            let span = self.ast.expr_spans[bound.0 as usize].clone();
+            self.error(
+                span,
+                "a `where` bound needs a reg/out with a concretely-known `bits[N]` width to \
+                 check against (v0 restriction)"
+                    .to_string(),
+            );
+            return;
+        };
+        self.bounded.insert(
+            def,
+            BoundedDef {
+                lower: lower_val,
+                upper,
+                width,
+            },
+        );
     }
 
     /// All rule/fn items, recursively through modules — the same
@@ -325,8 +336,8 @@ impl<'a> Checker<'a> {
                             "cannot verify this write stays within the declared bound \
                              `{lower} <= _ < {upper}` (either an unsupported expression shape, \
                              or a subtraction that isn't provably non-negative here — only a \
-                             bare bounded reg/local, a literal, their sum, or a provably-in-range \
-                             difference is recognized)"
+                             bare bounded reg/out/local, a literal, their sum, or a \
+                             provably-in-range difference is recognized)"
                         ),
                     ),
                     Some((_, hi)) if hi > 1u64.checked_shl(width as u32).unwrap_or(u64::MAX) => {

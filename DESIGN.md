@@ -2945,11 +2945,14 @@ own computed value range against the declared bound. An `if <bounded-reg> <
 < 8` proves `i + 1`'s composed range is `< 9`, exactly the declared bound).
 
 v0 restrictions, all deliberate scope cuts:
-- **`reg` only.** An `in` has no internal write site at all to prove
-  anything over — a bound on it would be a TRUSTED external contract (this
-  feature's whole point is proof, not trust), a different feature entirely.
-  An `out` is register-backed and provable in principle, but has no
-  motivating example yet.
+- **`reg`/`out` (v8: `out` gained this too).** `out` is register-backed
+  and written via the exact same `Stmt::Assign` shape a `reg` is — a pure
+  plumbing extension, not a new proof, since `bounds.rs`'s induction
+  argument never cared which kind of state def it was checking; see
+  `examples/output_bounded.tr`. An `in` still has no internal write site
+  at all to prove anything over — a bound on it would be a TRUSTED
+  external contract (this feature's whole point is proof, not trust), a
+  different feature entirely; `where` still isn't accepted there.
 - **A single strict upper bound against a compile-time constant, optionally
   paired with an explicit lower end.** No multi-variable or otherwise
   arbitrary bound expressions on either end. `narrow_for_condition` narrows
@@ -2977,10 +2980,12 @@ v0 restrictions, all deliberate scope cuts:
 - **No interaction with the banking argument (v3).** That argument's
   soundness rests on a modular fact a proven bound doesn't slot into, and no
   design needs the combination.
-- **Every register read is FROZEN, not forward-mutated, for the whole
+- **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
-  register read in this language follows (a write earlier in the SAME body
-  is never visible to a later read in that body). Only a `Stmt::Let` local
+  register (and, identically, `out` — DESIGN.md's own "Module ports"
+  section: `out` "behaves like a plain `reg` inside a rule") read in this
+  language follows (a write earlier in the SAME body is never visible to
+  a later read in that body). Only a `Stmt::Let` local
   gets real (blocking) forward-flow tracking, needed for `let next = i + 1;
   i := next`. Entering ANY nested scope (`if`/`while`/`if let`/`while let`)
   clones both the frozen bound map and the locals map and discards the clone

@@ -1,0 +1,18 @@
+-- v8 of bounds.rs: `where` extended to `out` ports. `out` is register-
+-- backed (DESIGN.md: "out is register-backed by design") and written via
+-- the exact same `Stmt::Assign` shape a `reg` is, so this is a plumbing
+-- extension, not a new proof -- the identical induction argument
+-- `examples/mem_disjoint_bounded.tr`'s `reg i` already used, now reachable
+-- from a second item kind. `cnt < 99` narrows `cnt`'s frozen upper bound
+-- before `cnt := cnt + 1`, exactly mirroring the `reg` version.
+module OutputBounded {
+    out cnt : [8] where cnt < 100 = 0
+
+    rule count {
+        if cnt < 99 {
+            cnt := cnt + 1
+        } else {
+            cnt := 0
+        }
+    }
+}

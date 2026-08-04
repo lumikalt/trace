@@ -137,7 +137,13 @@ impl<'a> TypeChecker<'a> {
                     }
                     self.state_tys.insert(def, ty);
                 }
-                Item::Output { ty, init, .. } => {
+                Item::Output {
+                    ty,
+                    init,
+                    bound,
+                    lower,
+                    ..
+                } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
                     if !matches!(
                         ty,
@@ -170,6 +176,9 @@ impl<'a> TypeChecker<'a> {
                             );
                         } else {
                             self.check_literal_fits(init, &ty);
+                        }
+                        if let Some(bound) = bound {
+                            self.check_where_bound_init(init, bound, lower);
                         }
                     }
                     self.state_tys.insert(def, ty);

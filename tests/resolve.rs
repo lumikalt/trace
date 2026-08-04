@@ -855,7 +855,30 @@ module M {
 ";
     let (_, _, errors) = run(src);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("same reg it's declared on"));
+    assert!(errors[0].message.contains("same reg/out it's declared on"));
+}
+
+#[test]
+fn where_bound_referencing_the_same_output_resolves() {
+    let src = "\
+module M {
+    out i : [4] where i < 10 = 0
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn where_bound_referencing_a_different_output_is_an_error() {
+    let src = "\
+module M {
+    out i : [4] where j < 10 = 0
+    out j : [4] = 0
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("same reg/out it's declared on"));
 }
 
 #[test]

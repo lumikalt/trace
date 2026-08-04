@@ -2068,3 +2068,22 @@ fn where_bound_degenerate_range_is_rejected() {
             .contains("strictly less than its upper end")
     );
 }
+
+#[test]
+fn where_bound_on_an_output_init_satisfying_the_bound_is_accepted() {
+    // v8: `where` extended to `out` -- the same init base-case check
+    // `reg` already gets.
+    let (_, _, errors) = run("module M {\n out i : [4] where i < 10 = 0\n}\n");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn where_bound_on_an_output_init_violating_the_bound_is_an_error() {
+    let (_, _, errors) = run("module M {\n out i : [4] where i < 10 = 12\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("does not satisfy the declared bound")
+    );
+}

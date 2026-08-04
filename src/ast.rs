@@ -433,6 +433,13 @@ pub enum Item {
         name: Name,
         ty: ExprId,
         init: Option<ExprId>,
+        /// A statically PROVEN bound (`bounds.rs`), identical in shape
+        /// and meaning to `Item::Reg`'s own `bound`/`lower` pair — `out`
+        /// is register-backed and written via the same `Stmt::Assign`
+        /// shape a `reg` is, so the same induction argument applies
+        /// unchanged; see `Item::Reg`'s own doc comment for the details.
+        bound: Option<ExprId>,
+        lower: Option<ExprId>,
     },
     /// `io name : ty` — a structural bidirectional port (lowers to
     /// FIRRTL's `Analog` type). No initializer: it carries no value a
@@ -703,8 +710,24 @@ impl Ast {
             Item::Input { name, ty } => {
                 out.push_str(&format!("{pad}in {name} : {}\n", self.expr_sexpr(*ty)));
             }
-            Item::Output { name, ty, init } => {
+            Item::Output {
+                name,
+                ty,
+                init,
+                bound,
+                lower,
+            } => {
                 out.push_str(&format!("{pad}out {name} : {}", self.expr_sexpr(*ty)));
+                if let Some(bound) = bound {
+                    match lower {
+                        Some(lower) => out.push_str(&format!(
+                            " where {} <= {}",
+                            self.expr_sexpr(*lower),
+                            self.expr_sexpr(*bound)
+                        )),
+                        None => out.push_str(&format!(" where {}", self.expr_sexpr(*bound))),
+                    }
+                }
                 if let Some(init) = init {
                     out.push_str(&format!(" = {}", self.expr_sexpr(*init)));
                 }

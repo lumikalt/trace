@@ -2261,6 +2261,31 @@ manually in the meantime.
   pass touches no scheduling logic at all, only `bounds.rs`'s own
   write-site proof) — the first RESOLVED entry in this whole arc with
   zero `schedule.rs` involvement.
+- **RESOLVED (v8) — `where` extended to `out` ports** (`examples/
+  output_bounded.tr`). A pure plumbing extension, not a new proof: `out`
+  is register-backed and written via the exact same `Stmt::Assign` shape
+  a `reg` is (DESIGN.md: `out` "behaves like a plain `reg` inside a
+  rule"), so `bounds.rs`'s whole induction argument — freeze the
+  declared range, narrow per guard, check every write site — never cared
+  which kind of state def it was checking; the only reason it didn't
+  already work was `parser.rs` explicitly rejecting `where` on anything
+  but `reg`, and no AST/resolve/types plumbing threading a bound through
+  `Item::Output` at all. Checked motivation before scoping, same
+  discipline as v3/v6: no existing example writes an `out` via
+  self-referencing arithmetic near an interesting bound or uses one as a
+  mem index — same "no existing consumer, would need an invented
+  example" situation as v6, disclosed to Lumi up front before they
+  picked this thread, so proceeding on the same informed basis v3/v6
+  did. `bounds.rs`'s `BoundedReg`/`collect_bounded_regs` renamed
+  `BoundedDef`/`collect_bounded_defs` (both no longer reg-specific);
+  every other function in `bounds.rs` needed ZERO changes, being already
+  fully generic over `DefId`. Discriminating baseline confirmed BEFORE
+  implementing (same variant on the discipline v7 used): `where` on an
+  `out` parse-errored on the pre-feature code, confirmed to parse/
+  resolve/type-check/prove cleanly after. A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical again — the second RESOLVED entry in this arc (after
+  v7) with zero `schedule.rs` involvement.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,
