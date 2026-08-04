@@ -3015,7 +3015,8 @@ v0 restrictions, all deliberate scope cuts:
   effect — is actually invoked; the realistic shape for this feature),
   or a call nested inside an `Add`/`Sub`/`Mul` operand. NOT checked in
   v1: a call inside `return` or an `if`/`while` condition (needs a
-  genuinely generic expression-tree walk, a separable follow-up).
+  genuinely generic expression-tree walk, a separable follow-up — see
+  v14 below, which closes it).
 - **Return-bound propagation (v13): a fn/impl's return TYPE can carry a
   `where result < N` postcondition too, checked against every
   `Stmt::Return` in the fn's own body and trusted at every CALL site so
@@ -3042,11 +3043,55 @@ v0 restrictions, all deliberate scope cuts:
   without it, the postcondition would be trusted at every call site
   with zero obligations ever verified (caught by an advisor pass during
   this feature's own development, confirmed empirically before being
-  closed — see `check_return_site_exhaustiveness`). Still NOT checked: a
-  call inside an `if`/`while` condition or as a bare argument to another
-  call
-  remains unchecked as an ARGUMENT position — v12's own remaining scope
-  gap, untouched by this pass.
+  closed — see `check_return_site_exhaustiveness`). Still NOT checked as
+  of v13: a call inside an `if`/`while` condition — v12's own remaining
+  scope gap, closed next by v14 below.
+- **Widened checked positions (v14): a call inside an `if`/`while`'s own
+  CONDITION, or an `if let`/`while let`'s own `init`, is now checked
+  too** (`examples/cond_call_check.tr`) — the last position v12/v13 left
+  open. Pure coverage widening, not a new capability: a new
+  `check_calls_in` walks `cond`/`init` (via `crate::lower::sub_exprs`,
+  the same generic one-level-children helper `elaborate.rs`/
+  `types/stmt.rs`/`firrtl/*.rs` already reuse), finds every "outermost"
+  `Call` (stopping the descent the instant one is found — `expr_bound`'s
+  own `Call` arm already recurses into ITS OWN args, so continuing
+  further would double-check the same site), and checks it via
+  `expr_bound` purely for the side effect, exactly like a bare
+  `Stmt::Expr` call statement already does. `narrow_for_condition` never
+  needed to change — it still only narrows ranges from `cond`'s shape;
+  `check_calls_in` runs alongside it, against the same frozen entry
+  state, before any narrowing takes effect. A SECOND, adjacent gap was
+  found empirically while writing this feature's own tests, not
+  assumed away: a call nested as ANOTHER call's own argument
+  (`Outer(Bump(50))`) was only reached when the OUTER param (`Outer`'s
+  own) had a declared bound to check the argument against — with none,
+  the old code skipped evaluating that argument's value entirely
+  (`continue` before ever calling `expr_bound`), silently missing
+  `Bump(50)`'s own violation. Fixed by calling `expr_bound` on every
+  argument to a call unconditionally; the bound CHECK itself still only
+  fires when the corresponding param actually declares one. A SECOND
+  advisor pass, suggested grepping for this exact shape rather than
+  fixing instances one at a time, found THREE more: `Stmt::Assign`'s own
+  early returns (a write to an unbounded reg skipped `rhs` entirely),
+  `Stmt::Return`'s own `current_ret_bound` gate (a `return` inside a fn
+  with no declared postcondition skipped its own expr entirely), and
+  `Add`/`Sub`/`Mul`'s own chained `?`-unwraps (an unprovable LHS
+  short-circuited before the RHS was ever evaluated, e.g. `unbounded +
+  Bump(50)`). All four fixed identically: compute the recursive descent
+  UNCONDITIONALLY, gate only the eventual check/arithmetic on whether a
+  bound actually exists. A THIRD advisor pass, asked for one more
+  targeted probe rather than assuming the grep sweep was exhaustive,
+  found a FIFTH instance the grep itself structurally could not have
+  surfaced: `Stmt::Assign`'s own `lhs` was never passed to `expr_bound`
+  at all (not gated — simply never reached) unless it was a bare
+  `Expr::Ident`, so a mem write's own index expression (`m[Bump(50)] :=
+  1`, an `Expr::Bracket`) silently skipped `Bump`'s argument check
+  entirely. Fixed by sweeping `lhs` through the same `check_calls_in`
+  used for conditions/inits. Lesson past "grep for the gating shape":
+  a grep only finds calls that already exist and are merely gated —
+  it can't find a position that was never wired to `expr_bound` in the
+  first place, which needs a distinct "what positions are never
+  reached at all" pass.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"

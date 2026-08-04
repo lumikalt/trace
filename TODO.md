@@ -2562,6 +2562,142 @@ manually in the meantime.
   unchecked as an argument position (v12's own remaining scope gap,
   untouched by this pass), and whether the interval-set domain is worth
   building remains undecided.
+- **RESOLVED (v14) — widened checked positions: a call inside an
+  `if`/`while`'s own CONDITION, or an `if let`/`while let`'s own
+  `init`, is now checked** (`examples/cond_call_check.tr`). Lumi picked
+  this over revisiting the v11-deferred interval-set domain. This is
+  pure coverage widening, not a new capability — the last position
+  v12/v13's own docs explicitly left open: `narrow_for_condition` only
+  ever pattern-matches `cond`'s shape to narrow ranges, never routes it
+  through `expr_bound` at all, and `Stmt::IfLet`/`Stmt::WhileLet`'s own
+  arms destructured `init` with `..` and never touched it — confirmed
+  by direct read, not assumed. New `check_calls_in` walks `cond`/`init`
+  via `crate::lower::sub_exprs` (the same generic one-level-children
+  helper `elaborate.rs`/`types/stmt.rs`/`firrtl/*.rs` already reuse),
+  finds every "outermost" `Call` (stopping the descent the instant one
+  is found — `expr_bound`'s own `Call` arm already recurses into ITS
+  OWN args, so continuing further would double-check and double-report
+  the same site), and checks it via `expr_bound` purely for the side
+  effect, the same idiom a bare `Stmt::Expr` call statement already
+  uses. Four one-line call sites (`Stmt::If`/`While`/`IfLet`/
+  `WhileLet`), no restructuring of the surrounding narrowing/branch
+  logic.
+
+  A SECOND, adjacent gap was found empirically while writing this
+  feature's OWN tests, not assumed away by the plan (which had
+  expected "a call as an argument to another call" to already work for
+  free): `Outer(Bump(50))` — a call nested as ANOTHER call's own
+  argument — was only reached when the OUTER param (`Outer`'s own) had
+  a declared bound to check the argument against; with none, the old
+  `Expr::Call` arm's loop `continue`d before ever calling `expr_bound`
+  on that argument, silently never checking `Bump(50)`'s own violation.
+  Fixed by calling `expr_bound` on every argument unconditionally; the
+  bound CHECK itself still only fires when the corresponding param
+  actually declares one. Caught by writing
+  `call_argument_as_an_argument_to_another_call_is_still_checked` as a
+  CONFIRMATION test per the plan, and discovering it wasn't confirming
+  anything — the reusable lesson: a plan's "this should already work"
+  claim is exactly the kind of thing a dedicated test needs to verify,
+  not just assert.
+
+  6 new tests in `tests/bounds.rs` (if-condition, while-condition,
+  if-let-init, while-let-init, a deeply-nested-under-an-extra-operator
+  condition, the argument-to-another-call fix above), bringing the
+  file's own total to 50. Bug-reintroduction on all three fixes:
+  temporarily made `check_calls_in` a no-op (all four condition/init
+  tests correctly flip to silently accepting), temporarily restored the
+  old `continue`-before-`expr_bound` gating (the argument-to-another-
+  call test correctly flips), and separately reverted JUST the
+  `Stmt::WhileLet` call site alone (its own dedicated test flips too,
+  confirming that ONE site specifically isn't dead wiring) — all three
+  confirmed then reverted.
+
+  **A second, later advisor pass (after the ones below) found the
+  argument-to-another-call gap wasn't an isolated instance — it was one
+  case of a reusable shape: gate the recursive `expr_bound` descent on
+  whether there's a bound to check against, instead of always
+  descending and gating only the CHECK.** Rather than fix each
+  occurrence as a separate round, grepped the file for every other
+  instance of that shape and found THREE more, all real, all confirmed
+  by a scratch file before fixing: `Stmt::Assign`'s own early returns (a
+  write to an UNBOUNDED reg, `plain := Bump(50)`, used to `return`
+  before `rhs` was ever evaluated), `Stmt::Return`'s own `current_ret_
+  bound` gate (a `return Bump(50)` inside a fn with NO declared
+  postcondition used to skip its own expr entirely), and `Add`/`Sub`/
+  `Mul`'s own chained `self.expr_bound(*lhs, ...)?` into
+  `self.expr_bound(*rhs, ...)?` (an unprovable LHS, e.g. an unbounded
+  `in` port, short-circuited via `?` before the RHS was ever evaluated
+  — `unbounded + Bump(50)` never checked `Bump`'s own argument). All
+  four fixed identically: compute the descent UNCONDITIONALLY, gate
+  only the eventual check/arithmetic on whether a bound actually
+  exists. 3 more tests added (bringing the file's own total to 53), each
+  independently bug-reintroduction-verified (temporarily restoring the
+  old gated code and confirming the relevant test flips, then
+  reverting). The reusable lesson, generalizing past this one feature:
+  when a gating-the-descent bug is found, grep the whole file for `if
+  let Some(...) = ... { ... expr_bound(...) }` (or an early `?`/`return`
+  immediately before an `expr_bound` call) rather than fixing instances
+  one at a time as they surface across separate advisor rounds.
+
+  **A THIRD advisor pass, explicitly asked for one more targeted probe
+  past the file-wide grep sweep above, found a FIFTH instance the grep
+  itself couldn't surface** — because it isn't a gated `expr_bound`
+  call at all, it's a position that was never passed to `expr_bound`
+  in the first place: `Stmt::Assign`'s own `lhs`. The existing code
+  only ever resolved `lhs` when it was a bare `Expr::Ident` (to look up
+  a `def`/`bounded` pair); a mem write's own index expression (`m[Bump
+  (50)] := 1`, an `Expr::Bracket`) is neither that Ident case nor part
+  of `rhs`, so `Bump(50)`'s own argument violation there was silently
+  accepted with 0 errors — confirmed via a dedicated scratch file
+  before fixing. Fixed by sweeping `lhs` itself through `check_calls_in`
+  unconditionally, the same walker already used for `if`/`while`
+  conditions and `if let`/`while let` inits — reusing the existing
+  "outermost Call, stop descending" mechanism rather than writing a new
+  one. 1 more test (`call_argument_in_a_mem_write_index_is_still_
+  checked`, bringing the file's own total to 54), bug-reintroduction-
+  verified (temporarily removed just that one `check_calls_in(lhs, ...)`
+  call, confirmed the test flips from 1 error to 0, then restored).
+  The lesson this adds past the "grep for the shape" one above: a
+  grep sweep only finds gated calls that already exist — it can't find
+  a position that was never wired to `expr_bound` at all. Worth a
+  distinct, deliberate "which expression positions in this file are
+  NEVER reached by any `expr_bound`/`check_calls_in` call, gated or
+  not" pass, not just a grep for one specific gating shape.
+
+  An advisor pass surfaced two more things before committing, both
+  resolved by direct empirical checks rather than assumed: (1) whether
+  `while`'s own lowering (`lower/render.rs`'s `while_loop_header`,
+  which re-renders a `while` as an `if`-shaped structure for FIRRTL
+  emission) could cause `check_calls_in` to run TWICE on the same
+  condition, double-reporting an error — traced to `main.rs`'s own
+  pipeline order (`bounds::check` runs exactly once, on the original
+  AST, well before any lowering/rendering happens) and confirmed
+  empirically (`while Bump(50) < 5 { ... }` under `--firrtl` reports
+  exactly ONE error, not two). (2) `Stmt::WhileLet`'s own new call site
+  had ZERO test coverage initially — none of the other bug-
+  reintroductions happened to flip through it — closed by the dedicated
+  while-let test and its own targeted bug-reintroduction above; along
+  the way, confirmed `WhileLet`'s `init` (unlike `IfLet`'s, which also
+  accepts a bare fifo op or failing call) is genuinely restricted to
+  `Expr::Guard(inner)` over `Ty::Option(T)` — but `inner` itself CAN be
+  a `?T`-returning fn's own call (`examples/call_struct_return.tr`'s
+  `Wrap` shape), which `check_calls_in`'s recursion through `Guard`'s
+  own child already reaches correctly. A `--firrtl` sanity check on a
+  passing scratch variant confirmed zero codegen impact (this pass only
+  adds new error sites to bounds.rs, touching no AST fields and no
+  codegen). A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical (rerun after all five gating/coverage fixes landed).
+  This closes out the position explicitly named in v12/v13's own
+  "still NOT done" language (a call inside an `if`/`while` condition);
+  the five gating-the-descent/never-reached fixes above were a
+  separate class of gap, found empirically rather than pre-existing in
+  any doc's "still NOT done" list — not asserted to be exhaustive over
+  every possible instance of that shape (the mem-write-index gap alone
+  proves a grep for the gating shape isn't exhaustive by construction),
+  just every one this file's grep sweep plus one further advisor probe
+  surfaced. Whether the interval-set domain is worth building remains
+  the one open item left in this whole arc.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

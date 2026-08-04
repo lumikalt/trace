@@ -93,9 +93,8 @@
 //!   invoked in this language; the realistic shape, not an edge case),
 //!   and any position `expr_bound`'s own `Add`/`Sub`/`Mul` recursion
 //!   already reaches (a call nested inside an argument or operand). NOT
-//!   checked: a call inside an `if`/`while` condition — reaching that
-//!   needs a genuinely generic expression-tree walk, a real but
-//!   separable follow-up, not bundled into this pass.
+//!   checked as of v13: a call inside an `if`/`while` condition —
+//!   closed by v14 below.
 //! - **Return-bound propagation (v13): a fn/impl's return type can
 //!   carry a `where result < N` postcondition too** — the mirror of
 //!   v12 in the OTHER direction. Checked against every `Stmt::Return`
@@ -121,6 +120,53 @@
 //!   postcondition and an empty body would otherwise let every caller
 //!   trust it with ZERO obligations ever verified (confirmed
 //!   empirically before being closed).
+//! - **Widened checked positions (v14): a call inside an `if`/`while`'s
+//!   own CONDITION, or an `if let`/`while let`'s own `init`, is now
+//!   checked too** — the last position v12/v13 left open. Pure
+//!   coverage widening, not a new capability: `check_calls_in` walks
+//!   `cond`/`init` (via `crate::lower::sub_exprs`), finds every
+//!   "outermost" `Call` (stopping the descent the instant one is found
+//!   — `expr_bound`'s own `Call` arm already recurses into ITS OWN
+//!   args, so continuing further would double-check the same site),
+//!   and checks it via `expr_bound` purely for the side effect, same
+//!   idiom a bare `Stmt::Expr` call statement already uses.
+//!   `narrow_for_condition` itself is untouched. A SECOND, adjacent gap
+//!   was found empirically while writing this feature's own tests, not
+//!   assumed away: a call nested as ANOTHER call's own argument
+//!   (`Outer(Bump(50))`) was only reached when the OUTER param's own
+//!   declared bound gated evaluating that argument at all — with none,
+//!   the old code skipped calling `expr_bound` on it entirely, silently
+//!   missing the inner call's own violation. Fixed by calling `expr_
+//!   bound` on every argument to a call unconditionally; the bound
+//!   CHECK itself still only fires when a declared bound exists. THREE
+//!   more instances of this exact shape (gate the recursive `expr_
+//!   bound` descent on whether there's a bound/postcondition to check
+//!   against, rather than always descending and gating only the
+//!   CHECK) surfaced from a second advisor pass's suggestion to grep
+//!   for it, rather than finding each independently: `Stmt::Assign`'s
+//!   own early returns (a write to an unbounded reg used to skip `rhs`
+//!   entirely), `Stmt::Return`'s own `current_ret_bound` gate (a `return`
+//!   inside a fn with no declared postcondition used to skip `e`
+//!   entirely), and `Add`/`Sub`/`Mul`'s own `self.expr_bound(*lhs,
+//!   ...)?` chained directly into `self.expr_bound(*rhs, ...)?` (an
+//!   unprovable LHS short-circuited before `rhs` was ever evaluated).
+//!   All four fixed the identical way: compute the descent
+//!   unconditionally, gate only the eventual check/arithmetic on
+//!   whether a bound exists. Reusable lesson for any future gap of this
+//!   shape: grep for `if let Some(...) = ... { ... expr_bound(...) }`
+//!   (or an early `?`/`return` before an `expr_bound` call) rather than
+//!   fixing instances one at a time as they're found. A THIRD advisor
+//!   pass (a targeted follow-up probe, not another blind grep) found a
+//!   FIFTH instance the grep above structurally could not surface:
+//!   `Stmt::Assign`'s own `lhs` was never passed to `expr_bound` at all
+//!   unless it was a bare `Expr::Ident` — not gated, simply never
+//!   reached — so a mem write's own index (`m[Bump(50)] := 1`, an
+//!   `Expr::Bracket`) silently skipped `Bump`'s own argument check.
+//!   Fixed by sweeping `lhs` through `check_calls_in` unconditionally,
+//!   same as `cond`/`init` above. Lesson past "grep for the gating
+//!   shape": a grep only finds calls that exist and are merely gated;
+//!   it can't find a position never wired to `expr_bound` at all —
+//!   that needs a distinct "what's never reached" pass, not a grep.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -548,19 +594,38 @@ impl<'a> Checker<'a> {
     ) {
         match self.ast.stmt(id).clone() {
             Stmt::Assign { lhs, rhs } => {
-                let Expr::Ident(_) = self.ast.expr(lhs) else {
-                    return; // a mem/struct-field write, irrelevant here
+                // v14: `expr_bound` is called on `rhs` unconditionally,
+                // even when the LHS isn't a bounded (or even a bare
+                // Ident) def at all -- found via the same "grep for the
+                // gating-the-descent shape" sweep that caught the
+                // `Expr::Call` arg-loop gap above: a mem/struct-field
+                // write, or a write to an UNBOUNDED reg (`plain := Bump
+                // (50)`), used to `return`/fall through before ever
+                // reaching `expr_bound`, silently skipping any nested
+                // `Call`'s own argument obligations in `rhs`. The bound
+                // CHECK itself still only fires when the LHS resolves
+                // to an actual bounded def.
+                //
+                // `lhs` itself is also swept via `check_calls_in`: a
+                // mem write's own index (`m[Bump(50)] := 1`) is neither
+                // a bare Ident nor part of `rhs`, so it was never passed
+                // to `expr_bound` at all until this call was added --
+                // the advisor's own follow-up probe past the four-site
+                // sweep above, confirmed with a driving scratch file
+                // before being fixed here.
+                self.check_calls_in(lhs, state, locals);
+                let def = if let Expr::Ident(_) = self.ast.expr(lhs) {
+                    self.res.expr_defs.get(&lhs).copied()
+                } else {
+                    None
                 };
-                let Some(def) = self.res.expr_defs.get(&lhs).copied() else {
-                    return;
-                };
-                let Some(bounded) = self.bounded.get(&def).copied() else {
-                    return; // not a bounded reg
-                };
-                self.found_writes.insert(def);
+                let bounded = def.and_then(|d| self.bounded.get(&d).copied());
                 let computed = self.expr_bound(rhs, state, locals);
-                let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                self.check_against_bound(computed, bounded, span, "write");
+                if let (Some(def), Some(bounded)) = (def, bounded) {
+                    self.found_writes.insert(def);
+                    let span = self.ast.expr_spans[rhs.0 as usize].clone();
+                    self.check_against_bound(computed, bounded, span, "write");
+                }
             }
             Stmt::Let { name, init } => {
                 let def = def_of_name(self.res, &name);
@@ -572,6 +637,12 @@ impl<'a> Checker<'a> {
                 then_body,
                 else_body,
             } => {
+                // v14: a call embedded in the condition ITSELF (e.g.
+                // `if Bump(50) < 5`) is checked against the frozen entry
+                // state, before any narrowing -- the call happens as
+                // part of evaluating the condition, not inside either
+                // branch.
+                self.check_calls_in(cond, state, locals);
                 let mut then_state = self.narrow_for_condition(cond, state);
                 let mut then_locals = locals.clone();
                 self.check_body(&then_body, &mut then_state, &mut then_locals);
@@ -582,10 +653,15 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::IfLet {
+                init,
                 then_body,
                 else_body,
                 ..
             } => {
+                // v14: `init` is exactly the position a fallible call
+                // (`if let x = Classify(a) { ... }`) or a fifo op sits
+                // in -- never checked before this pass.
+                self.check_calls_in(init, state, locals);
                 let mut then_state = state.clone();
                 let mut then_locals = locals.clone();
                 self.check_body(&then_body, &mut then_state, &mut then_locals);
@@ -605,11 +681,24 @@ impl<'a> Checker<'a> {
                 // sites identically. Locals introduced inside the loop
                 // don't survive past it (loop-boundary invalidation),
                 // same as an `if`.
+                //
+                // A `while` is later RENDERED as an `if`-shaped
+                // structure for FIRRTL emission (`lower/render.rs`'s
+                // `while_loop_header`) — checked directly, not assumed,
+                // that this doesn't make `check_calls_in` run twice on
+                // the same condition: `bounds::check` (`main.rs`) runs
+                // exactly once, on the ORIGINAL AST, entirely before any
+                // lowering/rendering happens, so there's no second pass
+                // to double-report through. Confirmed empirically too
+                // (a failing call in a `while` condition under
+                // `--firrtl` reports exactly one error, not two).
+                self.check_calls_in(cond, state, locals); // v14
                 let mut loop_state = self.narrow_for_condition(cond, state);
                 let mut loop_locals = locals.clone();
                 self.check_body(&body, &mut loop_state, &mut loop_locals);
             }
-            Stmt::WhileLet { body, .. } => {
+            Stmt::WhileLet { init, body, .. } => {
+                self.check_calls_in(init, state, locals); // v14
                 let mut loop_state = state.clone();
                 let mut loop_locals = locals.clone();
                 self.check_body(&body, &mut loop_state, &mut loop_locals);
@@ -634,8 +723,17 @@ impl<'a> Checker<'a> {
             // bound. A fn with no declared postcondition still has
             // nothing to check here, same as before this feature.
             Stmt::Return(Some(e)) => {
+                // v14: `expr_bound` is called on `e` unconditionally,
+                // even when the ENCLOSING fn declared no postcondition
+                // at all (`current_ret_bound` is `None`) -- same
+                // gating-the-descent shape as the `Stmt::Assign`/
+                // `Expr::Call`-arg-loop gaps above: `return Bump(50)`
+                // inside a fn with no `where result < N` used to skip
+                // straight past `expr_bound`, silently missing `Bump`'s
+                // own argument violation. The postcondition CHECK
+                // itself still only fires when one is actually declared.
+                let computed = self.expr_bound(e, state, locals);
                 if let Some(bounded) = self.current_ret_bound {
-                    let computed = self.expr_bound(e, state, locals);
                     let span = self.ast.expr_spans[e.0 as usize].clone();
                     self.check_against_bound(computed, bounded, span, "return value");
                     if let Some(fn_def) = self.current_fn_def {
@@ -805,6 +903,36 @@ impl<'a> Checker<'a> {
         Some((def, k))
     }
 
+    /// v14: recursively finds every "outermost" `Expr::Call` within
+    /// `id` and checks it via `expr_bound`, purely for that side effect
+    /// (checking any argument obligations against a bounded param, and
+    /// any declared return postcondition trusted onward) — the returned
+    /// bound itself is meaningless here and discarded, same idiom
+    /// `Stmt::Expr`'s own arm already uses for a bare call statement.
+    /// Closes the one gap both v12 and v13's own docs left open: a call
+    /// used inside an `if`/`while`'s own CONDITION, or an `if let`/
+    /// `while let`'s own `init` (`narrow_for_condition` only ever
+    /// pattern-matches `cond`'s shape, never routes it through `expr_
+    /// bound` at all). Stops recursing the instant it finds a `Call`
+    /// rather than continuing the generic descent into it: `expr_
+    /// bound`'s own `Expr::Call` arm already recurses into ITS OWN args,
+    /// so continuing here too would double-check (and double-report)
+    /// the same call site.
+    fn check_calls_in(
+        &mut self,
+        id: ExprId,
+        state: &HashMap<DefId, (u64, u64)>,
+        locals: &HashMap<DefId, Option<(u64, u64)>>,
+    ) {
+        if matches!(self.ast.expr(id), Expr::Call { .. }) {
+            self.expr_bound(id, state, locals);
+            return;
+        }
+        for child in crate::lower::sub_exprs(self.ast, id) {
+            self.check_calls_in(child, state, locals);
+        }
+    }
+
     /// The value range an expression is provably confined to, as a
     /// `(lower, upper)` pair (lower inclusive, upper exclusive), or
     /// `None` if this pass can't establish one. A bare bounded reg/
@@ -837,8 +965,22 @@ impl<'a> Checker<'a> {
                 lhs,
                 rhs,
             } => {
-                let (a_lo, a_hi) = self.expr_bound(*lhs, state, locals)?;
-                let (b_lo, b_hi) = self.expr_bound(*rhs, state, locals)?;
+                // v14: both operands' `expr_bound` are computed BEFORE
+                // either is unwrapped with `?` -- found via the same
+                // gating-the-descent sweep as the `Stmt::Assign`/
+                // `Stmt::Return`/`Expr::Call`-arg-loop fixes elsewhere
+                // in this file: chaining `self.expr_bound(*lhs, ...)?`
+                // directly into `self.expr_bound(*rhs, ...)?` meant an
+                // unprovable LHS (e.g. an unbounded `in` port) short-
+                // circuited the whole arm before `rhs` was ever
+                // evaluated, silently skipping any `Call` nested in
+                // `rhs` (`unbounded + Bump(50)` never checked `Bump`'s
+                // own argument). Both calls now always happen; only the
+                // ARITHMETIC bails early if either came back `None`.
+                let a = self.expr_bound(*lhs, state, locals);
+                let b = self.expr_bound(*rhs, state, locals);
+                let (a_lo, a_hi) = a?;
+                let (b_lo, b_hi) = b?;
                 let lo = a_lo.checked_add(b_lo)?;
                 let hi = a_hi.checked_add(b_hi)?.checked_sub(1)?;
                 Some((lo, hi))
@@ -857,9 +999,12 @@ impl<'a> Checker<'a> {
                 // both naturally return `None` here, the same
                 // "unprovable, fails closed" signal `Add`'s
                 // `checked_add` already gives on overflow — no separate
-                // error path needed.
-                let (a_lo, a_hi) = self.expr_bound(*lhs, state, locals)?;
-                let (b_lo, b_hi) = self.expr_bound(*rhs, state, locals)?;
+                // error path needed. Both operands evaluated before
+                // either `?`-unwrap, same v14 reasoning as `Add` above.
+                let a = self.expr_bound(*lhs, state, locals);
+                let b = self.expr_bound(*rhs, state, locals);
+                let (a_lo, a_hi) = a?;
+                let (b_lo, b_hi) = b?;
                 let b_max = b_hi.checked_sub(1)?;
                 let lo = a_lo.checked_sub(b_max)?;
                 let hi = a_hi.checked_sub(b_lo)?;
@@ -878,9 +1023,13 @@ impl<'a> Checker<'a> {
                 // correspond exactly to the operands' extremes, no
                 // sign-corner-case reasoning needed. `checked_mul`/
                 // `checked_add` fail closed (`None`) on overflow, the
-                // same idiom `Add`/`Sub` above already use.
-                let (a_lo, a_hi) = self.expr_bound(*lhs, state, locals)?;
-                let (b_lo, b_hi) = self.expr_bound(*rhs, state, locals)?;
+                // same idiom `Add`/`Sub` above already use. Both
+                // operands evaluated before either `?`-unwrap, same v14
+                // reasoning as `Add`/`Sub` above.
+                let a = self.expr_bound(*lhs, state, locals);
+                let b = self.expr_bound(*rhs, state, locals);
+                let (a_lo, a_hi) = a?;
+                let (b_lo, b_hi) = b?;
                 let a_max = a_hi.checked_sub(1)?;
                 let b_max = b_hi.checked_sub(1)?;
                 let lo = a_lo.checked_mul(b_lo)?;
@@ -926,17 +1075,30 @@ impl<'a> Checker<'a> {
                 let &fn_def = self.res.expr_defs.get(&callee)?;
                 if let Some(params) = self.fn_params.get(&fn_def).cloned() {
                     for (param, arg) in params.iter().zip(&args) {
-                        if param.bound.is_none() {
-                            continue;
-                        }
-                        let param_def = def_of_name(self.res, &param.name);
-                        let Some(bounded) = self.bounded.get(&param_def).copied() else {
-                            continue;
+                        // v14: `expr_bound` is called on EVERY argument
+                        // unconditionally, not just ones whose param
+                        // has a declared bound to check against — found
+                        // empirically, not assumed, while writing this
+                        // pass's own tests: `Outer(Bump(50))` where
+                        // `Outer`'s own param has NO bound used to skip
+                        // evaluating `Bump(50)` at all (`continue`
+                        // before ever reaching `expr_bound`), silently
+                        // never checking `Bump`'s own argument. The
+                        // bound CHECK itself still only fires when one
+                        // exists; the recursive descent (needed to
+                        // reach a nested `Call`) no longer waits on it.
+                        let bounded = if param.bound.is_none() {
+                            None
+                        } else {
+                            let param_def = def_of_name(self.res, &param.name);
+                            self.bounded.get(&param_def).copied()
                         };
                         let computed = self.expr_bound(*arg, state, locals);
-                        let span = self.ast.expr_spans[arg.0 as usize].clone();
-                        let context = format!("argument for parameter `{}`", param.name);
-                        self.check_against_bound(computed, bounded, span, &context);
+                        if let Some(bounded) = bounded {
+                            let span = self.ast.expr_spans[arg.0 as usize].clone();
+                            let context = format!("argument for parameter `{}`", param.name);
+                            self.check_against_bound(computed, bounded, span, &context);
+                        }
                     }
                 }
                 self.fn_ret_bound

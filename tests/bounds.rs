@@ -979,3 +979,284 @@ module M {
 ";
     assert!(run(src).is_empty(), "{:?}", run(src));
 }
+
+#[test]
+fn call_argument_in_an_if_condition_is_checked() {
+    // v14: a call embedded directly in an `if`'s own CONDITION was
+    // never checked before this pass -- `narrow_for_condition` only
+    // ever pattern-matches `cond`'s shape, never routes it through
+    // `expr_bound`. `Bump(50)`'s own argument (50) violates its
+    // declared param bound (`i < 10`).
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    rule step {
+        if Bump(50) < 5 {
+            total := 1
+        } else {
+            total := 2
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_a_while_condition_is_checked() {
+    // The `while` mirror of the test above.
+    let src = "\
+module M {
+    reg dummy : [8] = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    rule count <sequences> {
+        while Bump(50) < 5 {
+            dummy := 1
+            tick
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_an_if_let_init_is_checked() {
+    // v14: `if let`'s own `init` (`if let x = Classify(50) { ... }`,
+    // the exact shape `examples/if_let_failing_call.tr` already uses)
+    // was never checked before this pass either -- `Stmt::IfLet`'s own
+    // arm destructured `init` with `..` and never touched it.
+    let src = "\
+Classify(i : [8] where i < 10) : [8] <combines, fails> {
+    (i <> 0)?
+    return i
+}
+
+module M {
+    reg out_reg : [8] = 0
+    rule step {
+        if let x = Classify(50) {
+            out_reg := x
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_a_while_let_init_is_checked() {
+    // The `while let` mirror of the `if let` test above -- its own
+    // dedicated `Stmt::WhileLet` call site (`check_calls_in(init, ...)`)
+    // had zero coverage otherwise: none of this pass's other tests
+    // exercise it, so a wrong expression passed there would go
+    // undetected. `init` here is `Expr::Guard(Call(Bump, [50]))` (a
+    // `?T`-returning fn's own call, unwrapped with `?` -- the same
+    // shape `examples/call_struct_return.tr`'s `Wrap` demonstrates) --
+    // `check_calls_in`'s recursion through `Guard`'s own `sub_exprs`
+    // child reaches the nested `Call` correctly.
+    let src = "\
+Bump(i : [8] where i < 10) : ?[8] <combines, fails> {
+    (i <> 200)?
+    return i
+}
+
+module M {
+    reg dummy : [8] = 0
+    rule step <sequences, fails> {
+        while let x = Bump(50)? {
+            dummy := x
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_a_deeply_nested_condition_is_checked() {
+    // A call buried under an extra operator layer, not just a bare
+    // top-level comparison -- confirms `check_calls_in`'s recursive
+    // walk (via `sub_exprs`) actually descends, rather than only
+    // special-casing a condition that's directly `Call < const`.
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    rule step {
+        if (Bump(50) + 1) < 5 {
+            total := 1
+        } else {
+            total := 2
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_as_an_argument_to_another_call_is_still_checked() {
+    // Resolves the open question left in v12's own scope note -- NOT
+    // already true by inspection, as the plan assumed: a call nested as
+    // ANOTHER call's own argument (`Outer(Bump(50))`) is only reached
+    // via `expr_bound`'s own `Expr::Call` arm recursing into its own
+    // args when the OUTER param (`Outer`'s own) has a declared bound to
+    // check the arg against -- with no bound there, the old code
+    // skipped evaluating that argument's own value entirely (`continue`
+    // before ever calling `expr_bound`), silently missing `Bump(50)`'s
+    // own violation. Fixed (found empirically while writing this exact
+    // test) by calling `expr_bound` on every argument unconditionally;
+    // `Outer`'s OWN return bound here just keeps this test isolated to
+    // that one fix (otherwise the composition would ALSO be unprovable
+    // for its own, unrelated reason, since `Outer` declares none).
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    Outer(x : [8]) : [8] where result < 40 {
+        return 0
+    }
+    rule step {
+        total := Outer(Bump(50))
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_a_write_to_an_unbounded_reg_is_still_checked() {
+    // A second advisor pass found this (and the two tests below) as
+    // three MORE instances of the exact "gate the recursive `expr_
+    // bound` descent on whether there's a bound to check against"
+    // shape the argument-to-another-call fix above already needed --
+    // `Stmt::Assign`'s own early returns (non-Ident LHS, unresolvable
+    // def, or an UNBOUNDED reg) used to `return` before `expr_bound`
+    // ever saw `rhs` at all. `plain` carries no `where` bound, so
+    // `plain := Bump(50)` used to skip checking `Bump`'s own argument
+    // entirely.
+    let src = "\
+module M {
+    reg plain : [8] = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    rule step {
+        plain := Bump(50)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_a_return_with_no_declared_postcondition_is_still_checked() {
+    // The `Stmt::Return` mirror of the test above: `current_ret_bound`
+    // being `None` (no declared postcondition on the ENCLOSING fn) used
+    // to gate the whole `expr_bound` call, so `return Bump(50)` inside
+    // a fn with no `where result < N` never checked `Bump`'s own
+    // argument either.
+    let src = "\
+module M {
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    Outer(x : [8]) : [8] {
+        return Bump(50)
+    }
+    rule step {
+        Outer(3)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_past_an_unprovable_operand_is_still_checked() {
+    // The `Add`/`Sub`/`Mul` mirror: `self.expr_bound(*lhs, ...)?`
+    // chained directly into `self.expr_bound(*rhs, ...)?` meant an
+    // unprovable LHS (`unbounded`, an `in` port with no bound at all)
+    // short-circuited the whole arm via `?` BEFORE `rhs` was ever
+    // evaluated -- silently skipping `Bump(50)`'s own argument check
+    // inside `unbounded + Bump(50)`. Two errors now expected: the
+    // argument violation AND the pre-existing "cannot verify this
+    // write" (the sum itself was always unprovable, since `unbounded`
+    // has no bound -- that part is correct, unchanged behavior).
+    let src = "\
+module M {
+    in unbounded : [8]
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    rule step {
+        total := unbounded + Bump(50)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("argument for parameter"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("cannot verify this write"))
+    );
+}
+
+#[test]
+fn call_argument_in_a_mem_write_index_is_still_checked() {
+    // A fifth instance of the same shape, found by the advisor on a
+    // dedicated follow-up probe past the four-site sweep above:
+    // `Stmt::Assign`'s LHS handling only ever resolved a bare `Expr::
+    // Ident` to a `def`/`bounded` pair -- a mem write's own index
+    // expression (`m[Bump(50)] := 1`, an `Expr::Bracket`) was neither
+    // that Ident case nor part of `rhs`, so it was never passed to
+    // `expr_bound`/`check_calls_in` at all. Fixed by sweeping `lhs`
+    // itself through `check_calls_in` unconditionally.
+    let src = "\
+module M {
+    mem m : [8][4]
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    rule step {
+        m[Bump(50)] := 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}

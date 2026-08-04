@@ -1,0 +1,15 @@
+module CondCallCheck {
+    reg total : [8] where total < 40 = 0
+
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+
+    rule step {
+        if Bump(50) < 5 {
+            total := 1
+        } else {
+            total := 2
+        }
+    }
+}
