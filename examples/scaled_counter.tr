@@ -1,0 +1,11 @@
+module ScaledCounter {
+    reg cnt : [8] where cnt < 100 = 1
+
+    rule double {
+        if cnt < 10 {
+            cnt := cnt * 2
+        } else {
+            cnt := 1
+        }
+    }
+}

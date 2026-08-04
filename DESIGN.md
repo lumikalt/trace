@@ -2981,18 +2981,20 @@ v0 restrictions, all deliberate scope cuts:
   file specifically stays unprovable regardless of this feature: `cnt := x`
   reads an unbounded `in` port every cycle, and `cnt` there carries no
   `where` bound at all.
-- **`Add` and `Sub` are the supported compositions on a write's right-hand
-  side; `Mul`/anything else is still "unknown."** `i + 1` composes
-  unconditionally; `cnt - 1` composes only when the subtrahend's range
-  provably can't exceed the minuend's (the SMALLEST possible minuend must
-  still dominate the LARGEST possible subtrahend) — an unguarded
-  decrement fails this and stays rejected, exactly the false-rejection
-  case a `> 0`/`>= 1` guard's lower-end narrowing closes. Either way, an
+- **`Add`, `Sub`, and `Mul` (v11) are the supported compositions on a
+  write's right-hand side; anything else is still "unknown."** `i + 1`
+  composes unconditionally; `cnt - 1` composes only when the
+  subtrahend's range provably can't exceed the minuend's (the SMALLEST
+  possible minuend must still dominate the LARGEST possible subtrahend)
+  — an unguarded decrement fails this and stays rejected, exactly the
+  false-rejection case a `> 0`/`>= 1` guard's lower-end narrowing
+  closes. `Mul` composes unconditionally too, cleanly, because both
+  operands are non-negative (`bits[N]`): a product's extremes
+  correspond exactly to the operands' own extremes (`a_lo * b_lo`,
+  `a_max * b_max`), unlike general signed interval multiplication,
+  which would need sign-corner-case reasoning. Either way, an
   unprovable write fails closed (a compile error asking for an explicit
-  restructure) rather than silently assuming it's safe. `Mul` has no
-  motivating example (nothing in the repo multiplies into a state write)
-  and needs two more overflow paths for zero known consumers, so it stays
-  out of scope.
+  restructure) rather than silently assuming it's safe.
 - **No interaction with the banking argument (v3).** That argument's
   soundness rests on a modular fact a proven bound doesn't slot into, and no
   design needs the combination.

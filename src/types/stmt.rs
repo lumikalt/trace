@@ -258,8 +258,9 @@ impl<'a> TypeChecker<'a> {
         }
         // A BARE comparison directly as an `if`'s own condition (no `?`,
         // no `logic`): the branch-scoped discharge this feature adds.
-        // `while` never sets `allow_bare_comparison`, so its bare
-        // comparison stays a type error same as before. Deliberately
+        // `while` sets `allow_bare_comparison: true` too (its own arm
+        // above, "I still want while to work like if"), so a bare
+        // comparison is accepted there identically. Deliberately
         // narrow: only the WHOLE condition being a comparison qualifies,
         // not one nested inside a larger condition expression (`if (a >
         // b) & c`) -- see `expr_has_undischarged_comparison` just below
@@ -270,12 +271,13 @@ impl<'a> TypeChecker<'a> {
         {
             return;
         }
-        // A bare fifo `Deq[]` or failing call directly as an `if`'s own
-        // condition -- the same `if`-only discharge the bare-comparison
-        // exemption just above gets, extended to the two OTHER fallible-
-        // by-default shapes `if let`'s own arm already accepts (`is_fifo_
-        // deq`/`is_failing_call`, expr.rs). `while` never sets
-        // `allow_bare_comparison`, so stays restricted here too.
+        // A bare fifo `Deq[]` or failing call directly as an `if`/`while`
+        // condition -- the same discharge the bare-comparison exemption
+        // just above gets, extended to the two OTHER fallible-by-default
+        // shapes `if let`'s own arm already accepts (`is_fifo_deq`/
+        // `is_failing_call`, expr.rs). Both `if` and `while` set
+        // `allow_bare_comparison: true`, so this applies to both
+        // uniformly, same as the exemption above.
         if allow_bare_comparison && (self.is_fifo_deq(cond) || self.is_failing_call(cond)) {
             return;
         }

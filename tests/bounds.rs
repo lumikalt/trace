@@ -374,7 +374,11 @@ module M {
 }
 
 #[test]
-fn multiplication_on_the_rhs_is_rejected_as_unknown() {
+fn multiplication_by_a_literal_is_proven() {
+    // `Mul` composes (v11): both operands are non-negative, so a
+    // product's extremes correspond exactly to the operands' own
+    // extremes -- `i * 1` composes to `lo = 0*1 = 0`, `hi = 8*1+1 = 9`,
+    // exactly matching the declared bound.
     let src = "\
 module M {
     reg i : [4] where i < 9 = 0
@@ -383,9 +387,124 @@ module M {
     }
 }
 ";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn scaled_counter_doubling_is_proven() {
+    // The driving example's own shape (`examples/scaled_counter.tr`):
+    // under `if cnt < 10`, `cnt`'s tracked range narrows to `[0, 10)`,
+    // so `a_max = 9`; the literal `2` gives `b_lo = b_max = 2`. `cnt *
+    // 2` composes to `lo = 0*2 = 0`, `hi = 9*2+1 = 19` -- provably
+    // within the declared `[0, 100)`.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 100 = 1
+    rule double {
+        if cnt < 10 {
+            cnt := cnt * 2
+        } else {
+            cnt := 1
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn unguarded_multiplication_that_could_exceed_the_bound_is_rejected() {
+    // No narrowing guard: `cnt`'s full declared range `[0, 100)`
+    // composes to `hi = 99*2+1 = 199`, exceeding the bound. Discriminates
+    // an UNSOUND bug that computes `hi` from the operands' own `lo`
+    // instead of their `max` (e.g. `hi = a_lo*b_lo+1 = 0*2+1 = 1`, which
+    // would wrongly accept this write).
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 100 = 1
+    rule double {
+        cnt := cnt * 2
+    }
+}
+";
     let errors = run(src);
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("cannot verify"));
+}
+
+#[test]
+fn multiplication_composed_bound_exceeding_the_declared_width_is_rejected() {
+    // Same width-clamp distinction as the `Add`-based test above, now
+    // for `Mul`: `i`'s declared LOGICAL bound (`< 20`) is nowhere near
+    // violated (composed value never exceeds 9), but `i`'s declared
+    // WIDTH is only `[3]` (max representable value 7) -- a composed
+    // bound of 10 would silently wrap before reaching the logical limit.
+    let src = "\
+module M {
+    reg i : [3] where i < 20 = 0
+    rule bump {
+        if i < 4 {
+            i := i * 3
+        } else {
+            i := 0
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("declared width"));
+}
+
+#[test]
+fn multiplication_ceiling_is_exclusive_not_inclusive() {
+    // `hi` is exclusive everywhere in this module, so the ceiling must
+    // be `a_max * b_max + 1`, not `a_max * b_max`. Tight enough to
+    // discriminate dropping the `+ 1`: `cnt < 5` narrows to `[0,5)`
+    // (`a_max = 4`); the literal `2` gives `b_max = 2`. Correctly,
+    // `hi = 4*2+1 = 9`, which exceeds the declared bound (`cnt < 8`),
+    // so this must be REJECTED. A buggy version omitting the `+ 1`
+    // (`hi = 4*2 = 8`) would land exactly at the declared bound and be
+    // wrongly ACCEPTED.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 8 = 0
+    rule bump {
+        if cnt < 5 {
+            cnt := cnt * 2
+        } else {
+            cnt := 0
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify"));
+}
+
+#[test]
+fn multiplication_uses_the_operands_own_max_not_their_exclusive_upper_bound() {
+    // Tight enough to discriminate an off-by-one that uses `a_hi`/`b_hi`
+    // (the exclusive upper bound) instead of `a_max`/`b_max` (`hi - 1`)
+    // for the max computation: correctly, `cnt < 5` narrows to `[0,5)`,
+    // `a_max = 4`; the literal `2` gives `b_max = 2`. `hi = 4*2+1 = 9`,
+    // and `cnt < 10` is the declared bound, so `9 < 10` is provable. A
+    // buggy version using `a_hi*b_hi+1 = 5*3+1 = 16` would wrongly
+    // REJECT this write (16 > 10).
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 10 = 0
+    rule bump {
+        if cnt < 5 {
+            cnt := cnt * 2
+        } else {
+            cnt := 0
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
 }
 
 #[test]

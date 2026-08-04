@@ -2350,6 +2350,48 @@ manually in the meantime.
   explicitly rather than the misleading broad one. A normalized
   `--explain-schedule` diff across every existing example came back
   byte-identical.
+- **RESOLVED (v11) — `Mul` composition in `expr_bound`** (`examples/
+  scaled_counter.tr`). Lumi asked to build the full interval-set domain
+  for mid-range `<>` exclusion (v10's own deferred item); before writing
+  any code, checked whether it would buy anything and found it would
+  be PROVABLY INERT — every check in `bounds.rs` (width-clamp, upper,
+  lower) reads only the extreme `lo`/`hi` of a tracked range, and both
+  `Add`/`Sub` compose purely from the operands' own extremes, so
+  excluding one interior point (as opposed to an edge, which v9 already
+  handles) changes neither the min nor the max of anything downstream —
+  the domain would cost real complexity (cross-product composition, a
+  piece cap, every write-site check iterating pieces) for zero
+  additional proving power, given `Add`/`Sub`/bare-ident/literal are the
+  only compositions that exist. Confirmed with advisor before reporting
+  it back (same shape as v7's own "Sub would be inert" catch), then
+  surfaced the finding to Lumi rather than silently building an inert
+  feature or silently downscoping the ask. Lumi picked "build `Mul`
+  first, then revisit the domain" — `Mul` is the concrete operation
+  whose result actually depends on which values are reachable, not just
+  the extremes, so it's the domain's real prerequisite, the same
+  ordering relationship v7 found between lower-narrowing and `Sub`.
+  `Mul` composes cleanly because both operands are non-negative
+  (`bits[N]`): a product's minimum is exactly `a_lo * b_lo` and its
+  maximum is exactly `a_max * b_max` (no sign-corner-case reasoning
+  needed, unlike general signed interval multiplication), using the
+  same `checked_*`-fails-closed idiom `Add`/`Sub` already established.
+  Discriminating baseline confirmed before implementing (the driving
+  example fails to compile on pre-feature code); the existing
+  `multiplication_on_the_rhs_is_rejected_as_unknown` test flipped to
+  provable exactly as v7's `Sub`-related tests once did, replaced with
+  `multiplication_by_a_literal_is_proven`. Five new/flipped tests, two
+  verified by bug-reintroduction: an UNSOUND bug (computing the ceiling
+  from the operands' own `lo` instead of `max`) flips
+  `unguarded_multiplication_that_could_exceed_the_bound_is_rejected`
+  from 1 error to a wrongly-accepted 0; an over-conservative bug (using
+  `a_hi`/`b_hi`, the exclusive upper bound, instead of `a_max`/`b_max`)
+  flips `multiplication_uses_the_operands_own_max_not_their_exclusive_
+  upper_bound` from provable to a false rejection — both confirmed by
+  temporarily reintroducing the exact bug. A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical. Explicitly still NOT done: whether the interval-set
+  domain is worth building now that `Mul` exists to make it non-inert
+  remains open, not yet decided as of this entry.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

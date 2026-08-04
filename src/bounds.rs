@@ -25,18 +25,22 @@
 //!   (0 is always the implicit floor of an unsigned `bits[N]` value).
 //!   No multi-variable or otherwise arbitrary bound expressions on
 //!   either end.
-//! - RHS composition supports only bare idents/literals, `Add`, and `Sub`
-//!   — the motivating patterns (`i := i + 1` under a `< K` guard,
-//!   `cnt := cnt - 1` under a `> 0`/`>= 1` guard) need nothing else.
-//!   `Sub` fails closed (returns "unknown") whenever the subtrahend's
-//!   range could exceed the minuend's — a real, checked soundness
-//!   condition, not a syntactic restriction (see `expr_bound`'s own doc
-//!   comment). `Mul`/anything else composes to "unknown" unconditionally:
-//!   no example in the repo multiplies into a state write, and a
-//!   product's range needs two more overflow paths for zero known
-//!   consumers. Either way, an unprovable write fails the write-site
-//!   check closed (a compile error asking for an explicit restructure),
-//!   never silently "assumed in range."
+//! - RHS composition supports only bare idents/literals, `Add`, `Sub`,
+//!   and `Mul` (v11) — the motivating patterns (`i := i + 1` under a `<
+//!   K` guard, `cnt := cnt - 1` under a `> 0`/`>= 1` guard, doubling
+//!   under a narrowing guard) need nothing else. `Sub` fails closed
+//!   (returns "unknown") whenever the subtrahend's range could exceed
+//!   the minuend's — a real, checked soundness condition, not a
+//!   syntactic restriction (see `expr_bound`'s own doc comment). `Mul`
+//!   composes cleanly because both operands are non-negative
+//!   (`bits[N]`): a product's extremes correspond exactly to the
+//!   operands' own extremes (`a_lo` times `b_lo`, `a_max` times
+//!   `b_max`), no sign-corner-case reasoning needed the way general
+//!   integer interval multiplication would require. Anything else (a
+//!   call, a shift, ...) still composes to "unknown" unconditionally.
+//!   Either way, an unprovable write fails the write-site check closed
+//!   (a compile error asking for an explicit restructure), never
+//!   silently "assumed in range."
 //! - No interaction with `schedule.rs`'s v3 banking argument — that
 //!   argument's soundness rests on a modular (not real-integer) fact a
 //!   proven bound doesn't slot into, and no example needs the
@@ -543,9 +547,9 @@ impl<'a> Checker<'a> {
     /// The value range an expression is provably confined to, as a
     /// `(lower, upper)` pair (lower inclusive, upper exclusive), or
     /// `None` if this pass can't establish one. A bare bounded reg/local
-    /// reference, a literal, `Add`, or `Sub` of two such compose — see
-    /// this module's own doc comment for why everything else (`Mul`, a
-    /// call, ...) is deliberately left unsupported.
+    /// reference, a literal, `Add`, `Sub`, or `Mul` of two such compose —
+    /// see this module's own doc comment for why everything else (a
+    /// call, a shift, ...) is deliberately left unsupported.
     fn expr_bound(
         &self,
         id: ExprId,
@@ -594,6 +598,28 @@ impl<'a> Checker<'a> {
                 let b_max = b_hi.checked_sub(1)?;
                 let lo = a_lo.checked_sub(b_max)?;
                 let hi = a_hi.checked_sub(b_lo)?;
+                Some((lo, hi))
+            }
+            Expr::Binary {
+                op: BinOp::Mul,
+                lhs,
+                rhs,
+            } => {
+                // Both operands are non-negative (`bits[N]`, unsigned),
+                // which is what makes this argument clean, unlike
+                // general signed interval multiplication: a product's
+                // minimum is exactly `a_lo * b_lo` and its maximum is
+                // exactly `a_max * b_max` — the product's own extremes
+                // correspond exactly to the operands' extremes, no
+                // sign-corner-case reasoning needed. `checked_mul`/
+                // `checked_add` fail closed (`None`) on overflow, the
+                // same idiom `Add`/`Sub` above already use.
+                let (a_lo, a_hi) = self.expr_bound(*lhs, state, locals)?;
+                let (b_lo, b_hi) = self.expr_bound(*rhs, state, locals)?;
+                let a_max = a_hi.checked_sub(1)?;
+                let b_max = b_hi.checked_sub(1)?;
+                let lo = a_lo.checked_mul(b_lo)?;
+                let hi = a_max.checked_mul(b_max)?.checked_add(1)?;
                 Some((lo, hi))
             }
             _ => None,
