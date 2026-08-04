@@ -2883,6 +2883,25 @@ is proven safe. `examples/mem_disjoint_bounded.tr` demonstrates it against a
 depth-10 mem (not a power of two) that neither of the two arguments above
 could ever close.
 
+**A fifth case, sound regardless of base identity: two independently proven,
+non-overlapping ranges.** `bounds.rs`'s `where` bound can also declare an
+explicit LOWER end (`where L <= i < K`, see "Statically proven register
+bounds" below). Two DIFFERENT registers, each with its own proven `[L, K)`
+range, whose ranges don't overlap at all — `m[i]` where `i`'s range is
+`[0,5)`, `m[j]` where `j`'s range is `[5,10)` — can never address the same
+cell, no matter what either value actually is: this needs no shared base, no
+shared multiplier, no relationship between `i` and `j` whatsoever, only that
+their declared ranges are disjoint intervals and both stay within the mem's
+real depth. It's tried FIRST, before every other argument, and is strictly
+WEAKER than the fourth argument for a genuinely same-base pair (`m[i]` vs
+`m[i+1]` under `i < 9` has overlapping ranges even though the fourth argument
+already proves it disjoint by offset alone) — so it never replaces that
+argument, only reaches a case none of the other four can: two independently
+bounded, UNRELATED bases. `examples/mem_disjoint_ranges.tr` demonstrates it.
+This closes one further, narrow slice of tier-3 (see "Tier 3, not v0" below)
+— the genuinely general case (two arbitrary, UNANNOTATED bases with no
+declared range at all) stays exactly as unprovable as before.
+
 ## Statically proven register bounds
 
 `reg i : [w] where i < K = init` declares that `i`'s value is ALWAYS in `[0,
@@ -2893,6 +2912,17 @@ mem index against a non-power-of-two depth at all, so the three disjointness
 proofs above each sidestep it (require a power-of-two depth) rather than
 close it. A proven bound on a mem's own index base lets the scheduler prove
 the index stays inside the mem's REAL depth directly.
+
+The bound may also declare an explicit LOWER end: `reg j : [4] where 5 <= j <
+10 = 5` proves `j`'s value is ALWAYS in `[5, 10)`. `where i < K` is exactly
+`where 0 <= i < K` (0 is always the implicit floor of an unsigned `bits[N]`
+value) — the one-sided surface form is unchanged, and `bounds.rs` tracks a
+`(lower, upper)` pair internally either way. This exists for a different
+reason than the upper-only form: two DIFFERENT registers, each independently
+proven to occupy a non-overlapping sub-range, let the scheduler prove their
+mem accesses disjoint with no relationship between the two bases at all (see
+"A fifth case" below) — the upper-only form alone can't express that, since
+every bound would otherwise start at the same implicit floor 0.
 
 ```trace
 reg i : [4] where i < 9 = 0
@@ -2920,14 +2950,30 @@ v0 restrictions, all deliberate scope cuts:
   feature's whole point is proof, not trust), a different feature entirely.
   An `out` is register-backed and provable in principle, but has no
   motivating example yet.
-- **A single strict upper bound against a compile-time constant.** No `<=`,
-  no lower bounds (a `bits[N]` value is unsigned — 0 is always the implicit
-  floor), no multi-variable or otherwise arbitrary bound expressions.
-- **`Add` is the only supported composition on a write's right-hand side.**
-  `i + 1` composes cleanly; `Sub`/`Mul`/anything else is treated as an
-  unknown range, failing the write closed (a compile error asking for an
-  explicit restructure) rather than silently assuming it's safe. The
-  motivating pattern (`i := i + 1` under a guard) needs nothing else.
+- **A single strict upper bound against a compile-time constant, optionally
+  paired with an explicit lower end.** No multi-variable or otherwise
+  arbitrary bound expressions on either end. `narrow_for_condition` narrows
+  the UPPER end on `if <reg> < <const>` and the LOWER end on `if <reg> >
+  <const>`/`if <reg> >= <const>` (symmetric). A `<>`-shaped guard (the shape
+  `while_countdown.tr`'s own down-counter uses) is deliberately NOT
+  recognized: narrowing on `<>` is only sound when the excluded constant
+  equals the CURRENT frozen bound exactly — otherwise it splits the range
+  into two disjoint pieces this single-interval representation can't
+  express, a genuinely different argument than a plain inequality, and no
+  example needs it (`examples/countdown_bounded.tr` uses `if cnt > 0`
+  instead).
+- **`Add` and `Sub` are the supported compositions on a write's right-hand
+  side; `Mul`/anything else is still "unknown."** `i + 1` composes
+  unconditionally; `cnt - 1` composes only when the subtrahend's range
+  provably can't exceed the minuend's (the SMALLEST possible minuend must
+  still dominate the LARGEST possible subtrahend) — an unguarded
+  decrement fails this and stays rejected, exactly the false-rejection
+  case a `> 0`/`>= 1` guard's lower-end narrowing closes. Either way, an
+  unprovable write fails closed (a compile error asking for an explicit
+  restructure) rather than silently assuming it's safe. `Mul` has no
+  motivating example (nothing in the repo multiplies into a state write)
+  and needs two more overflow paths for zero known consumers, so it stays
+  out of scope.
 - **No interaction with the banking argument (v3).** That argument's
   soundness rests on a modular fact a proven bound doesn't slot into, and no
   design needs the combination.
@@ -3145,29 +3191,31 @@ either: a proven disjointness claim.** A read/write pair sharing only mem
 accesses that recognize as compile-time constants, as an affine expression of
 the SAME base def (register/input) with the mem's own depth a power of two, as
 an affine expression sharing a power-of-two multiplier (base identity
-irrelevant), OR as an affine expression sharing a base/multiplier BOTH
-confirmed to stay under the mem's own real depth via a `bounds.rs`-proven
-value bound (no power-of-two depth needed at all for this one — see
-"Statically proven register bounds"), and are provably different, is dropped
-from the conflict matrix on its own — the scheduler found the proof itself, so
-there is nothing left to trust OR to check (see "Arrays: one resource each"
-for exactly what's recognized and why). `--explain-schedule` reports it
-distinctly from both other exemptions:
+irrelevant), as an affine expression sharing a base/multiplier BOTH confirmed
+to stay under the mem's own real depth via a `bounds.rs`-proven value bound
+(no power-of-two depth needed at all for this one — see "Statically proven
+register bounds"), OR as two independently `bounds.rs`-proven, non-overlapping
+ranges regardless of base identity (the fifth case above), and are provably
+different, is dropped from the conflict matrix on its own — the scheduler
+found the proof itself, so there is nothing left to trust OR to check (see
+"Arrays: one resource each" for exactly what's recognized and why).
+`--explain-schedule` reports it distinctly from both other exemptions:
 
 ```
 rule write conflicts with rule read: write meets read on {m}
-    index sites proven disjoint (constant addresses, the same base plus a constant offset, a shared power-of-two multiplier, or a proven value bound): no stall derived (no annotation needed)
+    index sites proven disjoint (constant addresses, the same base plus a constant offset, a shared power-of-two multiplier, a proven value bound, or two independently proven disjoint ranges): no stall derived (no annotation needed)
 ```
 
 Deliberately narrow, matching v0's existing bar of failing closed rather than
 guessing: a mem sharing even ONE index that doesn't recognize as one of these
-shapes, two different bases with no shared power-of-two multiplier and no
-shared proven bound, a non-power-of-two depth with no proven bound either, or a
-write/write pair (v0's single shared write port makes two "disjoint" writers
-meaningless — see "Arrays: one resource each"), all stay fully conservative,
-exactly as if this proof did not exist. A user's own `conflict_free`/
-`mutually_exclusive` on a pair this already clears is legal, harmless
-overstatement, same as claiming either on a pair that never conflicted at all.
+shapes, two different bases with no shared power-of-two multiplier, no shared
+proven bound, and no independently proven disjoint ranges, a non-power-of-two
+depth with no proven bound either, or a write/write pair (v0's single shared
+write port makes two "disjoint" writers meaningless — see "Arrays: one
+resource each"), all stay fully conservative, exactly as if this proof did not
+exist. A user's own `conflict_free`/`mutually_exclusive` on a pair this
+already clears is legal, harmless overstatement, same as claiming either on a
+pair that never conflicted at all.
 
 **Tier 3, not v0: provable disjointness across DIFFERENT bases, in
 general.** Dahlia-style banked and affine array types would let the compiler
@@ -3175,19 +3223,23 @@ prove two accesses disjoint from genuinely different variables (`m[i]` against
 `m[j]`, two distinct registers whose values happen never to coincide, for ANY
 i and j — not just ones sharing a power-of-two multiplier or a proven bound)
 via real, general range tracking over arbitrary registers — out of scope for
-v0 so the scheduler work stays bounded. None of the three syntactic/proof-
+v0 so the scheduler work stays bounded. None of the four syntactic/proof-
 based checks above is a scoped version of this tier: the same-base affine case
 (`m[i]` against `m[i+1]`) needs no range tracking at all, since a shared
 base's value is identical on both sides by construction; the banking case
 (`m[2*i]` against `m[2*j+1]`) needs none either, for the opposite reason — it
 doesn't matter what `i` and `j`'s values are, or whether they coincide, only
-that the multiplier fixes their low bits; and `bounds.rs`'s proven-bound case
+that the multiplier fixes their low bits; `bounds.rs`'s proven-bound case
 needs a NARROW, explicitly-annotated bound (`where i < K`, checked by
 induction over every write site in the program) rather than inferring an
 arbitrary register's possible values from nothing, the way full range tracking
-would have to. The genuinely general case — two arbitrary, unrelated,
-unscaled, unannotated bases — stays exactly as unprovable as before; nothing
-in this section closes it.
+would have to; and the fifth (independently-proven-ranges) case only ever
+compares ranges that were each independently declared and proven the same
+narrow way — it infers nothing from an unannotated register, it just doesn't
+require the two bases to be related once both are individually annotated.
+The genuinely general case — two arbitrary, unrelated, unscaled, UNANNOTATED
+bases — stays exactly as unprovable as before; nothing in this section closes
+it.
 
 The checked `conflict_free` assertion above is not a smaller version of this
 tier, and does not retire it: it checks a runtime PRECONDITION (do these two
@@ -4444,13 +4496,18 @@ noted:
   `m[i+1]`, `examples/mem_disjoint_affine.tr`), an affine expression
   sharing a power-of-two multiplier across TWO DIFFERENT bases (`m[2*i]` vs
   `m[2*j+1]`, base identity irrelevant, `examples/mem_disjoint_banked.tr`),
-  or an affine expression confirmed to stay under the mem's own REAL depth
+  an affine expression confirmed to stay under the mem's own REAL depth
   via a statically-proven `where` bound, no power-of-two depth needed
-  (`examples/mem_disjoint_bounded.tr`), and provably different either way.
-- `reg i : [w] where i < K`: a statically PROVEN register value bound
+  (`examples/mem_disjoint_bounded.tr`), or two independently proven,
+  non-overlapping `where` ranges across TWO DIFFERENT bases regardless of
+  base identity (`examples/mem_disjoint_ranges.tr`), and provably different
+  either way.
+- `reg i : [w] where [L <=] i < K`: a statically PROVEN register value bound
   (`bounds.rs`), checked by induction over every write site in the program
-  — not trusted, not a runtime assertion. Exists to feed the mem-index
-  disjointness proof above; see "Statically proven register bounds".
+  — not trusted, not a runtime assertion. `L` (0 if omitted) lets two
+  DIFFERENT regs each be proven to occupy a disjoint sub-range. Exists to
+  feed the mem-index disjointness proof above; see "Statically proven
+  register bounds".
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/
@@ -4486,15 +4543,19 @@ Not yet implemented:
 - **Combinational-only (stateless) modules.** `out` is register-backed by
   design, so a pure function of inputs cannot be expressed without a cycle of
   delay.
-- **Array banking / provable disjointness across DIFFERENT bases (tier 3).**
-  v0 arrays are one conflict resource each, except that a read/write pair is
-  auto-proven disjoint when its indices are either both compile-time-constant
-  integers, or an affine expression of the SAME base register/input with the
-  mem's own depth a power of two (see "Arrays: one resource each"/"The
-  schedule block"). Two DIFFERENT bases (`m[i]` vs `m[j]`, distinct registers)
-  stay fully conservative — this is the real tier-3 gap, needing range
-  tracking, not a syntactic check — as does any write/write pair regardless
-  of index shape.
+- **Array banking / provable disjointness across DIFFERENT bases (tier 3),
+  in general.** v0 arrays are one conflict resource each, except that a
+  read/write pair is auto-proven disjoint when its indices are either both
+  compile-time-constant integers, an affine expression of the SAME base
+  register/input with the mem's own depth a power of two, a shared
+  power-of-two multiplier across two different bases, a `where`-proven
+  bound, or two independently `where`-proven, non-overlapping ranges across
+  two different bases (see "Arrays: one resource each"/"The schedule
+  block"). Two DIFFERENT, UNANNOTATED bases (`m[i]` vs `m[j]`, distinct
+  registers with no declared range at all) stay fully conservative — this
+  is the real tier-3 gap, needing general range tracking, not a syntactic
+  check or a narrow annotation — as does any write/write pair regardless of
+  index shape.
 - **A Verilator simulation path.** Icarus only today.
 
 ## Prior art

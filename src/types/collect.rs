@@ -30,7 +30,11 @@ impl<'a> TypeChecker<'a> {
             match self.ast.item(id).clone() {
                 Item::Module { items, .. } => stack.extend(items),
                 Item::Reg {
-                    ty, init, bound, ..
+                    ty,
+                    init,
+                    bound,
+                    lower,
+                    ..
                 } => {
                     let ty = self.eval_ty(ty, &HashMap::new());
                     if !matches!(
@@ -80,7 +84,7 @@ impl<'a> TypeChecker<'a> {
                             self.check_literal_fits(init, &ty);
                         }
                         if let Some(bound) = bound {
-                            self.check_where_bound_init(init, bound);
+                            self.check_where_bound_init(init, bound, lower);
                         }
                     }
                     self.state_tys.insert(def, ty);

@@ -2021,3 +2021,50 @@ fn where_bound_init_exactly_at_the_limit_is_an_error() {
             .contains("does not satisfy the declared bound")
     );
 }
+
+#[test]
+fn where_bound_two_sided_init_inside_the_range_is_accepted() {
+    let (_, _, errors) = run("module M {\n reg j : [4] where 5 <= j < 10 = 5\n}\n");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn where_bound_two_sided_init_below_the_lower_end_is_an_error() {
+    let (_, _, errors) = run("module M {\n reg j : [4] where 5 <= j < 10 = 4\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("does not satisfy the declared bound")
+    );
+}
+
+#[test]
+fn where_bound_lower_end_must_be_a_compile_time_constant() {
+    // `n` resolves fine (an ordinary reg), but `const_eval` never
+    // consults runtime state -- only elaboration-time env bindings --
+    // so a bare reg reference in the lower-end position must be its
+    // own clean error, not silently treated as some fallback value.
+    let (_, _, errors) =
+        run("module M {\n reg n : [4] = 3\n reg j : [4] where n <= j < 10 = 5\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("lower end must be a compile-time constant")
+    );
+}
+
+#[test]
+fn where_bound_degenerate_range_is_rejected() {
+    // `lower >= limit` is an empty range -- no init could ever satisfy
+    // it, so this must be its own clean error, not silently accepted or
+    // conflated with the ordinary "init doesn't satisfy" message.
+    let (_, _, errors) = run("module M {\n reg j : [4] where 10 <= j < 10 = 5\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("strictly less than its upper end")
+    );
+}

@@ -1,0 +1,61 @@
+-- v6 of the mem-disjointness proof, and the driving example for
+-- schedule.rs's FIFTH disjointness argument: two DIFFERENT registers,
+-- `i` and `j`, each independently proven (`bounds.rs`) to occupy a
+-- disjoint sub-range of `m`'s real depth. `i`'s declared range is
+-- `[0,5)`, `j`'s is `[5,10)` -- they never overlap, so `write` (writes
+-- `m[i]`) and `read` (reads `m[j]`) are proven disjoint with no shared
+-- base, multiplier, or offset relationship at all: this is the one
+-- argument in schedule.rs that's sound regardless of base identity.
+--
+-- Unlike v5's driving example (same base, different offset), this one
+-- is the genuinely general tier-3 shape (DESIGN.md's "Tier 3, not v0")
+-- -- narrowed to the one buildable slice: both bases must be
+-- INDEPENDENTLY, EXPLICITLY bounded and proven, not inferred from
+-- nothing. `m[i]` vs `m[j]` for two arbitrary UNANNOTATED registers
+-- stays exactly as unprovable as before this feature.
+--
+-- `bump_i`/`bump_j` each conflict with `write`/`read` on `i`/`j`
+-- themselves (plain register read/write, unrelated to the mem question)
+-- -- `conflict_free` resolves those separately, same as v5's `bump`.
+module MemDisjointRanges {
+    mem m : [8][10]
+
+    reg i : [4] where i < 5 = 0
+    reg j : [4] where 5 <= j < 10 = 5
+
+    in x : [8]
+    out y : [8] = 0
+    out write_count : [8] = 0
+    out read_count : [8] = 0
+
+    rule bump_i {
+        if i < 4 {
+            i := i + 1
+        } else {
+            i := 0
+        }
+    }
+
+    rule bump_j {
+        if j < 9 {
+            j := j + 1
+        } else {
+            j := 5
+        }
+    }
+
+    rule write {
+        m[i] := x
+        write_count := write_count + 1
+    }
+
+    rule read {
+        y := m[j]
+        read_count := read_count + 1
+    }
+
+    schedule {
+        conflict_free { bump_i, write }
+        conflict_free { bump_j, read }
+    }
+}

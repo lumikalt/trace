@@ -483,8 +483,8 @@ fn explain_names_a_proven_disjoint_mem_pair() {
     assert!(text.contains("rule write conflicts with rule read"));
     assert!(text.contains(
         "index sites proven disjoint (constant addresses, the same base plus a constant \
-         offset, a shared power-of-two multiplier, or a proven value bound): no stall derived \
-         (no annotation needed)"
+         offset, a shared power-of-two multiplier, a proven value bound, or two independently \
+         proven disjoint ranges): no stall derived (no annotation needed)"
     ));
 }
 
@@ -1133,7 +1133,7 @@ module M {
 
 #[test]
 fn mem_disjoint_v5_proven_bound_does_not_rescue_a_subtraction() {
-    // `m[i-1]` under a proven `i < 10`: `real_upper_bound` recognizes
+    // `m[i-1]` under a proven `i < 10`: `real_range` recognizes
     // only `Ident`/literal/`Add` (mirroring `bounds.rs`'s own
     // `expr_bound`) -- `Sub` is deliberately excluded, since `IndexForm`
     // stores `i-1`'s offset as a WRAPPED `u64::MAX`, which would be
@@ -1160,6 +1160,117 @@ module M {
     let group = &sched.groups[0];
     assert_eq!(group.conflicts.len(), 1);
     assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v6_disjoint_proven_ranges_across_different_bases() {
+    // The actual driving example for the fifth (range-disjointness)
+    // argument: `i`'s proven range is `[0,5)`, `j`'s is `[5,10)` -- they
+    // never overlap, so `write` (writes `m[i]`) and `read` (reads
+    // `m[j]`) are proven disjoint with no shared base, multiplier, or
+    // offset relationship at all.
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg i : [4] where i < 5 = 0
+    reg j : [4] where 5 <= j < 10 = 5
+    in x : [8]
+    out y : [8] = 0
+    rule bump_i {
+        if i < 4 {
+            i := i + 1
+        } else {
+            i := 0
+        }
+    }
+    rule bump_j {
+        if j < 9 {
+            j := j + 1
+        } else {
+            j := 5
+        }
+    }
+    rule write {
+        m[i] := x
+    }
+    rule read {
+        y := m[j]
+    }
+    schedule {
+        conflict_free { bump_i, write }
+        conflict_free { bump_j, read }
+    }
+}
+";
+    let (_, res, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    let mem_conflict = group
+        .conflicts
+        .iter()
+        .find(|c| c.on.iter().any(|d| res.def(*d).name == "m"))
+        .expect("a conflict on the mem `m` should exist");
+    assert_eq!(mem_conflict.exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v6_overlapping_proven_ranges_stay_unprovable() {
+    // `i`'s range `[0,5)` and `j`'s range `[3,8)` overlap in `[3,5)` --
+    // the range-disjointness argument must not overreach here, and
+    // neither base/multiplier is shared, so no other argument can fire
+    // either.
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg i : [4] where i < 5 = 0
+    reg j : [4] where 3 <= j < 8 = 3
+    in x : [8]
+    out y : [8] = 0
+    rule write {
+        m[i] := x
+    }
+    rule read {
+        y := m[j]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v6_constant_vs_bounded_different_base_is_a_freebie() {
+    // A bare constant compared against a bounded, unrelated base's index
+    // previously always failed closed (`(None, Some(db))` had no
+    // argument at all) -- the range-disjointness argument fires here
+    // for free, since it's tried before the base-identity match: `3` is
+    // outside `j`'s proven range `[5,10)`.
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg j : [4] where 5 <= j < 10 = 5
+    in x : [8]
+    out y : [8] = 0
+    rule write {
+        m[3] := x
+    }
+    rule read {
+        y := m[j]
+    }
+}
+";
+    let (_, res, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    let mem_conflict = group
+        .conflicts
+        .iter()
+        .find(|c| c.on.iter().any(|d| res.def(*d).name == "m"))
+        .expect("a conflict on the mem `m` should exist");
+    assert_eq!(mem_conflict.exemption, Exemption::Disjoint);
 }
 
 #[test]

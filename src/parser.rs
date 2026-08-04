@@ -416,38 +416,47 @@ impl<'a> Parser<'a> {
             }
             None
         };
-        // `where <ident> < <const>` — v0 restriction: `reg` only (an `in`
-        // has no write site at all to prove anything over; `out` is
-        // register-backed and provable in principle but has no driving
-        // example yet, see DESIGN.md). Parsed BEFORE `= init` (`resolve.
-        // rs`/`bounds.rs` validate the actual shape, same precedent as
-        // `IfLet`'s `init`). Built manually as `Binary{Lt, lhs, rhs}`
-        // rather than via `self.parse_expr(0)` on the whole clause: `=`
-        // is ALSO a comparison operator (`BinOp::Eq`) at the identical
-        // binding-power tier as `<`, so a full low-bp parse here would
+        // `where <ident> < <const>`, or `where <const> <= <ident> <
+        // <const>` for the two-sided form — v0 restriction: `reg` only
+        // (an `in` has no write site at all to prove anything over;
+        // `out` is register-backed and provable in principle but has no
+        // driving example yet, see DESIGN.md). Parsed BEFORE `= init`
+        // (`resolve.rs`/`bounds.rs` validate the actual shape, same
+        // precedent as `IfLet`'s `init`). Built manually rather than via
+        // `self.parse_expr(0)` on the whole clause: `=` is ALSO a
+        // comparison operator (`BinOp::Eq`) at the identical binding-
+        // power tier as `<`/`<=`, so a full low-bp parse here would
         // greedily chain straight into a following `= init` as `(i < 10)
-        // = 0` instead of stopping at `10` — parsing `lhs`/`rhs`
-        // separately at `TYPE_MIN_BP` (above the comparison tier, so
-        // neither side tries to consume a `<`/`=` itself) sidesteps the
-        // ambiguity entirely.
+        // = 0` instead of stopping at `10` — and a chained `L <= i < K`
+        // would itself parse as `(L <= i) < K` under the general
+        // grammar. Parsing every operand separately at `TYPE_MIN_BP`
+        // (above the comparison tier, so no operand ever tries to
+        // consume a `<`/`<=`/`=` itself) sidesteps both ambiguities.
         let where_span = self.cur_span();
-        let bound = if self.at_ident_text("where") {
+        let (bound, lower) = if self.at_ident_text("where") {
             self.bump();
             let bound_lo = self.cur_span().start;
-            let lhs = self.parse_expr(TYPE_MIN_BP)?;
+            let first = self.parse_expr(TYPE_MIN_BP)?;
+            let (lower, ident) = if self.eat(TokenKind::Le) {
+                let ident = self.parse_expr(TYPE_MIN_BP)?;
+                (Some(first), ident)
+            } else {
+                (None, first)
+            };
             self.expect(TokenKind::Lt, "`<` after `where <ident>`")
                 .ok()?;
             let rhs = self.parse_expr(TYPE_MIN_BP)?;
-            Some(self.ast.push_expr(
+            let bound = self.ast.push_expr(
                 Expr::Binary {
                     op: BinOp::Lt,
-                    lhs,
+                    lhs: ident,
                     rhs,
                 },
                 bound_lo..self.prev_end,
-            ))
+            );
+            (Some(bound), lower)
         } else {
-            None
+            (None, None)
         };
         if bound.is_some() && keyword != TokenKind::Reg {
             self.errors.push(ParseError {
@@ -491,6 +500,7 @@ impl<'a> Parser<'a> {
                         ty,
                         init,
                         bound,
+                        lower,
                     }
                 } else {
                     Item::Output { name, ty, init }
@@ -754,6 +764,7 @@ impl<'a> Parser<'a> {
                 ty: reg_ty,
                 init: Some(one),
                 bound: None,
+                lower: None,
             },
             span.clone(),
         );

@@ -2185,6 +2185,82 @@ manually in the meantime.
   tier-3 case (`m[i]` vs `m[j]`, two arbitrary unannotated bases) —
   explicitly a narrow, induction-checked annotation, not general range
   inference.
+- **RESOLVED (v6) — `where` gained an optional LOWER end (`where L <=
+  i < K`), letting two DIFFERENT registers each be independently
+  proven to occupy a non-overlapping sub-range, closing one further,
+  narrow slice of the general tier-3 gap v5 explicitly left open**
+  (`schedule.rs`'s `forms_differ` gains a FIFTH, independent argument
+  — tried FIRST, sound regardless of base identity, since two
+  provably non-overlapping real ranges can never coincide in value;
+  `examples/mem_disjoint_ranges.tr`, `i`'s range `[0,5)` vs `j`'s
+  `[5,10)`). Motivation checked directly before scoping, same
+  discipline v3 used: every existing mem access with two different
+  bases is either module inputs (already answered by the checked
+  `conflict_free` assertion) or data loaded out of the mem itself
+  (`subleq.tr`'s `m[a]`/`m[b]`, unprovable regardless) — no existing
+  design needed this, so a new example was written for it, same basis
+  v3 shipped on (confirmed to Lumi via AskUserQuestion before building
+  anyway). `bounds.rs`'s `BoundedReg`/`Bounds` now track a `(lower,
+  upper)` pair throughout (`Bounds.upper` renamed to `Bounds.ranges`);
+  every write site checks BOTH ends against the full declared range.
+  Deliberately NOT extended: `narrow_for_condition` still only narrows
+  the UPPER end via `if <reg> < <const>` — a `>=`/`>`-shaped guard
+  narrowing the LOWER end isn't recognized, traced by hand against the
+  driving example to confirm it isn't needed (every write is checked
+  directly against the full frozen declared range on both ends, not a
+  further-narrowed one). The fifth argument also gives a small freebie
+  for free: a bare constant vs. a bounded different-base index (`m[3]`
+  vs `m[j]` where `j`'s range is `[5,10)`) is now provable too, since
+  that combination previously always failed closed. `schedule.rs`'s
+  `real_upper_bound` (v5) is renamed `real_range`, returning the full
+  pair instead of just the upper end. Confirmed via a targeted
+  discriminating check (disabling just the new argument, not a full
+  `git stash`, since bounds.rs's `Bounds` struct shape changed too):
+  the driving example's `write`/`read` pair falls back to a derived
+  stall without it, proven disjoint with it, at both the
+  `--explain-schedule` and real firtool+Icarus sim level. Still does
+  NOT close the general tier-3 case: two arbitrary, unrelated,
+  UNANNOTATED bases (no declared range at all) stay exactly as
+  unprovable as before — this only ever compares ranges that were
+  each independently declared and proven, it infers nothing from
+  nothing.
+- **RESOLVED (v7) — `bounds.rs`'s guard narrowing gained `Gt`/`Ge` arms
+  (narrowing a bounded reg's LOWER end, symmetric to the existing `Lt`
+  arm) and `expr_bound` gained `Sub` composition, closing a FALSE
+  REJECTION rather than adding a new provable case** (unlike v3/v5/v6):
+  `reg cnt : [8] where cnt < 100 = 0` with `if cnt > 0 { cnt := cnt - 1
+  }` was previously rejected outright ("unsupported expression shape")
+  even though the guard makes it provably safe —
+  `examples/countdown_bounded.tr` is the driving example, confirmed to
+  fail on the pre-feature code before implementing (the same
+  discriminating-baseline discipline as every prior step, just checked
+  before writing code instead of via `git stash` after, since this pass
+  touches no scheduling logic to stash around). Traced by hand before
+  scoping (self-caught, then confirmed with Lumi via AskUserQuestion):
+  Sub as originally proposed alone would have been INERT — the only
+  real Sub pattern (`while_countdown.tr`'s down-counter) needs `cnt`'s
+  frozen LOWER bound narrowed first, or `0 - 1` always fails the
+  underflow check regardless of any guard, since narrowing only
+  recognized `<` before this. `Sub`'s soundness check reuses the
+  existing `checked_*`-fails-closed idiom exactly: `b_max =
+  b_hi.checked_sub(1)`, `lo = a_lo.checked_sub(b_max)`, `hi =
+  a_hi.checked_sub(b_lo)` — if the smallest possible minuend can't be
+  proven to dominate the largest possible subtrahend, `checked_sub`
+  itself returns `None`, the same "unprovable, fails closed" signal
+  `Add`'s `checked_add` already gives on overflow, needing no separate
+  error path. `Mul` and `<>`-shaped guard narrowing were both
+  considered and DROPPED: `Mul` has no motivating example (nothing in
+  the repo multiplies into a state write) and would need two more
+  overflow paths for zero known consumers; `<>` narrowing is only sound
+  when the excluded constant equals the CURRENT frozen bound exactly
+  (otherwise it splits the range into two disjoint pieces a single
+  interval can't express) — a genuinely different, more special-cased
+  argument than a plain inequality, confirmed to still stay rejected by
+  its own dedicated regression test. A normalized `--explain-schedule`
+  diff across every existing example came back byte-identical (this
+  pass touches no scheduling logic at all, only `bounds.rs`'s own
+  write-site proof) — the first RESOLVED entry in this whole arc with
+  zero `schedule.rs` involvement.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

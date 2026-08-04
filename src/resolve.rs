@@ -490,7 +490,11 @@ impl<'a> Resolver<'a> {
                 self.current_module.pop();
             }
             Item::Reg {
-                ty, init, bound, ..
+                ty,
+                init,
+                bound,
+                lower,
+                ..
             } => {
                 self.resolve_expr(*ty, false);
                 if let Some(init) = init {
@@ -499,6 +503,9 @@ impl<'a> Resolver<'a> {
                 if let Some(bound) = bound {
                     self.resolve_expr(*bound, false);
                     self.check_bound_self_reference(id, *bound);
+                }
+                if let Some(lower) = lower {
+                    self.resolve_expr(*lower, false);
                 }
             }
             Item::Mem { ty, .. }

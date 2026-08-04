@@ -1204,3 +1204,40 @@ fn where_clause_requires_an_explicit_init() {
     assert!(!errors.is_empty());
     assert!(errors[0].message.contains("requires an explicit `= init`"));
 }
+
+#[test]
+fn where_clause_parses_the_two_sided_form() {
+    let ast = parse_ok("module M {\n reg j : [4] where 5 <= j < 10 = 5\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Reg {
+        name,
+        bound,
+        lower,
+        init,
+        ..
+    } = ast.item(items[0])
+    else {
+        panic!("expected a reg");
+    };
+    assert_eq!(name.text, "j");
+    assert!(init.is_some());
+    let bound = bound.expect("where clause should have parsed");
+    // `bound` stays exactly the one-sided shape either way -- `lower` is
+    // a separate sibling field, not folded into this node.
+    assert_eq!(ast.expr_sexpr(bound), "(< j 10)");
+    let lower = lower.expect("two-sided form should have set `lower`");
+    assert_eq!(ast.expr_sexpr(lower), "5");
+}
+
+#[test]
+fn where_clause_two_sided_form_still_requires_the_lt_after_the_ident() {
+    // `where L <= i` with no trailing `< K` must still be a clean parse
+    // error, not silently accepted as a bound with no upper end.
+    let src = "module M {\n reg j : [4] where 5 <= j = 5\n}\n";
+    let (tokens, _) = lexer::lex(src);
+    let (_, errors) = parser::parse(src, &tokens);
+    assert!(!errors.is_empty());
+    assert!(errors[0].message.contains("`<` after `where"));
+}

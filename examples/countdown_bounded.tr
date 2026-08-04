@@ -1,0 +1,26 @@
+-- v7 of bounds.rs: the driving example for Sub composition + Gt/Ge guard
+-- narrowing. Before this feature, `cnt := cnt - 1` was rejected outright
+-- ("unsupported expression shape") even though `if cnt > 0` makes it
+-- provably safe -- a FALSE REJECTION of correct, safe code, unlike v3/v6
+-- which each added a genuinely new provable case. `cnt > 0` narrows the
+-- LOWER end of `cnt`'s frozen range to 1 for the `then` branch, making
+-- `cnt - 1`'s computed range provably within the declared `[0, 100)`; the
+-- `else` branch writes a bare literal, needing no narrowing at all.
+--
+-- Deliberately NOT the `while_countdown.tr` shape (`while cnt <> 0 { cnt :=
+-- cnt - 1 }`): `<>` guard narrowing is a genuinely different, more
+-- special-cased soundness argument (only sound when the excluded constant
+-- equals the CURRENT frozen bound exactly) and stays out of scope here.
+module CountdownBounded {
+    reg cnt : [8] where cnt < 100 = 0
+    out done_count : [8] = 0
+
+    rule count {
+        if cnt > 0 {
+            cnt := cnt - 1
+        } else {
+            cnt := 99
+            done_count := done_count + 1
+        }
+    }
+}

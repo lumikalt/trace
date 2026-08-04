@@ -1916,6 +1916,41 @@ fn mem_disjoint_bounded_runs_through_real_ports() {
     );
 }
 
+/// v6 of the mem-disjointness proof: `i`'s proven range `[0,5)` and
+/// `j`'s proven range `[5,10)` never overlap, so `write` (writes
+/// `m[i]`) and `read` (reads `m[j]`) are proven disjoint via
+/// schedule.rs's FIFTH (range-disjointness) argument -- sound
+/// regardless of base identity, unlike v5's same-base argument above.
+/// Confirmed via `git stash` (self-verification, not asserted in this
+/// test) that disabling the new argument reproduces the exact
+/// old-conservative-model failure: `write`/`read` fall back to a
+/// derived stall on the identical source.
+#[test]
+fn mem_disjoint_ranges_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/mem_disjoint_ranges.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/mem_disjoint_ranges_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: write_count=12 read_count=12 y=aa"),
+        "mem_disjoint_ranges result did not match expectations:\n{output}"
+    );
+}
+
 /// Proves DESIGN.md's own `<elaborates>` example (`AdderTree`, compile-
 /// time tree recursion over a `list` with one-sided slices) through real
 /// firtool and Icarus: `elaborate.rs`'s pre-pass unrolls `AdderTree([a,

@@ -405,6 +405,15 @@ pub enum Item {
         /// to this SAME def, `bounds.rs` requires the whole shape be
         /// `Binary { Lt, Ident(self), <compile-time-constant> }`.
         bound: Option<ExprId>,
+        /// `where <const> <= <name> < <const>` — the same bound's
+        /// optional LOWER end (inclusive), only set when the two-sided
+        /// surface form was written; `None` means the implicit floor 0
+        /// (a `bits[N]` value is unsigned). Kept as a sibling field
+        /// rather than folded into `bound`'s own AST shape so `bound`
+        /// stays exactly `Binary { Lt, Ident(self), <const> }` either
+        /// way — resolve.rs's self-reference check needs no changes for
+        /// this field to exist.
+        lower: Option<ExprId>,
     },
     Mem {
         name: Name,
@@ -667,10 +676,18 @@ impl Ast {
                 ty,
                 init,
                 bound,
+                lower,
             } => {
                 out.push_str(&format!("{pad}reg {name} : {}", self.expr_sexpr(*ty)));
                 if let Some(bound) = bound {
-                    out.push_str(&format!(" where {}", self.expr_sexpr(*bound)));
+                    match lower {
+                        Some(lower) => out.push_str(&format!(
+                            " where {} <= {}",
+                            self.expr_sexpr(*lower),
+                            self.expr_sexpr(*bound)
+                        )),
+                        None => out.push_str(&format!(" where {}", self.expr_sexpr(*bound))),
+                    }
                 }
                 if let Some(init) = init {
                     out.push_str(&format!(" = {}", self.expr_sexpr(*init)));

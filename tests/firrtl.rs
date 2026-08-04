@@ -433,6 +433,26 @@ fn mem_disjoint_bounded_needs_no_annotation_on_the_mem_pair() {
 }
 
 #[test]
+fn mem_disjoint_ranges_needs_no_annotation_on_the_mem_pair() {
+    // v6's driving example: `i`'s proven range `[0,5)` and `j`'s proven
+    // range `[5,10)` never overlap, so `write` (writes `m[i]`) and
+    // `read` (reads `m[j]`) -- the pair sharing `m` -- go unconditional
+    // with no `conflict_free` needed for THAT pair, even though `i` and
+    // `j` share no base, multiplier, or offset relationship at all.
+    let fir =
+        emit_from_source(&read_example("mem_disjoint_ranges.tr")).expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, i"));
+    assert!(fir.contains("connect m.r0.addr, j"));
+    assert!(fir.contains("node fires_write = UInt<1>(1)"));
+    assert!(fir.contains("node fires_read = UInt<1>(1)"));
+    // Neither the plain-register `{i}`/`{j}` conflicts (trusted
+    // `conflict_free`) nor the mem `{m}` conflict (proven `Disjoint`)
+    // has anything sound to check.
+    assert!(!fir.contains("assert("));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn mem_disjoint_banked_needs_no_conflict_free_annotation() {
     // v3 of the two tests above: examples/mem_disjoint_banked.tr's
     // `write`/`read` share a power-of-two multiplier (`2*i` vs `2*j+1`)

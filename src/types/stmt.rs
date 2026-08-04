@@ -655,18 +655,27 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// A `where <ident> < <const>` bound's own base case: the declared
-    /// init value must itself satisfy the bound, via the SAME
-    /// `const_eval` `check_literal_fits` already uses. The parser only
-    /// ever constructs this shape as `Binary { Lt, lhs, rhs }` (`where`
-    /// hard-requires the literal `<` token, so no other comparison
-    /// operator can reach here), and `resolve.rs` already requires
-    /// `lhs` self-reference the declared reg — so the only thing left
-    /// to verify here is the numeric relationship. An un-evaluable
-    /// limit or init is ALSO an error, not silently skipped: the whole
-    /// induction argument (`bounds.rs`) needs a verified starting
-    /// point, and there's nothing to induct from otherwise.
-    pub(crate) fn check_where_bound_init(&mut self, init: ExprId, bound: ExprId) {
+    /// A `where [<const> <=] <ident> < <const>` bound's own base case:
+    /// the declared init value must itself satisfy the bound, via the
+    /// SAME `const_eval` `check_literal_fits` already uses. The parser
+    /// only ever constructs `bound`'s shape as `Binary { Lt, lhs, rhs }`
+    /// (`where` hard-requires the literal `<` token, so no other
+    /// comparison operator can reach here), and `resolve.rs` already
+    /// requires `lhs` self-reference the declared reg — so the only
+    /// thing left to verify here is the numeric relationship. `lower`
+    /// (`None` for the one-sided surface form) defaults to 0, the
+    /// implicit floor of an unsigned `bits[N]` value. An un-evaluable
+    /// limit/lower/init, or a `lower >= limit` (an empty range that no
+    /// init could ever satisfy), is ALSO an error, not silently
+    /// skipped: the whole induction argument (`bounds.rs`) needs a
+    /// verified starting point, and there's nothing to induct from
+    /// otherwise.
+    pub(crate) fn check_where_bound_init(
+        &mut self,
+        init: ExprId,
+        bound: ExprId,
+        lower: Option<ExprId>,
+    ) {
         let Expr::Binary { rhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
@@ -677,6 +686,33 @@ impl<'a> TypeChecker<'a> {
             );
             return;
         };
+        let lower_val = match lower {
+            Some(lower) => match self.const_eval(lower, &HashMap::new()) {
+                Some(v) => v,
+                None => {
+                    self.error(
+                        self.expr_span(lower),
+                        "a `where` bound's own lower end must be a compile-time constant"
+                            .to_string(),
+                    );
+                    return;
+                }
+            },
+            None => 0,
+        };
+        if lower_val >= limit {
+            let span = lower
+                .map(|l| self.expr_span(l))
+                .unwrap_or(self.expr_span(rhs));
+            self.error(
+                span,
+                format!(
+                    "a `where` bound's lower end must be strictly less than its upper end \
+                     (`{lower_val} <= _ < {limit}` is empty -- no value could ever satisfy it)"
+                ),
+            );
+            return;
+        }
         let Some(v) = self.const_eval(init, &HashMap::new()) else {
             self.error(
                 self.expr_span(init),
@@ -686,10 +722,13 @@ impl<'a> TypeChecker<'a> {
             );
             return;
         };
-        if v >= limit {
+        if v < lower_val || v >= limit {
             self.error(
                 self.expr_span(init),
-                format!("init value {v} does not satisfy the declared bound (`< {limit}`)"),
+                format!(
+                    "init value {v} does not satisfy the declared bound (`{lower_val} <= _ < \
+                     {limit}`)"
+                ),
             );
         }
     }

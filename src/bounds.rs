@@ -19,19 +19,38 @@
 //!   is proof, not trust), a different feature. An `out` is register-
 //!   backed and provable in principle, but has no motivating example
 //!   yet — parser.rs rejects `where` on either.
-//! - A single strict upper bound against a compile-time constant only:
-//!   no `<=`, no lower bounds (a `bits[N]` value is unsigned — 0 is
-//!   always the implicit floor), no multi-variable or otherwise
-//!   arbitrary bound expressions.
-//! - RHS composition supports only bare idents/literals and `Add` — the
-//!   motivating pattern (`i := i + 1` under a guard) needs nothing else.
-//!   `Sub`/`Mul`/anything else composes to "unknown," which fails the
-//!   write-site check closed (a compile error asking for an explicit
-//!   restructure), never silently "assumed in range."
+//! - A single strict upper bound against a compile-time constant,
+//!   optionally paired with an explicit LOWER end too (`where L <= i <
+//!   K`, inclusive): a bare `where i < K` is exactly `where 0 <= i < K`
+//!   (0 is always the implicit floor of an unsigned `bits[N]` value).
+//!   No multi-variable or otherwise arbitrary bound expressions on
+//!   either end.
+//! - RHS composition supports only bare idents/literals, `Add`, and `Sub`
+//!   — the motivating patterns (`i := i + 1` under a `< K` guard,
+//!   `cnt := cnt - 1` under a `> 0`/`>= 1` guard) need nothing else.
+//!   `Sub` fails closed (returns "unknown") whenever the subtrahend's
+//!   range could exceed the minuend's — a real, checked soundness
+//!   condition, not a syntactic restriction (see `expr_bound`'s own doc
+//!   comment). `Mul`/anything else composes to "unknown" unconditionally:
+//!   no example in the repo multiplies into a state write, and a
+//!   product's range needs two more overflow paths for zero known
+//!   consumers. Either way, an unprovable write fails the write-site
+//!   check closed (a compile error asking for an explicit restructure),
+//!   never silently "assumed in range."
 //! - No interaction with `schedule.rs`'s v3 banking argument — that
 //!   argument's soundness rests on a modular (not real-integer) fact a
 //!   proven bound doesn't slot into, and no example needs the
 //!   combination.
+//! - `narrow_for_condition` narrows the UPPER end on `if <reg> < <const>`
+//!   and the LOWER end on `if <reg> > <const>`/`if <reg> >= <const>`. A
+//!   `<>`-shaped guard (the actual shape `while_countdown.tr` uses for
+//!   its own, unbounded, down-counter) is deliberately NOT recognized:
+//!   narrowing on `<>` is only sound when the excluded constant equals
+//!   the CURRENT frozen bound exactly (otherwise it splits the range
+//!   into two disjoint pieces this single-interval representation can't
+//!   express) — a genuinely different, more special-cased argument than
+//!   a plain inequality, and no example needs it (`examples/
+//!   countdown_bounded.tr` uses `if cnt > 0` instead).
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -94,19 +113,21 @@ pub struct BoundsError {
     pub message: String,
 }
 
-/// Every `reg` with a proven `where` bound, and the upper bound (K in
-/// `< K`) itself. Presence in this map, regardless of the value, means
-/// the bound was successfully proven across the whole program — a reg
-/// with no `where` clause is simply absent. Consumed by `schedule.rs`'s
-/// own third disjointness argument.
+/// Every `reg` with a proven `where` bound, and the `(lower, upper)`
+/// range itself (lower inclusive, upper exclusive). Presence in this
+/// map, regardless of the value, means the bound was successfully
+/// proven across the whole program — a reg with no `where` clause is
+/// simply absent. Consumed by `schedule.rs`'s own disjointness
+/// arguments.
 #[derive(Debug, Default)]
 pub struct Bounds {
-    pub upper: HashMap<DefId, u64>,
+    pub ranges: HashMap<DefId, (u64, u64)>,
 }
 
 /// One bounded reg's own declared facts, collected once up front.
 struct BoundedReg {
-    limit: u64,
+    lower: u64,
+    upper: u64,
     width: u64,
 }
 
@@ -127,10 +148,10 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
     }
     checker.check_write_site_exhaustiveness();
     let bounds = Bounds {
-        upper: checker
+        ranges: checker
             .bounded
             .iter()
-            .map(|(def, b)| (*def, b.limit))
+            .map(|(def, b)| (*def, (b.lower, b.upper)))
             .collect(),
     };
     (bounds, checker.errors)
@@ -163,20 +184,32 @@ impl<'a> Checker<'a> {
     /// `where` clause this way (hard-requires the literal `<` token),
     /// and `resolve.rs` already requires the LHS self-reference this
     /// same reg — so nothing left to validate here but extracting the
-    /// limit and the reg's own declared width.
+    /// range and the reg's own declared width. `lower` (`None` for the
+    /// one-sided surface form) is trusted to already const-fold to less
+    /// than the upper limit — `types/stmt.rs`'s `check_where_bound_init`
+    /// already validated exactly that as this bound's base case.
     fn collect_bounded_regs(&mut self) {
         let mut stack: Vec<ItemId> = self.ast.roots.clone();
         while let Some(id) = stack.pop() {
             match self.ast.item(id) {
                 Item::Module { items, .. } => stack.extend(items.iter().copied()),
                 Item::Reg {
-                    bound: Some(bound), ..
+                    bound: Some(bound),
+                    lower,
+                    ..
                 } => {
                     let Expr::Binary { rhs, .. } = self.ast.expr(*bound) else {
                         continue;
                     };
-                    let Some(limit) = const_fold(self.ast, *rhs) else {
+                    let Some(upper) = const_fold(self.ast, *rhs) else {
                         continue; // types.rs already reported this
+                    };
+                    let lower_val = match lower {
+                        Some(l) => match const_fold(self.ast, *l) {
+                            Some(v) => v,
+                            None => continue, // types.rs already reported this
+                        },
+                        None => 0,
                     };
                     let Some(def) = self.res.item_defs.get(&id).copied() else {
                         continue;
@@ -199,7 +232,14 @@ impl<'a> Checker<'a> {
                         );
                         continue;
                     };
-                    self.bounded.insert(def, BoundedReg { limit, width });
+                    self.bounded.insert(
+                        def,
+                        BoundedReg {
+                            lower: lower_val,
+                            upper,
+                            width,
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -235,17 +275,20 @@ impl<'a> Checker<'a> {
             Item::Fn { body, .. } => body.clone(),
             _ => return,
         };
-        let mut state: HashMap<DefId, u64> =
-            self.bounded.iter().map(|(d, b)| (*d, b.limit)).collect();
-        let mut locals: HashMap<DefId, Option<u64>> = HashMap::new();
+        let mut state: HashMap<DefId, (u64, u64)> = self
+            .bounded
+            .iter()
+            .map(|(d, b)| (*d, (b.lower, b.upper)))
+            .collect();
+        let mut locals: HashMap<DefId, Option<(u64, u64)>> = HashMap::new();
         self.check_body(&body, &mut state, &mut locals);
     }
 
     fn check_body(
         &mut self,
         body: &[StmtId],
-        state: &mut HashMap<DefId, u64>,
-        locals: &mut HashMap<DefId, Option<u64>>,
+        state: &mut HashMap<DefId, (u64, u64)>,
+        locals: &mut HashMap<DefId, Option<(u64, u64)>>,
     ) {
         for stmt in body {
             self.check_stmt(*stmt, state, locals);
@@ -255,8 +298,8 @@ impl<'a> Checker<'a> {
     fn check_stmt(
         &mut self,
         id: StmtId,
-        state: &mut HashMap<DefId, u64>,
-        locals: &mut HashMap<DefId, Option<u64>>,
+        state: &mut HashMap<DefId, (u64, u64)>,
+        locals: &mut HashMap<DefId, Option<(u64, u64)>>,
     ) {
         match self.ast.stmt(id).clone() {
             Stmt::Assign { lhs, rhs } => {
@@ -269,7 +312,8 @@ impl<'a> Checker<'a> {
                 let Some(bounded) = self.bounded.get(&def) else {
                     return; // not a bounded reg
                 };
-                let limit = bounded.limit;
+                let lower = bounded.lower;
+                let upper = bounded.upper;
                 let width = bounded.width;
                 self.found_writes.insert(def);
                 let computed = self.expr_bound(rhs, state, locals);
@@ -278,27 +322,36 @@ impl<'a> Checker<'a> {
                     None => self.error(
                         span,
                         format!(
-                            "cannot verify this write stays within the declared bound `< \
-                             {limit}` (unsupported expression shape — only a bare bounded \
-                             reg/local, a literal, or their sum is recognized)"
+                            "cannot verify this write stays within the declared bound \
+                             `{lower} <= _ < {upper}` (either an unsupported expression shape, \
+                             or a subtraction that isn't provably non-negative here — only a \
+                             bare bounded reg/local, a literal, their sum, or a provably-in-range \
+                             difference is recognized)"
                         ),
                     ),
-                    Some(c) if c > 1u64.checked_shl(width as u32).unwrap_or(u64::MAX) => {
+                    Some((_, hi)) if hi > 1u64.checked_shl(width as u32).unwrap_or(u64::MAX) => {
                         self.error(
                             span,
                             format!(
                                 "this write's computed value could reach or exceed the reg's \
                                  own declared width ([{width}]), which would silently wrap and \
-                                 invalidate the declared bound `< {limit}`"
+                                 invalidate the declared bound `{lower} <= _ < {upper}`"
                             ),
                         );
                     }
-                    Some(c) if c > limit => self.error(
+                    Some((_, hi)) if hi > upper => self.error(
                         span,
                         format!(
-                            "cannot verify this write stays within the declared bound `< \
-                             {limit}` (computed value could reach {})",
-                            c.saturating_sub(1)
+                            "cannot verify this write stays within the declared bound \
+                             `{lower} <= _ < {upper}` (computed value could reach {})",
+                            hi.saturating_sub(1)
+                        ),
+                    ),
+                    Some((lo, _)) if lo < lower => self.error(
+                        span,
+                        format!(
+                            "cannot verify this write stays within the declared bound \
+                             `{lower} <= _ < {upper}` (computed value could go below {lower})"
                         ),
                     ),
                     Some(_) => {}
@@ -361,47 +414,65 @@ impl<'a> Checker<'a> {
     }
 
     /// `if`/`while <bounded reg> < <const>` narrows that reg's tracked
-    /// bound to `min(current, const)` for the guarded body ONLY — the
-    /// caller clones `state` first, so this never mutates the outer
-    /// map. Any other condition shape (or a reg with no PRIOR bound at
-    /// all) is a no-op: narrowing only tightens an already-bounded
-    /// fact, never invents one.
+    /// UPPER end to `min(current, const)`; `> <const>`/`>= <const>`
+    /// narrows the LOWER end to `max(current, const+1)`/`max(current,
+    /// const)` — for the guarded body ONLY, since the caller clones
+    /// `state` first, so this never mutates the outer map. A `<>`-shaped
+    /// guard (the actual shape `while_countdown.tr` uses) is deliberately
+    /// NOT recognized: narrowing on `<>` is only sound when the excluded
+    /// constant equals the CURRENT frozen bound exactly (otherwise it
+    /// splits the range into two disjoint pieces this single-interval
+    /// representation can't express) — a genuinely different, more
+    /// special-cased argument than a plain inequality, and no example
+    /// needs it (this module's own driving example for `Sub` composition
+    /// uses `if cnt > 0` instead). Any other condition shape (or a reg
+    /// with no PRIOR bound at all) is a no-op: narrowing only tightens an
+    /// already-bounded fact, never invents one.
     fn narrow_for_condition(
         &self,
         cond: ExprId,
-        state: &HashMap<DefId, u64>,
-    ) -> HashMap<DefId, u64> {
+        state: &HashMap<DefId, (u64, u64)>,
+    ) -> HashMap<DefId, (u64, u64)> {
         let mut narrowed = state.clone();
-        if let Expr::Binary {
-            op: BinOp::Lt,
-            lhs,
-            rhs,
-        } = self.ast.expr(cond)
+        if let Expr::Binary { op, lhs, rhs } = self.ast.expr(cond)
             && matches!(self.ast.expr(*lhs), Expr::Ident(_))
             && let Some(def) = self.res.expr_defs.get(lhs)
             && let Some(k) = const_fold(self.ast, *rhs)
-            && let Some(existing) = narrowed.get(def)
+            && let Some((lo, hi)) = narrowed.get(def)
         {
-            narrowed.insert(*def, k.min(*existing));
+            match op {
+                BinOp::Lt => {
+                    narrowed.insert(*def, (*lo, k.min(*hi)));
+                }
+                BinOp::Gt => {
+                    if let Some(floor) = k.checked_add(1) {
+                        narrowed.insert(*def, (floor.max(*lo), *hi));
+                    }
+                }
+                BinOp::Ge => {
+                    narrowed.insert(*def, (k.max(*lo), *hi));
+                }
+                _ => {}
+            }
         }
         narrowed
     }
 
-    /// The value range an expression is provably confined to, as an
-    /// exclusive upper bound (`Some(K)` = value is in `[0, K)`), or
-    /// `None` if this pass can't establish one. Only a bare bounded
-    /// reg/local reference, a literal, or `Add` of two such compose —
-    /// see this module's own doc comment for why everything else
-    /// (`Sub`, `Mul`, a call, ...) is deliberately left unsupported.
+    /// The value range an expression is provably confined to, as a
+    /// `(lower, upper)` pair (lower inclusive, upper exclusive), or
+    /// `None` if this pass can't establish one. A bare bounded reg/local
+    /// reference, a literal, `Add`, or `Sub` of two such compose — see
+    /// this module's own doc comment for why everything else (`Mul`, a
+    /// call, ...) is deliberately left unsupported.
     fn expr_bound(
         &self,
         id: ExprId,
-        state: &HashMap<DefId, u64>,
-        locals: &HashMap<DefId, Option<u64>>,
-    ) -> Option<u64> {
+        state: &HashMap<DefId, (u64, u64)>,
+        locals: &HashMap<DefId, Option<(u64, u64)>>,
+    ) -> Option<(u64, u64)> {
         match self.ast.expr(id) {
-            Expr::Int(v) => v.checked_add(1),
-            Expr::SizedInt { value, .. } => value.checked_add(1),
+            Expr::Int(v) => Some((*v, v.checked_add(1)?)),
+            Expr::SizedInt { value, .. } => Some((*value, value.checked_add(1)?)),
             Expr::Ident(_) => {
                 let def = self.res.expr_defs.get(&id)?;
                 if let Some(&b) = state.get(def) {
@@ -415,9 +486,33 @@ impl<'a> Checker<'a> {
                 lhs,
                 rhs,
             } => {
-                let a = self.expr_bound(*lhs, state, locals)?;
-                let b = self.expr_bound(*rhs, state, locals)?;
-                a.checked_add(b)?.checked_sub(1)
+                let (a_lo, a_hi) = self.expr_bound(*lhs, state, locals)?;
+                let (b_lo, b_hi) = self.expr_bound(*rhs, state, locals)?;
+                let lo = a_lo.checked_add(b_lo)?;
+                let hi = a_hi.checked_add(b_hi)?.checked_sub(1)?;
+                Some((lo, hi))
+            }
+            Expr::Binary {
+                op: BinOp::Sub,
+                lhs,
+                rhs,
+            } => {
+                // Sound only when the SMALLEST possible `a` still
+                // dominates the LARGEST possible `b` — otherwise some
+                // combination in range could underflow (wrap, in the
+                // reg's real unsigned domain). `b_max`'s `checked_sub`
+                // failing (an empty `b` range) and `lo`'s `checked_sub`
+                // failing (underflow IS possible for some combination)
+                // both naturally return `None` here, the same
+                // "unprovable, fails closed" signal `Add`'s
+                // `checked_add` already gives on overflow — no separate
+                // error path needed.
+                let (a_lo, a_hi) = self.expr_bound(*lhs, state, locals)?;
+                let (b_lo, b_hi) = self.expr_bound(*rhs, state, locals)?;
+                let b_max = b_hi.checked_sub(1)?;
+                let lo = a_lo.checked_sub(b_max)?;
+                let hi = a_hi.checked_sub(b_lo)?;
+                Some((lo, hi))
             }
             _ => None,
         }
