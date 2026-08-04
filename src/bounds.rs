@@ -234,6 +234,47 @@
 //!   (the established "find every outermost Call, check it, discard
 //!   the bound" idiom already used elsewhere in this file) is reused
 //!   here rather than duplicated.
+//! - **Per-site proven ranges exported to `schedule.rs` (v16)**: this
+//!   module's own `Bounds.ranges` only ever exported a def's FLAT,
+//!   whole-program DECLARED range — `schedule.rs`'s own mem-
+//!   disjointness proof had no visibility into any branch-local
+//!   narrowing this pass proves internally (`if i < 10 { m[i] := x }`
+//!   proves a tighter fact for THIS site than `i`'s raw declared bound,
+//!   but `schedule.rs` only ever saw the latter). Before building
+//!   anything, checked whether the v11/v13/v14/v15-deferred interval-
+//!   set domain was FINALLY the answer here — it's not, for the same
+//!   reason as before (every check remains extremal, every composition
+//!   remains monotonic) — this is a genuinely different capability, the
+//!   first in the whole arc a bolted-on post-pass structurally cannot
+//!   express: a per-`ExprId` fact, not a per-def one. New `Bounds.
+//!   site_ranges: HashMap<ExprId, (u64, u64)>`, populated by widening
+//!   `check_calls_in`'s own stopping condition from "just `Call`" to
+//!   EVERY shape `expr_bound` has a dedicated arm for (`Int`,
+//!   `SizedInt`, `Ident`, `Add`/`Sub`/`Mul`, `Call`, `Bracket`) and
+//!   giving it a real return value (previously discarded `()`); `expr_
+//!   bound`'s own `Bracket` arm captures that value and exports it,
+//!   keyed by the index's own `ExprId`, whenever `callee` resolves to a
+//!   `mem` (a fifo shares this `Bracket` shape but has no consumer —
+//!   `effects.rs`'s `mem_read_idx`/`mem_write_idx` are mem-keyed
+//!   specifically). No other call site needed to change: every existing
+//!   checked position already routes through `check_calls_in` or
+//!   `expr_bound` directly, both now handling `Bracket` uniformly, so a
+//!   mem access anywhere gains the export automatically. `schedule.rs`'s
+//!   `real_range` consults `site_ranges` first, falling back to its own
+//!   independent walk — consulted-then-fallback, never replaced, so the
+//!   whole proof stays fail-closed for any `ExprId` this pass never
+//!   visited. Verified structurally (not assumed) that no `ExprId` is
+//!   ever visited by this pass's forward walk more than once under a
+//!   different state (each Rule/Fn item is walked exactly once, `if`/
+//!   `while` branches are disjoint subtrees walked once each, no fn is
+//!   ever inlined per call site), so a plain `insert` is sound with no
+//!   merge-on-conflict needed. `examples/mem_site_narrowing.tr`: two
+//!   regs each merely declared `< 20` (individually insufficient — both
+//!   ranges span the mem's whole depth and fully overlap) proven
+//!   disjoint once each is narrowed by a DIFFERENT `if` guard, in its
+//!   own accessing rule, to a disjoint half — pre-fix, the scheduler
+//!   inserts a real stall between the two rules; post-fix, it proves
+//!   disjointness automatically and removes it, with no annotation.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -306,6 +347,19 @@ pub struct BoundsError {
 #[derive(Debug, Default)]
 pub struct Bounds {
     pub ranges: HashMap<DefId, (u64, u64)>,
+    /// v16: a per-SITE proven range, keyed by the specific `ExprId`
+    /// this pass visited it at — tighter than (or equal to) `ranges`'
+    /// own flat, whole-program range whenever that expression sits
+    /// under a narrowing condition (`if i < 10 { m[i] := x }` proves a
+    /// tighter range for THIS `m[i]`'s own index than `i`'s raw
+    /// declared bound). Populated only for a mem access's own index
+    /// expression (`check_calls_in`'s widened stop-list, `expr_bound`'s
+    /// `Expr::Bracket` arm) -- absence here is never a signal that the
+    /// expression is unprovable, only that this pass never computed
+    /// (or never visited) a site-specific fact for it; `schedule.rs`'s
+    /// own `real_range` falls back to its independent walk whenever a
+    /// lookup here misses.
+    pub site_ranges: HashMap<ExprId, (u64, u64)>,
 }
 
 /// One bounded def's (a `reg`, `out`, or fn/impl param, v12) own
@@ -331,6 +385,7 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         current_fn_def: None,
         found_writes: HashSet::new(),
         found_returns: HashSet::new(),
+        site_ranges: HashMap::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
@@ -347,6 +402,7 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
             .iter()
             .map(|(def, b)| (*def, (b.lower, b.upper)))
             .collect(),
+        site_ranges: checker.site_ranges,
     };
     (bounds, checker.errors)
 }
@@ -409,6 +465,14 @@ struct Checker<'a> {
     /// verified: a real fail-open soundness hole, not just an internal
     /// invariant.
     found_returns: HashSet<DefId>,
+    /// v16: per-site proven ranges for a mem access's own index
+    /// expression, exported into `Bounds.site_ranges` once the whole
+    /// walk finishes — see that field's own doc comment. Populated by
+    /// `expr_bound`'s `Expr::Bracket` arm; never merged or overwritten,
+    /// since no `ExprId` is ever visited by this pass's forward walk
+    /// more than once under a different `state` (see that arm's own
+    /// doc comment for why).
+    site_ranges: HashMap<ExprId, (u64, u64)>,
     errors: Vec<BoundsError>,
 }
 
@@ -1071,34 +1135,59 @@ impl<'a> Checker<'a> {
         Some((def, k))
     }
 
-    /// v14: recursively finds every "outermost" `Expr::Call` within
-    /// `id` and checks it via `expr_bound`, purely for that side effect
-    /// (checking any argument obligations against a bounded param, and
-    /// any declared return postcondition trusted onward) — the returned
-    /// bound itself is meaningless here and discarded, same idiom
-    /// `Stmt::Expr`'s own arm already uses for a bare call statement.
-    /// Closes the one gap both v12 and v13's own docs left open: a call
-    /// used inside an `if`/`while`'s own CONDITION, or an `if let`/
-    /// `while let`'s own `init` (`narrow_for_condition` only ever
-    /// pattern-matches `cond`'s shape, never routes it through `expr_
-    /// bound` at all). Stops recursing the instant it finds a `Call`
-    /// rather than continuing the generic descent into it: `expr_
-    /// bound`'s own `Expr::Call` arm already recurses into ITS OWN args,
-    /// so continuing here too would double-check (and double-report)
-    /// the same call site.
+    /// v14: recursively finds every "outermost" occurrence of a shape
+    /// `expr_bound` has its own dedicated arm for, within `id`, and
+    /// delegates to it — purely for that side effect (checking any
+    /// argument obligations against a bounded param, any declared
+    /// return postcondition trusted onward, and — v16 — exporting a mem
+    /// access's own index range) — the returned bound is meaningless to
+    /// most callers and freely discarded (Rust allows discarding a
+    /// non-`()` return), same idiom `Stmt::Expr`'s own arm already uses
+    /// for a bare call statement. Originally closed the gap both v12
+    /// and v13's own docs left open: a call used inside an `if`/`while`'s
+    /// own CONDITION, or an `if let`/`while let`'s own `init`
+    /// (`narrow_for_condition` only ever pattern-matches `cond`'s shape,
+    /// never routes it through `expr_bound` at all).
+    ///
+    /// Stops recursing the instant it finds ANY shape in the list below
+    /// (originally just `Call`, widened at v16 to every shape `expr_
+    /// bound` has an arm for) rather than continuing the generic
+    /// descent into it: `expr_bound` already recurses into its OWN
+    /// children for every one of these shapes (`Add`/`Sub`/`Mul` into
+    /// both operands, `Call`/`Bracket` into callee/args), so continuing
+    /// the generic walk past that point too would double-check (and
+    /// double-report) the same site. Every OTHER shape (`Field`,
+    /// `Guard`, `StructLit`, `ListLit`, `Range`, `Or`, ...) still
+    /// recurses generically via `sub_exprs` — confirmed empirically,
+    /// not assumed, that this still reaches a call hidden under one of
+    /// those (`m[SomeStructCall().field]` parses and type-checks as a
+    /// legal mem index; `Field` isn't in the stop-list below, so this
+    /// function recurses into its own `base`, which IS a `Call`,
+    /// correctly dispatching to `expr_bound`).
     fn check_calls_in(
         &mut self,
         id: ExprId,
         state: &HashMap<DefId, (u64, u64)>,
         locals: &HashMap<DefId, Option<(u64, u64)>>,
-    ) {
-        if matches!(self.ast.expr(id), Expr::Call { .. }) {
-            self.expr_bound(id, state, locals);
-            return;
+    ) -> Option<(u64, u64)> {
+        if matches!(
+            self.ast.expr(id),
+            Expr::Int(_)
+                | Expr::SizedInt { .. }
+                | Expr::Ident(_)
+                | Expr::Binary {
+                    op: BinOp::Add | BinOp::Sub | BinOp::Mul,
+                    ..
+                }
+                | Expr::Call { .. }
+                | Expr::Bracket { .. }
+        ) {
+            return self.expr_bound(id, state, locals);
         }
         for child in crate::lower::sub_exprs(self.ast, id) {
             self.check_calls_in(child, state, locals);
         }
+        None
     }
 
     /// The value range an expression is provably confined to, as a
@@ -1281,18 +1370,47 @@ impl<'a> Checker<'a> {
             // catch-all below with ZERO recursion, so `y := m[Bump(50)]`
             // (a mem READ used as a value, not an assignment target)
             // silently skipped `Bump`'s own argument check entirely --
-            // found empirically while designing a later feature, not
-            // assumed, and confirmed to be the same gap at `return m
-            // [Bump(50)]` and `Outer(m[Bump(50)])` (a call argument)
-            // too, since all three route through this same shallow
-            // `expr_bound` call. `check_calls_in` is exactly the
-            // established "find every outermost Call and check it,
-            // discard the returned bound" idiom already used elsewhere
-            // in this file, reused here rather than duplicating it.
+            // found empirically while designing v16 below, not assumed,
+            // and confirmed to be the same gap at `return m[Bump(50)]`
+            // and `Outer(m[Bump(50)])` (a call argument) too, since all
+            // three route through this same shallow `expr_bound` call.
+            // `check_calls_in` is exactly the established "find every
+            // outermost checkable shape and delegate to `expr_bound`"
+            // idiom already used elsewhere in this file, reused here
+            // rather than duplicating it.
+            //
+            // v16: `check_calls_in`'s own return value (widened from
+            // `()` to `Option<(u64, u64)>`) is now captured here and
+            // exported into `site_ranges`, keyed by the index's own
+            // `ExprId`, whenever `callee` resolves to a `mem` --
+            // `schedule.rs`'s own mem-disjointness proof (`real_range`)
+            // consults this map before falling back to its own
+            // independent, per-def-only walk. Only a mem's own index
+            // is exported: `effects.rs`'s `mem_read_idx`/`mem_write_idx`
+            // maps (the only consumer of a per-site mem-index fact) are
+            // keyed by mem `DefId` specifically, so a fifo's own index
+            // (sharing this exact `Bracket` shape) has no consumer here
+            // -- not an oversight, there is genuinely nothing that would
+            // read a fifo-index entry. No `ExprId` is ever visited by
+            // this pass's forward walk more than once under a different
+            // `state` (see `Bounds.site_ranges`'s own doc comment for
+            // the full structural argument), so a plain `insert` is
+            // correct -- no merge-on-conflict is needed.
             Expr::Bracket { callee, args } => {
                 self.check_calls_in(*callee, state, locals);
+                let mem_def = self
+                    .res
+                    .expr_defs
+                    .get(callee)
+                    .copied()
+                    .filter(|d| self.res.def(*d).kind == crate::resolve::DefKind::Mem);
                 for arg in args {
-                    self.check_calls_in(*arg, state, locals);
+                    let computed = self.check_calls_in(*arg, state, locals);
+                    if mem_def.is_some()
+                        && let Some(range) = computed
+                    {
+                        self.site_ranges.insert(*arg, range);
+                    }
                 }
                 None
             }

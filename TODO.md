@@ -2801,9 +2801,9 @@ manually in the meantime.
 - **RESOLVED — `Expr::Bracket` (a mem/fifo access) now recurses into
   `callee`/`args` for the side effect of checking any nested `Call`**
   (`examples/mem_read_call_check.tr`). Found empirically while
-  designing a follow-up feature (exporting this pass's own per-site
-  facts to `schedule.rs`, not yet built as of this entry):
-  `Bracket` had no arm in `expr_bound` at all through v15, falling to
+  designing v16 below (exporting this pass's own per-site facts to
+  `schedule.rs`): `Bracket` had no arm in `expr_bound` at all through
+  v15, falling to
   the catch-all `_ => None` with ZERO recursion — so a mem access used
   as a VALUE, not an assignment target (`y := m[Bump(50)]`, `return m
   [Bump(50)]`, `Outer(m[Bump(50)])` as a call argument), silently
@@ -2821,6 +2821,136 @@ manually in the meantime.
   (`tests/bounds.rs`, file's own total 64), each bug-reintroduction-
   verified (reverting the arm to `Expr::Bracket { .. } => None` flips
   all three from passing to a spurious accept).
+- **RESOLVED (v16) — per-site proven ranges exported to `schedule.rs`**
+  (`examples/mem_site_narrowing.tr`). Lumi asked "time for the type
+  system proper?" — surveyed what's actually left rather than guessing:
+  every prior "the type system" ask (v4, v12, v13, v15) resolved to a
+  specific, scoped gap once investigated, never the big rewrite, and
+  the concrete gaps were nearly exhausted except one. `bounds.rs`'s own
+  `Bounds.ranges` only ever exports a def's FLAT, whole-program
+  DECLARED range; `schedule.rs`'s mem-disjointness proof (`real_range`)
+  had zero visibility into any branch-local narrowing `bounds.rs` proves
+  internally during its own forward walk (`if i < 10 { m[i] := x }`
+  proves a tighter fact for THIS site than `i`'s raw declared bound, but
+  `schedule.rs` only ever saw the latter, however wide). This is the
+  first capability in the whole arc a bolted-on post-pass structurally
+  cannot express — needs an actual per-`ExprId` fact table populated
+  during the existing forward walk, not a per-def one. Lumi picked this
+  over `where` on struct fields/mem elements via `AskUserQuestion`.
+  Verified as a non-issue, not assumed: promoting `bounds.rs`'s own
+  refinements into a real `Ty::Refined` variant in `types.rs` was
+  already offered at v12 and declined — no proving power over what
+  exists, just a much larger implementation shape. Not part of this.
+
+  Found while investigating and shipped separately first (see the
+  `Expr::Bracket` entry directly above, per advisor's explicit "ship the
+  bug apart from the feature" direction, the same call made at v10).
+
+  Design: new `Bounds.site_ranges: HashMap<ExprId, (u64, u64)>`.
+  `check_calls_in` widened from stopping only at `Call` to stopping at
+  EVERY shape `expr_bound` has a dedicated arm for (`Int`, `SizedInt`,
+  `Ident`, `Add`/`Sub`/`Mul`, `Call`, `Bracket`), and given a real return
+  value (previously discarded `()`) — the exact same "don't double-check
+  a shape `expr_bound` already fully recurses through" reasoning that
+  justified stopping at `Call` alone now applies uniformly to the wider
+  list. `expr_bound`'s own `Bracket` arm captures that value and exports
+  it, keyed by the index's own `ExprId`, only when `callee` resolves to
+  a `mem` (a fifo shares this exact `Bracket` shape but has no consumer
+  — `effects.rs`'s `mem_read_idx`/`mem_write_idx`, the only reader of a
+  per-site mem-index fact, are keyed by mem `DefId` specifically). No
+  other call site needed to change: every existing checked position
+  (`If`/`While` cond, `IfLet`/`WhileLet` init, `Assign`'s lhs AND rhs,
+  `Return`'s expr, a call's own arg loop, `Add`/`Sub`/`Mul`'s own operand
+  recursion) already routes through one of these two functions, both now
+  handling `Bracket` uniformly, so a mem access anywhere gains the
+  export automatically. `schedule.rs`'s `real_range` consults `bounds.
+  site_ranges` first, falling back to its own independent walk
+  unchanged — consulted-then-fallback, never replaced, keeping the
+  whole proof fail-closed for any `ExprId` this pass never visited. Its
+  own stale doc comment (claiming it recognizes "the same restricted
+  shape `expr_bound` does") was corrected — `expr_bound` gained `Sub` at
+  v7 and `Mul` at v11, `real_range`'s own independent walk still hasn't.
+
+  A design fork surfaced mid-investigation: naively calling `expr_bound`
+  alone on a mem index (to get both the export AND the call-check in one
+  call, avoiding a double-check) would have silently dropped `check_
+  calls_in`'s own thorough recursion through shapes `expr_bound` doesn't
+  reach at all (`Field`, `Guard`, `StructLit`, ...) — confirmed
+  empirically, not assumed, that this is a REAL reachable shape
+  (`m[SomeStructCall().data]` parses and type-checks as a legal mem
+  index). Resolved by widening `check_calls_in`'s OWN stop-list instead
+  of introducing a second, parallel traversal: since `expr_bound`
+  already recurses fully through every shape now in that widened list,
+  `check_calls_in` dispatches to it once per top-level recognized shape
+  and still falls through generically for everything else, so a call
+  hidden under `Field`/`Guard`/etc. is still found via that generic
+  path. An earlier advisor-suggested simplification (a bare `new_lo <
+  new_hi` check with no clamp, from the UNRELATED v15 conversation) was
+  explicitly NOT reused here without re-deriving it for this shape —
+  the two problems aren't the same.
+
+  Soundness: cited the SPECIFIC invariant, not a generic "this site
+  proves it" claim — schedule.rs's own pre-edge-read argument (every
+  rule sees a shared reg's IDENTICAL frozen value within one cycle,
+  regardless of which rule fires) is what makes a per-site fact proven
+  in ONE rule's own body a valid fact for a CROSS-RULE pairwise
+  comparison, not just "true within that one rule." No-collision
+  verified structurally, not assumed: no `ExprId` is ever visited by
+  this pass's forward walk more than once under a different state
+  (`collect_bodied_items` yields each Rule/Fn item exactly once; each
+  item's body is walked once; `if`/`while` branches are disjoint
+  subtrees walked once each; no fn is ever inlined per call site) — a
+  plain `insert` is correct, no merge-on-conflict needed.
+
+  `examples/mem_site_narrowing.tr`: two regs `i`/`j`, each merely
+  declared `< 20` (individually insufficient — identical, fully-
+  overlapping declared ranges), each narrowed by a DIFFERENT `if` guard
+  in ITS OWN accessing rule to a disjoint half (`if i < 10` in `write`,
+  `if j >= 10` in `read`). Discriminating baseline confirmed before
+  implementing: NOT a compile error either way (there's no
+  `conflict_free` annotation on this file at all, so there's no trusted
+  fallback to fall back to) — pre-fix, the scheduler derives a real
+  STALL between the two rules (`--explain-schedule` shows `read` waits
+  on `write`); post-fix, it proves disjointness automatically
+  (`--explain-schedule` shows "index sites proven disjoint... no stall
+  derived") and removes it, with zero annotation needed. (First attempt
+  at this example used an explicit `conflict_free { write, read }`
+  annotation, which turned out to short-circuit the auto-detection path
+  entirely — `schedule.rs`'s own auto-proof is only ever attempted when
+  there's NO user annotation at all; caught by checking the actual
+  scheduling output rather than assuming the annotation was harmless.)
+
+  5 new tests: 4 in `tests/bounds.rs` (`site_ranges` populated with the
+  NARROWED, not flat-declared, value at a write, a read, a return, and
+  a call-argument position — file's own total 69 with the regression
+  test below), 1 in `tests/schedule.rs` (the driving example's own
+  schedule has exactly one conflict, exempted via `Exemption::Disjoint`)
+  — plus a dedicated regression test pinning the `Field`-hidden-call
+  design-fork resolution above. Every test bug-reintroduction-verified,
+  including two JOINT reintroductions that each flip multiple tests at
+  once: disabling `real_range`'s own `site_ranges` lookup flips the
+  schedule test; skipping the `site_ranges.insert` in `expr_bound`'s
+  `Bracket` arm flips all 4 `site_ranges` tests AND the schedule test
+  together; reverting `check_calls_in`'s stop-list to `Call`-only flips
+  the same 4 `site_ranges` tests (confirming the widening itself, not
+  just the export line, is load-bearing) with no impact on the other 68
+  pre-existing tests (confirming the widening doesn't regress anything).
+
+  The stated `--explain-schedule` prediction (byte-identical across
+  every EXISTING example, checked file-by-file before running the diff,
+  not guessed after seeing a surprise): `checksum`/`fifo2`/`port_ram`/
+  `rmw`/`subleq*` use literal or unconditional/undeclared-bound indices;
+  `conflict_free_mem`/`mem_write_branch` index via untracked `in` ports;
+  `mem_disjoint_affine`/`banked` are `IndexForm`/`pow2_addr_width`-
+  driven, never touching `Bounds` at all; `mem_disjoint_bounded`/
+  `ranges` are already satisfied by the FLAT declared bound alone (no
+  narrowing wraps the actual mem access in either file's own accessing
+  rule bodies). Confirmed exactly as predicted — only the new driving
+  example differed. `cargo fmt`/`clippy`/`test` all clean; a `--firrtl`
+  sanity check on the driving example confirmed clean codegen (a
+  separate mem read port, no stall-mux serialization needed). Plan mode
+  was used for this one (the first since v5) given it genuinely touches
+  two subsystems' own contract, not just `bounds.rs` alone.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

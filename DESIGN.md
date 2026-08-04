@@ -3152,6 +3152,69 @@ v0 restrictions, all deliberate scope cuts:
   still composes to `None`, unchanged; `check_calls_in` (the established
   idiom already used elsewhere in this file) is reused rather than
   duplicated. 3 new tests, each bug-reintroduction-verified.
+- **Per-site proven ranges exported to `schedule.rs` (v16)**. Lumi asked
+  "time for the type system proper?" — surveyed what's actually left
+  (every prior ask resolved to a scoped gap, not the big rewrite) and
+  found the concrete gaps nearly exhausted except one: `bounds.rs`'s own
+  `Bounds.ranges` only ever exports a def's FLAT, whole-program declared
+  range; `schedule.rs`'s mem-disjointness proof had zero visibility into
+  any branch-local narrowing `bounds.rs` proves internally (`if i < 10 {
+  m[i] := x}` proves a tighter fact for THIS site, but `schedule.rs` only
+  ever saw `i`'s raw declared bound). Confirmed (not assumed) this is
+  the first capability in the whole arc a bolted-on post-pass
+  structurally cannot express — a per-`ExprId` fact, not a per-def one.
+  Lumi picked this over `where` on struct fields/mem elements via
+  AskUserQuestion.
+
+  Found and shipped separately first (`7adf768`, per advisor's explicit
+  "ship the bug apart from the feature" direction): `Expr::Bracket` had
+  no arm in `expr_bound` at all, so a call nested in a mem access used
+  as a value silently skipped its own argument check.
+
+  New `Bounds.site_ranges: HashMap<ExprId, (u64, u64)>`. `check_calls_in`
+  widened from stopping only at `Call` to stopping at EVERY shape
+  `expr_bound` has a dedicated arm for, and given a real return value
+  (previously discarded `()`); `expr_bound`'s own `Bracket` arm captures
+  that value and exports it, keyed by the index's own `ExprId`, only
+  when `callee` resolves to a `mem` (a fifo shares this shape but has no
+  consumer). No other call site needed to change — every existing
+  checked position already routes through one of these two functions.
+  `schedule.rs`'s `real_range` consults `site_ranges` first, falling
+  back to its own independent walk — consulted-then-fallback, never
+  replaced, keeping the whole proof fail-closed for any `ExprId` this
+  pass never visited. A design fork surfaced mid-investigation
+  (confirmed empirically, not assumed, that `m[SomeStructCall().data]`
+  parses and type-checks as a legal mem index): naively calling
+  `expr_bound` alone on a mem index for the export would have silently
+  dropped `check_calls_in`'s own thorough recursion through shapes
+  `expr_bound` doesn't reach (`Field`, `Guard`, ...) — resolved by
+  widening `check_calls_in`'s OWN stop-list instead of introducing a
+  second, parallel traversal, since `expr_bound` already recurses fully
+  through every shape in that widened list.
+
+  `examples/mem_site_narrowing.tr`: two regs each merely declared `<
+  20` (individually insufficient — identical, fully-overlapping ranges)
+  proven disjoint once each is narrowed by a DIFFERENT `if` guard, in
+  its own accessing rule, to a disjoint half. Discriminating baseline
+  confirmed before implementing: pre-fix, the scheduler derives a real
+  STALL between the two rules (not a compile error — there's no
+  `conflict_free` annotation to fall back to trusting); post-fix, it
+  proves disjointness automatically and removes the stall, with no
+  annotation needed. 5 new tests (4 in `tests/bounds.rs` pinning
+  `site_ranges` population at a write/read/return/call-argument
+  position, 1 in `tests/schedule.rs` pinning the driving example's own
+  schedule outcome), plus a dedicated regression test for the `Field`-
+  hidden-call design fork above — every one bug-reintroduction-verified,
+  including a joint reintroduction (reverting the widened stop-list to
+  `Call`-only) that flips all 5 at once alongside the individual ones.
+  The stated `--explain-schedule` prediction (byte-identical across
+  every EXISTING example, checked file-by-file rather than guessed —
+  `mem_disjoint_affine`/`banked` are `IndexForm`/pow2-driven and never
+  touch `Bounds`; `mem_disjoint_bounded`/`ranges` are already satisfied
+  by the flat declared bound alone; the rest use literal or untracked-
+  `in`-port indices) was confirmed exactly — only the new driving
+  example differed. A `--firrtl` sanity check confirmed clean codegen
+  (a separate mem read port, no stall-mux serialization).
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"

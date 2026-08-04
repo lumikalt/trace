@@ -1,0 +1,21 @@
+module MemSiteNarrowing {
+    mem m : [8][20]
+
+    reg i : [8] where i < 20 = 0
+    reg j : [8] where j < 20 = 10
+
+    in x : [8]
+    out y : [8] = 0
+
+    rule write {
+        if i < 10 {
+            m[i] := x
+        }
+    }
+
+    rule read {
+        if j >= 10 {
+            y := m[j]
+        }
+    }
+}

@@ -1,4 +1,5 @@
-use trace::bounds::{self, BoundsError};
+use trace::bounds::{self, Bounds, BoundsError};
+use trace::effects::Effects;
 use trace::{effects, lexer, parser, resolve, types};
 
 fn run(src: &str) -> Vec<BoundsError> {
@@ -17,6 +18,58 @@ fn run(src: &str) -> Vec<BoundsError> {
     assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
     let (_, errors) = bounds::check(&ast, &res, &fx, &ty);
     errors
+}
+
+/// v16: the `run` helper above discards `Bounds`/`Effects` entirely,
+/// which every prior test only ever needed errors from. `site_ranges`
+/// tests need both: `Effects`'s own `mem_read_idx`/`mem_write_idx`
+/// (populated independently by `effects.rs`, the SAME enumerable set
+/// `schedule.rs` itself consults) to locate the exact `ExprId` a mem
+/// index sits at, and `Bounds.site_ranges` to check what `bounds.rs`
+/// exported for it.
+fn run_with_bounds(src: &str) -> (Effects, Bounds, Vec<BoundsError>) {
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(src, &tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(
+        resolve_errors.is_empty(),
+        "resolve errors: {resolve_errors:?}"
+    );
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "effect errors: {effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
+    assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
+    let (bounds, errors) = bounds::check(&ast, &res, &fx, &ty);
+    (fx, bounds, errors)
+}
+
+/// The one DISTINCT `ExprId` recorded across every item's own
+/// `mem_write_idx`/`mem_read_idx` for `mem` -- panics if there isn't
+/// exactly one (keeps each test's driving shape unambiguous rather
+/// than silently picking an arbitrary match). The SAME `ExprId` can
+/// legitimately appear more than once here -- `effects.rs`'s own
+/// aggregation merges a callee's mem-index sites into every caller's
+/// own summary too, so a mem read inside a called `fn`'s body shows up
+/// under both that `fn`'s own item AND the rule that calls it.
+fn the_only_mem_index(fx: &Effects) -> trace::ast::ExprId {
+    let mut found = std::collections::BTreeSet::new();
+    for sig in fx.sigs.values() {
+        for idxs in sig.mem_write_idx.values() {
+            found.extend(idxs.iter().copied());
+        }
+        for idxs in sig.mem_read_idx.values() {
+            found.extend(idxs.iter().copied());
+        }
+    }
+    let found: Vec<_> = found.into_iter().collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one distinct mem index site, found {found:?}"
+    );
+    found[0]
 }
 
 #[test]
@@ -1515,6 +1568,133 @@ module M {
     reg total : [8] where total < 40 = 0
     rule step {
         total := Outer(m[Bump(50)])
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+// v16: `bounds.rs` now exports a per-SITE proven range for a mem
+// access's own index expression -- tighter than (or equal to) the
+// def's own flat declared range whenever that specific index sits
+// under a narrowing condition -- so `schedule.rs`'s own disjointness
+// proof can see `if i < 10 { m[i] := x }`'s own narrowed `i < 10` fact,
+// not just `i`'s whole-program declared bound. Each test below
+// declares the def's range wider than the narrowing (`i < 20` declared,
+// `i < 10` narrowed) specifically so the assertion only passes if the
+// NARROWED value was exported, not the flat declared one.
+
+#[test]
+fn site_range_is_exported_at_a_mem_write_index() {
+    let src = "\
+module M {
+    mem m : [8][20]
+    reg i : [8] where i < 20 = 0
+    in x : [8]
+    rule step {
+        if i < 10 {
+            m[i] := x
+        }
+    }
+}
+";
+    let (fx, bounds, errors) = run_with_bounds(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let index = the_only_mem_index(&fx);
+    assert_eq!(bounds.site_ranges.get(&index), Some(&(0, 10)));
+}
+
+#[test]
+fn site_range_is_exported_at_a_mem_read_index() {
+    let src = "\
+module M {
+    mem m : [8][20]
+    reg i : [8] where i < 20 = 0
+    out y : [8] = 0
+    rule step {
+        if i < 10 {
+            y := m[i]
+        }
+    }
+}
+";
+    let (fx, bounds, errors) = run_with_bounds(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let index = the_only_mem_index(&fx);
+    assert_eq!(bounds.site_ranges.get(&index), Some(&(0, 10)));
+}
+
+#[test]
+fn site_range_is_exported_at_a_mem_read_inside_a_return() {
+    let src = "\
+module M {
+    mem m : [8][20]
+    reg i : [8] where i < 20 = 0
+    Get() : [8] {
+        if i < 10 {
+            return m[i]
+        }
+        return 0
+    }
+    reg y : [8] = 0
+    rule step {
+        y := Get()
+    }
+}
+";
+    let (fx, bounds, errors) = run_with_bounds(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let index = the_only_mem_index(&fx);
+    assert_eq!(bounds.site_ranges.get(&index), Some(&(0, 10)));
+}
+
+#[test]
+fn site_range_is_exported_at_a_mem_read_as_a_call_argument() {
+    let src = "\
+module M {
+    mem m : [8][20]
+    reg i : [8] where i < 20 = 0
+    Identity(v : [8]) : [8] {
+        return v
+    }
+    reg y : [8] = 0
+    rule step {
+        if i < 10 {
+            y := Identity(m[i])
+        }
+    }
+}
+";
+    let (fx, bounds, errors) = run_with_bounds(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let index = the_only_mem_index(&fx);
+    assert_eq!(bounds.site_ranges.get(&index), Some(&(0, 10)));
+}
+
+#[test]
+fn call_argument_hidden_under_a_field_access_in_a_mem_index_is_still_checked() {
+    // The exact regression `check_calls_in`'s widened stop-list had to
+    // avoid: `Field` is deliberately NOT in the stop-list (unlike `Add`/
+    // `Sub`/`Mul`/`Call`/`Bracket`), so a call nested under one is still
+    // found via the generic `sub_exprs` recursion -- confirmed via a
+    // scratch file before this test was written that `m[MakePair(50)
+    // .data]` parses and type-checks as a legal mem index at all (this
+    // arc's own standing "measure it, don't assume" discipline).
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8]
+    }
+    mem m : [8][4]
+    MakePair(d : [8] where d < 10) : Pair <combines> {
+        return Pair{ valid: 1, data: d }
+    }
+    reg y : [8] = 0
+    rule step {
+        y := m[MakePair(50).data]
     }
 }
 ";

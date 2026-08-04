@@ -1382,3 +1382,26 @@ module B {
         assert!(group.conflicts.is_empty());
     }
 }
+
+#[test]
+fn mem_site_narrowing_schedules_with_no_stall() {
+    // v16's own driving example: `write`/`read` each narrow a
+    // DIFFERENT reg (`i`/`j`, both merely declared `< 20`, individually
+    // insufficient) via their OWN `if` guard to a disjoint half of the
+    // mem's depth. `bounds.rs`'s newly-exported per-site fact is what
+    // lets `schedule.rs` prove this automatically (no annotation) --
+    // without it, this same file (confirmed via a pre-fix scratch run)
+    // schedules with a real STALL (`read` waits on `write`), not a
+    // compile error, since there's no `conflict_free` claim to fall
+    // back to trusting either.
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/mem_site_narrowing.tr"
+    ))
+    .unwrap();
+    let (_, _, sched, errors) = run(&src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}

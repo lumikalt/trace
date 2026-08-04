@@ -136,6 +136,29 @@
 //! declared range at all) stays exactly as unprovable as before —
 //! nothing here infers a range from nothing, it only ever compares
 //! ranges that were each independently declared and proven.
+//!
+//! # A sixth case: a per-SITE narrowed bound (v16), not just a flat
+//! declared one
+//!
+//! The fourth/fifth cases above both read `Bounds.ranges`, a def's
+//! FLAT, whole-program declared range — real, but often far wider than
+//! what's actually true at one specific access site. `bounds.rs`'s own
+//! forward walk proves a TIGHTER fact whenever a mem access sits under
+//! a narrowing condition (`if i < 10 { m[i] := x }` proves `i < 10` at
+//! THIS site, even when `i`'s own declared bound is far wider, `i <
+//! 20`); v16 exports that per-site fact into `Bounds.site_ranges`,
+//! keyed by the index expression's own `ExprId`, and `real_range` below
+//! consults it first. Two regs each merely declared `i < 20`/`j < 20`
+//! (individually insufficient — both ranges span the whole mem and
+//! fully overlap) can still be proven disjoint this way if each is
+//! narrowed to a different half by its OWN accessing rule's `if` guard
+//! (`examples/mem_site_narrowing.tr`). Sound for exactly the same
+//! reason the fourth/fifth cases are: every rule sees a shared reg's
+//! IDENTICAL frozen, pre-edge value within one cycle (this module's own
+//! "pre-edge-read invariant" above), so a narrowed fact proven at one
+//! rule's own access site is just as true a fact about that shared
+//! value as the def's flat declared range is — not a weaker, rule-local
+//! claim.
 
 use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, ScheduleDirective};
 use crate::bounds::Bounds;
@@ -962,19 +985,38 @@ fn mem_accesses_disjoint(
 /// The value range an index expression is provably confined to, as a
 /// REAL (non-wrapping, non-modular) `(lower, upper)` pair — `Some((L,
 /// K))` means the expression's value is ALWAYS in `[L, K)`, given
-/// `bounds` (`bounds.rs`'s own proven per-def ranges; see this module's
-/// own doc comment's "A fourth case" and "A fifth case"). Deliberately
-/// computed via an INDEPENDENT walk, not derived from `IndexForm`:
+/// `bounds` (`bounds.rs`'s own proven ranges; see this module's own doc
+/// comment's "A fourth case" and "A fifth case").
+///
+/// v16: first consults `bounds.site_ranges`, keyed by this exact
+/// `ExprId` — a per-SITE fact `bounds.rs` proved during its own forward
+/// walk, tighter than (or equal to) a bare def's flat declared range
+/// whenever this specific index sits under a narrowing condition
+/// (`if i < 10 { m[i] := x }` proves `i < 10` at THIS site, not just
+/// `i`'s own whole-program declared bound). Falls back to the
+/// INDEPENDENT walk below when that lookup misses (an `ExprId` this
+/// pass never visited, or never found provable) — this fallback is
+/// what keeps the whole proof fail-closed, not a replacement for it.
+///
+/// The independent walk itself is NOT derived from `IndexForm`:
 /// `IndexForm`'s own `add`/`sub`/`mul` use `wrapping_*` arithmetic on
 /// purpose (v1-v3's proofs reason mod 2^width), so `m[i-1]`'s
 /// `IndexForm` stores its offset as a wrapped `u64::MAX` — treating
-/// that as a real, non-negative integer would be simply wrong. This
-/// function recognizes only the SAME restricted shape `bounds.rs`'s own
-/// `expr_bound` does (a bare bounded def, a literal, or `Add` of two
-/// such) — `Sub`/`Mul`/anything else is `None`, so `m[i-1]` never gets a
-/// real range here regardless of what `IndexForm` separately computed
-/// for it.
+/// that as a real, non-negative integer would be simply wrong. Only a
+/// bare bounded def, a literal, or `Add` of two such are recognized
+/// here directly — `Sub`/`Mul`/`Call`/anything else falls to `None` in
+/// THIS independent walk (stale claim, corrected: this no longer
+/// matches `bounds.rs`'s own `expr_bound`, which gained `Sub` at v7 and
+/// `Mul` at v11) — but for any `ExprId` `bounds.rs`'s own forward walk
+/// already visited as a mem index, the `site_ranges` lookup above
+/// already covers those wider shapes directly, so this independent
+/// walk only needs to keep covering whatever `bounds.rs` never visited
+/// (an index outside any mem access this pass reaches, or one it found
+/// unprovable).
 fn real_range(ast: &Ast, res: &Resolution, bounds: &Bounds, id: ExprId) -> Option<(u64, u64)> {
+    if let Some(&range) = bounds.site_ranges.get(&id) {
+        return Some(range);
+    }
     match ast.expr(id) {
         Expr::Int(v) => Some((*v, v.checked_add(1)?)),
         Expr::SizedInt { value, .. } => Some((*value, value.checked_add(1)?)),
