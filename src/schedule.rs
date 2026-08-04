@@ -26,16 +26,23 @@
 //! A third case is neither user-directed nor trusted: a read/write pair
 //! that both touch the same `mem` is auto-checked for address
 //! disjointness (`Exemption::Disjoint`, `mem_disjoint` below). This is
-//! the scoped v1+v2 of DESIGN.md's "Arrays: one resource each" tier-3
-//! proof — a syntactic affine-offset check living entirely in this
-//! module, deliberately NOT a dependent/refinement type system: no new
-//! types, no propositions, just one more index shape the same proof
-//! recognizes. Sound only for read/write pairs (a mem's write port is
-//! still one shared, priority-muxed port in emission — see
-//! firrtl/module.rs — so two PROVEN-disjoint writers would still race on
-//! it; write/write pairs stay fully conservative, unaffected by this).
+//! the scoped v1+v2+v3 of DESIGN.md's "Arrays: one resource each" tier-3
+//! proof — a syntactic check living entirely in this module, deliberately
+//! NOT a dependent/refinement type system: no new types, no propositions.
+//! `IndexForm` (below) is a single compositional representation — a
+//! linear combination `multiplier * base + offset` of at most one state
+//! def — built up by recursing through `+`/`-`/`*` via its own add/sub/
+//! mul methods, rather than one enum variant or hardcoded pattern per
+//! syntactic shape (v4): a new shape that still reduces to this same
+//! linear form (nested arithmetic, sugar, whatever) is recognized by
+//! composing the SAME rules, not by adding a new arm to `index_form`
+//! every time one shows up — see that function's own doc comment.
+//! Sound only for read/write pairs (a mem's write port is still one
+//! shared, priority-muxed port in emission — see firrtl/module.rs — so
+//! two PROVEN-disjoint writers would still race on it; write/write pairs
+//! stay fully conservative, unaffected by this).
 //!
-//! Two index shapes are recognized (`IndexForm` below); every index on
+//! `IndexForm` covers two provably-different shapes; every index on
 //! BOTH sides of a pair must recognize as one of them or the whole
 //! proof fails closed:
 //! - A bare compile-time-constant integer (`m[0]`) — two of these are
@@ -567,121 +574,139 @@ fn rule_name(ast: &Ast, id: ItemId) -> &str {
 }
 
 /// The shape a mem-index expression is recognized as, for the
-/// disjointness proof — see this module's own doc comment for exactly
-/// what each variant means and when two of them are provably different.
+/// disjointness proof: a linear combination `multiplier * base +
+/// offset` of AT MOST one state def, `base: None` standing for a bare
+/// compile-time constant (`offset` alone, `multiplier` unused). This is
+/// a single, compositional representation, not one enum variant per
+/// syntactic shape — see `index_form`'s own doc comment for why that
+/// matters. `m[i]` is `{base: Some(i), multiplier: 1, offset: 0}`,
+/// `m[2*i+1]` is `{base: Some(i), multiplier: 2, offset: 1}`, `m[3]` is
+/// `{base: None, offset: 3}`. Two forms are provably different either
+/// by SAME base + SAME multiplier (the v1/v2 argument, unaffected by
+/// which multiplier — it cancels in the subtraction), or by SAME
+/// power-of-two multiplier alone regardless of base identity (the
+/// banking argument — see `forms_differ`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexForm {
-    /// A bare compile-time-constant integer.
-    Const(u64),
-    /// A state def (register/input/...), optionally scaled by a
-    /// compile-time-constant multiplier, plus a compile-time constant
-    /// offset — `m[i]` is `Affine(i, 1, 0)`, `m[i+1]` is `Affine(i, 1,
-    /// 1)`, `m[i-1]` is `Affine(i, 1, u64::MAX)` (the offset is already
-    /// reduced modulo 2^64), `m[2*i]` is `Affine(i, 2, 0)`, `m[2*i+1]`
-    /// is `Affine(i, 2, 1)`. Two forms are provably different either by
-    /// SAME base + SAME multiplier (the v1/v2 argument, unaffected by
-    /// which multiplier — it cancels in the subtraction), or by SAME
-    /// power-of-two multiplier alone regardless of base identity (the
-    /// banking argument — see `forms_differ`).
-    Affine(DefId, u64, u64),
+struct IndexForm {
+    base: Option<DefId>,
+    multiplier: u64,
+    offset: u64,
 }
 
-/// Recognize an index expression as one of `IndexForm`'s two shapes, or
-/// `None` if it's neither — never chases through a rule-local (a local
-/// can be reassigned mid-rule; resolving through the wrong binding
-/// would be the exact reassigned-local/`Avg(Avg(x,y),z)` bug class this
-/// codebase has already shipped and fixed twice).
+impl IndexForm {
+    fn constant(offset: u64) -> Self {
+        IndexForm {
+            base: None,
+            multiplier: 0,
+            offset,
+        }
+    }
+
+    fn base(def: DefId) -> Self {
+        IndexForm {
+            base: Some(def),
+            multiplier: 1,
+            offset: 0,
+        }
+    }
+
+    /// `self + other`, if representable as a single linear term. At
+    /// most one side may carry a base — two DIFFERENT bases summed
+    /// (`i + j`) is a genuinely two-variable expression this
+    /// representation can't capture, so composition fails rather than
+    /// silently dropping one side.
+    fn add(self, other: Self) -> Option<Self> {
+        match (self.base, other.base) {
+            (None, None) => Some(Self::constant(self.offset.wrapping_add(other.offset))),
+            (Some(_), None) => Some(Self {
+                offset: self.offset.wrapping_add(other.offset),
+                ..self
+            }),
+            (None, Some(_)) => other.add(self),
+            (Some(_), Some(_)) => None,
+        }
+    }
+
+    /// `self - other`. Only `base - k` is representable (`k - base`
+    /// negates the base, not a translation of it — a genuinely
+    /// different shape, not the same "runtime value shifted by a known
+    /// amount" this proof reasons about; `base1 - base2` is two-variable,
+    /// same reason as `add`).
+    fn sub(self, other: Self) -> Option<Self> {
+        match (self.base, other.base) {
+            (None, None) => Some(Self::constant(self.offset.wrapping_sub(other.offset))),
+            (Some(_), None) => Some(Self {
+                offset: self.offset.wrapping_sub(other.offset),
+                ..self
+            }),
+            _ => None,
+        }
+    }
+
+    /// `self * other`. Only representable when at least one side is a
+    /// pure constant — `base * base'` would be quadratic, not linear.
+    fn mul(self, other: Self) -> Option<Self> {
+        match (self.base, other.base) {
+            (None, None) => Some(Self::constant(self.offset.wrapping_mul(other.offset))),
+            (Some(_), None) => Some(Self {
+                multiplier: self.multiplier.wrapping_mul(other.offset),
+                offset: self.offset.wrapping_mul(other.offset),
+                ..self
+            }),
+            (None, Some(_)) => other.mul(self),
+            (Some(_), Some(_)) => None,
+        }
+    }
+}
+
+/// Recognize an index expression as an `IndexForm`, or `None` if it
+/// isn't one — never chases through a rule-local (a local can be
+/// reassigned mid-rule; resolving through the wrong binding would be
+/// the exact reassigned-local/`Avg(Avg(x,y),z)` bug class this codebase
+/// has already shipped and fixed twice). Recurses through `+`/`-`/`*`
+/// via `IndexForm`'s own composition methods rather than pattern-
+/// matching each syntactic shape (`base+k`, `M*base`, `M*base+k`, ...)
+/// as its own case: a NEW shape that still reduces to "one base, known-
+/// scaled, plus a constant" — nested arithmetic like `(i+1)*2`, sugar,
+/// whatever — is handled automatically by composing the SAME rules,
+/// not by adding a new match arm here every time one shows up.
 fn index_form(ast: &Ast, res: &Resolution, id: ExprId) -> Option<IndexForm> {
     match ast.expr(id) {
-        Expr::Int(v) => Some(IndexForm::Const(*v)),
-        Expr::SizedInt { value, .. } => Some(IndexForm::Const(*value)),
-        Expr::Binary {
-            op: BinOp::Add,
-            lhs,
-            rhs,
-        } => affine_operand(ast, res, *lhs, *rhs).or_else(|| affine_operand(ast, res, *rhs, *lhs)),
-        // Only `base - k`, never `k - base`: the latter negates the
-        // base itself, not a translation of it, and isn't the same
-        // "same runtime value, shifted by a known amount" shape at all.
-        Expr::Binary {
-            op: BinOp::Sub,
-            lhs,
-            rhs,
-        } => {
-            let (base, mult) = scaled_base(ast, res, *lhs)?;
-            let k = const_index(ast, *rhs)?;
-            Some(IndexForm::Affine(base, mult, 0u64.wrapping_sub(k)))
+        Expr::Int(v) => Some(IndexForm::constant(*v)),
+        Expr::SizedInt { value, .. } => Some(IndexForm::constant(*value)),
+        Expr::Ident(_) => state_base(ast, res, id).map(IndexForm::base),
+        Expr::Binary { op, lhs, rhs } => {
+            let a = index_form(ast, res, *lhs)?;
+            let b = index_form(ast, res, *rhs)?;
+            match op {
+                BinOp::Add => a.add(b),
+                BinOp::Sub => a.sub(b),
+                BinOp::Mul => a.mul(b),
+                _ => None,
+            }
         }
-        _ => scaled_base(ast, res, id).map(|(base, mult)| IndexForm::Affine(base, mult, 0)),
+        _ => None,
     }
-}
-
-/// `base_expr + offset_expr` (either operand order) -> `Affine(base
-/// def, multiplier, k)`, if `base_expr` recognizes as `scaled_base` and
-/// `offset_expr` folds to a constant.
-fn affine_operand(
-    ast: &Ast,
-    res: &Resolution,
-    base_expr: ExprId,
-    offset_expr: ExprId,
-) -> Option<IndexForm> {
-    let (base, mult) = scaled_base(ast, res, base_expr)?;
-    let k = const_index(ast, offset_expr)?;
-    Some(IndexForm::Affine(base, mult, k))
-}
-
-/// A bare state-def reference (`i`, multiplier 1), or that reference
-/// scaled by a compile-time constant (`M*i`/`i*M`, multiplier `M`) —
-/// the two shapes `index_form` recognizes as "a single unknown runtime
-/// value, known-scaled." Never chases through a rule-local, same
-/// reasoning as `state_base` itself.
-fn scaled_base(ast: &Ast, res: &Resolution, id: ExprId) -> Option<(DefId, u64)> {
-    if let Some(def) = state_base(ast, res, id) {
-        return Some((def, 1));
-    }
-    let Expr::Binary {
-        op: BinOp::Mul,
-        lhs,
-        rhs,
-    } = ast.expr(id)
-    else {
-        return None;
-    };
-    if let (Some(def), Some(m)) = (state_base(ast, res, *lhs), const_index(ast, *rhs)) {
-        return Some((def, m));
-    }
-    if let (Some(def), Some(m)) = (state_base(ast, res, *rhs), const_index(ast, *lhs)) {
-        return Some((def, m));
-    }
-    None
 }
 
 /// The state def a bare `Expr::Ident` resolves to, if any — the
-/// disjointness proof's only notion of "the same runtime value."
+/// disjointness proof's only notion of "the same runtime value".
 /// Deliberately requires the `Ident` shape explicitly (unlike
 /// `effects.rs`'s own `state_def`, which doesn't need to since every
-/// caller there already only reaches it from an Ident position): without
-/// this check, `res.expr_defs` would also resolve an inst-port `Expr::
-/// Field` base (e.g. `m[c.a + 1]`), which is sound on its own (a port's
-/// value is just as pre-edge-stable within a cycle) but would recognize
-/// asymmetrically — `m[c.a + 1]` matching while a bare `m[c.a]` (offset
-/// 0, the `Expr::Ident` match arm in `index_form`) does not.
+/// caller there already only reaches it from an Ident position): this
+/// function's own only caller (`index_form`'s `Expr::Ident` arm) already
+/// guarantees the shape today, making the check structurally redundant
+/// there — but it's left in as defense-in-depth, since it's what closed
+/// a real asymmetry before the v4 compositional refactor (when a since-
+/// removed helper called this from a Binary operand position, where
+/// `res.expr_defs` would also resolve an inst-port `Expr::Field` base
+/// like `c.a`, recognizing `m[c.a + 1]` while a bare `m[c.a]` did not).
 fn state_base(ast: &Ast, res: &Resolution, id: ExprId) -> Option<DefId> {
     if !matches!(ast.expr(id), Expr::Ident(_)) {
         return None;
     }
     let def = res.expr_defs.get(&id)?;
     res.def(*def).kind.is_state().then_some(*def)
-}
-
-/// Fold a mem-index expression to a compile-time constant, if it is
-/// one.
-fn const_index(ast: &Ast, id: ExprId) -> Option<u64> {
-    match ast.expr(id) {
-        Expr::Int(v) => Some(*v),
-        Expr::SizedInt { value, .. } => Some(*value),
-        _ => None,
-    }
 }
 
 /// The declared bit width of a state def, if it's a plain `bits[N]`
@@ -734,22 +759,25 @@ fn base_width(ty: &Types, def: DefId) -> Option<u64> {
 /// argument fails closed. A constant compared against an affine form
 /// (or the reverse) is never provable.
 fn forms_differ(ty: &Types, a: IndexForm, b: IndexForm, pow2_width: Option<u64>) -> bool {
-    match (a, b) {
-        (IndexForm::Const(x), IndexForm::Const(y)) => x != y,
-        (IndexForm::Affine(da, ma, ka), IndexForm::Affine(db, mb, kb)) => {
+    match (a.base, b.base) {
+        (None, None) => a.offset != b.offset,
+        (Some(da), Some(db)) => {
             let Some(addr_w) = pow2_width else {
                 return false;
             };
             let same_base_argument = da == db
-                && ma == mb
+                && a.multiplier == b.multiplier
                 && base_width(ty, da)
-                    .is_some_and(|base_w| offsets_differ(ka, kb, addr_w.min(base_w)));
-            let banking_argument = ma == mb && ma >= 2 && ma.is_power_of_two() && {
-                let k_used = (ma.trailing_zeros() as u64).min(addr_w);
-                base_width(ty, da).is_some_and(|w| w >= k_used)
-                    && base_width(ty, db).is_some_and(|w| w >= k_used)
-                    && offsets_differ(ka, kb, k_used)
-            };
+                    .is_some_and(|base_w| offsets_differ(a.offset, b.offset, addr_w.min(base_w)));
+            let banking_argument = a.multiplier == b.multiplier
+                && a.multiplier >= 2
+                && a.multiplier.is_power_of_two()
+                && {
+                    let k_used = (a.multiplier.trailing_zeros() as u64).min(addr_w);
+                    base_width(ty, da).is_some_and(|w| w >= k_used)
+                        && base_width(ty, db).is_some_and(|w| w >= k_used)
+                        && offsets_differ(a.offset, b.offset, k_used)
+                };
             same_base_argument || banking_argument
         }
         _ => false,

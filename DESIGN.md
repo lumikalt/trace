@@ -2760,7 +2760,14 @@ In v0, a whole array (`mem`) is one conflict resource: any two accesses to the
 same array conflict unless both are reads. Three exceptions exist, all scoped
 to **read/write** pairs only, all a syntactic check living entirely in
 `schedule.rs` — NOT dependent or refinement types, no new types or
-propositions, just one more index shape the same proof recognizes:
+propositions. The index recognizer itself (`IndexForm`, `schedule.rs`) is a
+single COMPOSITIONAL representation, not one case per syntactic shape: a
+linear combination `multiplier * base + offset` of at most one state def,
+built by recursing through `+`/`-`/`*` via its own composition rules. A new
+syntactic shape that still reduces to this same linear form — nested
+arithmetic, sugar, whatever — is handled automatically by composing the SAME
+rules, not by adding a new hardcoded pattern every time one shows up (`(i+1)*2`
+recognizes identically to `2*i+2`, with no dedicated case for either).
 
 ```trace
 rule a { x := m[3] }      -- reads {m}

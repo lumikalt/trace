@@ -2101,7 +2101,7 @@ manually in the meantime.
   schedule.rs, no new types or propositions.
 - **RESOLVED (v3, scoped) — `m[2*i]` vs `m[2*j+1]` for TWO DIFFERENT
   bases is also now auto-proven disjoint, without any range tracking**
-  (`schedule.rs`'s `IndexForm::Affine` gained a multiplier field,
+  (`schedule.rs`'s `IndexForm` gained a multiplier field,
   `examples/mem_disjoint_banked.tr`). NOT a scoped version of Dahlia-
   style banking/range tracking — the argument doesn't need one: `M*x` is
   congruent to 0 mod `M` for ANY x, so base identity drops out entirely,
@@ -2120,6 +2120,32 @@ manually in the meantime.
   case — two arbitrary, unrelated, unscaled bases — remains exactly as
   unprovable as before; Dahlia-style banked/affine array types (real
   range tracking) are still tier 3, explicitly deferred in DESIGN.md.
+- **RESOLVED (v4, refactor, not a new proof) — the index recognizer
+  itself is now a single compositional representation, not a growing
+  pile of hardcoded shapes** (`schedule.rs`'s `IndexForm` went from an
+  enum with one variant per shape to a struct `{base, multiplier,
+  offset}` with `add`/`sub`/`mul` composition methods; `index_form`
+  recurses through `+`/`-`/`*` generically instead of pattern-matching
+  `base+k`/`M*base`/`M*base+k` as separate cases). Direct response to
+  Lumi flagging the v1/v2/v3 pattern itself as the problem ("add the
+  type system now, instead of proving just different disjoint cases")
+  — advisor's reframe: the actual complaint was `forms_differ`/
+  `index_form` growing one arm per shape, not a request for dependent
+  types in the abstract, and a symbolic composable representation
+  fixes that without new syntax, new annotations, or any whole-program
+  analysis. Zero behavior change for anything already provable
+  (confirmed via a normalized `--explain-schedule` diff across every
+  example both before and after, not just the unit/firrtl/sim test
+  suite passing unchanged) — this is a pure generalization: a NEW shape
+  that reduces to the same linear form (`(i+1)*2`, nested arithmetic)
+  is now recognized automatically, confirmed via `git stash` to have
+  fallen back to a derived stall before this commit and proven disjoint
+  after, with no new arm added for it. Does NOT touch the two
+  disjointness ARGUMENTS themselves (same-base-same-multiplier,
+  same-power-of-two-multiplier) — those are two fixed mathematical
+  cases, not an open-ended list, and stay as `forms_differ`'s own `||`.
+  Does NOT attempt the genuinely general different-base case either;
+  that's still exactly as unprovable, and still tier 3.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

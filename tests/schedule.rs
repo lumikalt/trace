@@ -934,7 +934,8 @@ module M {
 #[test]
 fn mem_disjoint_v3_banked_commuted_multiplier_is_proven() {
     // `i*2` (base first) must recognize identically to `2*i` (base
-    // second) -- `scaled_base` tries both operand orders.
+    // second) -- `IndexForm::mul` commutes when the base is on the
+    // right.
     let src = "\
 module M {
     mem m : [8][16]
@@ -955,6 +956,104 @@ module M {
     let group = &sched.groups[0];
     assert_eq!(group.conflicts.len(), 1);
     assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v4_nested_arithmetic_composes_with_no_new_recognizer_arm() {
+    // The whole point of the compositional `IndexForm`/`index_form`
+    // refactor: `(i+1)*2` was NOT recognized by the old hardcoded
+    // recognizer at all (it only pattern-matched `base+k`, `M*base`,
+    // and `M*base+k` at the TOP level, never a `Mul` applied to a
+    // nested `Add`) -- confirmed via `git stash` before writing this
+    // test, which showed the pre-refactor code falling back to a
+    // derived stall here. The new recognizer needs no new arm for this
+    // shape: `(i+1)*2` composes to the SAME `{base: i, multiplier: 2,
+    // offset: 2}` that `2*i+2` would, via the existing add/mul
+    // composition rules alone.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    reg j : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[(i+1)*2] := x
+    }
+    rule q {
+        y := m[(j+1)*2 + 1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v4_sum_of_two_bases_stays_unprovable() {
+    // The fail-closed direction of the compositional recognizer, not
+    // just the positive one above: the OLD recognizer could never even
+    // REACH a subexpression with a base on both sides (it only ever
+    // looked at specific operand positions via `scaled_base`/
+    // `const_index`), but the new one recurses into every operand and
+    // relies on `IndexForm::add`'s `(Some, Some) => None` to reject
+    // `i + j` (two DIFFERENT bases summed is a genuinely two-variable
+    // expression this linear representation can't capture -- silently
+    // keeping one base and dropping the other would be a real
+    // fail-open miscompile, the same class as the reassigned-local/
+    // `Avg(Avg(x,y),z)` bug already shipped and fixed twice).
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    reg j : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i+j] := x
+    }
+    rule q {
+        y := m[i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v4_product_of_two_bases_stays_unprovable() {
+    // Same fail-closed direction as the sum case above, for `mul`:
+    // `i * j` (both operands a base, neither a constant) must reject via
+    // `IndexForm::mul`'s `(Some, Some) => None` -- a product of two
+    // unknowns is quadratic, not the linear form this proof reasons
+    // about.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    reg j : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i*j] := x
+    }
+    rule q {
+        y := m[i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
 }
 
 #[test]
