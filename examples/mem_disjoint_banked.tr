@@ -1,0 +1,37 @@
+-- v3 of the mem-disjointness proof: `write` and `read` touch the SAME
+-- mem at `2*i` and `2*j+1` -- TWO GENUINELY DIFFERENT registers/inputs,
+-- `i` and `j`, whose runtime values could otherwise coincide (see
+-- examples/conflict_free_mem.tr and examples/subleq.tr's own comment
+-- for why that general case stays unprovable: `i` and `j` are
+-- independent unknowns, and proving them disjoint in general needs real
+-- range tracking). What makes THIS pair provable without any range
+-- tracking at all is the shared power-of-two multiplier: `2*i` is
+-- always EVEN and `2*j+1` is always ODD, for ANY values `i` and `j`
+-- happen to take -- including `i == j` -- base identity drops out of
+-- the argument entirely. No `conflict_free` annotation needed; the
+-- scheduler proves it on its own (schedule.rs's `Exemption::Disjoint`,
+-- the banking case).
+--
+-- Still a syntactic check, not dependent types or range tracking: no new
+-- types, no propositions, just one more index shape (a state def scaled
+-- by a compile-time power-of-two constant) the same proof recognizes.
+module MemDisjointBanked {
+    mem m : [8][16]
+
+    in i : [4]
+    in j : [4]
+    in x : [8]
+    out y : [8] = 0
+    out write_count : [8] = 0
+    out read_count : [8] = 0
+
+    rule write {
+        m[2*i] := x
+        write_count := write_count + 1
+    }
+
+    rule read {
+        y := m[2*j + 1]
+        read_count := read_count + 1
+    }
+}

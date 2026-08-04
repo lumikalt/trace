@@ -41,39 +41,48 @@
 //! - A bare compile-time-constant integer (`m[0]`) — two of these are
 //!   provably different iff the constants themselves differ, e.g.
 //!   `m[0] := x` and `y := m[1]` (v1).
-//! - A plain state def (register/input/...) plus a compile-time-
-//!   constant offset (`m[i]`, `m[i+1]`, `m[i-1]`) — never chased through
-//!   a rule-local: a local can be reassigned mid-rule, and resolving
-//!   through the wrong binding would be the exact reassigned-local/
-//!   `Avg(Avg(x,y),z)` bug class this codebase has already shipped and
-//!   fixed twice. Two of these are provably different only when BOTH
-//!   name the SAME base def (a different register's value could
-//!   coincide at runtime — `m[i]` vs `m[j]` for two distinct registers
-//!   stays unprovable, by design, not an oversight) AND the mem's own
-//!   depth is exactly a power of two. The latter is load-bearing, not
-//!   caution for its own sake: address arithmetic wraps modulo the
-//!   base's own width, and that modular argument is only sound when
-//!   every representable address is a real, distinct memory cell — v0
-//!   has no bounds check on an index against a non-power-of-two depth
-//!   at all (an out-of-range index is currently undefined, left
-//!   entirely to firtool), so this proof simply never depends on that
-//!   undefined behavior rather than guessing at it (v2). Given both
-//!   conditions, offsets are compared modulo 2^(the SMALLER of the
-//!   mem's own address width and the base's own declared width) — `i +
-//!   k` wraps at the base's own width (types.rs's modular-add rule),
-//!   which can be narrower than the address width connected to the mem
-//!   port, and two offsets differing mod the wider width can still
-//!   alias mod the narrower one. The base's width must be a
-//!   concretely-known `bits[N]` or the whole comparison fails closed.
+//! - A state def (register/input/...), optionally scaled by a compile-
+//!   time-constant multiplier, plus a compile-time-constant offset
+//!   (`m[i]`, `m[i+1]`, `m[i-1]`, `m[2*i]`, `m[2*i+1]`) — never chased
+//!   through a rule-local: a local can be reassigned mid-rule, and
+//!   resolving through the wrong binding would be the exact reassigned-
+//!   local/`Avg(Avg(x,y),z)` bug class this codebase has already shipped
+//!   and fixed twice. Two of these are provably different via EITHER of
+//!   two independent arguments (both need the mem's own depth to be
+//!   exactly a power of two — load-bearing, not caution for its own
+//!   sake: v0 has no bounds check on an index against a non-power-of-
+//!   two depth at all, an out-of-range index's behavior is undefined,
+//!   left entirely to firtool, so neither argument may depend on it):
+//!   - SAME base def AND SAME multiplier (v1/v2's original argument,
+//!     unaffected by which multiplier is shared — it cancels exactly in
+//!     the subtraction). Offsets are compared modulo 2^(the SMALLER of
+//!     the mem's own address width and the base's own declared width):
+//!     the base's own term wraps at ITS width (types.rs's modular-add
+//!     rule), which can be narrower than the address width connected to
+//!     the mem port, and two offsets differing mod the wider width can
+//!     still alias mod the narrower one.
+//!   - SAME power-of-two multiplier `M >= 2`, base identity IRRELEVANT
+//!     (v3, the banking case): `m[i]` vs `m[j]` for two distinct
+//!     registers stays unprovable on its own (a different register's
+//!     value could coincide at runtime, and proving otherwise in
+//!     general needs real range tracking — deliberately out of scope,
+//!     not an oversight), but `m[2*i]` vs `m[2*j+1]` IS provable
+//!     regardless of whether `i` and `j` coincide: `M*x` is congruent to
+//!     0 mod `M` for ANY x, so base identity drops out of the argument
+//!     entirely. Sound only up to `k = log2(M)` bits — see
+//!     `forms_differ`'s own doc comment for exactly why (an empirical,
+//!     not assumed, fact about how this compiles).
 //!
-//!   The pre-edge-read invariant this whole affine argument leans on
-//!   (both rules see the SAME value of a shared base within one cycle,
+//!   The pre-edge-read invariant the same-base argument leans on (both
+//!   rules see the SAME value of a shared base within one cycle,
 //!   regardless of which rule writes it) never needs a side condition
 //!   checked here: if either rule also WRITES the base register, that
 //!   register lands in the pair's own shared-state set alongside the
 //!   mem, and `mem_disjoint`'s "every shared def must be this one mem"
 //!   requirement rejects the whole pair outright — the case where the
-//!   invariant would matter cannot reach this proof at all.
+//!   invariant would matter cannot reach this proof at all. The banking
+//!   argument doesn't lean on this invariant at all — it doesn't care
+//!   what either base's value is, or whether it changes.
 //!
 //! A CONSTANT compared against an AFFINE form (or the reverse) is never
 //! provable either way — a fixed number says nothing about a variable's
@@ -531,8 +540,9 @@ impl Schedule {
                         });
                     }
                     Exemption::Disjoint => out.push_str(
-                        "    index sites proven disjoint (constant addresses, or the same base \
-                         plus a constant offset): no stall derived (no annotation needed)\n",
+                        "    index sites proven disjoint (constant addresses, the same base \
+                         plus a constant offset, or a shared power-of-two multiplier): no stall \
+                         derived (no annotation needed)\n",
                     ),
                     Exemption::None => {
                         let loser = if c.winner == c.a { b } else { a };
@@ -563,12 +573,17 @@ fn rule_name(ast: &Ast, id: ItemId) -> &str {
 enum IndexForm {
     /// A bare compile-time-constant integer.
     Const(u64),
-    /// A plain state def (register/input/...) plus a compile-time
-    /// constant offset — `m[i]` is `Affine(i, 0)`, `m[i+1]` is
-    /// `Affine(i, 1)`, `m[i-1]` is `Affine(i, u64::MAX)` (the offset is
-    /// already reduced modulo 2^64; the disjointness check reduces it
-    /// again modulo the mem's own address width).
-    Affine(DefId, u64),
+    /// A state def (register/input/...), optionally scaled by a
+    /// compile-time-constant multiplier, plus a compile-time constant
+    /// offset — `m[i]` is `Affine(i, 1, 0)`, `m[i+1]` is `Affine(i, 1,
+    /// 1)`, `m[i-1]` is `Affine(i, 1, u64::MAX)` (the offset is already
+    /// reduced modulo 2^64), `m[2*i]` is `Affine(i, 2, 0)`, `m[2*i+1]`
+    /// is `Affine(i, 2, 1)`. Two forms are provably different either by
+    /// SAME base + SAME multiplier (the v1/v2 argument, unaffected by
+    /// which multiplier — it cancels in the subtraction), or by SAME
+    /// power-of-two multiplier alone regardless of base identity (the
+    /// banking argument — see `forms_differ`).
+    Affine(DefId, u64, u64),
 }
 
 /// Recognize an index expression as one of `IndexForm`'s two shapes, or
@@ -580,7 +595,6 @@ fn index_form(ast: &Ast, res: &Resolution, id: ExprId) -> Option<IndexForm> {
     match ast.expr(id) {
         Expr::Int(v) => Some(IndexForm::Const(*v)),
         Expr::SizedInt { value, .. } => Some(IndexForm::Const(*value)),
-        Expr::Ident(_) => state_base(ast, res, id).map(|def| IndexForm::Affine(def, 0)),
         Expr::Binary {
             op: BinOp::Add,
             lhs,
@@ -594,16 +608,16 @@ fn index_form(ast: &Ast, res: &Resolution, id: ExprId) -> Option<IndexForm> {
             lhs,
             rhs,
         } => {
-            let base = state_base(ast, res, *lhs)?;
+            let (base, mult) = scaled_base(ast, res, *lhs)?;
             let k = const_index(ast, *rhs)?;
-            Some(IndexForm::Affine(base, 0u64.wrapping_sub(k)))
+            Some(IndexForm::Affine(base, mult, 0u64.wrapping_sub(k)))
         }
-        _ => None,
+        _ => scaled_base(ast, res, id).map(|(base, mult)| IndexForm::Affine(base, mult, 0)),
     }
 }
 
 /// `base_expr + offset_expr` (either operand order) -> `Affine(base
-/// def, k)`, if `base_expr` is a bare state-def reference and
+/// def, multiplier, k)`, if `base_expr` recognizes as `scaled_base` and
 /// `offset_expr` folds to a constant.
 fn affine_operand(
     ast: &Ast,
@@ -611,9 +625,35 @@ fn affine_operand(
     base_expr: ExprId,
     offset_expr: ExprId,
 ) -> Option<IndexForm> {
-    let base = state_base(ast, res, base_expr)?;
+    let (base, mult) = scaled_base(ast, res, base_expr)?;
     let k = const_index(ast, offset_expr)?;
-    Some(IndexForm::Affine(base, k))
+    Some(IndexForm::Affine(base, mult, k))
+}
+
+/// A bare state-def reference (`i`, multiplier 1), or that reference
+/// scaled by a compile-time constant (`M*i`/`i*M`, multiplier `M`) —
+/// the two shapes `index_form` recognizes as "a single unknown runtime
+/// value, known-scaled." Never chases through a rule-local, same
+/// reasoning as `state_base` itself.
+fn scaled_base(ast: &Ast, res: &Resolution, id: ExprId) -> Option<(DefId, u64)> {
+    if let Some(def) = state_base(ast, res, id) {
+        return Some((def, 1));
+    }
+    let Expr::Binary {
+        op: BinOp::Mul,
+        lhs,
+        rhs,
+    } = ast.expr(id)
+    else {
+        return None;
+    };
+    if let (Some(def), Some(m)) = (state_base(ast, res, *lhs), const_index(ast, *rhs)) {
+        return Some((def, m));
+    }
+    if let (Some(def), Some(m)) = (state_base(ast, res, *rhs), const_index(ast, *lhs)) {
+        return Some((def, m));
+    }
+    None
 }
 
 /// The state def a bare `Expr::Ident` resolves to, if any — the
@@ -658,30 +698,59 @@ fn base_width(ty: &Types, def: DefId) -> Option<u64> {
 
 /// Whether two recognized index forms are provably different. A
 /// constant differs from another constant iff the values themselves
-/// differ. An affine form differs from another only when BOTH name the
-/// same base def (a different register's value could coincide at
-/// runtime), `pow2_width` is available (the mem's depth is a power of
-/// two — see this module's own doc comment for why that's required, not
-/// just cautious), AND the offsets differ modulo 2^width. That last
-/// width is NOT simply the mem's own address width: `i + k` wraps at
-/// the BASE's own declared width (types.rs's modular-add rule), which
-/// can be narrower than the address width connected to the mem port —
-/// two offsets differing mod the (wider) address width can still be
-/// congruent, and therefore the same real address, mod the (narrower)
-/// base width. Using `min(addr width, base width)` is sound either way:
-/// congruence in the smaller modulus implies congruence in the larger
-/// one it divides. The base's own width must be concretely known or the
-/// whole comparison fails closed — a constant compared against an
-/// affine form (or the reverse) is never provable.
+/// differ. An affine form differs from another via EITHER of two
+/// independent sufficient arguments (an `||`, not a single combined
+/// condition), both requiring `pow2_width` (the mem's depth is a power
+/// of two — see this module's own doc comment for why that's required,
+/// not just cautious):
+///
+/// - Same base AND same multiplier: the v1/v2 argument, unaffected by
+///   which multiplier is shared — the `M*base` term is byte-identical on
+///   both sides, so it cancels exactly in the subtraction regardless of
+///   M's value, leaving "offsets differ" as the whole question, exactly
+///   as if M were 1. Offsets are compared modulo 2^(the SMALLER of the
+///   mem's own address width and the base's own declared width) — `base`
+///   wraps at the base's own width (types.rs's modular-add rule), which
+///   can be narrower than the address width connected to the mem port,
+///   and two offsets differing mod the wider width can still alias mod
+///   the narrower one.
+/// - Same power-of-two multiplier M >= 2, base identity irrelevant (a
+///   DIFFERENT register's value could still coincide at runtime, but
+///   `M*x` is congruent to 0 mod M for ANY x — see this module's own doc
+///   comment's "Arrays: one resource each" companion in DESIGN.md): the
+///   banking argument. Sound only up to `k = log2(M)` bits: a compiled
+///   `M*base [+ k]` expression's own natural width was checked via the
+///   CLI (M = 2, 4, and 8 against a 4-bit base, not assumed from the
+///   general width-growth rule) and consistently collapses to the
+///   base's OWN declared width rather than growing to `|M|+|base|`, so
+///   the low k bits survive every later truncation only when that
+///   intermediate width — the base's own — is at least
+///   k, hence the `base_width(..) >= k_used` guard on BOTH sides
+///   (regardless of base identity). `k_used` is further capped at the
+///   mem's own address width for the same reason the same-base argument
+///   caps at it: only that many bits ultimately reach the port.
+///
+/// Either way, a def's own width must be concretely known or that
+/// argument fails closed. A constant compared against an affine form
+/// (or the reverse) is never provable.
 fn forms_differ(ty: &Types, a: IndexForm, b: IndexForm, pow2_width: Option<u64>) -> bool {
     match (a, b) {
         (IndexForm::Const(x), IndexForm::Const(y)) => x != y,
-        (IndexForm::Affine(da, ka), IndexForm::Affine(db, kb)) => {
-            da == db
-                && pow2_width.is_some_and(|addr_w| {
-                    base_width(ty, da)
-                        .is_some_and(|base_w| offsets_differ(ka, kb, addr_w.min(base_w)))
-                })
+        (IndexForm::Affine(da, ma, ka), IndexForm::Affine(db, mb, kb)) => {
+            let Some(addr_w) = pow2_width else {
+                return false;
+            };
+            let same_base_argument = da == db
+                && ma == mb
+                && base_width(ty, da)
+                    .is_some_and(|base_w| offsets_differ(ka, kb, addr_w.min(base_w)));
+            let banking_argument = ma == mb && ma >= 2 && ma.is_power_of_two() && {
+                let k_used = (ma.trailing_zeros() as u64).min(addr_w);
+                base_width(ty, da).is_some_and(|w| w >= k_used)
+                    && base_width(ty, db).is_some_and(|w| w >= k_used)
+                    && offsets_differ(ka, kb, k_used)
+            };
+            same_base_argument || banking_argument
         }
         _ => false,
     }

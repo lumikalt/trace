@@ -399,6 +399,29 @@ fn mem_disjoint_affine_needs_no_conflict_free_annotation() {
 }
 
 #[test]
+fn mem_disjoint_banked_needs_no_conflict_free_annotation() {
+    // v3 of the two tests above: examples/mem_disjoint_banked.tr's
+    // `write`/`read` share a power-of-two multiplier (`2*i` vs `2*j+1`)
+    // but TWO GENUINELY DIFFERENT bases (`i`, `j`) -- unlike v1
+    // (constants) and v2 (same base), base identity never enters this
+    // proof at all. Still no annotation anywhere in the source, and
+    // `fires_write`/`fires_read` must both be unconditional exactly like
+    // the other two cases.
+    let fir =
+        emit_from_source(&read_example("mem_disjoint_banked.tr")).expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, tail(mul(UInt<4>(2), i), 4)"));
+    assert!(
+        fir.contains("connect m.r0.addr, tail(add(tail(mul(UInt<4>(2), j), 4), UInt<4>(1)), 1)")
+    );
+    assert!(fir.contains("node fires_write = UInt<1>(1)"));
+    assert!(fir.contains("node fires_read = UInt<1>(1)"));
+    assert!(!fir.contains("not(fires_write)"));
+    assert!(!fir.contains("not(fires_read)"));
+    assert!(!fir.contains("assert("));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn conflict_free_mem_pair_gets_a_checked_disjointness_assertion() {
     // conflict_free_mem.tr's `write_addr`/`read_addr` are module INPUTS,
     // not registers with a provable value set -- there's no static proof

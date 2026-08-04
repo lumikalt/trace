@@ -480,8 +480,8 @@ fn explain_names_a_proven_disjoint_mem_pair() {
     let text = sched.explain(&ast, &res);
     assert!(text.contains("rule write conflicts with rule read"));
     assert!(text.contains(
-        "index sites proven disjoint (constant addresses, or the same base plus a constant \
-         offset): no stall derived (no annotation needed)"
+        "index sites proven disjoint (constant addresses, the same base plus a constant \
+         offset, or a shared power-of-two multiplier): no stall derived (no annotation needed)"
     ));
 }
 
@@ -860,6 +860,124 @@ module M {
     }
     rule q {
         y := m[j]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v3_banked_different_bases_is_proven() {
+    // The one shape where two DIFFERENT bases ARE provable: `m[2*i]`
+    // (even) against `m[2*j+1]` (odd) can never coincide for ANY i, j --
+    // base identity drops out of the argument entirely, since `2*x` is
+    // always congruent to 0 mod 2 regardless of which x. This is
+    // genuinely different from `mem_disjoint_v2_different_bases_stay_
+    // unprovable` just above: same shape (two distinct registers), but a
+    // shared power-of-two multiplier makes it provable where a bare
+    // shared base offset is not.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    reg j : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[2*i] := x
+    }
+    rule q {
+        y := m[2*j + 1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v3_banked_same_parity_stays_unprovable() {
+    // The discriminating negative case: `m[2*i]` against `m[2*j+2]` --
+    // BOTH even, so the residue argument gives no information (0 mod 2
+    // == 2 mod 2), and the two bases are different so the same-base
+    // argument doesn't apply either. If this were ever proven disjoint,
+    // the modulus would be wrong.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    reg j : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[2*i] := x
+    }
+    rule q {
+        y := m[2*j + 2]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v3_banked_commuted_multiplier_is_proven() {
+    // `i*2` (base first) must recognize identically to `2*i` (base
+    // second) -- `scaled_base` tries both operand orders.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [4] = 0
+    reg j : [4] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i*2] := x
+    }
+    rule q {
+        y := m[j*2 + 1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v3_banked_non_power_of_two_multiplier_stays_unprovable() {
+    // `3*i` isn't a power of two, so the banking argument's `M.is_
+    // power_of_two()` guard rejects it outright -- and since the bases
+    // are also different, the same-base argument doesn't apply either.
+    // Both conditions block this pair (unlike the depth test above,
+    // which isolates a single failing condition): this test only
+    // confirms neither argument fires, not which one specifically would
+    // if the other's guard were removed.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg i : [5] = 0
+    reg j : [5] = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[3*i] := x
+    }
+    rule q {
+        y := m[3*j + 1]
     }
 }
 ";

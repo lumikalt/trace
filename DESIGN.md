@@ -2757,8 +2757,8 @@ claim turns out false.
 ## Arrays: one resource each
 
 In v0, a whole array (`mem`) is one conflict resource: any two accesses to the
-same array conflict unless both are reads. Two exceptions exist, both scoped to
-**read/write** pairs only, both a syntactic check living entirely in
+same array conflict unless both are reads. Three exceptions exist, all scoped
+to **read/write** pairs only, all a syntactic check living entirely in
 `schedule.rs` — NOT dependent or refinement types, no new types or
 propositions, just one more index shape the same proof recognizes:
 
@@ -2776,51 +2776,90 @@ rule f { m[i+1] := y }    -- writes {m}, same base def i, constant offset 1
 rule c { x := m[i] }      -- reads {m}, i a runtime value
 rule d { m[j] := y }      -- writes {m}, j a DIFFERENT runtime value
 -- v0: c conflicts with d -- i and j could coincide at runtime, and proving
--- otherwise needs real range tracking, not a syntactic check; this stays the
--- general, conservative case.
+-- otherwise in general needs real range tracking, not a syntactic check; this
+-- stays the general, conservative case.
+
+rule g { x := m[2*i] }      -- reads {m}, i a runtime value, scaled by 2
+rule h { m[2*j+1] := y }    -- writes {m}, j a DIFFERENT runtime value, scaled by 2
+-- v0: proven disjoint anyway -- 2*i is always EVEN and 2*j+1 is always ODD,
+-- for ANY i and j, including i == j. Base identity never enters this
+-- argument at all, unlike e/f above.
 ```
 
 The first case (both indices literal constants) needs only the constants to
-differ. The second (an affine expression of a shared base — `m[i]`, `m[i+1]`,
-`m[i-1]`) needs: the SAME base def on both sides (a different register's value
-could coincide — `m[i]` vs `m[j]` for two distinct registers is deliberately
-`c`/`d` above, not provable), AND the mem's own depth to be exactly a power of
-two. That second condition is load-bearing, not caution for its own sake: index
-arithmetic wraps modulo the base's own width, and that modular argument is only
-sound when every representable address is a real, distinct memory cell — v0 has
-no bounds check on an index against a non-power-of-two depth at all (an
-out-of-range index is currently undefined, left entirely to firtool), so the
-proof simply never depends on that undefined behavior rather than guessing at
-it. Offsets are actually compared modulo 2^(the SMALLER of the mem's own
-address width and the base's own declared width): `i + k` wraps at the base's
-own width first, which can be narrower than the address width connected to the
-mem port, and two offsets differing mod the wider width can still alias mod the
-narrower one — the base's width must be a concretely-known `bits[N]` or the
-comparison fails closed. A base is never chased through a rule-local (a local
-can be reassigned mid-rule; resolving through the wrong binding would be the
-exact reassigned-local/`Avg(Avg(x,y),z)` bug class already shipped and fixed
-twice in this codebase) — only a bare register/input reference counts.
+differ. The other two share one shape — a state def (register/input/...),
+optionally scaled by a compile-time-constant multiplier, plus a compile-time
+constant offset (`m[i]`, `m[i+1]`, `m[2*i]`, `m[2*i+1]`) — and both need the
+mem's own depth to be exactly a power of two. That condition is load-bearing,
+not caution for its own sake, for either case: index arithmetic wraps modulo
+some register's own width, and the modular argument either case makes is only
+sound when every representable address is a real, distinct memory cell — v0
+has no bounds check on an index against a non-power-of-two depth at all (an
+out-of-range index is currently undefined, left entirely to firtool), so
+neither proof depends on that undefined behavior rather than guessing at it.
+A base (scaled or not) is never chased through a rule-local (a local can be
+reassigned mid-rule; resolving through the wrong binding would be the exact
+reassigned-local/`Avg(Avg(x,y),z)` bug class already shipped and fixed twice
+in this codebase) — only a bare register/input reference, or that reference
+times a constant, counts.
 
-The soundness argument above rests on both rules reading the IDENTICAL
-pre-edge value of the shared base within one cycle — true regardless of which
-rule writes it, since registers are speculatively written and read pre-edge
-(this scheduler's own core invariant). This never needs checking as a separate
-side condition: if either rule also writes the base, that register becomes
-shared state between the pair alongside the mem, and the scheduler's
+Given a power-of-two depth, two forms are provably different via EITHER of two
+independent arguments:
+
+- **`e`/`f`: same base def AND same multiplier.** Offsets are compared modulo
+  2^(the SMALLER of the mem's own address width and the base's own declared
+  width): the shared `base` (scaled or not) term is byte-identical on both
+  sides, so it cancels exactly in the subtraction regardless of what the
+  multiplier's value is — this is the ORIGINAL v1/v2 argument, unaffected by
+  scaling. `i + k` (or `M*i + k`) wraps at the base's own width first, which
+  can be narrower than the address width connected to the mem port, and two
+  offsets differing mod the wider width can still alias mod the narrower one
+  — the base's width must be a concretely-known `bits[N]` or the whole
+  comparison fails closed.
+- **`g`/`h`: same power-of-two multiplier `M >= 2`, base identity IRRELEVANT.**
+  `m[i]` vs `m[j]` for two distinct bases stays unprovable on its own — this is
+  deliberately `c`/`d` above, not an oversight, since `i` and `j`'s values
+  really could coincide and proving otherwise in general needs real range
+  tracking, a much larger feature this scheduler check deliberately does not
+  attempt. But `M*x` is congruent to 0 mod `M` for ANY x, so `m[M*i]` and
+  `m[M*j+r]` (`r` not itself ≡ 0 mod `M`) can never coincide regardless of
+  whether `i` and `j` happen to be equal — base identity drops out of the
+  argument entirely. Sound only up to `k = log2(M)` bits: a compiled `M*base
+  [+ r]` expression's own natural width was checked via the CLI (M = 2, 4,
+  and 8 against a 4-bit base, not assumed from the general width-growth
+  rule) and consistently collapses to the base's OWN declared width rather
+  than growing to accommodate the multiply, so the low `k` bits survive
+  every later truncation only when that intermediate width — the base's
+  own, on BOTH sides — is at least `k`; `k` is further capped at the mem's
+  own address width for the same reason the `e`/`f` argument caps at it. This is the
+  driving-example-free case: no design in this repo currently needs it (the
+  one real different-base candidate, `subleq.tr`'s `m[b]` vs `m[pc]`, is
+  empirically unprovable either way — `b` is loaded out of the mem itself, so
+  its value is arbitrary program data, not something any static analysis
+  bounds; see "The schedule block"'s checked `conflict_free` assertion for how
+  that shape is actually handled). `examples/mem_disjoint_banked.tr`
+  demonstrates it standalone.
+
+The pre-edge-read invariant the `e`/`f` argument leans on (both rules read the
+IDENTICAL pre-edge value of the shared base within one cycle — true regardless
+of which rule writes it, since registers are speculatively written and read
+pre-edge, this scheduler's own core invariant) never needs checking as a
+separate side condition: if either rule also writes the base, that register
+becomes shared state between the pair alongside the mem, and the scheduler's
 requirement that EVERY shared def be this one mem rejects the whole pair
 outright — the case where the invariant would matter cannot reach this proof
-at all.
+at all. The `g`/`h` argument doesn't lean on this invariant at all: it doesn't
+care what either base's value is, or whether it ever changes.
 
-Any index that isn't a bare constant or an affine expression of a shared base
-(or the two bases differing, or the depth not being a power of two) falls back
-to the ordinary conservative conflict. A **write/write** pair is never
-exempted this way even when both addresses are provably distinct: v0 emits one
-shared, priority-muxed write port per mem (see "The schedule block" and Part
-2's FIRRTL emission), so two "safe" writers would still race on that one port
-— proving their addresses disjoint doesn't change that there's only one write
-port to land on. A design with one memory otherwise serializes on it, one
-access per cycle. That is honest behavior for a single unbanked, single-port
-memory.
+Any index that isn't a bare constant or one of the two affine shapes above
+(or neither argument's own conditions hold) falls back to the ordinary
+conservative conflict. A **write/write** pair is never exempted this way even
+when both addresses are provably distinct: v0 emits one shared, priority-muxed
+write port per mem (see "The schedule block" and Part 2's FIRRTL emission), so
+two "safe" writers would still race on that one port — proving their addresses
+disjoint doesn't change that there's only one write port to land on. A design
+with one memory otherwise serializes on it, one access per cycle. That is
+honest behavior for a single unbanked, single-port memory.
 
 ## Combinational loops
 
@@ -3005,35 +3044,45 @@ words for.
 
 **A third, auto-derived exemption needs no annotation and no assertion
 either: a proven disjointness claim.** A read/write pair sharing only mem
-accesses that recognize as compile-time constants, or as an affine expression
-of the SAME base def (register/input) with the mem's own depth a power of two,
-and are provably different, is dropped from the conflict matrix on its own —
-the scheduler found the proof itself, so there is nothing left to trust OR to
-check (see "Arrays: one resource each" for exactly what's recognized and why).
-`--explain-schedule` reports it distinctly from both other exemptions:
+accesses that recognize as compile-time constants, as an affine expression of
+the SAME base def (register/input) with the mem's own depth a power of two, OR
+as an affine expression sharing a power-of-two multiplier (base identity
+irrelevant), and are provably different, is dropped from the conflict matrix
+on its own — the scheduler found the proof itself, so there is nothing left to
+trust OR to check (see "Arrays: one resource each" for exactly what's
+recognized and why). `--explain-schedule` reports it distinctly from both
+other exemptions:
 
 ```
 rule write conflicts with rule read: write meets read on {m}
-    index sites proven disjoint (constant addresses, or the same base plus a constant offset): no stall derived (no annotation needed)
+    index sites proven disjoint (constant addresses, the same base plus a constant offset, or a shared power-of-two multiplier): no stall derived (no annotation needed)
 ```
 
 Deliberately narrow, matching v0's existing bar of failing closed rather than
-guessing: a mem sharing even ONE index that doesn't recognize as either shape,
-two DIFFERENT bases, a non-power-of-two depth, or a write/write pair (v0's
-single shared write port makes two "disjoint" writers meaningless — see
-"Arrays: one resource each"), all stay fully conservative, exactly as if this
-proof did not exist. A user's own `conflict_free`/`mutually_exclusive` on a
-pair this already clears is legal, harmless overstatement, same as claiming
-either on a pair that never conflicted at all.
+guessing: a mem sharing even ONE index that doesn't recognize as one of these
+shapes, two different bases with no shared power-of-two multiplier, a
+non-power-of-two depth, or a write/write pair (v0's single shared write port
+makes two "disjoint" writers meaningless — see "Arrays: one resource each"),
+all stay fully conservative, exactly as if this proof did not exist. A user's
+own `conflict_free`/`mutually_exclusive` on a pair this already clears is
+legal, harmless overstatement, same as claiming either on a pair that never
+conflicted at all.
 
-**Tier 3, not v0: provable disjointness across DIFFERENT bases.** Dahlia-style
-banked and affine array types would let the compiler prove two accesses
-disjoint from genuinely different variables (`m[i]` against `m[j]`, two
-distinct registers whose values happen never to coincide) via real range
+**Tier 3, not v0: provable disjointness across DIFFERENT bases, in
+general.** Dahlia-style banked and affine array types would let the compiler
+prove two accesses disjoint from genuinely different variables (`m[i]` against
+`m[j]`, two distinct registers whose values happen never to coincide, for ANY
+i and j — not just ones sharing a power-of-two multiplier) via real range
 tracking — a whole type-system feature on its own, out of scope for v0 so the
-scheduler work stays bounded. The same-base affine case (`m[i]` against
-`m[i+1]`) is NOT this; it's a syntactic check that needs no range tracking at
-all, since a shared base's value is identical on both sides by construction.
+scheduler work stays bounded. Neither of the two syntactic checks above is a
+scoped version of this tier: the same-base affine case (`m[i]` against
+`m[i+1]`) needs no range tracking at all, since a shared base's value is
+identical on both sides by construction; the banking case (`m[2*i]` against
+`m[2*j+1]`) needs none either, for the opposite reason — it doesn't matter
+what `i` and `j`'s values are, or whether they coincide, only that the
+multiplier fixes their low bits. The genuinely general case — two arbitrary,
+unrelated, unscaled bases — stays exactly as unprovable as before; nothing in
+this section closes it.
 
 The checked `conflict_free` assertion above is not a smaller version of this
 tier, and does not retire it: it checks a runtime PRECONDITION (do these two
@@ -4285,10 +4334,12 @@ noted:
   — trusted/unchecked only for non-mem shared state), plus an auto-derived
   third exemption needing no annotation at all: a read/write pair whose mem
   indices are either ALL compile-time-constant integers
-  (`examples/mem_disjoint_rw.tr`) or an affine expression of the SAME base
+  (`examples/mem_disjoint_rw.tr`), an affine expression of the SAME base
   register/input with the mem's own depth a power of two (`m[i]` vs
-  `m[i+1]`, `examples/mem_disjoint_affine.tr`), and provably different
-  either way.
+  `m[i+1]`, `examples/mem_disjoint_affine.tr`), or an affine expression
+  sharing a power-of-two multiplier across TWO DIFFERENT bases (`m[2*i]` vs
+  `m[2*j+1]`, base identity irrelevant, `examples/mem_disjoint_banked.tr`),
+  and provably different either way.
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/

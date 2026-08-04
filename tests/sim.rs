@@ -1831,6 +1831,40 @@ fn mem_disjoint_affine_runs_through_real_ports() {
     );
 }
 
+/// v3 of the mem-disjointness proof: `write`/`read` share a power-of-two
+/// multiplier (`2*i` vs `2*j+1`) but TWO GENUINELY DIFFERENT bases,
+/// unlike v1/v2's same-address/same-base cases -- base identity drops
+/// out of the argument entirely (`2*x` is always even for ANY x), so no
+/// range tracking is needed even though `i` and `j` are unrelated
+/// inputs. The testbench specifically drives `i == j` on one cycle to
+/// prove the argument holds even when the two bases coincide, not just
+/// when they happen to differ.
+#[test]
+fn mem_disjoint_banked_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/mem_disjoint_banked.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/mem_disjoint_banked_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: write_count=3 read_count=3 y=cc Memory[0]=22 Memory[10]=33"),
+        "mem_disjoint_banked result did not match expectations:\n{output}"
+    );
+}
+
 /// Proves DESIGN.md's own `<elaborates>` example (`AdderTree`, compile-
 /// time tree recursion over a `list` with one-sided slices) through real
 /// firtool and Icarus: `elaborate.rs`'s pre-pass unrolls `AdderTree([a,

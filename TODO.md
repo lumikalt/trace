@@ -2088,17 +2088,38 @@ manually in the meantime.
   bounds check on an index against a non-power-of-two depth at all (an
   out-of-range index is undefined, left to firtool), so the modular
   disjointness argument simply never depends on that undefined behavior.
-  Still fully conservative for: two DIFFERENT bases (`m[i]` vs `m[j]`,
-  distinct registers — their runtime values could coincide, and proving
-  otherwise needs real range tracking, not a syntactic check — this is
-  the actual remaining tier-3 gap, not the same-base case); a mem sharing
-  even one unrecognized index; and every write/write pair regardless of
-  index shape (v0 has one shared, priority-muxed write port per mem — see
-  DESIGN.md's "Arrays: one resource each" — so two "disjoint" writers
-  would still race on it). Dahlia-style banking for the different-base
-  case is still tier 3, explicitly deferred in DESIGN.md. Explicitly NOT
+  Still fully conservative for: two DIFFERENT bases with no shared
+  power-of-two multiplier (`m[i]` vs `m[j]`, distinct registers — their
+  runtime values could coincide, and proving otherwise IN GENERAL needs
+  real range tracking, not a syntactic check — this is the genuinely
+  remaining tier-3 gap, see v3 below for the scoped exception); a mem
+  sharing even one unrecognized index; and every write/write pair
+  regardless of index shape (v0 has one shared, priority-muxed write
+  port per mem — see DESIGN.md's "Arrays: one resource each" — so two
+  "disjoint" writers would still race on it). Explicitly NOT
   dependent/refinement types: a syntactic affine-offset check in
   schedule.rs, no new types or propositions.
+- **RESOLVED (v3, scoped) — `m[2*i]` vs `m[2*j+1]` for TWO DIFFERENT
+  bases is also now auto-proven disjoint, without any range tracking**
+  (`schedule.rs`'s `IndexForm::Affine` gained a multiplier field,
+  `examples/mem_disjoint_banked.tr`). NOT a scoped version of Dahlia-
+  style banking/range tracking — the argument doesn't need one: `M*x` is
+  congruent to 0 mod `M` for ANY x, so base identity drops out entirely,
+  unlike the v2 same-base case. Recon before implementing found no
+  existing design needs this (`subleq.tr`'s `m[b]` vs `m[pc]`, the one
+  real different-base candidate, is empirically unprovable regardless —
+  `b` is loaded out of the mem itself, arbitrary program data, exactly
+  the shape the checked `conflict_free` assertion handles dynamically
+  instead); this is a new capability with its own new example, not a
+  gap an existing design was blocked on. Sound only up to `k = log2(M)`
+  bits — a compiled `M*base [+ r]` expression's own natural width
+  empirically collapses to the base's OWN declared width rather than
+  growing to accommodate the multiply (confirmed via the CLI, not
+  assumed), so the `base_width(..) >= k` guard on BOTH sides is
+  load-bearing, not caution for its own sake. The genuinely general
+  case — two arbitrary, unrelated, unscaled bases — remains exactly as
+  unprovable as before; Dahlia-style banked/affine array types (real
+  range tracking) are still tier 3, explicitly deferred in DESIGN.md.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,
