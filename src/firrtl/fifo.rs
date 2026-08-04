@@ -402,7 +402,7 @@ impl<'a> Emitter<'a> {
                     is_enq: false,
                     value: None,
                     callee_ctx: None,
-                    select: Some(select),
+                    select: Some(FifoSelect::Cond(select)),
                 });
                 continue;
             }
@@ -429,8 +429,61 @@ impl<'a> Emitter<'a> {
                     is_enq: false,
                     value: None,
                     callee_ctx: None,
-                    select: Some(select),
+                    select: Some(FifoSelect::Cond(select)),
                 });
+                continue;
+            }
+            // A Deq sitting directly in `then_body`/`else_body` of an
+            // ordinary `if`/`else` — NOT the if's own condition (that's
+            // the case just above); v0: exactly one level deep (a Deq
+            // nested inside a FURTHER if/while within the branch is
+            // still rejected — checks.rs's `contains_disallowed_branch_
+            // fifo_op` enforces the identical eligibility test so the
+            // two can't drift), and only when this if's own `cond` is
+            // NOT itself a fifo op or failing call — composing "did the
+            // branch fire" with "was ITS OWN dequeue/call also
+            // successful" hasn't been reasoned about, so it's rejected
+            // outright rather than silently assumed to compose (same
+            // v0 boundary `check_fifo_op_counts`'s conditional/
+            // unconditional mix rejection already applies elsewhere).
+            // `select` carries the RAW condition expr, not a compiled
+            // string — see `FifoSelect`'s own doc comment for why.
+            if let Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } = self.ast.stmt(*stmt).clone()
+                && self.fifo_op(cond).is_none()
+                && !matches!(self.ast.expr(cond), Expr::Call { .. })
+            {
+                for bstmt in &then_body {
+                    if let Some((fifo, depth, false, _)) = self.fifo_op_stmt(*bstmt) {
+                        out.push(RuleFifoOp {
+                            stmt: *bstmt,
+                            fifo,
+                            depth,
+                            is_enq: false,
+                            value: None,
+                            callee_ctx: None,
+                            select: Some(FifoSelect::Branch(cond, true)),
+                        });
+                    }
+                }
+                if let Some(else_body) = &else_body {
+                    for bstmt in else_body {
+                        if let Some((fifo, depth, false, _)) = self.fifo_op_stmt(*bstmt) {
+                            out.push(RuleFifoOp {
+                                stmt: *bstmt,
+                                fifo,
+                                depth,
+                                is_enq: false,
+                                value: None,
+                                callee_ctx: None,
+                                select: Some(FifoSelect::Branch(cond, false)),
+                            });
+                        }
+                    }
+                }
                 continue;
             }
             let call_expr = match self.ast.stmt(*stmt) {
@@ -517,7 +570,7 @@ impl<'a> Emitter<'a> {
                     is_enq: false,
                     value: None,
                     callee_ctx: None,
-                    select: Some(select),
+                    select: Some(FifoSelect::Cond(select)),
                 });
             }
         }
@@ -561,14 +614,30 @@ impl<'a> Emitter<'a> {
 /// op sitting directly in the rule. `select`: `None` for every op this
 /// struct represented before `or` existed — gate its state transition on
 /// `fires_rule` alone, and DO contribute its occupancy to the rule's own
-/// guard, exactly today's behavior. `Some(cond)` marks an `or`-
-/// alternative (`Emitter::rule_fifo_ops`'s or-chain handling, below): gate
-/// its state transition on `fires_rule AND cond` instead, and do NOT
-/// contribute occupancy to the rule's guard here — `compile_guard`
-/// (writes.rs) folds a whole chain's alternatives into ONE ORed term
-/// separately. A consumer that forgets this distinction reproduces
-/// exactly the silent-no-state-transition bug class this file's fifo-op-
-/// position checks (checks.rs) exist to close off elsewhere.
+/// guard, exactly today's behavior. `Some(FifoSelect::Cond(cond))` marks
+/// an `or`-alternative (`Emitter::rule_fifo_ops`'s or-chain handling,
+/// below): gate its state transition on `fires_rule AND cond` instead,
+/// and do NOT contribute occupancy to the rule's guard here —
+/// `compile_guard` (writes.rs) folds a whole chain's alternatives into
+/// ONE ORed term separately. `Some(FifoSelect::Branch(if_cond, is_then))`
+/// marks a Deq sitting directly in an `if`'s `then_body`/`else_body`
+/// (the branch-mutual-exclusivity feature, TODO.md's "four open
+/// questions"): `if_cond` is compiled lazily, at the actual emission
+/// site (module.rs), via `compile_guard_unwrap_cond` — unlike every
+/// other `select` producer, this one can't be pre-built into a plain
+/// string inside `rule_fifo_ops` itself, since compiling an arbitrary
+/// condition expression needs the emitting rule's `enter_rule`/`set_pos`
+/// context already established, which `rule_fifo_ops` (called from
+/// checks.rs too, before that context exists) doesn't have. A consumer
+/// that forgets any of this reproduces exactly the silent-no-state-
+/// transition bug class this file's fifo-op-position checks (checks.rs)
+/// exist to close off elsewhere.
+#[derive(Clone)]
+pub(crate) enum FifoSelect {
+    Cond(String),
+    Branch(ExprId, bool),
+}
+
 #[derive(Clone)]
 pub(crate) struct RuleFifoOp {
     pub(crate) stmt: StmtId,
@@ -577,5 +646,5 @@ pub(crate) struct RuleFifoOp {
     pub(crate) is_enq: bool,
     pub(crate) value: Option<ExprId>,
     pub(crate) callee_ctx: Option<(ItemId, Vec<ExprId>)>,
-    pub(crate) select: Option<String>,
+    pub(crate) select: Option<FifoSelect>,
 }

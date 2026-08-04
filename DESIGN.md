@@ -1794,6 +1794,163 @@ Verified through real firtool + Icarus AND Verilator simulation:
 (`tests/sim.rs`'s `if_bare_failing_call_condition_tracks_the_callees_
 own_guard`), the un-bound twin of `if_let_failing_call.tr`.
 
+### Branch-mutual-exclusivity: two `Deq[]`s on the same fifo, one per branch
+
+TODO.md's "four open questions" left one deliberately unanswered even
+after the bare-`if` feature above landed: `check_fifo_op_counts` rejects
+a SECOND `Deq[]` on the same fifo per rule, unconditionally, today — but
+two `Deq[]`s in mutually exclusive branches (one in `then`, one in
+`else` of the SAME `if`) are provably not a double-dequeue. Lumi's call
+on revisiting it: "we need some static analysis to prove it, but I do
+want to allow branching on it" — so this became real, but scoped to the
+NARROWEST provable case, not a general dataflow analysis over arbitrary
+branch structure.
+
+```trace
+rule consumer {
+    if route = 1 {
+        out_a := f.Deq[]
+    } else {
+        out_b := f.Deq[]
+    }
+}
+```
+
+Both dequeues are real (either branch clears the fifo's own occupancy),
+and — same branch-scoped convention every other fallible-condition
+feature above establishes — neither gates the rule; only the taken
+branch's own write happens, the other output holds its prior value via
+the pre-existing if/else register-write mux (`reg_value_in_stmts`,
+unchanged).
+
+**Two prerequisite pieces, landed in order, each independently useful.**
+
+**1. A fifo `Deq[]` may now sit directly as an ordinary statement inside
+an `if`'s `then_body`/`else_body` at all** — previously ANY fifo op
+nested anywhere inside an `if`/`while` was rejected outright
+(`contains_fifo_op`'s blanket recursive scan, `check_guard_placement`),
+a broader restriction than the same-fifo double-touch check. `fifo.rs`'s
+`rule_fifo_ops` gained a new case, structurally next to its `if let`/
+bare-`if`-condition cases: for an `if` whose own `cond` is NOT itself a
+fifo op or failing call (see the composition boundary below), walk
+`then_body`/`else_body` for a bare Deq (`fifo_op_stmt`'s recognized
+shapes only — a whole statement, `:=` RHS, or `let` init; ANYTHING
+deeper, a fifo op nested inside a FURTHER if/while within the branch, or
+buried in a larger expression, still isn't supported and falls through
+to the ordinary `contains_fifo_op` rejection). Enq stays excluded — no
+`select`-gating machinery exists for it yet, same reason `if let`'s fifo
+case excluded it (there's no bound name for a value with no reader to
+matter for, but more fundamentally here: extending it is real future
+work, not free).
+
+This piece alone is useful with no second op at all — a Deq
+conditionally gated on some UNRELATED condition:
+
+```trace
+rule consumer {
+    if keep = 1 {
+        out_v := f.Deq[]
+    }
+}
+```
+
+**The `select` field couldn't stay a pre-built string.** Every earlier
+`RuleFifoOp::select` producer (`or`, `if let`'s presence check, bare
+`if`'s own fifo/call condition) builds its condition from `fifo_guard_
+cond` alone — pure string formatting, no expression compilation needed.
+This case's condition is the enclosing `if`'s arbitrary `cond` expression
+(a comparison, a plain boolean register, anything `compile_guard_unwrap_
+cond` already handles) — compiling it for real needs `enter_rule`/
+`set_pos` context already established for the CORRECT rule and
+statement position, which `rule_fifo_ops` doesn't have (it's called from
+`checks.rs` too, before that context exists for the rule being checked).
+So `RuleFifoOp::select` became an enum:
+
+```rust
+enum FifoSelect {
+    Cond(String),           // pre-built, the three earlier producers
+    Branch(ExprId, bool),   // the enclosing if's own `cond`, is_then
+}
+```
+
+`Branch`'s `ExprId` is compiled lazily, at the actual module.rs emission
+site — the ONE place in this whole feature that already has correct
+`enter_rule`/`set_pos` context — via `compile_guard_unwrap_cond`, negated
+with `not(...)` for an `else`-branch op. Every consumer that only ever
+checked `select.is_some()` (`compile_guard`'s whole-rule fold,
+`check_fifo_op_counts`'s conditional/unconditional mix check) needed no
+changes at all; only the one site that reads the STRING (module.rs's
+depth-1 Deq emission) needed to grow a match over the two variants.
+
+v0-restricted to **depth-1 fifos only** — a new `check_branch_fifo_op_
+depth`, mirroring `check_or_shape`'s identical depth restriction on `or`
+alternatives, for the identical reason: `emit_fifo_depth_n` (module.rs)
+has no `select`-gating logic in its head/count update path to extend,
+only the depth-1 path does.
+
+**2. `check_fifo_op_counts` gained `mutually_exclusive_branch_pair`** —
+the actual collision relaxation. Exactly two ops on the same fifo, both
+`FifoSelect::Branch`-selected off the IDENTICAL enclosing `if`, with
+opposite `is_then`, are allowed; anything else (three or more touches,
+an unconditional touch mixed in with a conditional one, two DIFFERENT
+`if`s even with textually identical conditions) still collides exactly
+as before. `ExprId` equality is sufficient to prove "the identical `if`
+statement": two lexically distinct `if`s always get distinct `cond`
+`ExprId`s in this AST (a tree, never hash-consed/interned), so comparing
+the stored `ExprId`s IS comparing "same `if`-statement identity," no
+separate `StmtId` needed. This is the narrowest, purely syntactic
+mutual-exclusivity proof — no general dataflow/SMT-style reasoning about
+arbitrary branch trees, deliberately: proving exclusivity across a
+longer if/else-if chain, across two unrelated `if`s, or through nesting
+deeper than one level is still out of scope, unattempted.
+
+**A real latent bug this surfaced, self-caught before it ever shipped:**
+`module.rs`'s per-fifo touch-collection loop tracked `enq`/`deq` as
+`Option<RuleFifoOp>` per rule — a second touch silently OVERWROTE the
+first. Before this feature, that was always safe (`check_fifo_op_counts`
+never let two Deqs on the same fifo coexist in the first place), but the
+whole point of `mutually_exclusive_branch_pair` is to let exactly that
+happen — collapsing two mutually-exclusive Deqs into one `Option` would
+have silently dropped one's state transition with no error, exactly the
+class of bug this emitter's checks exist to close off elsewhere. Fixed
+by widening the Deq slot to `Vec<RuleFifoOp>` (the Enq slot and the
+depth>1 emission path stay `Option`-shaped — both are still provably
+≤1-per-rule-per-fifo by construction, so the depth>1 path's own
+signature needed no changes, just a lossless `Vec` → `Option` conversion
+at its call site).
+
+**The composition boundary, flagged by `advisor`'s second-opinion review
+before implementation and built in from the start, not discovered
+later:** a nested op is rejected outright when the enclosing `if`'s own
+condition is ITSELF a fifo op or failing call (`f.Deq[]`'s own bare-`if`-
+condition feature, above) — composing "did the branch fire" with "was
+ITS OWN condition's dequeue/call also successful" hasn't been reasoned
+about, the same v0 boundary `check_fifo_op_counts`'s pre-existing
+conditional/unconditional mix rejection already applies elsewhere.
+`rule_fifo_ops`'s branch-nested case explicitly excludes this shape
+(`self.fifo_op(cond).is_none() && !matches!(Expr::Call)`), and `checks.
+rs`'s matching exemption (`contains_disallowed_branch_fifo_op`) uses the
+IDENTICAL eligibility test — deliberately, so a statement the placement
+check lets through is GUARANTEED to actually get a state transition from
+`rule_fifo_ops`, never silently vanish from emission (exactly the
+failure mode `rule_fifo_ops`'s own doc comment warns every fifo-touch
+question in this file to avoid).
+
+Hand-verified end to end against real firtool + Icarus simulation before
+any test was written (the discipline every feature in this run follows):
+first the single-branch-nested-Deq case alone (a parked value that
+stays put across cycles until the gating branch is actually taken, not
+dropped or double-read), then the two-mutually-exclusive-Deqs case
+(pushing two values with different routing, confirming the un-taken
+output genuinely holds its prior value rather than glitching). See
+`examples/branch_fifo_deq.tr` + `sim/branch_fifo_deq_tb.v`
+(`tests/sim.rs`'s `two_deqs_on_the_same_fifo_in_then_and_else_are_
+really_mutually_exclusive`, plus its Verilator twin) for the proven
+example, and `tests/firrtl.rs` for the full structural coverage of both
+the newly-allowed shapes and the still-rejected boundary cases (Enq
+nested in a branch, two Deqs in the SAME branch, depth>1, two levels of
+nesting, and the composition-boundary case above).
+
 ### `?.` safe navigation
 
 `opt?.field?.next` — Verse's own multi-hop chained unwrap-and-field-access

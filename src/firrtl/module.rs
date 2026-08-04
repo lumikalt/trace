@@ -529,6 +529,7 @@ pub(crate) fn emit_module(
         cx.check_fifo_op_positions(*rule);
         cx.check_logic_args(*rule);
         cx.check_or_shape(*rule);
+        cx.check_branch_fifo_op_depth(*rule);
         cx.check_fifo_op_counts(*rule);
     }
     if !cx.errors.is_empty() {
@@ -737,13 +738,23 @@ pub(crate) fn emit_module(
     // depth_n`'s own Deq slot is guaranteed `select: None` even though
     // it's now the same richer type; it only ever reads `is_some()`, not
     // `select`, so that guarantee is all it needs.
-    type FifoTouch = (ItemId, Option<RuleFifoOp>, Option<RuleFifoOp>);
+    // `deq` used to be `Option<RuleFifoOp>` like `enq` (a rule can only
+    // ever enqueue or dequeue a given fifo ONCE, unconditionally — the
+    // ONE conditional op an `or`/`if let`/bare-`if` chain can produce
+    // was still just one entry). The branch-mutual-exclusivity feature
+    // (TODO.md's "four open questions", question 1) can now produce TWO
+    // `Deq`s on the same fifo in the same rule (one per branch of an
+    // if/else, proven exclusive by `check_fifo_op_counts`'s `mutually_
+    // exclusive_branch_pair`) — collapsing them into a single `Option`
+    // the way `enq`/`deq` used to work would silently drop one, exactly
+    // the class of bug this emitter's checks exist to close off.
+    type FifoTouch = (ItemId, Option<RuleFifoOp>, Vec<RuleFifoOp>);
     let mut fifo_body = String::new();
     for (fifo_name, width, depth) in &fifos {
         let mut touching: Vec<FifoTouch> = Vec::new();
         for rule in &rules {
             let mut enq: Option<RuleFifoOp> = None;
-            let mut deq: Option<RuleFifoOp> = None;
+            let mut deqs: Vec<RuleFifoOp> = Vec::new();
             for op in cx.rule_fifo_ops(*rule) {
                 if &op.fifo != fifo_name {
                     continue;
@@ -751,11 +762,11 @@ pub(crate) fn emit_module(
                 if op.is_enq {
                     enq = Some(op);
                 } else {
-                    deq = Some(op);
+                    deqs.push(op);
                 }
             }
-            if enq.is_some() || deq.is_some() {
-                touching.push((*rule, enq, deq));
+            if enq.is_some() || !deqs.is_empty() {
+                touching.push((*rule, enq, deqs));
             }
         }
         if touching.is_empty() {
@@ -765,7 +776,7 @@ pub(crate) fn emit_module(
         if *depth == 1 {
             let valid = fifo_valid_name(fifo_name);
             let data = fifo_data_name(fifo_name);
-            for (rule, enq, deq) in touching {
+            for (rule, enq, deqs) in touching {
                 cx.enter_rule(rule);
                 let f = &fires_name[&rule];
                 let _ = writeln!(fifo_body, "    when {f} :");
@@ -776,25 +787,49 @@ pub(crate) fn emit_module(
                         .unwrap_or_default();
                     let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(1)");
                     let _ = writeln!(fifo_body, "      connect {data}, {value}");
-                } else if let Some(deq_op) = deq {
-                    match &deq_op.select {
-                        Some(sel) => {
-                            let _ = writeln!(fifo_body, "      when {sel} :");
-                            let _ = writeln!(fifo_body, "        connect {valid}, UInt<1>(0)");
-                        }
-                        None => {
-                            let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(0)");
+                } else {
+                    for deq_op in &deqs {
+                        cx.set_pos(rule, deq_op.stmt);
+                        match &deq_op.select {
+                            Some(FifoSelect::Cond(sel)) => {
+                                let _ = writeln!(fifo_body, "      when {sel} :");
+                                let _ = writeln!(fifo_body, "        connect {valid}, UInt<1>(0)");
+                            }
+                            Some(FifoSelect::Branch(cond, is_then)) => {
+                                let cond = cx.compile_guard_unwrap_cond(*cond);
+                                let sel = if *is_then {
+                                    cond
+                                } else {
+                                    format!("not({cond})")
+                                };
+                                let _ = writeln!(fifo_body, "      when {sel} :");
+                                let _ = writeln!(fifo_body, "        connect {valid}, UInt<1>(0)");
+                            }
+                            None => {
+                                let _ = writeln!(fifo_body, "      connect {valid}, UInt<1>(0)");
+                            }
                         }
                     }
                 }
             }
         } else {
+            // `check_branch_fifo_op_depth` (checks.rs) has already
+            // rejected a `Branch`-selected op on a depth > 1 fifo before
+            // this ever runs, and `check_or_shape` likewise restricts an
+            // `or` alternative to depth 1 — so `deqs` here holds at most
+            // one entry; `emit_fifo_depth_n` keeps its own pre-existing
+            // `Option`-based signature (it has no `select`-gating logic
+            // to extend for a second entry).
+            let touching_n: Vec<(ItemId, Option<RuleFifoOp>, Option<RuleFifoOp>)> = touching
+                .into_iter()
+                .map(|(r, enq, deqs)| (r, enq, deqs.into_iter().next()))
+                .collect();
             cx.emit_fifo_depth_n(
                 &mut fifo_body,
                 fifo_name,
                 *width,
                 *depth,
-                &touching,
+                &touching_n,
                 &fires_name,
             );
         }

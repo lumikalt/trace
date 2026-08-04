@@ -1608,6 +1608,59 @@ Speculative, bigger, not committed to:
     body), so this exact question — a Deq in `then` AND a DIFFERENT
     Deq in `else` — never had to be answered; `check_fifo_op_counts`
     stays exactly as unconditional/blanket as before.
+
+    **UPDATE — ACHIEVED, for the narrowest provable case.** Lumi's
+    call: "we need some static analysis to prove it, but I do want to
+    allow branching on it" — so `check_fifo_op_counts` DOES become
+    branch-aware, but only for the single syntactic shape that's
+    provably exclusive by AST construction alone, not a general
+    dataflow analysis. Two prerequisite pieces, in order: (1) a fifo
+    `Deq[]` may now sit directly as an ordinary statement inside an
+    `if`'s `then_body`/`else_body` at all (previously ANY fifo op
+    nested in if/while was rejected outright, `contains_fifo_op`) —
+    `rule_fifo_ops` (fifo.rs) gained a new case mirroring its `if let`/
+    bare-`if`-condition cases, but this time the `select` can't be a
+    pre-built string (an arbitrary enclosing condition needs real
+    expression compilation, which needs `enter_rule`/`set_pos` context
+    `rule_fifo_ops` doesn't have), so `RuleFifoOp::select` became an
+    enum (`FifoSelect::Cond(String)` for the three pre-existing
+    producers, `FifoSelect::Branch(ExprId, bool)` for this one,
+    compiled lazily at the actual module.rs emission site). Enq stays
+    excluded (no `select`-gating exists for it), and this is v0-
+    restricted to depth-1 fifos (`check_branch_fifo_op_depth`, mirroring
+    `check_or_shape`'s identical depth restriction on `or` — `emit_fifo_
+    depth_n` has no gating logic to extend) and exactly one level of
+    nesting (a fifo op nested inside a FURTHER if/while within the
+    branch still isn't supported). (2) `check_fifo_op_counts` gained
+    `mutually_exclusive_branch_pair`: exactly two ops on the same fifo,
+    both `FifoSelect::Branch`-selected off the IDENTICAL enclosing `if`
+    (`ExprId` equality IS same-`if`-statement identity — two lexically
+    distinct `if`s always get distinct `cond` `ExprId`s) with opposite
+    `is_then`, are allowed; anything else (three or more touches, an
+    unconditional touch mixed in, two `if`s instead of one) still
+    collides exactly as before. `module.rs`'s per-fifo touch tracking
+    had a REAL latent bug this surfaced: `enq`/`deq` were `Option<
+    RuleFifoOp>` per rule, silently overwritten by a second touch — two
+    mutually-exclusive Deqs would have dropped one on the floor with no
+    error. Fixed by widening the Deq slot to `Vec<RuleFifoOp>` (the Enq
+    slot and the depth>1 path stay `Option`-shaped; both are still
+    provably ≤1 by construction). One v0 boundary flagged by the
+    external second-opinion review (`advisor`) before implementation
+    and built in from the start: a nested op is REJECTED when the
+    enclosing `if`'s own condition is itself a fifo op or failing call
+    — composing "did the branch fire" with "was ITS OWN dequeue/call
+    also successful" hasn't been reasoned about, so `rule_fifo_ops`
+    excludes it explicitly and `checks.rs`'s matching exemption
+    (`contains_disallowed_branch_fifo_op`) stays in sync with the exact
+    same eligibility test, rather than letting checks.rs allow something
+    `rule_fifo_ops` doesn't recognize (which would silently drop the
+    dequeue from emission). Hand-verified end to end against real
+    firtool+Icarus simulation before any test was written — see
+    `examples/branch_fifo_deq.tr` + `sim/branch_fifo_deq_tb.v`.
+    **Still open beyond this narrowest case**: proving exclusivity
+    across a longer if/else-if chain, across two unrelated `if`s, or
+    through nesting deeper than one level — all deliberately out of
+    scope for now, not attempted.
   - **Interaction with "a guard must appear before any state write."**
     That restriction (`check_guard_placement`) is rule-wide today. Does
     it become per-branch (a state write before the branch's OWN

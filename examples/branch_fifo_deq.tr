@@ -1,0 +1,30 @@
+-- Two `Deq[]`s on the SAME fifo, one in `then` and one in `else` of the
+-- identical `if` -- provably mutually exclusive by AST construction, so
+-- both are allowed (TODO.md's "four open questions", question 1). Each
+-- routes the dequeued value to a DIFFERENT output register depending on
+-- `route`, exercising both halves of the feature at once: a single fifo
+-- op nested directly in an `if`'s branch body (not the `if`'s own
+-- condition -- see examples/if_bare_fifo.tr for that), and the mutual-
+-- exclusivity relaxation that lets a second one sit in the opposite
+-- branch of the SAME `if` without colliding with the first.
+module Top {
+    fifo f : [8]
+    in push : [1]
+    in push_val : [8]
+    in route : [1]
+    out out_a : [8] = 0
+    out out_b : [8] = 0
+
+    rule producer {
+        push = 1
+        f.Enq[push_val]
+    }
+
+    rule consumer {
+        if route = 1 {
+            out_a := f.Deq[]
+        } else {
+            out_b := f.Deq[]
+        }
+    }
+}

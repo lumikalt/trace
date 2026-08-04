@@ -1869,6 +1869,60 @@ fn if_bare_fifo_deq_condition_drives_a_real_dequeue_exactly_when_present_under_v
     );
 }
 
+/// Proves the branch-mutual-exclusivity feature end to end
+/// (TODO.md's "four open questions", question 1): `examples/branch_fifo_
+/// deq.tr` has two `Deq[]`s on the SAME fifo, one in `then` and one in
+/// `else` of the identical `if` -- each routes to a different output,
+/// and `sim/branch_fifo_deq_tb.v` confirms they're really mutually
+/// exclusive real hardware (one fires, never both, and the un-taken
+/// branch's output holds its prior value), not just a structural FIRRTL
+/// claim that happens to type-check.
+#[test]
+fn two_deqs_on_the_same_fifo_in_then_and_else_are_really_mutually_exclusive() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/branch_fifo_deq.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/branch_fifo_deq_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// The Verilator-backed twin of
+/// `two_deqs_on_the_same_fifo_in_then_and_else_are_really_mutually_exclusive`.
+#[test]
+fn two_deqs_on_the_same_fifo_in_then_and_else_are_really_mutually_exclusive_under_verilator() {
+    if !tool_available("firtool") || !tool_available("verilator") {
+        eprintln!("firtool/verilator not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/branch_fifo_deq.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/branch_fifo_deq_tb.v");
+    let output = simulate_verilator(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves `if Classify(a) { ... }` end to end -- a failing call used
 /// DIRECTLY as a bare `if`'s own condition, no bound name:
 /// `examples/if_bare_failing_call.tr`'s `was_present` tracks `Classify`'s

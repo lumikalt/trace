@@ -252,10 +252,40 @@ impl<'a> Emitter<'a> {
                         );
                     }
                 }
-                Stmt::If { .. }
-                | Stmt::While { .. }
-                | Stmt::IfLet { .. }
-                | Stmt::WhileLet { .. } => {
+                Stmt::If { .. } => {
+                    if contains_guard(self.ast, self.res, *stmt) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a guard nested in if/while is not yet supported (v0 restriction)"
+                                .to_string(),
+                        );
+                    }
+                    if self.contains_disallowed_branch_fifo_op(*stmt) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a fifo operation nested in if/while is not yet supported \
+                             (v0 restriction)"
+                                .to_string(),
+                        );
+                    }
+                    if self.contains_failing_call(*stmt) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a call to a function that can fail, nested in if/while, \
+                             is not yet supported (v0 restriction)"
+                                .to_string(),
+                        );
+                    }
+                    if contains_comparison(self.ast, *stmt) {
+                        self.error(
+                            self.ast.stmt_spans[stmt.0 as usize].clone(),
+                            "a comparison nested in if/while is not yet supported (v0 \
+                             restriction)"
+                                .to_string(),
+                        );
+                    }
+                }
+                Stmt::While { .. } | Stmt::IfLet { .. } | Stmt::WhileLet { .. } => {
                     if contains_guard(self.ast, self.res, *stmt) {
                         self.error(
                             self.ast.stmt_spans[stmt.0 as usize].clone(),
@@ -293,6 +323,59 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Like `contains_fifo_op` restricted to a single `Stmt::If`, but
+    /// exempts a bare Deq sitting directly as a statement/`:=`-rhs/`let`-
+    /// init in `then_body`/`else_body` — exactly the shape `rule_fifo_
+    /// ops`' branch-nested case (fifo.rs) finds and gates, using the
+    /// IDENTICAL eligibility test (this if's own `cond` must not itself
+    /// be a fifo op or failing call) so a statement exempted here is
+    /// guaranteed to actually get a state transition, never silently
+    /// vanish. Enq stays rejected — no `select`-gating exists for it yet
+    /// (`rule_fifo_ops`' own doc comment). Anything deeper — a fifo op
+    /// nested inside a FURTHER if/while within the branch, or buried in
+    /// a larger expression — falls through to the ordinary `contains_
+    /// fifo_op` recursion on that one nested statement.
+    fn contains_disallowed_branch_fifo_op(&self, stmt: StmtId) -> bool {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = self.ast.stmt(stmt).clone()
+        else {
+            unreachable!()
+        };
+        if self.fifo_op(cond).is_some() || matches!(self.ast.expr(cond), Expr::Call { .. }) {
+            return contains_fifo_op(self.ast, self.res, stmt);
+        }
+        let bad = |stmts: &[StmtId]| {
+            stmts.iter().any(|s| match self.fifo_op_stmt(*s) {
+                Some((_, _, false, _)) => false,
+                Some((_, _, true, _)) => true,
+                None => contains_fifo_op(self.ast, self.res, *s),
+            })
+        };
+        bad(&then_body) || else_body.as_ref().is_some_and(|b| bad(b))
+    }
+
+    /// A Deq nested in an `if`'s branch body (fifo.rs's `rule_fifo_ops`
+    /// branch-nested case) needs a `select`-gated state transition —
+    /// `emit_fifo_depth_n`'s own head/count update logic (module.rs) has
+    /// no such gating, only the depth-1 path does — so v0 restricts this
+    /// shape to depth-1 fifos, exactly `check_or_shape`'s existing
+    /// restriction on `or` alternatives, for the identical reason.
+    pub(crate) fn check_branch_fifo_op_depth(&mut self, rule: ItemId) {
+        for op in self.rule_fifo_ops(rule) {
+            if matches!(op.select, Some(FifoSelect::Branch(..))) && op.depth != 1 {
+                self.error(
+                    self.ast.stmt_spans[op.stmt.0 as usize].clone(),
+                    "a fifo op nested in an if/else branch, on a fifo with depth > 1, \
+                     is not yet supported (v0 restriction)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     /// At most one `Enq` and at most one `Deq` per fifo per rule,
     /// regardless of the fifo's depth — a second `Enq[x]` on the same
     /// fifo silently discards the first candidate value (only the last
@@ -308,11 +391,11 @@ impl<'a> Emitter<'a> {
     /// per fifo, not per rule.
     pub(crate) fn check_fifo_op_counts(&mut self, rule: ItemId) {
         let ops = self.rule_fifo_ops(rule);
-        let mut enqs: HashMap<String, Vec<StmtId>> = HashMap::new();
-        let mut deqs: HashMap<String, Vec<StmtId>> = HashMap::new();
+        let mut enqs: HashMap<String, Vec<&RuleFifoOp>> = HashMap::new();
+        let mut deqs: HashMap<String, Vec<&RuleFifoOp>> = HashMap::new();
         for op in &ops {
             let bucket = if op.is_enq { &mut enqs } else { &mut deqs };
-            bucket.entry(op.fifo.clone()).or_default().push(op.stmt);
+            bucket.entry(op.fifo.clone()).or_default().push(op);
         }
         for (kind, map, message) in [
             (
@@ -333,10 +416,10 @@ impl<'a> Emitter<'a> {
             let mut fifos: Vec<&String> = map.keys().collect();
             fifos.sort();
             for fifo in fifos {
-                let stmts = &map[fifo];
-                if stmts.len() > 1 {
+                let group = &map[fifo];
+                if group.len() > 1 && !Self::mutually_exclusive_branch_pair(group) {
                     self.error(
-                        self.ast.stmt_spans[stmts[1].0 as usize].clone(),
+                        self.ast.stmt_spans[group[1].stmt.0 as usize].clone(),
                         format!("`{fifo}.{kind}` appears more than once in this rule; {message}"),
                     );
                 }
@@ -384,6 +467,26 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+    }
+
+    /// True iff `group` is EXACTLY two ops, both gated on opposite
+    /// branches of the identical enclosing `if` (`FifoSelect::Branch`'s
+    /// `ExprId` equality IS same-if-statement identity: two lexically
+    /// distinct `if`s always get distinct `cond` `ExprId`s in this AST,
+    /// never shared/interned) — the narrowest, purely syntactic mutual-
+    /// exclusivity proof v0 supports (TODO.md's "four open questions",
+    /// question 1: "two `Deq[]`s on the same fifo, one in `then` and one
+    /// in `else`"). Three or more touches, or two touches that aren't
+    /// both `Branch`-selected on the SAME `if`, stay rejected — proving
+    /// exclusivity across a longer if/else-if chain, or across unrelated
+    /// `if`s, is deliberately out of scope here.
+    fn mutually_exclusive_branch_pair(group: &[&RuleFifoOp]) -> bool {
+        let [a, b] = group else { return false };
+        matches!(
+            (&a.select, &b.select),
+            (Some(FifoSelect::Branch(ca, ta)), Some(FifoSelect::Branch(cb, tb)))
+                if ca == cb && ta != tb
+        )
     }
 
     /// `call_writes_reg`/`call_writes_port` only ever look for a

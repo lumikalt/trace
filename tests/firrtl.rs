@@ -601,25 +601,32 @@ module M {
 }
 
 #[test]
-fn let_bound_fifo_op_nested_in_if_is_an_error() {
-    // Same restriction as an `:=`-bound fifo op nested in if/while, but
-    // through the `let` binding form -- this used to compile silently
-    // (no error, no guard contribution at all) when the local was never
-    // referenced again, since `contains_fifo_op`'s nesting scan didn't
-    // look inside a `Stmt::Let`.
+fn let_bound_fifo_deq_nested_in_if_with_no_else_gates_only_the_dequeue() {
+    // A `let`-bound Deq sitting directly in an `if`'s `then_body`
+    // (fifo.rs's `rule_fifo_ops` branch-nested case, TODO.md's "four
+    // open questions", question 1) -- the dequeue only happens when the
+    // branch is taken, and (unlike a top-level Deq) never gates the
+    // rule itself. This exact shape used to be rejected outright
+    // ("nested in if/while") before that feature existed; verified
+    // against real firtool+Icarus simulation before this was written
+    // (see DESIGN.md).
     let src = "\
 module M {
     fifo f : [8]
+    reg out : [8] = 0
     reg cond : [1] = 0
     rule r {
-        if logic cond = 1 {
+        if cond = 1 {
             let x = f.Deq[]
+            out := x
         }
     }
 }
 ";
-    let err = emit_from_source(src).unwrap_err();
-    assert!(err.iter().any(|e| e.message.contains("nested in if/while")));
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("when eq(cond, UInt<1>(1)) :"));
+    assert!(fir.contains("connect __fifo_f_valid, UInt<1>(0)"));
 }
 
 #[test]
@@ -6927,4 +6934,193 @@ module M {
     assert!(fir.contains("node fires___edge_step = UInt<1>(1)"));
     assert!(fir.contains("node fires_step = and(step, not(__prev_step))"));
     run_firtool(&fir, &[]);
+}
+
+/// A Deq sitting directly in an `if`'s `then_body`, no `else` at all
+/// (fifo.rs's `rule_fifo_ops` branch-nested case, TODO.md's "four open
+/// questions", question 1) -- the rule always fires (`fires_r =
+/// UInt<1>(1)`, matching every other branch-scoped fallible condition
+/// this emitter supports), and the dequeue itself is gated on the
+/// branch's own condition, not the rule's. Hand-verified against real
+/// firtool+Icarus simulation before this was written (see DESIGN.md).
+#[test]
+fn a_deq_nested_directly_in_an_ifs_then_body_gates_only_the_dequeue() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg v : [8] = 0
+    reg cond : [1] = 0
+    rule r {
+        if cond = 1 {
+            v := f.Deq[]
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(
+        fir.contains("when eq(cond, UInt<1>(1)) :\n        connect __fifo_f_valid, UInt<1>(0)")
+    );
+    assert!(fir.contains("connect v, mux(eq(cond, UInt<1>(1)), __fifo_f_data, v)"));
+    run_firtool(&fir, &[]);
+}
+
+/// Two `Deq[]`s on the SAME fifo, one in `then` and one in `else` of the
+/// identical `if` -- provably mutually exclusive by AST construction
+/// (`check_fifo_op_counts`'s `mutually_exclusive_branch_pair`), so both
+/// are allowed, each gated on its own branch. Hand-verified end-to-end
+/// against real firtool+Icarus simulation before this was written (see
+/// DESIGN.md and `sim/branch_fifo_deq_tb.v`).
+#[test]
+fn two_deqs_on_the_same_fifo_in_then_and_else_are_mutually_exclusive_and_allowed() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg a : [8] = 0
+    reg b : [8] = 0
+    reg route : [1] = 0
+    rule r {
+        if route = 1 {
+            a := f.Deq[]
+        } else {
+            b := f.Deq[]
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(
+        fir.contains("when eq(route, UInt<1>(1)) :\n        connect __fifo_f_valid, UInt<1>(0)")
+    );
+    assert!(
+        fir.contains(
+            "when not(eq(route, UInt<1>(1))) :\n        connect __fifo_f_valid, UInt<1>(0)"
+        )
+    );
+    assert!(fir.contains("connect a, mux(eq(route, UInt<1>(1)), __fifo_f_data, a)"));
+    assert!(fir.contains("connect b, mux(eq(route, UInt<1>(1)), b, __fifo_f_data)"));
+    run_firtool(&fir, &[]);
+}
+
+/// An `Enq` nested in an `if`'s branch body is still rejected -- no
+/// `select`-gating machinery exists for it yet (`RuleFifoOp`'s own doc
+/// comment, fifo.rs), unlike the Deq case just above.
+#[test]
+fn an_enq_nested_in_an_if_branch_is_still_rejected() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg cond : [1] = 0
+    rule r {
+        if cond = 1 {
+            f.Enq[5]
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("nested in if/while")));
+}
+
+/// Two `Deq[]`s on the SAME fifo, BOTH sitting in the same `then_body`
+/// -- not mutually exclusive (nothing about their positions proves only
+/// one runs), so this still collides exactly like two top-level Deqs
+/// would; `mutually_exclusive_branch_pair` only recognizes the
+/// opposite-branch-of-the-identical-`if` shape.
+#[test]
+fn two_deqs_on_the_same_fifo_both_in_the_same_branch_still_collide() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg v : [8] = 0
+    reg cond : [1] = 0
+    rule r {
+        if cond = 1 {
+            v := f.Deq[]
+            v := f.Deq[]
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("appears more than once") && e.message.contains("Deq"))
+    );
+}
+
+/// A Deq nested in an `if`'s branch body, on a fifo with depth > 1, is
+/// rejected with its own specific message -- `emit_fifo_depth_n`
+/// (module.rs) has no `select`-gating logic to extend, only the depth-1
+/// path does (`check_branch_fifo_op_depth`, checks.rs, mirroring `check_
+/// or_shape`'s identical depth-1-only restriction on `or` alternatives).
+#[test]
+fn a_deq_nested_in_an_if_branch_on_a_depth_greater_than_one_fifo_is_rejected() {
+    let src = "\
+module M {
+    fifo f : {4}[8]
+    reg v : [8] = 0
+    reg cond : [1] = 0
+    rule r {
+        if cond = 1 {
+            v := f.Deq[]
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("depth > 1")));
+}
+
+/// A Deq nested two levels deep -- inside an `if` that's itself inside
+/// another `if` -- is still rejected: `rule_fifo_ops`' branch-nested
+/// case only recognizes a Deq sitting DIRECTLY in `then_body`/
+/// `else_body`, one level, not a further-nested `if`'s own body.
+#[test]
+fn a_deq_nested_two_levels_deep_in_if_is_still_rejected() {
+    let src = "\
+module M {
+    fifo f : [8]
+    reg v : [8] = 0
+    reg a : [1] = 0
+    reg b : [1] = 0
+    rule r {
+        if a = 1 {
+            if b = 1 {
+                v := f.Deq[]
+            }
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("nested in if/while")));
+}
+
+/// A Deq nested in a branch whose OWN enclosing `if`'s condition is
+/// itself a fifo Deq is still rejected -- composing "did the branch
+/// fire" with "was the condition's OWN dequeue also successful" hasn't
+/// been reasoned about (same v0 boundary `check_fifo_op_counts`'s
+/// conditional/unconditional mix rejection already applies elsewhere);
+/// `rule_fifo_ops`' branch-nested case explicitly excludes this shape,
+/// and this check stays in sync with it rather than silently letting the
+/// dequeue vanish from emission.
+#[test]
+fn a_deq_nested_in_a_branch_whose_own_if_condition_is_a_fifo_deq_is_still_rejected() {
+    let src = "\
+module M {
+    fifo f : [8]
+    fifo g : [8]
+    reg v : [8] = 0
+    rule r {
+        if f.Deq[] {
+            v := g.Deq[]
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(err.iter().any(|e| e.message.contains("nested in if/while")));
 }
