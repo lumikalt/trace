@@ -1,0 +1,44 @@
+-- The scoped v1 of DESIGN.md's "Arrays: one resource each" tier-3 proof:
+-- `write` and `read` touch the SAME mem at DIFFERENT, compile-time-
+-- constant addresses, with NO `conflict_free` annotation -- unlike
+-- conflict_free_mem.tr, which needs the annotation because its
+-- addresses are runtime port values the compiler can't see disjoint.
+-- Here the scheduler proves it on its own (schedule.rs's
+-- `Exemption::Disjoint`) and drops the derived stall entirely.
+--
+-- Both rules are UNCONDITIONAL (fire every cycle), which makes this the
+-- maximal-contention case: under the old, fully conservative model,
+-- `read` (lower urgency) would NEVER fire at all, since `write` never
+-- blocks or goes idle for it to catch a turn -- `read_count` would
+-- stay 0 forever. See sim/mem_disjoint_rw_tb.v for the actual proof.
+--
+-- Bare integer literal addresses (`m[3]`, not `4'd3`) work here because
+-- this feature also fixed a real, separate emission gap: a mem WRITE's
+-- address used to compile unhinted (`mem_write_in_stmts`, writes.rs),
+-- so a bare-literal write index hit "no concrete width for this
+-- expression" even though a bare-literal READ index already worked
+-- fine (`examples/checksum.tr`'s `m[0]`) -- fixed by hinting the
+-- address compile with the mem's own address width, mirroring how the
+-- data operand right next to it was already hinted.
+module MemDisjointRw {
+    mem m : [8][16]
+
+    in x : [8]
+    out y : [8] = 0
+    out write_count : [8] = 0
+    out read_count : [8] = 0
+
+    rule write {
+        m[3] := x
+        write_count := write_count + 1
+    }
+
+    rule read {
+        y := m[7]
+        read_count := read_count + 1
+    }
+
+    schedule {
+        urgency write > read
+    }
+}

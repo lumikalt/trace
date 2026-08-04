@@ -423,6 +423,66 @@ module M {
 }
 
 #[test]
+fn mem_access_index_sites_are_recorded_per_mem() {
+    // `schedule.rs`'s disjointness proof needs each rule's own mem index
+    // expressions, not just the whole-mem read/write DefId -- this pins
+    // that effects.rs actually records them, keyed by the same mem DefId
+    // on both the reading and the writing rule.
+    let src = "\
+module M {
+    mem m : [8][16]
+
+    rule w {
+        m[0] := 1
+    }
+
+    rule r {
+        let v = m[1]
+    }
+}
+";
+    let (ast, fx) = run_ok(src);
+    let w_sig = &fx.sigs[&item_named(&ast, "w")];
+    let r_sig = &fx.sigs[&item_named(&ast, "r")];
+    assert_eq!(w_sig.mem_write_idx.len(), 1, "one mem written");
+    assert_eq!(r_sig.mem_read_idx.len(), 1, "one mem read");
+    let mem_def = *w_sig.mem_write_idx.keys().next().unwrap();
+    assert!(
+        r_sig.mem_read_idx.contains_key(&mem_def),
+        "both rules' index tables must be keyed by the SAME mem DefId"
+    );
+    assert_eq!(w_sig.mem_write_idx[&mem_def].len(), 1);
+    assert_eq!(r_sig.mem_read_idx[&mem_def].len(), 1);
+}
+
+#[test]
+fn mem_index_sites_merge_through_a_callee_call_graph() {
+    // A rule that touches a mem only THROUGH a callee must still get the
+    // callee's index sites merged in via the fixpoint -- otherwise the
+    // mem would appear in `reads`/`writes` with no recorded index at
+    // all, which the disjointness proof must treat as "unknown index,"
+    // not "no access."
+    let src = "\
+module M {
+    mem m : [8][16]
+
+    Bump() : [8] {
+        return m[2]
+    }
+
+    rule r {
+        let v = Bump()
+    }
+}
+";
+    let (ast, fx) = run_ok(src);
+    let r_sig = &fx.sigs[&item_named(&ast, "r")];
+    assert_eq!(r_sig.mem_read_idx.len(), 1, "mem read via callee");
+    let mem_def = *r_sig.mem_read_idx.keys().next().unwrap();
+    assert_eq!(r_sig.mem_read_idx[&mem_def].len(), 1);
+}
+
+#[test]
 fn recursion_requires_elaborates() {
     let (_, _, errors) = run("F(x : [8]) : [8] <combines> {\n return F(x)\n}\n");
     assert_eq!(errors.len(), 1);

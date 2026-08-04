@@ -26,7 +26,7 @@
 use crate::ast::{Ast, Effect, Expr, ExprId, FnKind, Item, ItemId, Stmt, StmtId};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution, is_guard_like};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EffectSig {
@@ -40,6 +40,47 @@ pub struct EffectSig {
     pub reads: BTreeSet<DefId>,
     /// State this item writes, inferred, including through calls.
     pub writes: BTreeSet<DefId>,
+    /// Per-`mem` index expressions this item reads at, including through
+    /// calls — used by `schedule.rs` to attempt a compile-time-constant
+    /// disjointness proof between two rules' accesses to the SAME mem
+    /// instead of always conservatively conflicting (see DESIGN.md's
+    /// "Arrays: one resource each"). A mem present in `reads`/`writes`
+    /// with no entry here (or an entry that can't be proven constant)
+    /// must be treated as an unknown index, never as "no access" — the
+    /// proof is fail-closed by construction, not by convention.
+    pub mem_read_idx: BTreeMap<DefId, BTreeSet<ExprId>>,
+    /// Same as `mem_read_idx`, for writes.
+    pub mem_write_idx: BTreeMap<DefId, BTreeSet<ExprId>>,
+}
+
+impl EffectSig {
+    /// Merge another signature's `reads`/`writes` into this one, along
+    /// with their mem-index tables — the one place every call-graph
+    /// merge site below goes through, so the index tables can never
+    /// drift out of sync with the plain `DefId` sets they annotate.
+    fn merge_all(&mut self, other: &EffectSig) {
+        self.reads.extend(other.reads.iter().copied());
+        self.writes.extend(other.writes.iter().copied());
+        merge_mem_idx(&mut self.mem_read_idx, &other.mem_read_idx);
+        merge_mem_idx(&mut self.mem_write_idx, &other.mem_write_idx);
+    }
+
+    /// Like `merge_all`, but reads only — for `logic(...)`'s isolation,
+    /// which deliberately discharges a callee's writes (see the `Logic`
+    /// arm's own doc comment below).
+    fn merge_reads(&mut self, other: &EffectSig) {
+        self.reads.extend(other.reads.iter().copied());
+        merge_mem_idx(&mut self.mem_read_idx, &other.mem_read_idx);
+    }
+}
+
+fn merge_mem_idx(
+    dst: &mut BTreeMap<DefId, BTreeSet<ExprId>>,
+    src: &BTreeMap<DefId, BTreeSet<ExprId>>,
+) {
+    for (def, idxs) in src {
+        dst.entry(*def).or_default().extend(idxs.iter().copied());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -281,8 +322,7 @@ impl<'a> Checker<'a> {
             }
         } else if let Expr::Call { callee, args } = self.ast.expr(id) {
             if let Some(callee_sig) = self.callee_sig(*callee) {
-                sig.reads.extend(callee_sig.reads.iter().copied());
-                sig.writes.extend(callee_sig.writes.iter().copied());
+                sig.merge_all(callee_sig);
             }
             self.infer_expr(*callee, sig);
             for arg in args {
@@ -382,8 +422,7 @@ impl<'a> Checker<'a> {
                     // as the fifo-Deq case above -- does NOT set `sig.
                     // fails`, unlike the ordinary `Expr::Call` arm below.
                     if let Some(callee_sig) = self.callee_sig(*callee) {
-                        sig.reads.extend(callee_sig.reads.iter().copied());
-                        sig.writes.extend(callee_sig.writes.iter().copied());
+                        sig.merge_all(callee_sig);
                     }
                     self.infer_expr(*callee, sig);
                     for arg in args {
@@ -446,6 +485,9 @@ impl<'a> Checker<'a> {
             Expr::Bracket { callee, args } => {
                 if let Some(def) = self.state_def(*callee) {
                     sig.writes.insert(def);
+                    if let (Some(mem), Some(index)) = (self.mem_target(*callee), args.first()) {
+                        sig.mem_write_idx.entry(mem).or_default().insert(*index);
+                    }
                 } else {
                     self.infer_expr(*callee, sig);
                 }
@@ -508,6 +550,18 @@ impl<'a> Checker<'a> {
                     sig.fails = true;
                     sig.reads.insert(fifo);
                     sig.writes.insert(fifo);
+                } else if let Some(mem) = self.mem_target(*callee) {
+                    // A plain `mem[index]` read — record the index
+                    // alongside the whole-mem read so schedule.rs can
+                    // later attempt a constant-disjointness proof against
+                    // some other rule's write to the same mem, instead of
+                    // always conflicting (equivalent to what `infer_expr`
+                    // on `callee` would have inserted via `state_def`,
+                    // just without losing the index along the way).
+                    sig.reads.insert(mem);
+                    if let Some(index) = args.first() {
+                        sig.mem_read_idx.entry(mem).or_default().insert(*index);
+                    }
                 } else {
                     self.infer_expr(*callee, sig);
                 }
@@ -518,8 +572,7 @@ impl<'a> Checker<'a> {
             Expr::Call { callee, args } => {
                 if let Some(callee_sig) = self.callee_sig(*callee) {
                     sig.fails |= callee_sig.fails;
-                    sig.reads.extend(callee_sig.reads.iter().copied());
-                    sig.writes.extend(callee_sig.writes.iter().copied());
+                    sig.merge_all(callee_sig);
                 }
                 self.infer_expr(*callee, sig);
                 for arg in args {
@@ -647,7 +700,7 @@ impl<'a> Checker<'a> {
             Expr::Logic(inner) => {
                 if let Expr::Call { callee, args } = self.ast.expr(*inner).clone() {
                     if let Some(callee_sig) = self.callee_sig(callee) {
-                        sig.reads.extend(callee_sig.reads.iter().copied());
+                        sig.merge_reads(callee_sig);
                     }
                     self.infer_expr(callee, sig);
                     for arg in args {
@@ -663,7 +716,7 @@ impl<'a> Checker<'a> {
                 } else {
                     let mut inner_sig = EffectSig::default();
                     self.infer_expr(*inner, &mut inner_sig);
-                    sig.reads.extend(inner_sig.reads);
+                    sig.merge_reads(&inner_sig);
                 }
             }
         }
@@ -682,6 +735,14 @@ impl<'a> Checker<'a> {
         };
         let def = self.res.expr_defs.get(base)?;
         (self.res.def(*def).kind == DefKind::Fifo).then_some(*def)
+    }
+
+    /// `callee` of a Bracket that is a plain `mem[index]` access -> the
+    /// mem def. Unlike `fifo_op_target`, the callee is a bare ident (no
+    /// `.field` wrapping), matching the direct `m[addr]` shape.
+    fn mem_target(&self, callee: ExprId) -> Option<DefId> {
+        let def = self.res.expr_defs.get(&callee)?;
+        (self.res.def(*def).kind == DefKind::Mem).then_some(*def)
     }
 
     /// Signature of a called fn/impl, if the callee resolves to one.

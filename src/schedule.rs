@@ -15,19 +15,36 @@
 //! the same cycle — checked, `Emitter` (firrtl/module.rs) emits a
 //! FIRRTL `assert` for it. `conflict_free { a, b }` claims it's safe
 //! for both to fire the same cycle (e.g. genuinely separate ports on
-//! one resource) — trusted, NOT checked: v0 has no way to prove or
-//! check address disjointness (that's the tier-3 banked-array proof
-//! DESIGN.md defers), so there is nothing sound to assert for this one;
-//! only the derived stall is waived. Claiming either for a pair that
-//! does not conflict is legal overstatement.
+//! one resource) — trusted, NOT checked: user-directed, for cases the
+//! compiler cannot see into (an enable condition, a genuinely separate
+//! port the effect system doesn't model as such).
+//!
+//! A third case is neither user-directed nor trusted: a read/write pair
+//! that both touch the same `mem` is auto-checked for address
+//! disjointness (`Exemption::Disjoint`, `mem_disjoint` below) whenever
+//! EVERY index expression on both sides folds to a compile-time
+//! constant and every such constant differs — e.g. `m[0] := x` and `y :=
+//! m[1]`. This is the scoped v1 of DESIGN.md's "Arrays: one resource
+//! each" tier-3 proof: sound only for read/write pairs (a mem's write
+//! port is still one shared, priority-muxed port in emission — see
+//! firrtl/module.rs — so two PROVEN-disjoint writers would still race on
+//! it; write/write pairs stay fully conservative, unaffected by this),
+//! and only for indices that are literal integers, never a variable or
+//! an affine expression of one (`m[i]` vs `m[i+1]` is a real, sound v2
+//! but needs a side condition — neither rule may write `i` that cycle —
+//! deliberately not bundled here). Any single non-constant index on
+//! either side fails the whole proof closed: unknown, not "assumed
+//! disjoint." Claiming `mutually_exclusive`/`conflict_free` on a pair
+//! that does not conflict (whether because it never did, or because
+//! this proof now clears it) is legal overstatement.
 //!
 //! Rules conflict only within their own scope (module body or top level):
 //! state is scope-local, so cross-scope conflicts cannot exist.
 
-use crate::ast::{Ast, Item, ItemId, ScheduleDirective};
-use crate::effects::Effects;
+use crate::ast::{Ast, Expr, ExprId, Item, ItemId, ScheduleDirective};
+use crate::effects::{EffectSig, Effects};
 use crate::lexer::Span;
-use crate::resolve::{DefId, Resolution};
+use crate::resolve::{DefId, DefKind, Resolution};
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +64,12 @@ pub enum Exemption {
     MutuallyExclusive,
     /// `conflict_free { a, b }` — trusted, unchecked in v0.
     ConflictFree,
+    /// Auto-derived, not user-written: every shared mem access site on
+    /// this read/write pair provably touches a different compile-time-
+    /// constant address — see this module's own doc comment. Proven, so
+    /// unlike `ConflictFree` it needs no simulation check either (there
+    /// is nothing left to trust).
+    Disjoint,
 }
 
 impl Exemption {
@@ -220,7 +243,7 @@ impl<'a> Scheduler<'a> {
                 let on: Vec<DefId> = ww
                     .iter()
                     .copied()
-                    .chain(rw)
+                    .chain(rw.iter().copied())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
@@ -228,6 +251,21 @@ impl<'a> Scheduler<'a> {
                     .iter()
                     .find(|(_, set, _)| set.contains(a) && set.contains(b));
                 let exemption = matched.map_or(Exemption::None, |(kind, _, _)| *kind);
+                // No user annotation, but every shared def is a mem whose
+                // access sites provably touch different addresses: prove
+                // it automatically rather than requiring `conflict_free`.
+                // Scoped to ReadWrite pairs only (see this module's own
+                // doc comment for why WriteWrite can't benefit the same
+                // way in v0's emission model) and left alone if the user
+                // already wrote an annotation of their own.
+                let exemption = if exemption == Exemption::None
+                    && kind == ConflictKind::ReadWrite
+                    && self.mem_disjoint(&rw, sa, sb)
+                {
+                    Exemption::Disjoint
+                } else {
+                    exemption
+                };
                 // `conflict_free` ("safe to fire concurrently") has no
                 // meaning for a WriteWrite conflict in v0's emission
                 // model: there is one shared writer port/connect target,
@@ -281,6 +319,40 @@ impl<'a> Scheduler<'a> {
             conflicts,
             directed,
         });
+    }
+
+    /// Whether every def in `rw` (a pure read/write set — the caller
+    /// only calls this when the pair's overall `ww` is empty, so no def
+    /// here is written by both sides) is a `mem` whose access sites in
+    /// `sa`/`sb` provably touch different compile-time-constant
+    /// addresses. A single non-mem def, or a mem def the proof can't
+    /// close, fails the whole set — see this module's own doc comment.
+    fn mem_disjoint(&self, rw: &BTreeSet<DefId>, sa: &EffectSig, sb: &EffectSig) -> bool {
+        !rw.is_empty()
+            && rw.iter().all(|def| {
+                self.res.def(*def).kind == DefKind::Mem && self.one_mem_disjoint(*def, sa, sb)
+            })
+    }
+
+    /// One mem def's own proof: find which side writes it (the other
+    /// reads it, guaranteed by `mem_disjoint`'s caller), then check that
+    /// side's recorded write-index sites against the other's read-index
+    /// sites. Missing index data (a mem present in `reads`/`writes` with
+    /// no recorded site) is treated as an unknown index, not "no
+    /// access" — fails closed, never assumed disjoint.
+    fn one_mem_disjoint(&self, def: DefId, sa: &EffectSig, sb: &EffectSig) -> bool {
+        let (writer, reader) = if sa.writes.contains(&def) {
+            (sa, sb)
+        } else {
+            (sb, sa)
+        };
+        let Some(w_idx) = writer.mem_write_idx.get(&def) else {
+            return false;
+        };
+        let Some(r_idx) = reader.mem_read_idx.get(&def) else {
+            return false;
+        };
+        mem_accesses_disjoint(self.ast, w_idx, r_idx)
     }
 
     /// Kahn's algorithm over urgency edges; declaration order breaks
@@ -374,6 +446,10 @@ impl Schedule {
                     Exemption::ConflictFree => out.push_str(
                         "    claimed conflict_free: no stall derived (trusted, not checked)\n",
                     ),
+                    Exemption::Disjoint => out.push_str(
+                        "    index sites proven disjoint (compile-time constants): no stall \
+                         derived (no annotation needed)\n",
+                    ),
                     Exemption::None => {
                         let loser = if c.winner == c.a { b } else { a };
                         let winner = rule_name(ast, c.winner);
@@ -394,4 +470,32 @@ fn rule_name(ast: &Ast, id: ItemId) -> &str {
         Item::Rule { name, .. } => &name.text,
         _ => "?",
     }
+}
+
+/// Fold a mem-index expression to a compile-time constant, if it is
+/// one. v1 deliberately recognizes only bare integer literals — a
+/// variable, or an affine expression of one (`m[i]`/`m[i+1]`), is a
+/// real, sound proof but needs a side condition (neither rule may write
+/// the variable that cycle) this module's own doc comment explicitly
+/// defers rather than bundling in here.
+fn const_index(ast: &Ast, id: ExprId) -> Option<u64> {
+    match ast.expr(id) {
+        Expr::Int(v) => Some(*v),
+        Expr::SizedInt { value, .. } => Some(*value),
+        _ => None,
+    }
+}
+
+/// Every index in `a` is provably different from every index in `b` —
+/// sound only when EVERY index on both sides folds to a known
+/// constant; a single non-constant index anywhere fails the whole
+/// proof closed (unknown, not "assumed disjoint").
+fn mem_accesses_disjoint(ast: &Ast, a: &BTreeSet<ExprId>, b: &BTreeSet<ExprId>) -> bool {
+    let fold = |set: &BTreeSet<ExprId>| -> Option<Vec<u64>> {
+        set.iter().map(|e| const_index(ast, *e)).collect()
+    };
+    let (Some(a_vals), Some(b_vals)) = (fold(a), fold(b)) else {
+        return false;
+    };
+    a_vals.iter().all(|x| b_vals.iter().all(|y| x != y))
 }

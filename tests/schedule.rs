@@ -300,6 +300,115 @@ fn explain_names_the_derived_stall() {
 }
 
 #[test]
+fn conflict_free_mem_example_still_needs_its_own_annotation() {
+    // examples/conflict_free_mem.tr addresses `m` through runtime input
+    // ports (`write_addr`/`read_addr`), not compile-time constants -- the
+    // new auto-proof must fail closed here exactly as before this
+    // feature existed, leaving the user's own `conflict_free` claim as
+    // the only reason the derived stall is waived.
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/conflict_free_mem.tr"
+    ))
+    .unwrap();
+    let (_, _, sched, errors) = run(&src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::ConflictFree);
+}
+
+#[test]
+fn mem_disjoint_proof_reaches_a_read_via_a_callee() {
+    // The index table merges through the call-graph fixpoint
+    // (effects.rs's `mem_read_idx`/`mem_write_idx`, see
+    // tests/effects.rs's `mem_index_sites_merge_through_a_callee_call_
+    // graph`) -- this pins that the resulting exemption is what
+    // schedule.rs actually derives for the pair, not just that the
+    // table itself gets populated. FIRRTL emission for a mem read
+    // reached through a callee is a separate, pre-existing, unrelated
+    // restriction (v0 restriction: "this indexing form is not yet
+    // supported") -- the exemption is correct here regardless of
+    // whether emission can act on it yet.
+    let src = "\
+module M {
+    mem m : [8][16]
+    in x : [8]
+    out y : [8] = 0
+
+    Fetch() : [8] {
+        return m[7]
+    }
+
+    rule p {
+        m[3] := x
+    }
+
+    rule q {
+        y := Fetch()
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_proof_stays_conservative_through_a_callee_param_index() {
+    // `Fetch(i) { return m[i] }` called as `Fetch(7)` -- the literal 7
+    // lives at the CALL site, not inside `Fetch`'s own body, whose
+    // index expression is just `Ident(i)`. `const_index` only folds a
+    // bare `Int`/`SizedInt` at the expression itself, never chasing an
+    // identifier back through a call's argument substitution -- so this
+    // must fail closed and keep the ordinary derived stall, exactly the
+    // same restriction the base feature's own doc comment states.
+    let src = "\
+module M {
+    mem m : [8][16]
+    in x : [8]
+    out y : [8] = 0
+
+    Fetch(i : [4]) : [8] {
+        return m[i]
+    }
+
+    rule p {
+        m[3] := x
+    }
+
+    rule q {
+        y := Fetch(7)
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn explain_names_a_proven_disjoint_mem_pair() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/mem_disjoint_rw.tr"
+    ))
+    .unwrap();
+    let (ast, res, sched, errors) = run(&src);
+    assert!(errors.is_empty());
+    let text = sched.explain(&ast, &res);
+    assert!(text.contains("rule write conflicts with rule read"));
+    assert!(text.contains(
+        "index sites proven disjoint (compile-time constants): no stall derived (no annotation \
+         needed)"
+    ));
+}
+
+#[test]
 fn different_instance_ports_do_not_conflict() {
     // Two rules writing DIFFERENT ports of the same instance must not
     // conflict: v0's conflict model is per-port, not per-instance (unlike
@@ -407,6 +516,148 @@ module Top {
         .find(|g| g.order.len() == 2)
         .expect("Top's group");
     assert!(group.conflicts.is_empty());
+}
+
+#[test]
+fn mem_disjoint_constant_indices_clear_a_readwrite_conflict() {
+    // DESIGN.md's own "Arrays: one resource each" example (`x := m[i]`
+    // vs `m[j] := y`) but with LITERAL, provably-different indices --
+    // the scoped v1 auto-proof this closes: no `conflict_free`
+    // annotation needed, and the conflict should be gone entirely, not
+    // just waived.
+    let src = "\
+module M {
+    mem m : [8][16]
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[0] := x
+    }
+    rule q {
+        y := m[1]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    // Still recorded (same shape as `conflict_free`/`mutually_exclusive`
+    // — `--explain-schedule` can say what was proven), but exempted:
+    // `is_exempted()` is what firrtl/module.rs actually checks to waive
+    // the derived stall, and no user annotation was written at all.
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].kind, ConflictKind::ReadWrite);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+    assert!(group.conflicts[0].exemption.is_exempted());
+}
+
+#[test]
+fn mem_non_constant_index_stays_conservative() {
+    // Same shape, but `q`'s index is a runtime value (an input port),
+    // not a literal -- v1 only folds bare integer literals, so this
+    // must fail closed and keep the ordinary derived stall, exactly as
+    // before this feature existed.
+    let src = "\
+module M {
+    mem m : [8][16]
+    in x : [8]
+    in i : [4]
+    out y : [8] = 0
+    rule p {
+        m[0] := x
+    }
+    rule q {
+        y := m[i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_same_constant_index_stays_conservative() {
+    // Both sides name the SAME literal address -- must NOT be treated
+    // as disjoint just because both are constants.
+    let src = "\
+module M {
+    mem m : [8][16]
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[0] := x
+    }
+    rule q {
+        y := m[0]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_writewrite_pair_stays_conservative_even_with_disjoint_literals() {
+    // v0 has one shared, priority-muxed write port per mem (see
+    // firrtl/module.rs) -- proving two literal addresses disjoint buys
+    // nothing there, since a proven-disjoint pair of WRITERS would
+    // still race on that one port. The auto-proof must stay scoped to
+    // ReadWrite pairs only.
+    let src = "\
+module M {
+    mem m : [8][16]
+    in x : [8]
+    in z : [8]
+    rule p {
+        m[0] := x
+    }
+    rule q {
+        m[1] := z
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].kind, ConflictKind::WriteWrite);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_proof_does_not_exempt_a_pair_sharing_other_state_too() {
+    // `p`/`q` share BOTH a disjoint-proven mem access and an unrelated
+    // register -- the mem half alone must not exempt the whole pair;
+    // the register conflict is real and still needs the ordinary
+    // derived stall.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg shared : [8] = 0
+    in x : [8]
+    out y : [8] = 0
+    out z : [8] = 0
+    rule p {
+        m[0] := x
+        shared := 1
+    }
+    rule q {
+        y := m[1]
+        z := shared
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
 }
 
 #[test]

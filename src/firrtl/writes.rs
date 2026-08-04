@@ -691,7 +691,9 @@ impl<'a> Emitter<'a> {
                     let Expr::Bracket { args, .. } = self.ast.expr(lhs).clone() else {
                         unreachable!()
                     };
-                    let addr = self.compile_expr(args[0]).unwrap_or_default();
+                    let addr = self
+                        .compile_expr_hinted(args[0], Some(addr_width))
+                        .unwrap_or_default();
                     let data = self
                         .compile_expr_hinted(rhs, Some(elem_width))
                         .unwrap_or_default();

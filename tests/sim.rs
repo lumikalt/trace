@@ -1722,6 +1722,42 @@ fn checksum_runs_through_real_ports() {
     );
 }
 
+/// Proves the scheduler's own auto-derived mem-disjointness proof
+/// (schedule.rs's `Exemption::Disjoint`) through real firtool and
+/// Icarus, not just `--explain-schedule`'s own text. `write` and
+/// `read` are both unconditional and share no `conflict_free`
+/// annotation at all -- under the old, fully conservative model,
+/// `read` would never get a turn (see sim/mem_disjoint_rw_tb.v's own
+/// comment for the exact regression this catches: the old behavior
+/// silently DCEs the whole memory reader down to a constant 0). Real
+/// output ports keep this alive without `--disable-opt`, same as
+/// conflict_free_mem.tr / accumulator.tr.
+#[test]
+fn mem_disjoint_rw_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/mem_disjoint_rw.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/mem_disjoint_rw_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: write_count=5 read_count=5 y=aa Memory[3]=42"),
+        "mem_disjoint_rw result did not match expectations:\n{output}"
+    );
+}
+
 /// Proves DESIGN.md's own `<elaborates>` example (`AdderTree`, compile-
 /// time tree recursion over a `list` with one-sided slices) through real
 /// firtool and Icarus: `elaborate.rs`'s pre-pass unrolls `AdderTree([a,

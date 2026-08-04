@@ -2733,8 +2733,12 @@ pair.
 `conflict_free { a, b }` claims it is safe for both rules to fire the same
 cycle — for example, a memory with independent read/write address ports, where a
 same-cycle read and write to different addresses do not hazard. This claim is
-**trusted, not checked**: v0 cannot prove or check address disjointness, so
-there is nothing sound to assert; only the derived stall is waived.
+**trusted, not checked**: for a runtime-valued index (`m[write_addr]` against
+`m[read_addr]`), v0 cannot prove or check the addresses are actually disjoint,
+so there is nothing sound to assert; only the derived stall is waived. When
+BOTH sides' indices happen to be compile-time constants instead, the scheduler
+proves disjointness on its own rather than asking for this annotation at all —
+see "Arrays: one resource each" below.
 
 `conflict_free` is only meaningful for a read/write conflict, never a
 write/write one: v0 gives no meaning to two rules writing the same register or
@@ -2746,18 +2750,32 @@ claim turns out false.
 
 ## Arrays: one resource each
 
-In v0, a whole array (`mem`) is one conflict resource. Any two accesses to the
-same array conflict unless both are reads, even when the accessed indices are
-provably different at compile time:
+In v0, a whole array (`mem`) is one conflict resource: any two accesses to the
+same array conflict unless both are reads. The one exception is a **read/write**
+pair whose indices are BOTH compile-time-constant integers and provably
+different — the scheduler proves this on its own, automatically, no annotation
+needed:
 
 ```trace
-rule a { x := m[i] }      -- reads {m}
-rule b { m[j] := y }      -- writes {m}
--- v0: a conflicts with b, even if i <> j always holds.
+rule a { x := m[3] }      -- reads {m}
+rule b { m[7] := y }      -- writes {m}
+-- v0: proven disjoint (3 <> 7, both constants) -- a and b do not conflict.
+
+rule c { x := m[i] }      -- reads {m}, i a runtime value
+rule d { m[j] := y }      -- writes {m}, j a runtime value
+-- v0: c conflicts with d -- neither index is a compile-time constant, so
+-- there is nothing to prove; this is the general, still-conservative case.
 ```
 
-A design with one memory serializes on it, one access per cycle. That is honest
-behavior for a single unbanked, single-port memory.
+Any non-constant index on either side, or the two constants being equal, falls
+back to the ordinary conservative conflict. A **write/write** pair is never
+exempted this way even when both addresses are constant and distinct: v0 emits
+one shared, priority-muxed write port per mem (see "The schedule block" and
+Part 2's FIRRTL emission), so two "safe" writers would still race on that one
+port — proving their addresses disjoint doesn't change that there's only one
+write port to land on. A design with one memory otherwise serializes on it, one
+access per cycle. That is honest behavior for a single unbanked, single-port
+memory.
 
 ## Combinational loops
 
@@ -2905,8 +2923,30 @@ there is nothing sound to check in v0.
 vocabulary for these two ideas, rather than inventing new terms bsc already has
 words for.
 
-**Tier 3, not v0: provable disjointness.** Dahlia-style banked and affine array
-types would let the compiler prove two accesses disjoint and drop the conflict.
+**A third, auto-derived exemption needs no annotation and no assertion
+either: a proven disjointness claim.** A read/write pair sharing only mem
+accesses whose indices are ALL compile-time-constant integers, and provably
+different, is dropped from the conflict matrix on its own — the scheduler
+found the proof itself, so there is nothing left to trust OR to check.
+`--explain-schedule` reports it distinctly from both other exemptions:
+
+```
+rule write conflicts with rule read: write meets read on {m}
+    index sites proven disjoint (compile-time constants): no stall derived (no annotation needed)
+```
+
+Deliberately narrow, matching v0's existing bar of failing closed rather than
+guessing: a mem sharing even ONE non-constant index anywhere, or a write/write
+pair (v0's single shared write port makes two "disjoint" writers meaningless —
+see "Arrays: one resource each"), stays fully conservative, exactly as if this
+proof did not exist. A user's own `conflict_free`/`mutually_exclusive` on a
+pair this already clears is legal, harmless overstatement, same as claiming
+either on a pair that never conflicted at all.
+
+**Tier 3, not v0: provable disjointness over RUNTIME values.** Dahlia-style
+banked and affine array types would let the compiler prove two accesses
+disjoint from a variable index (`m[i]` against `m[j]`, or an affine offset of
+one like `m[i]` against `m[i+1]`) rather than only from literal constants.
 This is a real type-system feature on its own, out of scope for v0 so the
 scheduler work stays bounded.
 
@@ -4146,7 +4186,10 @@ noted:
   optional infallible default tail (`examples/or_fifos.tr`).
 - The `schedule` block: `urgency`, `mutually_exclusive` (checked simulation
   assertion), `conflict_free` (trusted, unchecked; rejected outright on a
-  write/write conflict).
+  write/write conflict), plus an auto-derived third exemption needing no
+  annotation at all: a read/write pair whose mem indices are ALL
+  compile-time-constant integers and provably different (`examples/
+  mem_disjoint_rw.tr`).
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/
@@ -4182,8 +4225,12 @@ Not yet implemented:
 - **Combinational-only (stateless) modules.** `out` is register-backed by
   design, so a pure function of inputs cannot be expressed without a cycle of
   delay.
-- **Array banking / provable disjointness (tier 3).** v0 arrays are one
-  conflict resource each.
+- **Array banking / provable disjointness over runtime values (tier 3).** v0
+  arrays are one conflict resource each, except that a read/write pair whose
+  indices are ALL compile-time-constant integers is auto-proven disjoint (see
+  "Arrays: one resource each"/"The schedule block"). A variable or affine
+  index (`m[i]` vs `m[j]`, `m[i]` vs `m[i+1]`), and any write/write pair, stay
+  fully conservative.
 - **A Verilator simulation path.** Icarus only today.
 
 ## Prior art

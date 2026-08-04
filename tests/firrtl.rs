@@ -339,6 +339,27 @@ fn port_ram_emits_addressable_memory_through_ports() {
 }
 
 #[test]
+fn mem_disjoint_rw_needs_no_conflict_free_annotation() {
+    // examples/mem_disjoint_rw.tr has NO `schedule { conflict_free ... }`
+    // directive at all -- unlike port_ram.tr just above (a real derived
+    // stall) and conflict_free_mem.tr (a user-trusted claim), this pair
+    // is auto-proven disjoint from their literal, compile-time-constant
+    // addresses (3 and 7). `fires_read` must be unconditional, exactly
+    // like an exempted pair, and no assertion should exist (there's
+    // nothing to check -- it's proven, not trusted).
+    let fir =
+        emit_from_source(&read_example("mem_disjoint_rw.tr")).expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, UInt<4>(3)"));
+    assert!(fir.contains("connect m.r0.addr, UInt<4>(7)"));
+    assert!(fir.contains("node fires_write = UInt<1>(1)"));
+    assert!(fir.contains("node fires_read = UInt<1>(1)"));
+    assert!(!fir.contains("not(fires_write)"));
+    assert!(!fir.contains("not(fires_read)"));
+    assert!(!fir.contains("assert("));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn errors_on_unlowered_sequences_rule() {
     // emit_from_source lowers automatically when lowering applies, and
     // (self-caught while testing `while`'s own lowering) now correctly
@@ -968,6 +989,32 @@ module M {
     assert!(fir.contains("connect m.w_m.data, UInt<8>(0)"));
     assert!(fir.contains("connect m.w_m.addr, mux(eq(cond, UInt<1>(1)), addr, UInt<4>(0))"));
     assert!(fir.contains("connect m.w_m.data, mux(eq(cond, UInt<1>(1)), v, UInt<8>(0))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_bare_literal_mem_write_address_emits_at_the_mems_own_address_width() {
+    // Found while proving examples/mem_disjoint_rw.tr through real
+    // firtool: a bare-literal WRITE index used to hard-error ("no
+    // concrete width for this expression") because `mem_write_in_stmts`
+    // (writes.rs) compiled the address with plain `compile_expr`, never
+    // hinting it -- unlike the data operand right next to it, and
+    // unlike a bare-literal READ index (`examples/checksum.tr`'s
+    // `m[0]`), which already worked because it's compiled elsewhere.
+    // Fixed by hinting the address compile with the mem's own address
+    // width, mirroring the data operand's own hint.
+    let src = "\
+module M {
+    mem m : [8][16]
+    in x : [8]
+
+    rule r {
+        m[3] := x
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, UInt<4>(3)"));
     run_firtool(&fir, &[]);
 }
 

@@ -2075,8 +2075,20 @@ manually in the meantime.
 
 ## Scheduler / arrays
 
-- v0 arrays are one conflict resource each — no partial disjointness
-  (Dahlia-style banking is tier 3, explicitly deferred in DESIGN.md).
+- **RESOLVED (scoped v1) — a read/write pair whose mem indices are ALL
+  compile-time-constant integers is now auto-proven disjoint and dropped
+  from the conflict matrix, no `conflict_free` annotation needed**
+  (`schedule.rs`'s `Exemption::Disjoint`, `examples/mem_disjoint_rw.tr`).
+  Still fully conservative for: any non-constant (runtime-valued) index
+  on either side; a variable or affine index (`m[i]` vs `m[j]`, `m[i]`
+  vs `m[i+1]`) even if provably distinct in principle — needs tracking
+  a variable's possible values plus a side condition (neither rule
+  writes it that cycle), deliberately not bundled with the constants-
+  only proof; and every write/write pair regardless of index shape (v0
+  has one shared, priority-muxed write port per mem — see DESIGN.md's
+  "Arrays: one resource each" — so two "disjoint" writers would still
+  race on it). Dahlia-style banking for the runtime-value case is still
+  tier 3, explicitly deferred in DESIGN.md.
 - `combines` combinational-loop checking delegates entirely to firtool's
   `CheckCombLoops`, run only by `devenv.nix`'s `simulate` script and
   `tests/sim.rs` — never by `trace` itself, and its diagnostics are never
