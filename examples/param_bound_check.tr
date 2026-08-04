@@ -1,0 +1,17 @@
+module ParamBoundCheck {
+    reg cnt : [8] where cnt < 20 = 0
+    reg x : [8] where x < 10 = 0
+    reg y : [8] where y < 50 = 0
+
+    Bump(i : [8] where i < 10) {
+        cnt := i + 1
+    }
+
+    rule step {
+        if x < 5 {
+            Bump(x)
+        } else {
+            Bump(y)
+        }
+    }
+}

@@ -74,6 +74,32 @@
 //!   singleton, `<reg> == <const>`) is also left unnarrowed,
 //!   conservative but costless since no example needs the extra
 //!   precision there.
+//! - **Cross-boundary bound propagation (v12): a `fn`/`impl` PARAMETER
+//!   can carry a `where` bound too**, checked as an obligation at every
+//!   CALL site — the one thing this module's own per-item induction
+//!   structurally couldn't reach before (it only ever walked write
+//!   sites within ONE item's own body, with no way to check that a
+//!   CALLER upholds a callee's declared precondition). A bounded
+//!   param's own `DefId` is collected into the exact same `self.bounded`
+//!   map a reg/out populates, so the callee's OWN body trusts its
+//!   param's declared range unconditionally, exactly like a reg's
+//!   declared bound is the base case of ITS OWN induction — zero new
+//!   narrowing/composition logic needed there. The NEW work is entirely
+//!   at the call site: `Expr::Call`'s own `expr_bound` arm checks each
+//!   argument's provable range against the callee's declared param
+//!   bound, always returning `None` itself (no RETURN-bound propagation
+//!   in v1 — a fn's own return value carrying a provable bound a
+//!   caller's composition could use is a real, separable follow-up).
+//!   Checked at three expression positions: a `Stmt::Assign`'s RHS, a
+//!   bare `Stmt::Expr` call statement (how a VOID fn/impl — no return
+//!   value, called purely for its `writes` effect — is actually invoked
+//!   in this language; the realistic shape, not an edge case), and any
+//!   position `expr_bound`'s own `Add`/`Sub`/`Mul` recursion already
+//!   reaches (a call nested inside an argument or operand). NOT checked
+//!   in v1: `Stmt::Return`'s expr, or a call inside an `if`/`while`
+//!   condition — reaching those needs a genuinely generic expression-
+//!   tree walk, a real but separable follow-up, not bundled into this
+//!   pass.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -124,7 +150,7 @@
 //! false proof. Extending this to a real branch-merge/join would need
 //! more machinery than any current example motivates.
 
-use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Stmt, StmtId};
+use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::effects::Effects;
 use crate::lexer::Span;
 use crate::resolve::{DefId, Resolution};
@@ -148,8 +174,9 @@ pub struct Bounds {
     pub ranges: HashMap<DefId, (u64, u64)>,
 }
 
-/// One bounded def's (a `reg` or an `out`) own declared facts, collected
-/// once up front.
+/// One bounded def's (a `reg`, `out`, or fn/impl param, v12) own
+/// declared facts, collected once up front.
+#[derive(Clone, Copy)]
 struct BoundedDef {
     lower: u64,
     upper: u64,
@@ -163,10 +190,12 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         fx,
         ty,
         bounded: HashMap::new(),
+        fn_params: HashMap::new(),
         found_writes: HashSet::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
+    checker.collect_bounded_params();
     let bodied = checker.collect_bodied_items();
     for id in &bodied {
         checker.check_item(*id);
@@ -188,6 +217,12 @@ struct Checker<'a> {
     fx: &'a Effects,
     ty: &'a Types,
     bounded: HashMap<DefId, BoundedDef>,
+    /// Every `Item::Fn`'s own `DefId` (from `res.item_defs`) mapped to
+    /// its cloned `params` list (v12) — consulted at each `Expr::Call`
+    /// site to check the corresponding argument's own provable range
+    /// against a bounded param's declared bound. Cheap to clone once
+    /// per fn during collection rather than re-deriving per call site.
+    fn_params: HashMap<DefId, Vec<Param>>,
     /// Every bounded def this pass found an ACTUAL `Stmt::Assign` for,
     /// anywhere in the program — cross-checked against `fx`'s own
     /// per-item write sets once the whole walk finishes (defense in
@@ -227,16 +262,49 @@ impl<'a> Checker<'a> {
                     bound: Some(bound),
                     lower,
                     ..
-                } => self.collect_one_bounded_def(id, *bound, *lower),
+                } => {
+                    if let Some(&def) = self.res.item_defs.get(&id) {
+                        self.collect_one_bounded_def(def, *bound, *lower);
+                    }
+                }
                 _ => {}
             }
         }
     }
 
-    /// The shared body behind both `collect_bounded_defs` match arms
-    /// (`reg` and `out` are otherwise structurally identical here — see
-    /// that function's own doc comment).
-    fn collect_one_bounded_def(&mut self, id: ItemId, bound: ExprId, lower: Option<ExprId>) {
+    /// Every `fn`/`impl` parameter with a `where` bound (v12), collected
+    /// the same way `collect_bounded_defs` collects reg/out — inserted
+    /// into the SAME `self.bounded` map, so a bounded param's OWN body-
+    /// walk (as `check_item` walks `Item::Fn` bodies too) treats it
+    /// exactly like a bounded reg with zero new narrowing/composition
+    /// logic. Also records each fn's own `params` list, keyed by the
+    /// fn's own `DefId`, consulted at call sites to check arguments.
+    fn collect_bounded_params(&mut self) {
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            match self.ast.item(id) {
+                Item::Module { items, .. } => stack.extend(items.iter().copied()),
+                Item::Fn { params, .. } => {
+                    for param in params {
+                        if let Some(bound) = param.bound {
+                            let def = def_of_name(self.res, &param.name);
+                            self.collect_one_bounded_def(def, bound, param.lower);
+                        }
+                    }
+                    if let Some(&fn_def) = self.res.item_defs.get(&id) {
+                        self.fn_params.insert(fn_def, params.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The shared body behind `collect_bounded_defs`/`collect_bounded_
+    /// params` (a reg/out/param are otherwise structurally identical
+    /// here — see those functions' own doc comments). Takes the def
+    /// directly (not an `ItemId`) since a param has none of its own.
+    fn collect_one_bounded_def(&mut self, def: DefId, bound: ExprId, lower: Option<ExprId>) {
         let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
             return;
         };
@@ -250,9 +318,6 @@ impl<'a> Checker<'a> {
             },
             None => 0,
         };
-        let Some(def) = self.res.item_defs.get(&id).copied() else {
-            return;
-        };
         let Some(width) = base_width(self.ty, def) else {
             // A concretely-known `bits[N]` width is exactly what every
             // check below needs to clamp a composed bound against — an
@@ -264,8 +329,8 @@ impl<'a> Checker<'a> {
             let span = self.ast.expr_spans[bound.0 as usize].clone();
             self.error(
                 span,
-                "a `where` bound needs a reg/out with a concretely-known `bits[N]` width to \
-                 check against (v0 restriction)"
+                "a `where` bound needs a reg/out/param with a concretely-known `bits[N]` width \
+                 to check against (v0 restriction)"
                     .to_string(),
             );
             return;
@@ -343,53 +408,13 @@ impl<'a> Checker<'a> {
                 let Some(def) = self.res.expr_defs.get(&lhs).copied() else {
                     return;
                 };
-                let Some(bounded) = self.bounded.get(&def) else {
+                let Some(bounded) = self.bounded.get(&def).copied() else {
                     return; // not a bounded reg
                 };
-                let lower = bounded.lower;
-                let upper = bounded.upper;
-                let width = bounded.width;
                 self.found_writes.insert(def);
                 let computed = self.expr_bound(rhs, state, locals);
                 let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                match computed {
-                    None => self.error(
-                        span,
-                        format!(
-                            "cannot verify this write stays within the declared bound \
-                             `{lower} <= _ < {upper}` (either an unsupported expression shape, \
-                             or a subtraction that isn't provably non-negative here — only a \
-                             bare bounded reg/out/local, a literal, their sum, or a \
-                             provably-in-range difference is recognized)"
-                        ),
-                    ),
-                    Some((_, hi)) if hi > 1u64.checked_shl(width as u32).unwrap_or(u64::MAX) => {
-                        self.error(
-                            span,
-                            format!(
-                                "this write's computed value could reach or exceed the reg's \
-                                 own declared width ([{width}]), which would silently wrap and \
-                                 invalidate the declared bound `{lower} <= _ < {upper}`"
-                            ),
-                        );
-                    }
-                    Some((_, hi)) if hi > upper => self.error(
-                        span,
-                        format!(
-                            "cannot verify this write stays within the declared bound \
-                             `{lower} <= _ < {upper}` (computed value could reach {})",
-                            hi.saturating_sub(1)
-                        ),
-                    ),
-                    Some((lo, _)) if lo < lower => self.error(
-                        span,
-                        format!(
-                            "cannot verify this write stays within the declared bound \
-                             `{lower} <= _ < {upper}` (computed value could go below {lower})"
-                        ),
-                    ),
-                    Some(_) => {}
-                }
+                self.check_against_bound(computed, bounded, span, "write");
             }
             Stmt::Let { name, init } => {
                 let def = def_of_name(self.res, &name);
@@ -443,7 +468,80 @@ impl<'a> Checker<'a> {
                 let mut loop_locals = locals.clone();
                 self.check_body(&body, &mut loop_state, &mut loop_locals);
             }
-            Stmt::Expr(_) | Stmt::Tick | Stmt::Break | Stmt::Return(_) => {}
+            // A bare call statement (`Bump(x)`) is how a VOID fn/impl —
+            // one with no return value, invoked purely for its `writes`
+            // effect — is actually called in this language; it's the
+            // realistic shape a bounded-param call site takes (v12's
+            // own driving example uses exactly this shape), not an edge
+            // case. Routes through `expr_bound` purely for that side
+            // effect (checking any `Call` reached anywhere in `e`
+            // against its callee's declared param bounds); the returned
+            // range itself is meaningless here and discarded.
+            Stmt::Expr(e) => {
+                self.expr_bound(e, state, locals);
+            }
+            Stmt::Tick | Stmt::Break | Stmt::Return(_) => {}
+        }
+    }
+
+    /// Checks a `computed` provable range (or `None`, unprovable)
+    /// against a bounded def's OWN declared `[lower, upper)` range and
+    /// declared bit width. Shared by a `Stmt::Assign` write site and an
+    /// `Expr::Call` argument (v12) — the only two positions that check
+    /// a computed value against a PRE-EXISTING declared bound, as
+    /// opposed to `collect_one_bounded_def`, which validates a bound's
+    /// own declaration. `context` names what's being checked, for the
+    /// error message only (e.g. `"write"`, `"argument for parameter
+    /// \`i\`"`).
+    fn check_against_bound(
+        &mut self,
+        computed: Option<(u64, u64)>,
+        bounded: BoundedDef,
+        span: Span,
+        context: &str,
+    ) {
+        let BoundedDef {
+            lower,
+            upper,
+            width,
+        } = bounded;
+        match computed {
+            None => self.error(
+                span,
+                format!(
+                    "cannot verify this {context} stays within the declared bound \
+                     `{lower} <= _ < {upper}` (either an unsupported expression shape, or a \
+                     subtraction that isn't provably non-negative here — only a bare bounded \
+                     reg/out/local/param, a literal, their sum, product, or a provably-in-range \
+                     difference is recognized)"
+                ),
+            ),
+            Some((_, hi)) if hi > 1u64.checked_shl(width as u32).unwrap_or(u64::MAX) => {
+                self.error(
+                    span,
+                    format!(
+                        "this {context}'s computed value could reach or exceed the declared \
+                         width ([{width}]), which would silently wrap and invalidate the \
+                         declared bound `{lower} <= _ < {upper}`"
+                    ),
+                );
+            }
+            Some((_, hi)) if hi > upper => self.error(
+                span,
+                format!(
+                    "cannot verify this {context} stays within the declared bound \
+                     `{lower} <= _ < {upper}` (computed value could reach {})",
+                    hi.saturating_sub(1)
+                ),
+            ),
+            Some((lo, _)) if lo < lower => self.error(
+                span,
+                format!(
+                    "cannot verify this {context} stays within the declared bound \
+                     `{lower} <= _ < {upper}` (computed value could go below {lower})"
+                ),
+            ),
+            Some(_) => {}
         }
     }
 
@@ -546,12 +644,16 @@ impl<'a> Checker<'a> {
 
     /// The value range an expression is provably confined to, as a
     /// `(lower, upper)` pair (lower inclusive, upper exclusive), or
-    /// `None` if this pass can't establish one. A bare bounded reg/local
-    /// reference, a literal, `Add`, `Sub`, or `Mul` of two such compose —
-    /// see this module's own doc comment for why everything else (a
-    /// call, a shift, ...) is deliberately left unsupported.
+    /// `None` if this pass can't establish one. A bare bounded reg/
+    /// local/param reference, a literal, `Add`, `Sub`, or `Mul` of two
+    /// such compose — see this module's own doc comment for why
+    /// everything else (a shift, ...) is deliberately left unsupported.
+    /// `&mut self` (v12): a `Call` is visited here too, and checking its
+    /// arguments against the callee's declared param bounds is a real
+    /// SIDE EFFECT (pushes errors), not just a value computation — see
+    /// that arm's own comment for why it always returns `None` itself.
     fn expr_bound(
-        &self,
+        &mut self,
         id: ExprId,
         state: &HashMap<DefId, (u64, u64)>,
         locals: &HashMap<DefId, Option<(u64, u64)>>,
@@ -622,6 +724,56 @@ impl<'a> Checker<'a> {
                 let hi = a_max.checked_mul(b_max)?.checked_add(1)?;
                 Some((lo, hi))
             }
+            Expr::Call { callee, args } => {
+                // v12: cross-boundary bound propagation. `Bump`'s own
+                // body trusts `i < 10` as its declared precondition
+                // (checked, like a reg/out, by `check_item`'s own walk
+                // of `Item::Fn` — that trust is unconditional there);
+                // THIS is what makes that trust sound system-wide,
+                // verifying every actual caller upholds it. Always
+                // returns `None` for compositional purposes — no
+                // return-bound propagation in v1 (a fn's own return
+                // value carrying a provable bound a caller's
+                // composition could use is a real, separable
+                // follow-up, not bundled into this pass).
+                //
+                // `Expr::Bracket` (the OTHER `{callee, args}` shape) is
+                // deliberately not given a twin arm here. `resolve.rs`
+                // resolves a `Bracket`'s callee the same as a `Call`'s
+                // (no syntax discrimination), so `Fn[arg]` COULD in
+                // principle resolve `callee` to a real `Item::Fn`'s
+                // DefId -- but `type_bracket` (`types/expr.rs`) has no
+                // `DefKind::Fn` branch (falls through to `Ty::Unknown`,
+                // silently, no error), and FIRRTL emission's own
+                // `Expr::Bracket` arm only handles `Ty::Mem`/`Ty::Bits`
+                // shapes, erroring "this indexing form is not yet
+                // supported" on anything else -- confirmed empirically
+                // (`Bump[y]` dies at `--firrtl` emission before any
+                // hardware is produced). A pre-existing gap in types.rs/
+                // lower.rs, not introduced by v12 and not a bounds.rs
+                // soundness hole: no program shaped this way reaches
+                // codegen regardless of whether its argument obeys the
+                // callee's declared bound.
+                let (callee, args) = (*callee, args.clone());
+                if let Some(&fn_def) = self.res.expr_defs.get(&callee)
+                    && let Some(params) = self.fn_params.get(&fn_def).cloned()
+                {
+                    for (param, arg) in params.iter().zip(&args) {
+                        if param.bound.is_none() {
+                            continue;
+                        }
+                        let param_def = def_of_name(self.res, &param.name);
+                        let Some(bounded) = self.bounded.get(&param_def).copied() else {
+                            continue;
+                        };
+                        let computed = self.expr_bound(*arg, state, locals);
+                        let span = self.ast.expr_spans[arg.0 as usize].clone();
+                        let context = format!("argument for parameter `{}`", param.name);
+                        self.check_against_bound(computed, bounded, span, &context);
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -633,6 +785,19 @@ impl<'a> Checker<'a> {
     /// pass's own walk missed a real write site — an internal
     /// inconsistency, not a user-facing diagnostic, so it panics rather
     /// than silently reporting an unsound "proof."
+    ///
+    /// v12: a bounded PARAM's `DefId` is now also a key in `self.bounded`,
+    /// but reassigning a param (`i := 0` inside a fn body) can never
+    /// trip `effects_says_written` for it: `effects.rs`'s `infer_write`
+    /// only calls `sig.writes.insert` after `state_def` succeeds, and
+    /// `state_def` requires `DefKind::is_state()` (`effects.rs:726-729`,
+    /// `resolve.rs:76-88`) — `DefKind::Param` isn't in that list. So a
+    /// param's `DefId` is never inserted into any `sig.writes` set,
+    /// `effects_says_written` is always `false` for it, and this check
+    /// can't panic on a param regardless of whether `found_writes`
+    /// happens to contain it. Confirmed empirically, not just by
+    /// reading the match arm: compiled a scratch module reassigning a
+    /// bounded param inside its own fn body, no panic.
     fn check_write_site_exhaustiveness(&self) {
         for def in self.bounded.keys() {
             let effects_says_written = self.fx.sigs.values().any(|s| s.writes.contains(def));
@@ -663,9 +828,16 @@ fn const_fold(ast: &Ast, id: ExprId) -> Option<u64> {
 /// A state def's own declared bit width, if it's a plain `bits[N]`
 /// (concretely known) — mirrors `schedule.rs`'s own `base_width` helper
 /// exactly (same shape, same reasoning: anything else fails closed).
+/// Checks `state_tys` (reg/mem/fifo) first, falling back to `local_tys`
+/// (v12: a fn/impl PARAM's own declared type lives there instead —
+/// `types/collect.rs`'s `check_body` populates it for every param and
+/// ordinary `let` local alike — never `state_tys`). The two tables are
+/// keyed by disjoint `DefId` sets, so this fallback never shadows a
+/// reg/out's own entry.
 fn base_width(ty: &Types, def: DefId) -> Option<u64> {
-    match ty.state_tys.get(&def) {
-        Some(Ty::Bits(Width::Known(w))) => Some(*w),
+    let found = ty.state_tys.get(&def).or_else(|| ty.local_tys.get(&def))?;
+    match found {
+        Ty::Bits(Width::Known(w)) => Some(*w),
         _ => None,
     }
 }

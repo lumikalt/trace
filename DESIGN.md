@@ -2998,6 +2998,27 @@ v0 restrictions, all deliberate scope cuts:
 - **No interaction with the banking argument (v3).** That argument's
   soundness rests on a modular fact a proven bound doesn't slot into, and no
   design needs the combination.
+- **Cross-boundary bound propagation (v12): a `fn`/`impl` PARAMETER can
+  carry a `where` bound too, checked as an obligation at every CALL
+  site** (`examples/param_bound_check.tr`). This is the one thing the
+  per-item induction above structurally couldn't reach before — it only
+  ever walks write sites within ONE item's own body, with no way to
+  check that a CALLER upholds a callee's declared precondition. A
+  bounded param's own `DefId` is collected into the exact same map a
+  reg/out populates, so the callee's OWN body trusts its param's
+  declared range unconditionally (the base case of its own induction,
+  same as a reg's declared bound) — zero new narrowing/composition
+  logic needed there. The new work is entirely at the call site: each
+  argument's own provable range is checked against the callee's
+  declared param bound, at a `Stmt::Assign`'s RHS, a bare call statement
+  (how a VOID fn/impl — no return value, called purely for its `writes`
+  effect — is actually invoked; the realistic shape for this feature),
+  or a call nested inside an `Add`/`Sub`/`Mul` operand. NOT checked in
+  v1: a call inside `return` or an `if`/`while` condition (needs a
+  genuinely generic expression-tree walk, a separable follow-up), and
+  NO return-bound propagation (a callee's own return value carrying a
+  provable bound a caller's composition could use) — a call's own
+  provable range is always `None` for composition purposes in v1.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"

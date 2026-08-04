@@ -502,7 +502,9 @@ impl<'a> Resolver<'a> {
                 }
                 if let Some(bound) = bound {
                     self.resolve_expr(*bound, false);
-                    self.check_bound_self_reference(id, *bound);
+                    if let Some(&def) = self.res.item_defs.get(&id) {
+                        self.check_bound_self_reference(def, *bound);
+                    }
                 }
                 if let Some(lower) = lower {
                     self.resolve_expr(*lower, false);
@@ -553,7 +555,9 @@ impl<'a> Resolver<'a> {
                 }
                 if let Some(bound) = bound {
                     self.resolve_expr(*bound, false);
-                    self.check_bound_self_reference(id, *bound);
+                    if let Some(&def) = self.res.item_defs.get(&id) {
+                        self.check_bound_self_reference(def, *bound);
+                    }
                 }
                 if let Some(lower) = lower {
                     self.resolve_expr(*lower, false);
@@ -617,7 +621,20 @@ impl<'a> Resolver<'a> {
                 // body resolves.
                 for param in &params {
                     self.resolve_expr(param.ty, true);
-                    self.declare(&param.name, DefKind::Param);
+                    let param_def = self.declare(&param.name, DefKind::Param);
+                    // v12: a param's own `where` bound, checked as a
+                    // call-site obligation by `bounds.rs` -- resolved
+                    // AFTER `declare` so the self-reference check below
+                    // has the param's own `DefId` in hand already (no
+                    // `item_defs` lookup needed, unlike reg/out, since
+                    // a param has no `ItemId` of its own).
+                    if let Some(bound) = param.bound {
+                        self.resolve_expr(bound, false);
+                        self.check_bound_self_reference(param_def, bound);
+                    }
+                    if let Some(lower) = param.lower {
+                        self.resolve_expr(lower, false);
+                    }
                 }
                 if let Some(ret) = ret {
                     self.resolve_expr(ret, true);
@@ -1058,28 +1075,30 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// A `reg`'s `where` bound must constrain the SAME reg it's declared
-    /// on — `where other < 10` says nothing about THIS reg's own value,
-    /// so `bounds.rs`'s induction argument (which only ever checks
-    /// writes to the declared def) would have nothing to reason about.
-    /// The full shape (`Binary { Lt, .. }`, a compile-time-constant
-    /// RHS) is validated later, in `bounds.rs` — this only checks self-
-    /// reference, since that's a resolve-time (DefId-level) question. A
-    /// malformed shape (LHS not even an `Ident`, or one that fails to
-    /// resolve at all) falls through to the same "doesn't match" error,
-    /// which is fine: `bounds.rs` reports the precise shape complaint
-    /// separately.
-    fn check_bound_self_reference(&mut self, id: ItemId, bound: ExprId) {
+    /// A `reg`/`out`/param's `where` bound must constrain the SAME def
+    /// it's declared on — `where other < 10` says nothing about THIS
+    /// def's own value, so `bounds.rs`'s induction argument (which only
+    /// ever checks writes/call arguments against the declared def)
+    /// would have nothing to reason about. The full shape (`Binary {
+    /// Lt, .. }`, a compile-time-constant RHS) is validated later, in
+    /// `bounds.rs` — this only checks self-reference, since that's a
+    /// resolve-time (DefId-level) question. A malformed shape (LHS not
+    /// even an `Ident`, or one that fails to resolve at all) falls
+    /// through to the same "doesn't match" error, which is fine:
+    /// `bounds.rs` reports the precise shape complaint separately.
+    /// Takes the `DefId` directly (not an `ItemId`) so a param's own
+    /// def (returned straight from `declare`, v12 — no `item_defs`
+    /// entry exists for a param) can call this identically to a
+    /// reg/out's own `item_defs`-derived def.
+    fn check_bound_self_reference(&mut self, self_def: DefId, bound: ExprId) {
         let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        let Some(&reg_def) = self.res.item_defs.get(&id) else {
-            return;
-        };
-        if self.res.expr_defs.get(&lhs).copied() != Some(reg_def) {
+        if self.res.expr_defs.get(&lhs).copied() != Some(self_def) {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
-                "a `where` bound must reference the same reg/out it's declared on".to_string(),
+                "a `where` bound must reference the same reg/out/param it's declared on"
+                    .to_string(),
             );
         }
     }

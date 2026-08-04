@@ -312,10 +312,18 @@ pub struct Effect {
     pub args: Vec<Name>,
 }
 
+/// `bound`/`lower` (v12): only meaningful on an `Item::Fn`/`Impl`
+/// parameter, never on `Item::Struct`'s own `fields: Vec<Param>` (a
+/// struct field has no call site to check an obligation against) --
+/// always `None` there. Mirrors `Item::Reg`'s own `bound`/`lower`
+/// fields exactly; see `bounds.rs`'s module doc comment for how a
+/// bounded param is checked as an obligation at every call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
     pub name: Name,
     pub ty: ExprId,
+    pub bound: Option<ExprId>,
+    pub lower: Option<ExprId>,
 }
 
 /// An `extmodule` port's direction, spelled with the SAME keywords an
@@ -774,7 +782,20 @@ impl Ast {
                 };
                 let params = params
                     .iter()
-                    .map(|p| format!("{} : {}", p.name, self.expr_sexpr(p.ty)))
+                    .map(|p| {
+                        let mut s = format!("{} : {}", p.name, self.expr_sexpr(p.ty));
+                        if let Some(bound) = p.bound {
+                            match p.lower {
+                                Some(lower) => s.push_str(&format!(
+                                    " where {} <= {}",
+                                    self.expr_sexpr(lower),
+                                    self.expr_sexpr(bound)
+                                )),
+                                None => s.push_str(&format!(" where {}", self.expr_sexpr(bound))),
+                            }
+                        }
+                        s
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 out.push_str(&format!("{pad}{keyword} {name}({params})"));

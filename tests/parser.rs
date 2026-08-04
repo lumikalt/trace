@@ -1210,6 +1210,25 @@ fn where_clause_parses_on_an_output() {
 }
 
 #[test]
+fn where_clause_parses_on_a_fn_param() {
+    // v12: `where` unconditionally allowed on any fn/impl param (no
+    // reg/out-only restriction the way top-level state decls have) --
+    // checked as a call-site obligation by `bounds.rs`.
+    let ast = parse_ok("module M {\n Bump(i : [8] where i < 10) {\n }\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Fn { params, .. } = ast.item(items[0]) else {
+        panic!("expected a fn");
+    };
+    assert_eq!(params.len(), 1);
+    let bound = params[0]
+        .bound
+        .expect("where clause should have parsed on the param");
+    assert_eq!(ast.expr_sexpr(bound), "(< i 10)");
+}
+
+#[test]
 fn where_clause_requires_an_explicit_init() {
     let (tokens, _) = lexer::lex("module M {\n reg i : [4] where i < 10\n}\n");
     let (_, errors) = parser::parse("module M {\n reg i : [4] where i < 10\n}\n", &tokens);

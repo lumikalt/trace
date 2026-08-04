@@ -2392,6 +2392,87 @@ manually in the meantime.
   byte-identical. Explicitly still NOT done: whether the interval-set
   domain is worth building now that `Mul` exists to make it non-inert
   remains open, not yet decided as of this entry.
+- **RESOLVED (v12) — cross-boundary bound propagation: a `fn`/`impl`
+  PARAMETER can carry a `where` bound, checked as an obligation at
+  every CALL site** (`examples/param_bound_check.tr`). Lumi asked to
+  build "the type system" — the recurring broader ambition (v4's
+  "should we add the type system now," raised again here). Checked
+  whether `bounds.rs`'s own arm space still justified a v4-style
+  generalization before designing anything: it doesn't — `IndexForm`'s
+  arm space (v4) was syntactic SHAPES, genuinely open-ended;
+  `bounds.rs`'s arm space is OPERATORS, and it's now closed (all three
+  arithmetic ops, all four comparisons this language has are
+  implemented). Surfaced this distinction to Lumi directly rather than
+  assuming the v4 precedent transfers, and asked what a real type
+  system would need to buy that `bounds.rs` structurally can't: bounds
+  crossing a CALL boundary. `bounds.rs` only ever walked write sites
+  within one item's own body — no way to reach a callee's signature or
+  check a caller upholds it. Lumi picked this as the concrete
+  increment.
+
+  Does NOT need a new `Ty` variant: a param bound is checked the same
+  way a write site already is (compute the argument's provable range,
+  verify against the callee's declared `[lower, upper)`) — a boundary
+  CHECK, not a value flowing through unification, mirroring how
+  `check_assignable` already checks argument WIDTH at each call site.
+  `Param` (`ast.rs`, shared with `Item::Struct`'s own fields) gained
+  `bound`/`lower` fields, mirroring `Item::Reg`'s; `parse_where_bound`
+  extracted from `parse_state_decl`'s inline block into a shared helper,
+  called from both (reg/out keeps its restriction; a param has none —
+  always meaningful). `resolve.rs`'s `check_bound_self_reference`
+  generalized to take a `DefId` directly (a param has no `ItemId` of
+  its own, but `declare()` already returns its fresh `DefId` directly,
+  no span-scan needed unlike `types/collect.rs`'s own param-type
+  workaround). `bounds.rs`'s `base_width` extended to fall back to
+  `Types::local_tys` (where a param's own declared type actually lives
+  — `state_tys` is reg/mem/fifo only). A bounded param's `DefId` is
+  collected into the SAME `self.bounded` map a reg/out populates, so a
+  callee's own body trusts its param's declared range as the base case
+  of ITS OWN induction, zero new logic there — the actual new work is
+  `expr_bound`'s new `Expr::Call` arm (signature widened to `&mut self`,
+  since checking arguments is a real side effect), checking each
+  argument against the callee's declared param bound via a shared
+  `check_against_bound` helper extracted from the existing `Stmt::
+  Assign` arm (avoiding duplicating the 4-branch error logic, and
+  generalizing "the reg's own declared width" wording since a param
+  isn't a reg).
+
+  **Scope correction found empirically, not planned:** the plan
+  scoped checking to `Stmt::Assign`'s RHS and nested arithmetic only,
+  deliberately excluding bare call statements — but the driving example
+  itself (`Bump(x)`, a VOID fn called purely for its `writes` effect,
+  the realistic shape for ANY effectful call) turned out to BE a bare
+  `Stmt::Expr` call statement, which the original scope didn't cover at
+  all. Running the driving example against the just-implemented code
+  produced 0 errors instead of the expected 1 — caught by testing
+  against the example immediately, not assumed correct. Fixed by
+  routing `Stmt::Expr` through `expr_bound` for its side effect
+  (discarding the meaningless return value) — the realistic shape for
+  this feature, not an edge case, so this is a scope WIDENING from the
+  plan, not a workaround. `Stmt::Return`'s expr and `if`/`while`
+  conditions remain genuinely out of scope (need a generic expression-
+  tree walk, a separable follow-up).
+
+  Driving example (invented, same disclosure as v6/v8/v9/v10/v11): `Bump(i
+  : [8] where i < 10) { cnt := i + 1 }` called as `Bump(x)`/`Bump(y)`
+  from an `if`/`else` (both branches walked regardless of the runtime
+  condition, avoiding any scheduling complexity) — `x`'s declared range
+  exactly matches, proven; `y`'s declared range (`[0,50)`) doesn't,
+  rejected. Without the call-site check, `Bump`'s own proof (sound only
+  if callers respect `i < 10`) would be silently unenforced system-wide
+  — the actual soundness gap this closes, not just a new diagnostic
+  surface. 8 new/updated tests across `tests/parser.rs`/`tests/
+  resolve.rs`/`tests/bounds.rs` (parse, self-reference resolve/reject,
+  argument accept/reject, unbounded-param no-op, two-sided param bound);
+  the call-check logic verified by bug-reintroduction (swapping which
+  `DefId` is looked up in `self.bounded` flips the rejection test to a
+  wrongly-accepted pass, confirmed then reverted). A `--firrtl` sanity
+  check on the driving example confirmed zero codegen impact (`Param`'s
+  new fields are consumed only by `bounds.rs`). A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical. Explicitly still NOT done: `Stmt::Return`/condition
+  positions, return-bound propagation, and whether the interval-set
+  domain (v11's own open item) is worth building all remain undecided.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

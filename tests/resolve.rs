@@ -855,7 +855,43 @@ module M {
 ";
     let (_, _, errors) = run(src);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("same reg/out it's declared on"));
+    assert!(
+        errors[0]
+            .message
+            .contains("same reg/out/param it's declared on")
+    );
+}
+
+#[test]
+fn where_bound_referencing_the_same_param_resolves() {
+    let src = "\
+module M {
+    reg x : [8] = 0
+    Bump(i : [8] where i < 10) {
+        x := i
+    }
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn where_bound_referencing_a_different_param_is_an_error() {
+    let src = "\
+module M {
+    reg x : [8] = 0
+    Bump(i : [8] where x < 10) {
+        x := i
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("same reg/out/param it's declared on")
+    );
 }
 
 #[test]
@@ -878,7 +914,11 @@ module M {
 ";
     let (_, _, errors) = run(src);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("same reg/out it's declared on"));
+    assert!(
+        errors[0]
+            .message
+            .contains("same reg/out/param it's declared on")
+    );
 }
 
 #[test]

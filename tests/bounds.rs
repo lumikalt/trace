@@ -732,3 +732,90 @@ module M {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("cannot verify"));
 }
+
+#[test]
+fn call_argument_within_the_declared_param_bound_is_proven() {
+    // v12: cross-boundary bound propagation. `x`'s own declared range
+    // `[0,10)` exactly matches `Bump`'s declared param bound for `i` --
+    // `Bump`'s own body (`cnt := i + 1`) is separately proven via the
+    // existing per-item induction (unchanged since v5), the param's
+    // bound seeded into `self.bounded` exactly like a reg's own.
+    let src = "\
+module M {
+    reg x : [8] where x < 10 = 0
+    reg cnt : [8] where cnt < 20 = 0
+    Bump(i : [8] where i < 10) {
+        cnt := i + 1
+    }
+    rule step {
+        Bump(x)
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn call_argument_exceeding_the_declared_param_bound_is_rejected() {
+    // `y`'s own declared range `[0,50)` is NOT provably within `Bump`'s
+    // declared param bound `[0,10)` -- the call site is where this
+    // arc's first cross-boundary obligation gets checked. Without this
+    // check, `Bump`'s own proof (sound only if callers respect `i <
+    // 10`) would be silently unenforced.
+    let src = "\
+module M {
+    reg y : [8] where y < 50 = 0
+    reg cnt : [8] where cnt < 20 = 0
+    Bump(i : [8] where i < 10) {
+        cnt := i + 1
+    }
+    rule step {
+        Bump(y)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn unbounded_param_argument_is_unchecked() {
+    // A param with NO `where` bound imposes no obligation at all --
+    // `z`'s declared range (`[0,200)`) is irrelevant here, since `i`
+    // has nothing to check it against. Confirms no false rejection.
+    let src = "\
+module M {
+    reg z : [8] where z < 200 = 0
+    reg w : [4] where w < 9 = 0
+    Bump(i : [8]) {
+        w := 0
+    }
+    rule step {
+        Bump(z)
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn two_sided_param_bound_is_recognized() {
+    // The v6 two-sided surface form (`where L <= i < K`) works
+    // identically on a param -- same parse path (`parse_where_bound`),
+    // same collection path (`collect_one_bounded_def`). `j`'s own
+    // declared range `[5,10)` exactly matches.
+    let src = "\
+module M {
+    reg j : [8] where 5 <= j < 10 = 5
+    reg cnt : [8] where cnt < 20 = 0
+    Bump(i : [8] where 5 <= i < 10) {
+        cnt := i + 1
+    }
+    rule step {
+        Bump(j)
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
