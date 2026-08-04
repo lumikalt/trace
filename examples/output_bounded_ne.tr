@@ -1,0 +1,11 @@
+module OutputBoundedNe {
+    out cnt : [8] where cnt < 100 = 0
+
+    rule count {
+        if cnt <> 99 {
+            cnt := cnt + 1
+        } else {
+            cnt := 0
+        }
+    }
+}

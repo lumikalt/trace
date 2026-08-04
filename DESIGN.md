@@ -2957,14 +2957,30 @@ v0 restrictions, all deliberate scope cuts:
   paired with an explicit lower end.** No multi-variable or otherwise
   arbitrary bound expressions on either end. `narrow_for_condition` narrows
   the UPPER end on `if <reg> < <const>` and the LOWER end on `if <reg> >
-  <const>`/`if <reg> >= <const>` (symmetric). A `<>`-shaped guard (the shape
-  `while_countdown.tr`'s own down-counter uses) is deliberately NOT
-  recognized: narrowing on `<>` is only sound when the excluded constant
-  equals the CURRENT frozen bound exactly — otherwise it splits the range
-  into two disjoint pieces this single-interval representation can't
-  express, a genuinely different argument than a plain inequality, and no
-  example needs it (`examples/countdown_bounded.tr` uses `if cnt > 0`
-  instead).
+  <const>`/`if <reg> >= <const>` (symmetric).
+- **`<>` (v9) narrows EITHER end, but only at an exact edge.** `if <reg> <>
+  <const>` narrows the LOWER end up by one when `<const>` equals the
+  CURRENT frozen bound's own floor, and the UPPER end down by one when
+  `<const>` equals the current max (`upper - 1`) — excluding any OTHER
+  value would split the range into two disjoint pieces this single-interval
+  representation can't express, so that case stays a no-op (a real, checked
+  equality test, not a widened `<=`/`>=` comparison, which would be
+  unsound). See `examples/output_bounded_ne.tr` for the upper-edge shape.
+  **`Ne`'s commuted form (`<const> <> <reg>`, v10) IS recognized** — not
+  because `<>` is symmetric as a language construct in general (per
+  "Comparisons: fallible by default" above, a comparison yields its
+  LHS's own type/value on success, so the two orderings genuinely
+  differ wherever that returned value is consumed), but because guard
+  narrowing only ever treats a condition as a pass/fail predicate, never
+  its returned value, and `x != k`/`k != x` are the same fact about the
+  same two values. `Lt`/`Gt`/`Ge` stay single-order — `k < x`/`x < k`
+  are different claims even as bare predicates. The
+  `else` branch of an `if <>` (a provable singleton) is left unnarrowed
+  — conservative, not incorrect. `while_countdown.tr`'s own down-counter
+  (`while cnt <> 0 { cnt := cnt - 1 }`) is the lower-edge shape, but that
+  file specifically stays unprovable regardless of this feature: `cnt := x`
+  reads an unbounded `in` port every cycle, and `cnt` there carries no
+  `where` bound at all.
 - **`Add` and `Sub` are the supported compositions on a write's right-hand
   side; `Mul`/anything else is still "unknown."** `i + 1` composes
   unconditionally; `cnt - 1` composes only when the subtrahend's range

@@ -43,14 +43,33 @@
 //!   combination.
 //! - `narrow_for_condition` narrows the UPPER end on `if <reg> < <const>`
 //!   and the LOWER end on `if <reg> > <const>`/`if <reg> >= <const>`. A
-//!   `<>`-shaped guard (the actual shape `while_countdown.tr` uses for
-//!   its own, unbounded, down-counter) is deliberately NOT recognized:
-//!   narrowing on `<>` is only sound when the excluded constant equals
-//!   the CURRENT frozen bound exactly (otherwise it splits the range
-//!   into two disjoint pieces this single-interval representation can't
-//!   express) — a genuinely different, more special-cased argument than
-//!   a plain inequality, and no example needs it (`examples/
-//!   countdown_bounded.tr` uses `if cnt > 0` instead).
+//!   `<>`-shaped guard narrows EITHER end, but only when the excluded
+//!   constant equals the CURRENT frozen bound's own floor or ceiling
+//!   exactly (`if <reg> <> <lower>` narrows the lower end up by one;
+//!   `if <reg> <> <upper - 1>` narrows the upper end down by one) —
+//!   excluding any OTHER constant would split the range into two
+//!   disjoint pieces this single-interval representation can't express,
+//!   so that case stays a no-op (v9's own driving example, `examples/
+//!   output_bounded_ne.tr`, uses the upper-edge form; `while cnt <> 0 {
+//!   cnt := cnt - 1 }`, the lower-edge form, is likewise provable in
+//!   general — but NOT on the actual `while_countdown.tr` file, since
+//!   `cnt` there carries no `where` bound at all, and adding one
+//!   wouldn't help: its `cnt := x` reads an unbounded `in` port every
+//!   cycle, which stays unprovable regardless of this feature). `Ne`'s
+//!   commuted guard (`<const> <> <reg>`, v10) IS recognized — this
+//!   function only ever treats a guard as a pass/fail predicate
+//!   deciding which branch to check, never consuming a comparison's own
+//!   RETURNED value, so `x != k` and `k != x` (the same fact about the
+//!   same two values) narrow identically; this is narrower than
+//!   claiming `<>` is symmetric as a language construct in general
+//!   (`type_binop`'s own Verse-inspired rule makes a comparison yield
+//!   its LHS's own type/value on success, so the two orderings genuinely
+//!   differ wherever that returned value is consumed). `Lt`/`Gt`/`Ge`
+//!   stay single-order — `k < x`/`x < k` are different claims even as
+//!   bare predicates. The `else` branch of an `if <>` (a provable
+//!   singleton, `<reg> == <const>`) is also left unnarrowed,
+//!   conservative but costless since no example needs the extra
+//!   precision there.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -428,17 +447,41 @@ impl<'a> Checker<'a> {
     /// UPPER end to `min(current, const)`; `> <const>`/`>= <const>`
     /// narrows the LOWER end to `max(current, const+1)`/`max(current,
     /// const)` — for the guarded body ONLY, since the caller clones
-    /// `state` first, so this never mutates the outer map. A `<>`-shaped
-    /// guard (the actual shape `while_countdown.tr` uses) is deliberately
-    /// NOT recognized: narrowing on `<>` is only sound when the excluded
-    /// constant equals the CURRENT frozen bound exactly (otherwise it
-    /// splits the range into two disjoint pieces this single-interval
-    /// representation can't express) — a genuinely different, more
-    /// special-cased argument than a plain inequality, and no example
-    /// needs it (this module's own driving example for `Sub` composition
-    /// uses `if cnt > 0` instead). Any other condition shape (or a reg
-    /// with no PRIOR bound at all) is a no-op: narrowing only tightens an
-    /// already-bounded fact, never invents one.
+    /// `state` first, so this never mutates the outer map.
+    ///
+    /// `<> <const>` narrows EITHER end, but ONLY when `const` is exactly
+    /// the current frozen bound's own floor or ceiling: excluding the
+    /// floor (`const == lo`) narrows the lower end up to `lo + 1`;
+    /// excluding one-past-the-max (`const == hi - 1`) narrows the upper
+    /// end down to `const` itself. Excluding any OTHER value (still
+    /// inside `[lo, hi)` but not touching either edge) would split the
+    /// range into two disjoint pieces a single `(lo, hi)` interval can't
+    /// express, so that case is deliberately left a no-op — a real,
+    /// checked equality test, not a bounds check like `k <= lo` would be
+    /// (that "generalization" is unsound: it could narrow past a `k`
+    /// that isn't actually the current edge). `Ne`'s commuted form
+    /// (`<const> <> <reg>`, constant on the LEFT) IS recognized too —
+    /// NOT because `<>` is symmetric as a language construct in general
+    /// (`type_binop`'s own Verse-inspired rule makes a comparison yield
+    /// its LHS's own type/value on success, so `x <> k` and `k <> x`
+    /// are genuinely different expressions where that returned value is
+    /// consumed), but because this function only ever inspects a guard
+    /// as a pass/fail predicate deciding which branch to check, never
+    /// its returned value — and `x != k` and `k != x` are the same fact
+    /// about the same two values, so no new soundness argument is
+    /// needed here, just trying both operand orders
+    /// (`ident_const_operands`, below). `Lt`/`Gt`/`Ge` stay single-
+    /// order regardless: `k < x` and `x < k` are different claims even
+    /// as bare predicates, so commuting those would mean recognizing a
+    /// different operator in the flipped position, a separate feature.
+    /// The `else` branch of
+    /// an `if <>` (a provable singleton, `<reg> == <const>`) is left
+    /// unnarrowed — conservative, not incorrect, and no example needs
+    /// the extra precision there.
+    ///
+    /// Any other condition shape (or a reg with no PRIOR bound at all) is
+    /// a no-op: narrowing only tightens an already-bounded fact, never
+    /// invents one.
     fn narrow_for_condition(
         &self,
         cond: ExprId,
@@ -446,27 +489,55 @@ impl<'a> Checker<'a> {
     ) -> HashMap<DefId, (u64, u64)> {
         let mut narrowed = state.clone();
         if let Expr::Binary { op, lhs, rhs } = self.ast.expr(cond)
-            && matches!(self.ast.expr(*lhs), Expr::Ident(_))
-            && let Some(def) = self.res.expr_defs.get(lhs)
-            && let Some(k) = const_fold(self.ast, *rhs)
-            && let Some((lo, hi)) = narrowed.get(def)
+            && let Some((def, k)) = self.ident_const_operands(*lhs, *rhs).or_else(|| {
+                matches!(op, BinOp::Ne)
+                    .then(|| self.ident_const_operands(*rhs, *lhs))
+                    .flatten()
+            })
+            && let Some((lo, hi)) = narrowed.get(&def)
         {
             match op {
                 BinOp::Lt => {
-                    narrowed.insert(*def, (*lo, k.min(*hi)));
+                    narrowed.insert(def, (*lo, k.min(*hi)));
                 }
                 BinOp::Gt => {
                     if let Some(floor) = k.checked_add(1) {
-                        narrowed.insert(*def, (floor.max(*lo), *hi));
+                        narrowed.insert(def, (floor.max(*lo), *hi));
                     }
                 }
                 BinOp::Ge => {
-                    narrowed.insert(*def, (k.max(*lo), *hi));
+                    narrowed.insert(def, (k.max(*lo), *hi));
+                }
+                BinOp::Ne => {
+                    if k == *lo {
+                        if let Some(new_lo) = lo.checked_add(1) {
+                            narrowed.insert(def, (new_lo, *hi));
+                        }
+                    } else if let Some(edge) = hi.checked_sub(1)
+                        && k == edge
+                    {
+                        narrowed.insert(def, (*lo, k));
+                    }
                 }
                 _ => {}
             }
         }
         narrowed
+    }
+
+    /// Extracts `(def, k)` from a comparison's two operands in ONE
+    /// specific order: `a` must be a bare Ident resolving to a bounded
+    /// def, `b` must const-fold to a literal. `narrow_for_condition`
+    /// tries this in both operand orders for `Ne` (genuinely symmetric)
+    /// and only the direct order for every other op (not symmetric —
+    /// see that function's own doc comment).
+    fn ident_const_operands(&self, a: ExprId, b: ExprId) -> Option<(DefId, u64)> {
+        if !matches!(self.ast.expr(a), Expr::Ident(_)) {
+            return None;
+        }
+        let def = *self.res.expr_defs.get(&a)?;
+        let k = const_fold(self.ast, b)?;
+        Some((def, k))
     }
 
     /// The value range an expression is provably confined to, as a

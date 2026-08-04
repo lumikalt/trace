@@ -2286,6 +2286,70 @@ manually in the meantime.
   `--explain-schedule` diff across every existing example came back
   byte-identical again — the second RESOLVED entry in this arc (after
   v7) with zero `schedule.rs` involvement.
+- **RESOLVED (v9) — `bounds.rs`'s guard narrowing gained a `Ne` (`<>`)
+  arm, narrowing EITHER end but only at an exact edge** (`examples/
+  output_bounded_ne.tr`). `if <reg> <> <const>` narrows the LOWER end up
+  by one when `<const>` equals the current frozen floor, and the UPPER
+  end down by one when `<const>` equals the current max — excluding any
+  OTHER value would split the range into two disjoint pieces a single
+  `(lo, hi)` interval can't express, so that case stays a no-op exactly
+  as v7's own doc comment predicted. Exact equality only (`k == lo` /
+  `k + 1 == hi`), not a widened `<=`/`>=` comparison — the latter would
+  be unsound, narrowing past a `k` that isn't actually the current edge.
+  Same "new capability, not a gap an existing design is blocked on"
+  situation as v3/v6/v8: `while_countdown.tr` is the one file in the
+  repo using `<>` (`while cnt <> 0 { cnt := cnt - 1 }`), but it stays
+  unprovable regardless of this feature — `cnt := x` reads an unbounded
+  `in` port every cycle and carries no `where` bound at all, so the
+  driving example (`output_bounded_ne.tr`) had to be invented, disclosed
+  up front rather than built around silently. Advisor flagged the one
+  real test-design risk before implementing: the obvious mid-range
+  negative test (`if cnt <> 50 { cnt := cnt + 1 }`) doesn't discriminate
+  a buggy generalized narrow from a correct no-op, since both accept the
+  write — needed two narrower tests instead, picked so an unsound
+  generalization (`k >= lo` / `k < hi` instead of exact equality) flips
+  each to a false accept; both verified to actually catch that exact bug
+  by temporarily reintroducing it. Two more non-goals stated explicitly
+  at the time (the commuted form was left unrecognized, closed by v10
+  below): the `else` branch of an `if <>` (a provable singleton) is
+  left unnarrowed — conservative, blocks nothing a real example needs. A
+  normalized `--explain-schedule` diff across every existing example
+  came back byte-identical — the third RESOLVED entry in this arc (after
+  v7, v8) with zero `schedule.rs` involvement.
+- **RESOLVED (v10) — `Ne`'s commuted guard form (`<const> <> <reg>`,
+  constant on the LEFT) is now recognized too** (`ne_commuted_lower_
+  edge_subtraction_is_proven`, `tests/bounds.rs`). A ten-line operand-
+  order extraction, not a new soundness argument: `narrow_for_condition`
+  only ever treats a guard as a pass/fail predicate deciding which
+  branch to check, never a comparison's own RETURNED value (which IS
+  order-sensitive in this language — `type_binop`'s "comparisons return
+  their left operand" rule means `x <> k` and `k <> x` are genuinely
+  different expressions wherever that value is consumed) — so `x != k`
+  and `k != x`, the same fact about the same two values, narrow
+  identically. Extracted the shared `(def, k)` lookup into
+  `ident_const_operands`, tried in both operand orders but ONLY when
+  `op == Ne`; `Lt`/`Gt`/`Ge` stay single-order since `k < x`/`x < k` are
+  different claims even as bare predicates — commuting those would mean
+  recognizing a different operator in the flipped position, a separate
+  feature nobody asked for. Advisor's explicit guidance going in: treat
+  this as its own small commit, NOT the same increment as mid-range `<>`
+  exclusion (a materially bigger change — see below) — the two were
+  raised together but are a different complexity class. Two tests
+  verified by bug-reintroduction: the flipped `ne_commuted_..._is_
+  proven` test (was `ne_commuted_form_is_not_recognized`, pinning the
+  old behavior) and a new `commuted_lt_is_not_recognized`, confirming
+  the `Ne`-only gate doesn't leak into `Lt` — verified by temporarily
+  hoisting the commuted fallback out of its `Ne`-only guard and
+  observing `commuted_lt_is_not_recognized` fail exactly as predicted.
+  Mid-conversation, Lumi caught an overclaim in the doc-comment wording
+  ("`<>` is genuinely symmetric") — correct only for the narrow pass/
+  fail-predicate purpose this function uses it for, NOT as a claim about
+  `<>` in general in this Verse-inspired language, where a comparison's
+  own returned value is asymmetric by design; reworded across both
+  `bounds.rs` doc sites and DESIGN.md to state the narrower claim
+  explicitly rather than the misleading broad one. A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

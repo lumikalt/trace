@@ -180,13 +180,18 @@ module M {
 }
 
 #[test]
-fn ne_guarded_subtraction_stays_unprovable() {
-    // `<>` guard narrowing is deliberately NOT recognized (this module's
-    // own doc comment): sound only when the excluded constant equals
-    // the CURRENT frozen bound exactly, a genuinely different argument
-    // than a plain inequality. Confirms it doesn't work "by accident"
-    // now that `Sub` composes -- the actual `while_countdown.tr` shape
-    // stays rejected under a `where` bound.
+fn ne_guarded_lower_edge_subtraction_is_proven() {
+    // `<> 0` excludes the CURRENT lower bound (0) exactly, narrowing
+    // `cnt`'s lower end up to 1 -- sound, since a `where cnt < 100`
+    // reg's real floor is 0. This is the `while_countdown.tr` shape
+    // (`while cnt <> 0 { cnt := cnt - 1 }`), now provable when `cnt`
+    // carries a `where` bound (the real `while_countdown.tr` file still
+    // doesn't -- and couldn't usefully gain one, since its `cnt := x`
+    // reads an unbounded `in` port every cycle, which stays unprovable
+    // regardless of this feature).
+    // Discriminates the lower-narrow formula: a buggy `k` instead of
+    // `k + 1` would leave the lower end at 0, and `0 - 1` would still
+    // fail.
     let src = "\
 module M {
     reg cnt : [8] where cnt < 100 = 0
@@ -194,6 +199,171 @@ module M {
         while cnt <> 0 {
             cnt := cnt - 1
             tick
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn ne_guarded_upper_edge_increment_is_proven() {
+    // `<> 99` excludes the CURRENT max (`hi - 1 = 99`) exactly,
+    // narrowing `cnt`'s upper end down to 99 -- sound, since `cnt`'s
+    // declared range is `[0, 100)`. Mirrors `output_bounded_ne.tr`'s own
+    // driving example. Discriminates both the upper-narrow formula (a
+    // buggy `k + 1` or `k - 1` instead of `k` would compute the wrong
+    // new ceiling) and the edge condition itself (`k + 1 == hi`, not
+    // `k == hi`).
+    let src = "\
+module M {
+    out cnt : [8] where cnt < 100 = 0
+    rule count {
+        if cnt <> 99 {
+            cnt := cnt + 1
+        } else {
+            cnt := 0
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn ne_guarded_mid_range_lower_subtraction_stays_unprovable() {
+    // `<> 50` excludes neither edge of `cnt`'s declared `[0, 100)` range
+    // -- narrowing here would split the range into two disjoint pieces
+    // a single interval can't express, so this must stay a no-op.
+    // Discriminates an UNSOUND generalization of the lower-narrow rule
+    // (e.g. `k >= lo` instead of exact equality `k == lo`): such a bug
+    // would wrongly narrow the lower end to 51, and `51 - 50 = 1` would
+    // wrongly be accepted. Correctly: no narrow, `0 - 50` underflows,
+    // unprovable.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 100 = 0
+    rule count {
+        if cnt <> 50 {
+            cnt := cnt - 50
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify"));
+}
+
+#[test]
+fn ne_guarded_mid_range_upper_addition_stays_unprovable() {
+    // Same non-edge exclusion as above, the other direction.
+    // Discriminates an UNSOUND generalization of the upper-narrow rule
+    // (e.g. any `k < hi` instead of exact equality `k + 1 == hi`): such
+    // a bug would wrongly narrow the upper end to 50, and `50 + 50 =
+    // 100` would wrongly be accepted (`hi` would land exactly at 100,
+    // not exceeding it). Correctly: no narrow, `100 + 50 - 1 = 149`
+    // exceeds the declared bound, rejected.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 100 = 0
+    rule count {
+        if cnt <> 50 {
+            cnt := cnt + 50
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify"));
+}
+
+#[test]
+fn ne_guarded_lower_edge_subtraction_with_nonzero_floor_is_proven() {
+    // Same lower-edge narrowing as the `while_countdown.tr`-shaped test
+    // above, but with a v6 two-sided bound (`5 <= j < 10`) whose floor
+    // is NOT the implicit 0 -- discriminates a bug that reads `k == 0`
+    // (a plausible mistake if the implicit-floor case were special-cased
+    // instead of comparing against the ACTUAL current `lo`) instead of
+    // `k == *lo`, which would fail to narrow here and leave `j - 1`
+    // unprovable (`5 - 1` underflows).
+    let src = "\
+module M {
+    reg j : [4] where 5 <= j < 10 = 5
+    rule count {
+        if j <> 5 {
+            j := j - 1
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn ne_commuted_lower_edge_subtraction_is_proven() {
+    // `<const> <> <reg>` (the constant on the LEFT) IS recognized for
+    // `Ne` (v10) -- narrowing only ever treats a guard as a pass/fail
+    // predicate, never a comparison's own returned value (which IS
+    // order-sensitive in this language -- see `type_binop`'s "yields
+    // the LHS's type/value" rule), and `0 <> cnt` is the same fact as
+    // `cnt <> 0` for that purpose. Exact mirror of
+    // `ne_guarded_lower_edge_subtraction_is_proven` with the operands
+    // swapped.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 100 = 0
+    rule count {
+        if 0 <> cnt {
+            cnt := cnt - 1
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn ne_commuted_lower_edge_subtraction_in_while_is_proven() {
+    // Same commuted-form narrowing, but reached through `while`'s own
+    // condition rather than `if`'s -- confirms the commuted fallback
+    // isn't accidentally `if`-only. `Stmt::While` renders through the
+    // identical `if`-shaped path `check_cond` uses (see `types/stmt.rs`'s
+    // own `Stmt::While` arm, `allow_bare_comparison: true`), so this is
+    // expected to work uniformly, and does: exact mirror of
+    // `ne_guarded_lower_edge_subtraction_is_proven` (the `while cnt <>
+    // 0` shape) with the operands swapped.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 100 = 0
+    rule count <sequences> {
+        while 0 <> cnt {
+            cnt := cnt - 1
+            tick
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn commuted_lt_is_not_recognized() {
+    // Unlike `Ne`, `Lt`'s commuted fallback is NOT added -- `k < x` and
+    // `x < k` are different claims even as bare predicates (`8 < i`
+    // means `i > 8`, not `i < 8`), so recognizing a constant on the
+    // LEFT here would mean recognizing a different operator in the
+    // flipped position, a separate feature nobody asked for. Pins that
+    // the `Ne`-only commuted fallback in `narrow_for_condition` doesn't
+    // leak into the other arms: if it were hoisted out of its `Ne`-only
+    // gate, this would wrongly start narrowing `i`'s upper end here.
+    let src = "\
+module M {
+    reg i : [4] where i < 9 = 0
+    rule bump {
+        if 8 < i {
+            i := i + 1
         }
     }
 }
