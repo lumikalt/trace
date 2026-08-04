@@ -495,6 +495,13 @@ pub struct Ast {
     /// firrtl, which all only ever look at `op`/`lhs`/`rhs` regardless of
     /// whether this set contains a given id.
     pub lossy: std::collections::HashSet<ExprId>,
+    /// Operand `ExprId`s of an `Expr::Logic` node synthesized by `A and
+    /// B`'s parse-time desugar into `(logic A) & (logic B)` (see
+    /// `TokenKind::And`'s doc comment, lexer.rs) — never a `Logic` the
+    /// user wrote by hand. Consulted only by `check_logic_args_in`
+    /// (firrtl/checks.rs) to phrase its "not a legal operand" error in
+    /// terms of `and`, not a `logic` keyword the user never typed.
+    pub and_sugar: std::collections::HashSet<ExprId>,
 }
 
 /// Metadata for one `let {...} = source` destructuring pattern, consumed

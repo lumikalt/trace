@@ -189,6 +189,24 @@ Wrap(x : [8]) : [8] <combines, fails> {
 }
 
 #[test]
+fn and_as_an_if_conditions_own_operand_does_not_force_fails_on_the_callee() {
+    // `A and B` desugars to `(logic A) & (logic B)` (see `TokenKind::
+    // And`, lexer.rs) -- as a whole `if` condition this must route
+    // through `infer_branch_scoped_cond`'s ordinary `Logic`-discharging
+    // path, same as writing it out by hand, and NOT force `<fails>` onto
+    // the callee the way an undischarged bare comparison would.
+    let src = "\
+Bump(a : [8], b : [8], c : [8], d : [8]) <combines> {
+    if a > b and c > d {
+        return
+    }
+}
+";
+    let (ast, fx) = run_ok(src);
+    assert!(!fx.sigs[&item_named(&ast, "Bump")].fails);
+}
+
+#[test]
 fn fails_must_be_declared_wherever_it_ends_up_true() {
     // Explicit `?`, undeclared `<fails>`: an error, matching Verse's
     // own "unhandled failure" (a bare failing expression outside a

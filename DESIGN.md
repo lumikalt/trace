@@ -223,7 +223,8 @@ condition: a BARE comparison there is a type error (its type is no longer
 parses looser than any binary operator specifically so this reads cleanly —
 `logic a > b`, no parens — at the cost of the `logic A & logic B`
 `and`-combination idiom needing explicit parens on each side now
-(`(logic A) & (logic B)`); see `logic`'s own entry in TODO.md for the full
+(`(logic A) & (logic B)`, or just `A and B` — see "`and`: boolean
+combination sugar" below); see `logic`'s own entry in TODO.md for the full
 precedence tradeoff.
 
 Unlike a fifo op or failing call, a comparison has no dedicated "whole
@@ -297,7 +298,8 @@ exemption for either); and only when the comparison is the WHOLE condition,
 not nested inside a larger expression (`if (a > b) & c` is rejected, not
 silently folded) — combine with `logic` first instead, the same
 `(logic A) & (logic B)` idiom `logic`'s own entry above already documents
-(`(logic a > b) & c`).
+(`(logic a > b) & c`; `and` doesn't help here specifically since `c` is
+already a plain `[1]`, not itself a fallible shape for `and` to wrap).
 
 That last restriction closes a real, pre-existing silent-miscompile gap,
 not a hypothetical one: a comparison's own TYPE is its left operand's type
@@ -333,10 +335,11 @@ condition (Lumi's call) — in a rule body OR a callee (`fn`/`impl`)
 body alike. The condition must be one of: a bare comparison/fifo
 op/failing call as the WHOLE condition (the exemptions above), an
 explicit `<expr>?`, or a boolean combination of already-`logic`-
-discharged fallibles (`(logic A) & (logic B)`, the very next section's
-`and` idiom). Anything else — an ordinary state read (`opt.valid`, a
-`[1]` port used bare) or a bare `logic <expr>` with nothing else
-combining it — is a type error with a hint.
+discharged fallibles (`(logic A) & (logic B)`, or its sugar `A and B` —
+see "`and`: boolean combination sugar" below). Anything else — an
+ordinary state read (`opt.valid`, a `[1]` port used bare) or a bare
+`logic <expr>` with nothing else combining it — is a type error with a
+hint.
 
 ```trace
 rule r {
@@ -346,6 +349,7 @@ rule r {
                                  --   left to test; drop it or wrap: (logic a > b)?
     if a > b { ... }            -- fine (the bare-comparison exemption above)
     if (logic a > b)? { ... }   -- fine (explicit round trip)
+    if a > b and c > d { ... }  -- fine (sugar for (logic a>b) & (logic c>d))
 }
 ```
 
@@ -433,15 +437,62 @@ compiled a defaulted chain cleanly with the fifo's own dequeue silently
 missing (found by hand-testing, not by construction), which is what that
 check exists to close off.
 
-Verse's `and` needs no dedicated syntax of its own: sequential bare guards
-already conjoin into one rule's readiness for free, and `logic` (see
-"Calling a function from a rule" below) combined with bitwise `&` already
-covers `and` in expression position (`(logic A) & (logic B)` inside an `if`
-condition, for example — parens on each side needed, see `logic`'s own
-precedence note below) — there is no missing capability to port, only `or`'s
-discharge behavior, which is what this section covers.
+Sequential bare guards already conjoin into one rule's readiness for free
+(Verse's `and` needs no dedicated syntax for THAT), but combining two
+fallible expressions inside a single larger expression — an `if` condition,
+in particular — did need one: see "`and`: boolean combination sugar",
+next, for the operator this section's own `logic A & logic B` idiom used to
+stand in for by hand.
 
 See `examples/or_fifos.tr` + `sim/or_fifos_tb.v`.
+
+### `and`: boolean combination sugar
+
+`A and B` is pure parse-time sugar for `(logic A) & (logic B)` — the
+parenthesized idiom the previous section used to be the only way to spell
+(`logic`'s own precedence note above explains why the parens are needed by
+hand). `A and B and C` folds left-to-right, wrapping each of the three
+operands in its own `Logic` exactly once: `((logic A) & (logic B)) &
+(logic C)`, never re-wrapping the growing `&` accumulator (which would
+trip `check_logic_args` — a plain `&` expression isn't a legal `logic`
+operand). No new AST shape, no new type/effects/emission rule: every
+downstream pass sees the identical `Binary(BitAnd, Logic, Logic)` tree
+the hand-written idiom already produced and was already tested against —
+`and` only teaches the PARSER a new spelling for it (same "sugar with no
+AST trace" precedent as `tick sync[...]`'s own desugar).
+
+```trace
+if a > b and c > d { ... }        -- sugar for (logic a > b) & (logic c > d)
+if f.Deq[] and g.Deq[] { ... }    -- sugar for (logic f.Deq[]) & (logic g.Deq[])
+```
+
+Precedence: `and` binds at `(2, 3)` — looser than every real binary
+operator (comparisons are the loosest of those, `(3, 4)`, so a whole
+comparison forms before `and` ever sees it as an operand) but tighter than
+`or`'s `(0, 1)`, so mixing them unparenthesized reads the way every other
+language spells it: `A or B and C` groups as `A or (B and C)`, and `A and
+B or C` groups as `(A and B) or C`. Confirmed against the actual Pratt
+loop, not just intended: `and`'s own arm checks `if 2 < min_bp { break }`
+(so it stops at any tighter-binding recursive parse, e.g. as `or`'s own
+rhs) and consumes its whole chain with an inner `while` loop rather than
+`or`'s across-iterations flattening trick — `lhs` becomes an ordinary
+`Binary(BitAnd, ..)` after the first fold, indistinguishable by shape from
+a user's own literal `&`, so re-entering the outer arm and shape-sniffing
+`lhs` on a later `and` isn't safe the way it is for `Or`'s dedicated AST
+variant.
+
+Each operand still needs one of `logic`'s three legal shapes (a fifo op, a
+comparison, or a call to a function that can fail and doesn't also write
+state) — `check_logic_args_in` rejects anything else, phrased in terms of
+`and` rather than `logic` when the operand came from this desugar
+(`ast.and_sugar` tracks which `Logic` nodes are synthetic, purely so the
+error names the keyword the user actually typed).
+
+**`and` does not mutate, unlike `or`.** `A or B` genuinely dequeues the
+winning fifo; `and` inherits `logic`'s pure occupancy/space TEST with no
+`Enq`/`Deq` performed — `f.Deq[] and g.Deq[]` reads both fifos' readiness
+and dequeues neither. The two sibling-looking operators are NOT
+symmetric in this one respect.
 
 ### `sequences`: multi-cycle code
 

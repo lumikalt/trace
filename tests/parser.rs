@@ -1103,3 +1103,45 @@ fn lossy_operator_suffix_works_on_every_binary_operator_not_just_shifts() {
     assert_eq!(ast.expr_sexpr(*rhs), "(+ a b)");
     assert!(ast.lossy.contains(rhs));
 }
+
+#[test]
+fn and_desugars_to_logic_wrapped_operands_folded_with_amp() {
+    // `A and B` is pure sugar for `(logic A) & (logic B)` (see
+    // `TokenKind::And`'s doc comment, lexer.rs) -- no new AST shape, just
+    // the existing manual idiom built automatically.
+    assert_eq!(stmt_sexpr("x := a and b"), "(:= x (& (logic a) (logic b)))");
+}
+
+#[test]
+fn and_chains_fold_left_to_right_without_a_re_wrapped_accumulator() {
+    // `A and B and C` wraps each of the three operands in exactly one
+    // `Logic`, never re-wrapping the growing `&` accumulator (which
+    // would trip `check_logic_args`: a plain `&` expression isn't a
+    // legal `logic` operand).
+    assert_eq!(
+        stmt_sexpr("x := a and b and c"),
+        "(:= x (& (& (logic a) (logic b)) (logic c)))"
+    );
+}
+
+#[test]
+fn and_binds_tighter_than_or_but_looser_than_comparisons() {
+    // A whole comparison forms before `and` ever sees it as an operand
+    // (comparisons are `infix_bp`'s loosest REAL entry, `(3, 4)`; `and`
+    // sits looser than that at `(2, 3)`) --
+    assert_eq!(
+        stmt_sexpr("x := a > b and c > d"),
+        "(:= x (& (logic (> a b)) (logic (> c d))))"
+    );
+    // -- but `and` binds tighter than `or` (`(0, 1)`), so mixing them
+    // unparenthesized reads the way every other language spells it:
+    // `and` groups first on both sides.
+    assert_eq!(
+        stmt_sexpr("x := a or b and c"),
+        "(:= x (or a (& (logic b) (logic c))))"
+    );
+    assert_eq!(
+        stmt_sexpr("x := a and b or c"),
+        "(:= x (or (& (logic a) (logic b)) c))"
+    );
+}

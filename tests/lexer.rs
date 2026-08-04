@@ -146,6 +146,15 @@ fn lossy_suffix_beats_a_bare_dot_or_range() {
 }
 
 #[test]
+fn or_and_and_are_reserved_not_idents() {
+    // Both are dedicated tokens, no ident-fallback (matching `tick`, not
+    // `sync`/`race`), so a variable named `or`/`and` is unavailable —
+    // `a or b`/`a and b` never lex as three idents.
+    assert_eq!(kinds("a or b"), vec![Ident, Or, Ident]);
+    assert_eq!(kinds("a and b"), vec![Ident, And, Ident]);
+}
+
+#[test]
 fn bad_bytes_merge_into_one_error() {
     let (tokens, errors) = lex("a @@ b");
     assert_eq!(

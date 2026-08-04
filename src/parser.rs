@@ -1680,6 +1680,48 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // `A and B and C` — pure sugar for `(logic A) & (logic B) &
+            // (logic C)` (see `Expr::Logic`'s doc comment for why that
+            // needs explicit parens spelled out by hand): each operand
+            // gets its own `Logic` wrap, folded left-to-right with
+            // ordinary `&`. Binds at `(2, 3)` — looser than every real
+            // operator (comparisons are the loosest at `(3, 4)`, see
+            // `infix_bp`) so a whole comparison forms before `and` sees
+            // it, but tighter than `or`'s `(0, 1)` so `A or B and C`
+            // reads as `A or (B and C)`, matching every real language.
+            // The whole chain is consumed in one pass (not flattened
+            // across loop iterations like `Or`): `lhs` becomes an
+            // ordinary `Binary(BitAnd, ..)` after the first fold, which
+            // would be indistinguishable from a user's own literal `&`
+            // by shape alone, so re-entering this arm on a later `and`
+            // and shape-sniffing `lhs` isn't safe — looping here instead
+            // guarantees each operand is wrapped in `Logic` exactly once.
+            if kind == And {
+                if 2 < min_bp {
+                    break;
+                }
+                let lhs_span = self.ast.expr_spans[lhs.0 as usize].clone();
+                self.ast.and_sugar.insert(lhs);
+                let mut acc = self.ast.push_expr(Expr::Logic(lhs), lhs_span);
+                while self.peek() == Some(And) {
+                    self.bump();
+                    let rhs = self.parse_expr(3)?;
+                    let rhs_span = self.ast.expr_spans[rhs.0 as usize].clone();
+                    self.ast.and_sugar.insert(rhs);
+                    let rhs_logic = self.ast.push_expr(Expr::Logic(rhs), rhs_span);
+                    acc = self.ast.push_expr(
+                        Expr::Binary {
+                            op: BinOp::BitAnd,
+                            lhs: acc,
+                            rhs: rhs_logic,
+                        },
+                        lo..self.prev_end,
+                    );
+                }
+                lhs = acc;
+                continue;
+            }
+
             let Some((l_bp, r_bp)) = infix_bp(kind) else {
                 break;
             };

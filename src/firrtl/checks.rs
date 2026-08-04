@@ -874,44 +874,62 @@ impl<'a> Emitter<'a> {
             if matches!(self.ast.expr(arg), Expr::Binary { op, .. } if op.is_comparison()) {
                 continue;
             }
+            // `and`'s desugar (`ast.and_sugar`) wraps each operand in its
+            // own synthetic `Logic` the user never wrote — name `and`,
+            // not `logic`, in its errors, or this reads as a compiler
+            // bug ("I didn't write `logic`").
+            let not_legal_operand = if self.ast.and_sugar.contains(&arg) {
+                "`and`'s operands must each be a fifo op, a comparison, or a \
+                 call to a function that can fail"
+            } else {
+                "`logic` needs a fifo op, a comparison, or a call to a \
+                 function that can fail as its operand"
+            };
             let Expr::Call { .. } = self.ast.expr(arg).clone() else {
-                self.error(
-                    span,
-                    "`logic` needs a fifo op, a comparison, or a call to a \
-                     function that can fail as its operand"
-                        .to_string(),
-                );
+                self.error(span, not_legal_operand.to_string());
                 continue;
             };
             let Some(fn_item) = self.call_target_fn(arg) else {
-                self.error(
-                    span,
-                    "`logic` needs a fifo op, a comparison, or a call to a \
-                     function that can fail as its operand"
-                        .to_string(),
-                );
+                self.error(span, not_legal_operand.to_string());
                 continue;
             };
             let Some(callee_sig) = self.fx.sigs.get(&fn_item) else {
                 continue;
             };
+            let is_and = self.ast.and_sugar.contains(&arg);
             if !callee_sig.fails {
                 self.error(
                     span,
-                    "`logic`'s call operand must be able to fail (declare \
-                     `<fails>`, or a bare condition/fifo op inside it) — a call \
-                     that always succeeds has nothing for `logic` to test"
-                        .to_string(),
+                    if is_and {
+                        "`and`'s call operand must be able to fail (declare \
+                         `<fails>`, or a bare condition/fifo op inside it) — a call \
+                         that always succeeds has nothing for `and` to test"
+                            .to_string()
+                    } else {
+                        "`logic`'s call operand must be able to fail (declare \
+                         `<fails>`, or a bare condition/fifo op inside it) — a call \
+                         that always succeeds has nothing for `logic` to test"
+                            .to_string()
+                    },
                 );
             } else if !callee_sig.writes.is_empty() {
                 self.error(
                     span,
-                    "`logic` cannot test a function that also writes state \
-                     (v0 restriction): testing success here would either silently \
-                     discard the write or require it to happen regardless of \
-                     whether the result is used — write the call directly instead \
-                     if you need its effect"
-                        .to_string(),
+                    if is_and {
+                        "`and` cannot test a function that also writes state \
+                         (v0 restriction): testing success here would either silently \
+                         discard the write or require it to happen regardless of \
+                         whether the result is used — write the call directly instead \
+                         if you need its effect"
+                            .to_string()
+                    } else {
+                        "`logic` cannot test a function that also writes state \
+                         (v0 restriction): testing success here would either silently \
+                         discard the write or require it to happen regardless of \
+                         whether the result is used — write the call directly instead \
+                         if you need its effect"
+                            .to_string()
+                    },
                 );
             }
         }

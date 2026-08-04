@@ -3930,10 +3930,10 @@ module M {
 
 #[test]
 fn two_logic_wrapped_comparisons_combine_with_amp() {
-    // DESIGN.md documents `(logic a > b) & (logic c < d)` as the
-    // parenthesized idiom that replaces a Verse-style `and` operator now
-    // that `logic`'s operand parses loosely — pin it directly rather
-    // than relying on the fifo-op/call variant above to stand in for it.
+    // `(logic a > b) & (logic c < d)` -- the manual idiom `A and B`
+    // (below) now desugars to at parse time. Both spellings compile
+    // identically; this pins the hand-written form directly rather than
+    // relying on the fifo-op/call variant above to stand in for it.
     let src = "\
 module M {
     in a : [8]
@@ -3949,6 +3949,191 @@ module M {
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("connect __out_ok, and(gt(a, b), lt(c, d))"));
     assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn and_desugars_to_the_same_amp_combined_logic_pair() {
+    // `A and B` -- sugar for `(logic A) & (logic B)`, see `TokenKind::
+    // And`'s doc comment (lexer.rs) -- emits identically to the manual
+    // idiom above, no parens needed.
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    in d : [8]
+    out ok : [1] = 0
+    rule r {
+        ok := a > b and c < d
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ok, and(gt(a, b), lt(c, d))"));
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn and_chains_three_operands_into_nested_amp() {
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    out ok : [1] = 0
+    rule r {
+        ok := a > 0 and b > 0 and c > 0
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_ok, and(and(gt(a, UInt<8>(0)), gt(b, UInt<8>(0))), gt(c, UInt<8>(0)))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn and_of_two_fifo_deqs_tests_occupancy_without_dequeuing_either() {
+    // Unlike `A or B`, which genuinely dequeues the winning fifo, `and`
+    // inherits `logic`'s pure occupancy/space TEST -- `f.Deq[] and
+    // g.Deq[]` reads both fifos' state and dequeues neither. Pin this
+    // asymmetry directly: it's easy to assume the two read/write the
+    // same way since they look like siblings.
+    let src = "\
+module M {
+    fifo f : [8]
+    fifo g : [8]
+    out ready : [1] = 0
+    rule r {
+        ready := f.Deq[] and g.Deq[]
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_ready, and(__fifo_f_valid, __fifo_g_valid)"));
+    assert!(!fir.contains("connect __fifo_f_valid, UInt<1>(0)"));
+    assert!(!fir.contains("connect __fifo_g_valid, UInt<1>(0)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn and_rejects_a_non_fallible_operand_with_an_and_specific_hint() {
+    // `and`'s desugar wraps each operand in a synthetic `Logic` the user
+    // never wrote -- `check_logic_args_in` must name `and`, not `logic`,
+    // here (`ast.and_sugar` is what tells the two apart).
+    let src = "\
+module M {
+    in x : [1]
+    in y : [1]
+    out o : [1] = 0
+    rule r {
+        if x and y {
+            o := 1
+        }
+    }
+}
+";
+    let err = emit_from_source(src).unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.message.contains("`and`'s operands must each be")),
+        "expected an `and`-specific hint, got {err:?}"
+    );
+    assert!(!err.iter().any(|e| e.message.contains("`logic` needs")));
+}
+
+#[test]
+fn bare_and_statement_in_a_callee_body_needs_fails_declared_then_folds_into_the_callers_guard() {
+    // Same "does it silently drop the guard, or does it fold" question
+    // as the rule-body test below, but one level deeper: a bare `and`
+    // statement inside a `fn`/`impl` body behaves exactly like a bare
+    // comparison statement there already does -- undeclared `<fails>`
+    // is a clean error (not a silent no-op), and once declared, both
+    // operands correctly fold into the CALLER's own `fires_r`.
+    let without_fails = "\
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    Chk(a : [8], b : [8]) <combines> {
+        a > b and a <> 0
+        v := 1
+    }
+    rule r { Chk(a, b) }
+}
+";
+    let messages = pipeline_error_messages(without_fails);
+    assert!(messages.iter().any(|m| m.contains("does not declare")));
+
+    let with_fails = "\
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    Chk(a : [8], b : [8]) <combines, fails> {
+        a > b and a <> 0
+        v := 1
+    }
+    rule r { Chk(a, b) }
+}
+";
+    let fir = emit_from_source(with_fails).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = and(gt(a, b), neq(a, UInt<8>(0)))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn and_nested_inside_an_if_bodys_own_statement_is_allowed_and_discharged() {
+    // Mirrors `logic_wrapped_comparison_inside_an_if_body_is_allowed_
+    // and_discharged` for the `and` spelling: `contains_comparison`'s
+    // walk has to stop at EACH of the two synthetic `Logic` nodes `and`
+    // produces, or a fully discharged `a > b and c > d` sitting inside a
+    // branch would be wrongly rejected (or, worse, silently fold into
+    // `fires_r` instead of staying branch-local).
+    let src = "\
+module M {
+    reg v : [1] = 0
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    in d : [8]
+    in cc : [1]
+    rule r {
+        if cc = 1 {
+            v := a > b and c > d
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = UInt<1>(1)"));
+    assert!(fir.contains("mux(eq(cc, UInt<1>(1)), and(gt(a, b), gt(c, d)), v)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn bare_and_statement_folds_into_the_rules_own_guard() {
+    // `a > b and c > d` used as a whole statement (no `if`) stays
+    // fallible the same way a bare comparison already does -- it folds
+    // into `fires_r` rather than silently compiling to a no-op mux.
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    in d : [8]
+    out o : [1] = 0
+    rule r {
+        a > b and c > d
+        o := 1
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("node fires_r = and(gt(a, b), gt(c, d))"));
     run_firtool(&fir, &[]);
 }
 
@@ -6078,6 +6263,33 @@ module M {
             .any(|m| m.contains("already discharges its operand"))
     );
     assert!(messages.iter().any(|m| m.contains("(logic <expr>)?")));
+}
+
+#[test]
+fn a_bare_and_expression_is_accepted_directly_as_an_if_condition() {
+    // `A and B` desugars to `(logic A) & (logic B)`, which `check_cond`'s
+    // `contains_logic` exemption already treats as self-sufficiently
+    // fallible (same as the hand-written idiom) -- no wrapping `?`
+    // needed, unlike a bare `[1]` value.
+    let src = "\
+module M {
+    reg v : [8] = 0
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    in d : [8]
+    rule r {
+        if a > b and c > d {
+            v := 1
+        } else {
+            v := 2
+        }
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("mux(and(gt(a, b), gt(c, d))"));
+    run_firtool(&fir, &[]);
 }
 
 /// `if f.Deq[] { ... } [else { ... }]` -- a fifo op used directly as a

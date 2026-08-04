@@ -80,6 +80,15 @@ pub enum TokenKind {
     /// reserved, no ident-fallback (matching `tick`, not `sync`/`race`).
     #[token("or")]
     Or,
+    /// Sugar for `(logic A) & (logic B) & ...` (see `logic`): `A and B`
+    /// desugars at parse time into exactly that shape, one `Logic` wrap
+    /// per operand folded with ordinary `&`. Binds tighter than `or` but
+    /// looser than every real infix operator (see `infix_bp`'s doc
+    /// comment) so `a > b and c > d` groups each comparison whole and
+    /// `A or B and C` reads as `A or (B and C)`. Reserved like `or`, no
+    /// ident-fallback.
+    #[token("and")]
+    And,
     #[token("spawn")]
     Spawn,
     #[token("return")]

@@ -774,9 +774,39 @@ Worth building:
   (`08_failure`), not a paraphrase. Call alternatives, `Enq`
   alternatives, depth>1 fifos, and `or` nested in `if`/`while` or a
   callee's own body are all separate, larger gaps, not silently
-  accepted. `and` needed no dedicated syntax: sequential bare guards
-  already conjoin for free, and `logic` combined with bitwise `&`
-  already covers it in expression position.
+  accepted. Sequential bare guards already conjoin for free, needing no
+  dedicated `and` syntax for THAT — but combining two fallibles inside a
+  single larger expression (an `if` condition, especially) did want one;
+  see the next bullet.
+  **Follow-up: `A and B` ACHIEVED (Lumi's call, "bring `and` instead of
+  relying on that" — replacing the `(logic A) & (logic B)` idiom's
+  required-by-hand parens).** Pure parse-time sugar, not a new AST node:
+  the parser desugars `A and B [and C ...]` directly into that same
+  `Binary(BitAnd, Logic, Logic)` shape, one `Logic` wrap per operand
+  folded left-to-right (`parser.rs`'s new `TokenKind::And` arm, right
+  after `or`'s). Every downstream pass (types/effects/firrtl checks and
+  emission) needed zero changes — they already handle the hand-written
+  idiom, and sugar with no AST trace of its own already has precedent
+  here (`tick sync[...]`'s desugar). The one real design question was
+  precedence, since copying `or`'s own mechanism (looser than every
+  real operator, checked outside `infix_bp`'s table entirely) verbatim
+  would have made `A or B and C` parse as one flat, ambiguous chain with
+  no `and`/`or` distinction — resolved by giving `and` its own threshold
+  (`2`, rhs at `3`): looser than every real operator (comparisons are
+  the loosest at `(3, 4)`) but tighter than `or`'s `(0, 1)`, so `A or B
+  and C` reads as `A or (B and C)` like every real language, confirmed
+  by tracing the actual Pratt loop rather than assumed. Advisor-flagged
+  before shipping and fixed rather than left as a footgun: (1) the
+  synthesized `Logic` nodes made `check_logic_args_in`'s rejection
+  message say `` `logic` needs... `` for an operand the user wrote via
+  `and`, naming a keyword never typed — fixed with a new `ast.and_sugar`
+  side set (mirroring `ast.lossy`) marking which `Logic` operands came
+  from the desugar, so the error names `and` instead; (2) `and` does
+  NOT mutate the way `or` does — `f.Deq[] and g.Deq[]` reads both fifos'
+  occupancy and dequeues neither (`logic`'s existing pure-test emission,
+  inherited as-is) — documented directly in DESIGN.md's `and` section
+  rather than left as a silent asymmetry between two sibling-looking
+  operators. See DESIGN.md's "`and`: boolean combination sugar".
 - **Comparisons returning their left operand in a failure context ACHIEVED**
   (Verse: `X > 0` yields `X` on success, fails otherwise, `04_operators`)
   — see DESIGN.md's "Comparisons: fallible by default" for the full
