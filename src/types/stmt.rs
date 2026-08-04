@@ -655,6 +655,45 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// A `where <ident> < <const>` bound's own base case: the declared
+    /// init value must itself satisfy the bound, via the SAME
+    /// `const_eval` `check_literal_fits` already uses. The parser only
+    /// ever constructs this shape as `Binary { Lt, lhs, rhs }` (`where`
+    /// hard-requires the literal `<` token, so no other comparison
+    /// operator can reach here), and `resolve.rs` already requires
+    /// `lhs` self-reference the declared reg — so the only thing left
+    /// to verify here is the numeric relationship. An un-evaluable
+    /// limit or init is ALSO an error, not silently skipped: the whole
+    /// induction argument (`bounds.rs`) needs a verified starting
+    /// point, and there's nothing to induct from otherwise.
+    pub(crate) fn check_where_bound_init(&mut self, init: ExprId, bound: ExprId) {
+        let Expr::Binary { rhs, .. } = self.ast.expr(bound).clone() else {
+            return;
+        };
+        let Some(limit) = self.const_eval(rhs, &HashMap::new()) else {
+            self.error(
+                self.expr_span(rhs),
+                "a `where` bound's own limit must be a compile-time constant".to_string(),
+            );
+            return;
+        };
+        let Some(v) = self.const_eval(init, &HashMap::new()) else {
+            self.error(
+                self.expr_span(init),
+                "a `where`-bounded reg's init value must be a compile-time constant, to \
+                 verify it satisfies the declared bound"
+                    .to_string(),
+            );
+            return;
+        };
+        if v >= limit {
+            self.error(
+                self.expr_span(init),
+                format!("init value {v} does not satisfy the declared bound (`< {limit}`)"),
+            );
+        }
+    }
+
     /// A constant shift amount `>= w` discards every bit of a `[w]`
     /// operand — `Shr`/`AShr` always land on all-zero (or all-sign, for
     /// `AShr`), and `Shl` shifts every original bit out past the top

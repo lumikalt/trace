@@ -2868,6 +2868,97 @@ disjoint doesn't change that there's only one write port to land on. A design
 with one memory otherwise serializes on it, one access per cycle. That is
 honest behavior for a single unbanked, single-port memory.
 
+**A fourth case, independent of the two above: a STATICALLY PROVEN register
+bound (`bounds.rs`, see "Statically proven register bounds" below).** Both
+arguments above require the mem's own depth to be an exact power of two,
+purely to avoid depending on out-of-range-index behavior (undefined in this
+compiler). `reg i : [w] where i < K` proves `i`'s value is ALWAYS in `[0, K)`
+by induction over every write site in the program — given that proof, a
+read/write pair sharing the SAME base and multiplier is disjoint by plain
+integer offset comparison the moment both sides are confirmed to stay under
+the mem's own REAL (non-padded) depth, no power-of-two requirement at all.
+This is a strictly SIMPLER argument than the `e`/`f` one, not a generalization
+of it — there's no modulus or wraparound reasoning left once the range itself
+is proven safe. `examples/mem_disjoint_bounded.tr` demonstrates it against a
+depth-10 mem (not a power of two) that neither of the two arguments above
+could ever close.
+
+## Statically proven register bounds
+
+`reg i : [w] where i < K = init` declares that `i`'s value is ALWAYS in `[0,
+K)` — proven, not trusted, by `bounds.rs` via induction over every write site
+in the whole program, not a runtime-checked assertion. This exists to close
+the real gap the previous section just described: v0 has no bounds check on a
+mem index against a non-power-of-two depth at all, so the three disjointness
+proofs above each sidestep it (require a power-of-two depth) rather than
+close it. A proven bound on a mem's own index base lets the scheduler prove
+the index stays inside the mem's REAL depth directly.
+
+```trace
+reg i : [4] where i < 9 = 0
+rule bump {
+    if i < 8 {
+        i := i + 1
+    } else {
+        i := 0
+    }
+}
+```
+
+The bound's own base case is the declared init (checked via the same
+compile-time-constant folding `check_literal_fits` already uses — an
+un-evaluable or out-of-bound init is a compile error, not silently trusted).
+The inductive step walks every `Item::Rule`/`Item::Fn` body in the program
+exactly once (no fixpoint — see below for why), checking each write site's
+own computed value range against the declared bound. An `if <bounded-reg> <
+<const>` guard narrows the bound within that branch only (`bump`'s own `if i
+< 8` proves `i + 1`'s composed range is `< 9`, exactly the declared bound).
+
+v0 restrictions, all deliberate scope cuts:
+- **`reg` only.** An `in` has no internal write site at all to prove
+  anything over — a bound on it would be a TRUSTED external contract (this
+  feature's whole point is proof, not trust), a different feature entirely.
+  An `out` is register-backed and provable in principle, but has no
+  motivating example yet.
+- **A single strict upper bound against a compile-time constant.** No `<=`,
+  no lower bounds (a `bits[N]` value is unsigned — 0 is always the implicit
+  floor), no multi-variable or otherwise arbitrary bound expressions.
+- **`Add` is the only supported composition on a write's right-hand side.**
+  `i + 1` composes cleanly; `Sub`/`Mul`/anything else is treated as an
+  unknown range, failing the write closed (a compile error asking for an
+  explicit restructure) rather than silently assuming it's safe. The
+  motivating pattern (`i := i + 1` under a guard) needs nothing else.
+- **No interaction with the banking argument (v3).** That argument's
+  soundness rests on a modular fact a proven bound doesn't slot into, and no
+  design needs the combination.
+- **Every register read is FROZEN, not forward-mutated, for the whole
+  body-walk of one item** — the same pre-edge-read invariant every other
+  register read in this language follows (a write earlier in the SAME body
+  is never visible to a later read in that body). Only a `Stmt::Let` local
+  gets real (blocking) forward-flow tracking, needed for `let next = i + 1;
+  i := next`. Entering ANY nested scope (`if`/`while`/`if let`/`while let`)
+  clones both the frozen bound map and the locals map and discards the clone
+  once that scope ends — conservative, not unsound: a local whose bound
+  really would still be known after a branch (per this language's own
+  `Stmt::Let` body-wide visibility) is simply treated as unknown there
+  instead, which only ever causes a write to fail closed, never a false
+  proof.
+
+**Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2
+width inference).** A WIDTH is one property unified across an entire body —
+an early read may need whatever width a LATER rebinding forces (Chisel-style
+single wire), which is exactly why `types/collect.rs` iterates its own body
+check to a fixed point. A BOUND is a per-program-point fact, not a
+whole-body-unified one — narrower here, wider there, entirely by design (an
+`if i < 8` guard only narrows `i` inside that one branch). A single forward
+walk is the architecturally correct model for this problem, not an
+approximation of a fixpoint. Cross-cycle soundness comes from INDUCTION over
+write sites: each item that can write a bounded def is checked once,
+independently, assuming the invariant held at entry (the declared bound,
+whose own base case is the verified init) — repeated across every item in
+the program, that's the whole proof; no global fixpoint across items is
+needed.
+
 ## Combinational loops
 
 Inside one `combines` scope, no forward reference is allowed, so a local cycle
@@ -3052,44 +3143,51 @@ words for.
 **A third, auto-derived exemption needs no annotation and no assertion
 either: a proven disjointness claim.** A read/write pair sharing only mem
 accesses that recognize as compile-time constants, as an affine expression of
-the SAME base def (register/input) with the mem's own depth a power of two, OR
-as an affine expression sharing a power-of-two multiplier (base identity
-irrelevant), and are provably different, is dropped from the conflict matrix
-on its own — the scheduler found the proof itself, so there is nothing left to
-trust OR to check (see "Arrays: one resource each" for exactly what's
-recognized and why). `--explain-schedule` reports it distinctly from both
-other exemptions:
+the SAME base def (register/input) with the mem's own depth a power of two, as
+an affine expression sharing a power-of-two multiplier (base identity
+irrelevant), OR as an affine expression sharing a base/multiplier BOTH
+confirmed to stay under the mem's own real depth via a `bounds.rs`-proven
+value bound (no power-of-two depth needed at all for this one — see
+"Statically proven register bounds"), and are provably different, is dropped
+from the conflict matrix on its own — the scheduler found the proof itself, so
+there is nothing left to trust OR to check (see "Arrays: one resource each"
+for exactly what's recognized and why). `--explain-schedule` reports it
+distinctly from both other exemptions:
 
 ```
 rule write conflicts with rule read: write meets read on {m}
-    index sites proven disjoint (constant addresses, the same base plus a constant offset, or a shared power-of-two multiplier): no stall derived (no annotation needed)
+    index sites proven disjoint (constant addresses, the same base plus a constant offset, a shared power-of-two multiplier, or a proven value bound): no stall derived (no annotation needed)
 ```
 
 Deliberately narrow, matching v0's existing bar of failing closed rather than
 guessing: a mem sharing even ONE index that doesn't recognize as one of these
-shapes, two different bases with no shared power-of-two multiplier, a
-non-power-of-two depth, or a write/write pair (v0's single shared write port
-makes two "disjoint" writers meaningless — see "Arrays: one resource each"),
-all stay fully conservative, exactly as if this proof did not exist. A user's
-own `conflict_free`/`mutually_exclusive` on a pair this already clears is
-legal, harmless overstatement, same as claiming either on a pair that never
-conflicted at all.
+shapes, two different bases with no shared power-of-two multiplier and no
+shared proven bound, a non-power-of-two depth with no proven bound either, or a
+write/write pair (v0's single shared write port makes two "disjoint" writers
+meaningless — see "Arrays: one resource each"), all stay fully conservative,
+exactly as if this proof did not exist. A user's own `conflict_free`/
+`mutually_exclusive` on a pair this already clears is legal, harmless
+overstatement, same as claiming either on a pair that never conflicted at all.
 
 **Tier 3, not v0: provable disjointness across DIFFERENT bases, in
 general.** Dahlia-style banked and affine array types would let the compiler
 prove two accesses disjoint from genuinely different variables (`m[i]` against
 `m[j]`, two distinct registers whose values happen never to coincide, for ANY
-i and j — not just ones sharing a power-of-two multiplier) via real range
-tracking — a whole type-system feature on its own, out of scope for v0 so the
-scheduler work stays bounded. Neither of the two syntactic checks above is a
-scoped version of this tier: the same-base affine case (`m[i]` against
-`m[i+1]`) needs no range tracking at all, since a shared base's value is
-identical on both sides by construction; the banking case (`m[2*i]` against
-`m[2*j+1]`) needs none either, for the opposite reason — it doesn't matter
-what `i` and `j`'s values are, or whether they coincide, only that the
-multiplier fixes their low bits. The genuinely general case — two arbitrary,
-unrelated, unscaled bases — stays exactly as unprovable as before; nothing in
-this section closes it.
+i and j — not just ones sharing a power-of-two multiplier or a proven bound)
+via real, general range tracking over arbitrary registers — out of scope for
+v0 so the scheduler work stays bounded. None of the three syntactic/proof-
+based checks above is a scoped version of this tier: the same-base affine case
+(`m[i]` against `m[i+1]`) needs no range tracking at all, since a shared
+base's value is identical on both sides by construction; the banking case
+(`m[2*i]` against `m[2*j+1]`) needs none either, for the opposite reason — it
+doesn't matter what `i` and `j`'s values are, or whether they coincide, only
+that the multiplier fixes their low bits; and `bounds.rs`'s proven-bound case
+needs a NARROW, explicitly-annotated bound (`where i < K`, checked by
+induction over every write site in the program) rather than inferring an
+arbitrary register's possible values from nothing, the way full range tracking
+would have to. The genuinely general case — two arbitrary, unrelated,
+unscaled, unannotated bases — stays exactly as unprovable as before; nothing
+in this section closes it.
 
 The checked `conflict_free` assertion above is not a smaller version of this
 tier, and does not retire it: it checks a runtime PRECONDITION (do these two
@@ -4343,10 +4441,16 @@ noted:
   indices are either ALL compile-time-constant integers
   (`examples/mem_disjoint_rw.tr`), an affine expression of the SAME base
   register/input with the mem's own depth a power of two (`m[i]` vs
-  `m[i+1]`, `examples/mem_disjoint_affine.tr`), or an affine expression
+  `m[i+1]`, `examples/mem_disjoint_affine.tr`), an affine expression
   sharing a power-of-two multiplier across TWO DIFFERENT bases (`m[2*i]` vs
   `m[2*j+1]`, base identity irrelevant, `examples/mem_disjoint_banked.tr`),
-  and provably different either way.
+  or an affine expression confirmed to stay under the mem's own REAL depth
+  via a statically-proven `where` bound, no power-of-two depth needed
+  (`examples/mem_disjoint_bounded.tr`), and provably different either way.
+- `reg i : [w] where i < K`: a statically PROVEN register value bound
+  (`bounds.rs`), checked by induction over every write site in the program
+  — not trusted, not a runtime assertion. Exists to feed the mem-index
+  disjointness proof above; see "Statically proven register bounds".
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/

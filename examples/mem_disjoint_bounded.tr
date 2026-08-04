@@ -1,0 +1,54 @@
+-- v5 of the mem-disjointness proof, and the actual driving example
+-- `bounds.rs` exists for: `m`'s depth (10) is deliberately NOT a power
+-- of two, so neither v2 (same-base affine) nor v3 (banking) can fire --
+-- both require `pow2_addr_width`, which this mem doesn't have. What
+-- makes `write`/`read` provable anyway is `i`'s declared bound (`i <
+-- 9`), STATICALLY PROVEN by `bounds.rs` (not trusted, not a runtime
+-- assertion) via induction over every write site in the program:
+-- `bump`'s own `if i < 8` guard narrows `i` before `i := i + 1`, giving
+-- a composed bound of exactly `< 9`; the `else` branch's `i := 0`
+-- trivially satisfies it too.
+--
+-- Given that proof, `m[i+1]` and `m[i]` are both confined to `[0, 10)`
+-- -- the mem's REAL depth, no power-of-two padding needed -- so the
+-- scheduler's own real-integer disjointness argument fires directly
+-- (schedule.rs's "A fourth case").
+--
+-- `bump` also conflicts with `write`/`read` on `i` itself (a plain
+-- register read/write, unrelated to the mem question this example is
+-- about) -- `conflict_free` resolves that separately and is a legitimate
+-- claim regardless of this feature, since pre-edge-read semantics mean
+-- `write`/`read` always see `i`'s frozen start-of-cycle value no matter
+-- which rule fires first.
+module MemDisjointBounded {
+    mem m : [8][10]
+
+    reg i : [4] where i < 9 = 0
+    in x : [8]
+    out y : [8] = 0
+    out write_count : [8] = 0
+    out read_count : [8] = 0
+
+    rule bump {
+        if i < 8 {
+            i := i + 1
+        } else {
+            i := 0
+        }
+    }
+
+    rule write {
+        m[i+1] := x
+        write_count := write_count + 1
+    }
+
+    rule read {
+        y := m[i]
+        read_count := read_count + 1
+    }
+
+    schedule {
+        conflict_free { bump, write }
+        conflict_free { bump, read }
+    }
+}

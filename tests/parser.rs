@@ -1145,3 +1145,62 @@ fn and_binds_tighter_than_or_but_looser_than_comparisons() {
         "(:= x (or (& (logic a) (logic b)) c))"
     );
 }
+
+#[test]
+fn where_clause_parses_on_a_reg() {
+    let ast = parse_ok("module M {\n reg i : [4] where i < 10 = 0\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Reg {
+        name, bound, init, ..
+    } = ast.item(items[0])
+    else {
+        panic!("expected a reg");
+    };
+    assert_eq!(name.text, "i");
+    assert!(init.is_some());
+    let bound = bound.expect("where clause should have parsed");
+    assert_eq!(ast.expr_sexpr(bound), "(< i 10)");
+}
+
+#[test]
+fn where_clause_stops_at_the_following_init_not_eaten_as_a_comparison() {
+    // `=` is ALSO a comparison operator (`BinOp::Eq`) at the same
+    // binding-power tier as `<` -- confirms the where-clause's own
+    // manual lhs/rhs parse (TYPE_MIN_BP, above the comparison tier on
+    // both sides) doesn't greedily chain into `= 0` as `(i < 10) = 0`.
+    let ast = parse_ok("module M {\n reg i : [4] where i < 10 = 5\n}\n");
+    let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
+        panic!()
+    };
+    let Item::Reg { bound, init, .. } = ast.item(items[0]) else {
+        panic!("expected a reg");
+    };
+    assert_eq!(ast.expr_sexpr(bound.unwrap()), "(< i 10)");
+    assert_eq!(ast.expr_sexpr(init.unwrap()), "5");
+}
+
+#[test]
+fn where_clause_is_rejected_on_an_input() {
+    let (tokens, _) = lexer::lex("module M {\n in i : [4] where i < 10\n}\n");
+    let (_, errors) = parser::parse("module M {\n in i : [4] where i < 10\n}\n", &tokens);
+    assert!(!errors.is_empty());
+    assert!(errors[0].message.contains("only allowed on `reg`"));
+}
+
+#[test]
+fn where_clause_is_rejected_on_an_output() {
+    let (tokens, _) = lexer::lex("module M {\n out i : [4] where i < 10 = 0\n}\n");
+    let (_, errors) = parser::parse("module M {\n out i : [4] where i < 10 = 0\n}\n", &tokens);
+    assert!(!errors.is_empty());
+    assert!(errors[0].message.contains("only allowed on `reg`"));
+}
+
+#[test]
+fn where_clause_requires_an_explicit_init() {
+    let (tokens, _) = lexer::lex("module M {\n reg i : [4] where i < 10\n}\n");
+    let (_, errors) = parser::parse("module M {\n reg i : [4] where i < 10\n}\n", &tokens);
+    assert!(!errors.is_empty());
+    assert!(errors[0].message.contains("requires an explicit `= init`"));
+}

@@ -1991,3 +1991,33 @@ fn while_let_rhs_must_be_an_option_unwrap_not_another_fallible_shape() {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("Option's own unwrap"));
 }
+
+#[test]
+fn where_bound_init_satisfying_the_bound_is_accepted() {
+    let (_, _, errors) = run("module M {\n reg i : [4] where i < 10 = 0\n}\n");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn where_bound_init_violating_the_bound_is_an_error() {
+    let (_, _, errors) = run("module M {\n reg i : [4] where i < 10 = 12\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("does not satisfy the declared bound")
+    );
+}
+
+#[test]
+fn where_bound_init_exactly_at_the_limit_is_an_error() {
+    // `< 10` excludes 10 itself -- an off-by-one regression here would
+    // silently accept the boundary value.
+    let (_, _, errors) = run("module M {\n reg i : [4] where i < 10 = 10\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("does not satisfy the declared bound")
+    );
+}

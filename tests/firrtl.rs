@@ -1,5 +1,5 @@
 use trace::firrtl::{EmitError, emit};
-use trace::{effects, lexer, lower, parser, resolve, schedule, types};
+use trace::{bounds, effects, lexer, lower, parser, resolve, schedule, types};
 
 /// Runs the pipeline up through whichever stage first reports an error
 /// (lex, parse, resolve, effects, or lower — the same order `emit_from_
@@ -87,7 +87,12 @@ fn emit_from_source(src: &str) -> Result<String, Vec<EmitError>> {
     );
     let (ty2, type_errors2) = types::check(&ast2, &res2, &fx2);
     assert!(type_errors2.is_empty(), "{type_errors2:?}\n{lowered_src}");
-    let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2, &ty2);
+    let (b2, bounds_errors2) = bounds::check(&ast2, &res2, &fx2, &ty2);
+    assert!(
+        bounds_errors2.is_empty(),
+        "{bounds_errors2:?}\n{lowered_src}"
+    );
+    let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2, &ty2, &b2);
     assert!(
         schedule_errors2.is_empty(),
         "{schedule_errors2:?}\n{lowered_src}"
@@ -394,6 +399,35 @@ fn mem_disjoint_affine_needs_no_conflict_free_annotation() {
     assert!(fir.contains("node fires_read = UInt<1>(1)"));
     assert!(!fir.contains("not(fires_write)"));
     assert!(!fir.contains("not(fires_read)"));
+    assert!(!fir.contains("assert("));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn mem_disjoint_bounded_needs_no_annotation_on_the_mem_pair() {
+    // v5 of the four tests above -- the actual driving example
+    // `bounds.rs` exists for: examples/mem_disjoint_bounded.tr's `m`
+    // has depth 10, NOT a power of two, so neither v2 nor v3 can fire
+    // (both gated on `pow2_addr_width`). `i`'s declared `where i < 9`
+    // bound is statically proven by `bounds.rs` (not trusted), and that
+    // proof alone is what lets `write`/`read` -- the pair sharing `m`
+    // -- go unconditional with no `conflict_free` needed for THAT pair.
+    // (`bump` still conflicts with `write`/`read` on the plain register
+    // `i` itself, resolved by the source's own `conflict_free`
+    // directives for THAT unrelated pair -- see the example's own
+    // comment -- which is why this test doesn't assert the WHOLE file
+    // has no `conflict_free`/assert machinery, only that the mem pair
+    // specifically needed none.)
+    let fir = emit_from_source(&read_example("mem_disjoint_bounded.tr"))
+        .expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, tail(add(i, UInt<4>(1)), 1)"));
+    assert!(fir.contains("connect m.r0.addr, i"));
+    assert!(fir.contains("node fires_write = UInt<1>(1)"));
+    assert!(fir.contains("node fires_read = UInt<1>(1)"));
+    // Neither the plain-register `{i}` conflicts (trusted `conflict_
+    // free`) nor the mem `{m}` conflict (proven `Disjoint`) has
+    // anything sound to check -- a proven claim needs no assertion, and
+    // `conflict_free` on a non-mem pair stays fully trusted.
     assert!(!fir.contains("assert("));
     run_firtool(&fir, &[]);
 }

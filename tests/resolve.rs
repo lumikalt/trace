@@ -836,6 +836,29 @@ module M {
 }
 
 #[test]
+fn where_bound_referencing_the_same_reg_resolves() {
+    let src = "\
+module M {
+    reg i : [4] where i < 10 = 0
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn where_bound_referencing_a_different_reg_is_an_error() {
+    let src = "\
+module M {
+    reg i : [4] where j < 10 = 0
+    reg j : [4] = 0
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("same reg it's declared on"));
+}
+
+#[test]
 fn all_examples_resolve() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     for entry in std::fs::read_dir(dir).unwrap() {

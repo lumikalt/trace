@@ -2146,6 +2146,45 @@ manually in the meantime.
   cases, not an open-ended list, and stay as `forms_differ`'s own `||`.
   Does NOT attempt the genuinely general different-base case either;
   that's still exactly as unprovable, and still tier 3.
+- **RESOLVED (v5) — `reg i : [w] where i < K` STATICALLY PROVES `i`'s
+  value bound by induction over every write site, closing the actual
+  gap all three prior proofs sidestepped rather than fixed: v1/v2/v3
+  all require the mem's depth to be an exact power of two, purely to
+  avoid depending on undefined out-of-range-index behavior** (new
+  module `src/bounds.rs`; `schedule.rs`'s `forms_differ` gains a
+  FOURTH, independent argument — same base/multiplier, both index
+  forms confirmed under the mem's REAL depth via the proven bound, no
+  power-of-two requirement at all; `examples/mem_disjoint_bounded.tr`,
+  depth 10, not a power of two). Reached after a second AskUserQuestion
+  round (purpose: bounds-checking, not disjointness — the real
+  motivation, since disjointness itself had run out of use cases;
+  tier: statically proven, not trusted, not a runtime assertion) and a
+  full plan-mode design pass. v0 restrictions, all deliberate: `reg`
+  only (`in` has no write site to prove anything over — a bound there
+  would be a TRUSTED contract, a different feature; `out` is provable
+  in principle but unmotivated); a single strict upper bound against a
+  compile-time constant, no `<=`/lower bounds/arbitrary expressions;
+  `Add`-only RHS composition (`Sub`/`Mul` fail closed); no interaction
+  with the v3 banking argument (different, modular soundness argument
+  a value bound doesn't slot into). Register reads are FROZEN for a
+  whole item's walk (pre-edge-read invariant — a write earlier in the
+  same body is never visible to a later read in it), unlike a
+  `Stmt::Let` local's ordinary forward-flow tracking; a single forward
+  walk suffices, no fixpoint, since a bound is a per-program-point
+  fact (narrower here, wider there by an `if` guard) rather than
+  width-inference's whole-body-unified property. `IndexForm`'s own
+  wrapping arithmetic is NOT reused for the new argument's range math
+  (`m[i-1]` under a proven bound must not be treated as safe just
+  because `IndexForm` stores its offset as a wrapped `u64::MAX`) — a
+  separate, independent `real_upper_bound` walk recognizes only the
+  same restricted shape `bounds.rs` itself proves. Confirmed via `git
+  stash` end to end: the driving example's `write`/`read` pair falls
+  back to a derived stall without the `where` clause (`read_count`
+  stuck at 0 forever in real simulation, `write_count` climbing) and
+  fires unconditionally with it. Still does NOT close the general
+  tier-3 case (`m[i]` vs `m[j]`, two arbitrary unannotated bases) —
+  explicitly a narrow, induction-checked annotation, not general range
+  inference.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

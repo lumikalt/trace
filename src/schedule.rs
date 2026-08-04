@@ -101,8 +101,28 @@
 //!
 //! Rules conflict only within their own scope (module body or top level):
 //! state is scope-local, so cross-scope conflicts cannot exist.
+//!
+//! # A fourth case: a proven value bound (`bounds.rs`)
+//!
+//! `reg i : [w] where i < K` (`bounds.rs`) statically proves `i`'s value
+//! is ALWAYS in `[0, K)` — real integer arithmetic, no modulus, no
+//! power-of-two-depth requirement. When both sides of a read/write pair
+//! share the SAME base def and multiplier (the same structural
+//! precondition the same-base argument above needs) and BOTH forms'
+//! index expressions are independently confirmed to stay within the
+//! mem's own REAL (non-padded) depth under that proven bound, the two
+//! addresses differ by exactly `offset_a - offset_b` in plain integers
+//! — no wraparound is possible, since the whole range is already proven
+//! in-bounds, so there's nothing left to reason about mod anything. This
+//! is a strictly SIMPLER argument than the same-base one above, not a
+//! generalization of it: it just doesn't need the mem's depth to be a
+//! power of two at all. See `forms_differ`'s own doc comment for the
+//! exact gate, and `real_upper_bound`'s for why this is computed via an
+//! INDEPENDENT walk rather than reusing `IndexForm`'s own (deliberately
+//! wrapping) arithmetic.
 
 use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, ScheduleDirective};
+use crate::bounds::Bounds;
 use crate::effects::{EffectSig, Effects};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
@@ -194,12 +214,14 @@ pub fn schedule(
     res: &Resolution,
     fx: &Effects,
     ty: &Types,
+    bounds: &Bounds,
 ) -> (Schedule, Vec<ScheduleError>) {
     let mut scheduler = Scheduler {
         ast,
         res,
         fx,
         ty,
+        bounds,
         out: Schedule::default(),
         errors: Vec::new(),
     };
@@ -212,6 +234,7 @@ struct Scheduler<'a> {
     res: &'a Resolution,
     fx: &'a Effects,
     ty: &'a Types,
+    bounds: &'a Bounds,
     out: Schedule,
     errors: Vec<ScheduleError>,
 }
@@ -426,7 +449,17 @@ impl<'a> Scheduler<'a> {
             return false;
         };
         let pow2_width = self.pow2_addr_width(def);
-        mem_accesses_disjoint(self.ast, self.res, self.ty, pow2_width, w_idx, r_idx)
+        let real_depth = self.real_depth(def);
+        mem_accesses_disjoint(
+            self.ast,
+            self.res,
+            self.ty,
+            self.bounds,
+            pow2_width,
+            real_depth,
+            w_idx,
+            r_idx,
+        )
     }
 
     /// This mem's address width, but ONLY when its depth is exactly a
@@ -435,6 +468,20 @@ impl<'a> Scheduler<'a> {
     fn pow2_addr_width(&self, mem: DefId) -> Option<u64> {
         match self.ty.state_tys.get(&mem) {
             Some(Ty::Mem { len, .. }) if len.is_power_of_two() => Some(len.trailing_zeros() as u64),
+            _ => None,
+        }
+    }
+
+    /// This mem's REAL, non-padded depth — unlike `pow2_addr_width`, no
+    /// power-of-two filter at all. Used only by the proven-bound
+    /// disjointness argument (this module's own doc comment, "A fourth
+    /// case"), which needs the mem's actual depth rather than the
+    /// padded address space `clog2` rounds up to — the whole point of
+    /// that argument is working on a depth the OTHER two arguments
+    /// can't (a non-power-of-two one).
+    fn real_depth(&self, mem: DefId) -> Option<u64> {
+        match self.ty.state_tys.get(&mem) {
+            Some(Ty::Mem { len, .. }) => Some(*len),
             _ => None,
         }
     }
@@ -548,8 +595,8 @@ impl Schedule {
                     }
                     Exemption::Disjoint => out.push_str(
                         "    index sites proven disjoint (constant addresses, the same base \
-                         plus a constant offset, or a shared power-of-two multiplier): no stall \
-                         derived (no annotation needed)\n",
+                         plus a constant offset, a shared power-of-two multiplier, or a proven \
+                         value bound): no stall derived (no annotation needed)\n",
                     ),
                     Exemption::None => {
                         let loser = if c.winner == c.a { b } else { a };
@@ -758,15 +805,45 @@ fn base_width(ty: &Types, def: DefId) -> Option<u64> {
 /// Either way, a def's own width must be concretely known or that
 /// argument fails closed. A constant compared against an affine form
 /// (or the reverse) is never provable.
-fn forms_differ(ty: &Types, a: IndexForm, b: IndexForm, pow2_width: Option<u64>) -> bool {
+///
+/// A FOURTH, independent argument (this module's own doc comment, "A
+/// fourth case") is tried FIRST, before either pow2-gated argument
+/// above, since it needs no power-of-two depth at all: same base AND
+/// same multiplier (the identical structural precondition the same-
+/// base argument needs — the shared `base*multiplier` term cancels
+/// exactly in the subtraction, leaving `offset_a - offset_b`, real
+/// integers, as the whole question), BOTH sides' `real_upper_bound`
+/// confirmed `<= ` the mem's own REAL depth (so neither address can
+/// ever reach the undefined out-of-range region), and the offsets
+/// genuinely differ. No modulus, no wraparound reasoning needed at
+/// all — the range proof already rules out wraparound occurring in the
+/// first place.
+fn forms_differ(
+    ty: &Types,
+    a: IndexForm,
+    b: IndexForm,
+    pow2_width: Option<u64>,
+    a_real_bound: Option<u64>,
+    b_real_bound: Option<u64>,
+    real_depth: Option<u64>,
+) -> bool {
     match (a.base, b.base) {
         (None, None) => a.offset != b.offset,
         (Some(da), Some(db)) => {
+            let same_base_and_multiplier = da == db && a.multiplier == b.multiplier;
+            let proven_bound_argument = same_base_and_multiplier
+                && a.offset != b.offset
+                && real_depth.is_some_and(|depth| {
+                    a_real_bound.is_some_and(|r| r <= depth)
+                        && b_real_bound.is_some_and(|r| r <= depth)
+                });
+            if proven_bound_argument {
+                return true;
+            }
             let Some(addr_w) = pow2_width else {
                 return false;
             };
-            let same_base_argument = da == db
-                && a.multiplier == b.multiplier
+            let same_base_argument = same_base_and_multiplier
                 && base_width(ty, da)
                     .is_some_and(|base_w| offsets_differ(a.offset, b.offset, addr_w.min(base_w)));
             let banking_argument = a.multiplier == b.multiplier
@@ -798,22 +875,73 @@ fn offsets_differ(ka: u64, kb: u64, width: u64) -> bool {
 /// Every index in `a` is provably different from every index in `b` —
 /// sound only when EVERY index on both sides recognizes as one of
 /// `IndexForm`'s two shapes; a single unrecognized index anywhere fails
-/// the whole proof closed (unknown, not "assumed disjoint").
+/// the whole proof closed (unknown, not "assumed disjoint"). Each index
+/// is ALSO paired with its own `real_upper_bound` (independent of
+/// whether `index_form` itself succeeds for it) — the proven-bound
+/// disjointness argument in `forms_differ` needs both.
+// Each parameter is a genuinely distinct fact the proof needs (three
+// proof-independent contexts — `ty`/`bounds` for width/bound lookups,
+// `pow2_width`/`real_depth` for the two DIFFERENT sound-only-under-this-
+// condition arguments — plus the two access-site sets themselves);
+// bundling them into a struct here alone would be inconsistent with
+// `one_mem_disjoint`'s own equally-flat call one level up.
+#[allow(clippy::too_many_arguments)]
 fn mem_accesses_disjoint(
     ast: &Ast,
     res: &Resolution,
     ty: &Types,
+    bounds: &Bounds,
     pow2_width: Option<u64>,
+    real_depth: Option<u64>,
     a: &BTreeSet<ExprId>,
     b: &BTreeSet<ExprId>,
 ) -> bool {
-    let fold = |set: &BTreeSet<ExprId>| -> Option<Vec<IndexForm>> {
-        set.iter().map(|e| index_form(ast, res, *e)).collect()
+    let fold = |set: &BTreeSet<ExprId>| -> Option<Vec<(IndexForm, Option<u64>)>> {
+        set.iter()
+            .map(|e| index_form(ast, res, *e).map(|f| (f, real_upper_bound(ast, res, bounds, *e))))
+            .collect()
     };
     let (Some(a_forms), Some(b_forms)) = (fold(a), fold(b)) else {
         return false;
     };
-    a_forms
-        .iter()
-        .all(|x| b_forms.iter().all(|y| forms_differ(ty, *x, *y, pow2_width)))
+    a_forms.iter().all(|(fa, ra)| {
+        b_forms
+            .iter()
+            .all(|(fb, rb)| forms_differ(ty, *fa, *fb, pow2_width, *ra, *rb, real_depth))
+    })
+}
+
+/// The value range an index expression is provably confined to, as a
+/// REAL (non-wrapping, non-modular) exclusive upper bound — `Some(K)`
+/// means the expression's value is ALWAYS in `[0, K)`, given `bounds`
+/// (`bounds.rs`'s own proven per-def bounds; see this module's own doc
+/// comment's "A fourth case"). Deliberately computed via an INDEPENDENT
+/// walk, not derived from `IndexForm`: `IndexForm`'s own `add`/`sub`/
+/// `mul` use `wrapping_*` arithmetic on purpose (v1-v3's proofs reason
+/// mod 2^width), so `m[i-1]`'s `IndexForm` stores its offset as a
+/// wrapped `u64::MAX` — treating that as a real, non-negative integer
+/// would be simply wrong. This function recognizes only the SAME
+/// restricted shape `bounds.rs`'s own `expr_bound` does (a bare bounded
+/// def, a literal, or `Add` of two such) — `Sub`/`Mul`/anything else is
+/// `None`, so `m[i-1]` never gets a real bound here regardless of what
+/// `IndexForm` separately computed for it.
+fn real_upper_bound(ast: &Ast, res: &Resolution, bounds: &Bounds, id: ExprId) -> Option<u64> {
+    match ast.expr(id) {
+        Expr::Int(v) => v.checked_add(1),
+        Expr::SizedInt { value, .. } => value.checked_add(1),
+        Expr::Ident(_) => {
+            let def = res.expr_defs.get(&id)?;
+            bounds.upper.get(def).copied()
+        }
+        Expr::Binary {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => {
+            let a = real_upper_bound(ast, res, bounds, *lhs)?;
+            let b = real_upper_bound(ast, res, bounds, *rhs)?;
+            a.checked_add(b)?.checked_sub(1)
+        }
+        _ => None,
+    }
 }

@@ -1,7 +1,7 @@
 use trace::ast::{Ast, Item};
 use trace::resolve::Resolution;
 use trace::schedule::{ConflictKind, Exemption, Schedule, ScheduleError, schedule};
-use trace::{effects, lexer, parser, resolve, types};
+use trace::{bounds, effects, lexer, parser, resolve, types};
 
 fn run(src: &str) -> (Ast, Resolution, Schedule, Vec<ScheduleError>) {
     let (tokens, lex_errors) = lexer::lex(src);
@@ -17,7 +17,9 @@ fn run(src: &str) -> (Ast, Resolution, Schedule, Vec<ScheduleError>) {
     assert!(effect_errors.is_empty(), "effect errors: {effect_errors:?}");
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
-    let (sched, errors) = schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(bounds_errors.is_empty(), "bounds errors: {bounds_errors:?}");
+    let (sched, errors) = schedule(&ast, &res, &fx, &ty, &b);
     (ast, res, sched, errors)
 }
 
@@ -481,7 +483,8 @@ fn explain_names_a_proven_disjoint_mem_pair() {
     assert!(text.contains("rule write conflicts with rule read"));
     assert!(text.contains(
         "index sites proven disjoint (constant addresses, the same base plus a constant \
-         offset, or a shared power-of-two multiplier): no stall derived (no annotation needed)"
+         offset, a shared power-of-two multiplier, or a proven value bound): no stall derived \
+         (no annotation needed)"
     ));
 }
 
@@ -1045,6 +1048,109 @@ module M {
         m[i*j] := x
     }
     rule q {
+        y := m[i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v5_proven_bound_closes_a_non_power_of_two_depth() {
+    // The actual driving example for `bounds.rs`: `m`'s depth (10) is
+    // NOT a power of two, so neither the same-base nor the banking
+    // argument can fire (both are gated on `pow2_addr_width`) -- but
+    // `i`'s declared bound (`< 9`, proven by `bump`'s own `if i < 8`
+    // guard) confines both `m[i+1]` and `m[i]` to the mem's REAL depth
+    // (10) directly, no power-of-two padding needed at all.
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg i : [4] where i < 9 = 0
+    in x : [8]
+    out y : [8] = 0
+    rule bump {
+        if i < 8 {
+            i := i + 1
+        } else {
+            i := 0
+        }
+    }
+    rule wr {
+        m[i+1] := x
+    }
+    rule rd {
+        y := m[i]
+    }
+    schedule {
+        conflict_free { bump, wr }
+        conflict_free { bump, rd }
+    }
+}
+";
+    let (_, res, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    let mem_conflict = group
+        .conflicts
+        .iter()
+        .find(|c| c.on.iter().any(|d| res.def(*d).name == "m"))
+        .expect("a conflict on the mem `m` should exist");
+    assert_eq!(mem_conflict.exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v5_same_offset_under_a_proven_bound_stays_unprovable() {
+    // `m[i]` vs `m[i]` (identical offset): even with `i`'s bound proven
+    // and both sides confined to the mem's real depth, the SAME address
+    // is never disjoint from itself -- confirms the proven-bound
+    // argument still requires `a.offset != b.offset`, not just "both in
+    // range".
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg i : [4] where i < 9 = 0
+    in x : [8]
+    out y : [8] = 0
+    rule wr {
+        m[i] := x
+    }
+    rule rd {
+        y := m[i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v5_proven_bound_does_not_rescue_a_subtraction() {
+    // `m[i-1]` under a proven `i < 10`: `real_upper_bound` recognizes
+    // only `Ident`/literal/`Add` (mirroring `bounds.rs`'s own
+    // `expr_bound`) -- `Sub` is deliberately excluded, since `IndexForm`
+    // stores `i-1`'s offset as a WRAPPED `u64::MAX`, which would be
+    // wrong to treat as a real, non-negative integer (`i=0` genuinely
+    // underflows). Depth is deliberately non-power-of-two here too, so
+    // if this regressed to "provable," it could only be via the
+    // proven-bound argument, not one of the other two.
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg i : [4] where i < 10 = 0
+    in x : [8]
+    out y : [8] = 0
+    rule wr {
+        m[i-1] := x
+    }
+    rule rd {
         y := m[i]
     }
 }

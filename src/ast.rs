@@ -396,6 +396,15 @@ pub enum Item {
         name: Name,
         ty: ExprId,
         init: Option<ExprId>,
+        /// `where <name> < <const>` — an optional, statically PROVEN
+        /// upper bound (`bounds.rs`) on this reg's own value, checked
+        /// at every write site in the program via induction, not
+        /// trusted. Parsed as an ordinary expression (not restricted to
+        /// any particular shape by the parser, same precedent as
+        /// `IfLet`'s own `init`) — resolve.rs requires the LHS resolve
+        /// to this SAME def, `bounds.rs` requires the whole shape be
+        /// `Binary { Lt, Ident(self), <compile-time-constant> }`.
+        bound: Option<ExprId>,
     },
     Mem {
         name: Name,
@@ -653,8 +662,16 @@ impl Ast {
                     self.dump_item(*item, depth + 1, out);
                 }
             }
-            Item::Reg { name, ty, init } => {
+            Item::Reg {
+                name,
+                ty,
+                init,
+                bound,
+            } => {
                 out.push_str(&format!("{pad}reg {name} : {}", self.expr_sexpr(*ty)));
+                if let Some(bound) = bound {
+                    out.push_str(&format!(" where {}", self.expr_sexpr(*bound)));
+                }
                 if let Some(init) = init {
                     out.push_str(&format!(" = {}", self.expr_sexpr(*init)));
                 }

@@ -3,7 +3,7 @@ use trace::lower::{LowerError, LoweredRule, plan, render};
 use trace::resolve::Resolution;
 use trace::schedule;
 use trace::types::{Ty, Width};
-use trace::{effects, lexer, parser, resolve, types};
+use trace::{bounds, effects, lexer, parser, resolve, types};
 
 struct Checked {
     ast: Ast,
@@ -59,7 +59,12 @@ fn assert_round_trips(src: &str) -> String {
         type_errors.is_empty(),
         "type errors in lowered output: {type_errors:?}\n---\n{src}"
     );
-    let (_, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(
+        bounds_errors.is_empty(),
+        "bounds errors in lowered output: {bounds_errors:?}\n---\n{src}"
+    );
+    let (_, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
     assert!(
         schedule_errors.is_empty(),
         "schedule errors in lowered output: {schedule_errors:?}\n---\n{src}"
@@ -164,7 +169,9 @@ fn subleq_schedule_directive_rewrites_and_only_s5_conflicts() {
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
     let (ty2, type_errors) = types::check(&ast2, &res2, &fx2);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast2, &res2, &fx2, &ty2);
+    let (b2, bounds_errors) = bounds::check(&ast2, &res2, &fx2, &ty2);
+    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast2, &res2, &fx2, &ty2, &b2);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
 
     // Every segment writes the shared continuation register, so all

@@ -489,10 +489,16 @@ impl<'a> Resolver<'a> {
                 self.scopes.pop();
                 self.current_module.pop();
             }
-            Item::Reg { ty, init, .. } => {
+            Item::Reg {
+                ty, init, bound, ..
+            } => {
                 self.resolve_expr(*ty, false);
                 if let Some(init) = init {
                     self.resolve_expr(*init, false);
+                }
+                if let Some(bound) = bound {
+                    self.resolve_expr(*bound, false);
+                    self.check_bound_self_reference(id, *bound);
                 }
             }
             Item::Mem { ty, .. }
@@ -1029,6 +1035,32 @@ impl<'a> Resolver<'a> {
             // `logic <expr>`'s `<expr>` is a value, not a type — same
             // pass-through as `Optional` above.
             Expr::Logic(inner) => self.resolve_expr(inner, in_type),
+        }
+    }
+
+    /// A `reg`'s `where` bound must constrain the SAME reg it's declared
+    /// on — `where other < 10` says nothing about THIS reg's own value,
+    /// so `bounds.rs`'s induction argument (which only ever checks
+    /// writes to the declared def) would have nothing to reason about.
+    /// The full shape (`Binary { Lt, .. }`, a compile-time-constant
+    /// RHS) is validated later, in `bounds.rs` — this only checks self-
+    /// reference, since that's a resolve-time (DefId-level) question. A
+    /// malformed shape (LHS not even an `Ident`, or one that fails to
+    /// resolve at all) falls through to the same "doesn't match" error,
+    /// which is fine: `bounds.rs` reports the precise shape complaint
+    /// separately.
+    fn check_bound_self_reference(&mut self, id: ItemId, bound: ExprId) {
+        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+            return;
+        };
+        let Some(&reg_def) = self.res.item_defs.get(&id) else {
+            return;
+        };
+        if self.res.expr_defs.get(&lhs).copied() != Some(reg_def) {
+            self.error(
+                self.ast.expr_spans[lhs.0 as usize].clone(),
+                "a `where` bound must reference the same reg it's declared on".to_string(),
+            );
         }
     }
 }

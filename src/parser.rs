@@ -416,6 +416,46 @@ impl<'a> Parser<'a> {
             }
             None
         };
+        // `where <ident> < <const>` — v0 restriction: `reg` only (an `in`
+        // has no write site at all to prove anything over; `out` is
+        // register-backed and provable in principle but has no driving
+        // example yet, see DESIGN.md). Parsed BEFORE `= init` (`resolve.
+        // rs`/`bounds.rs` validate the actual shape, same precedent as
+        // `IfLet`'s `init`). Built manually as `Binary{Lt, lhs, rhs}`
+        // rather than via `self.parse_expr(0)` on the whole clause: `=`
+        // is ALSO a comparison operator (`BinOp::Eq`) at the identical
+        // binding-power tier as `<`, so a full low-bp parse here would
+        // greedily chain straight into a following `= init` as `(i < 10)
+        // = 0` instead of stopping at `10` — parsing `lhs`/`rhs`
+        // separately at `TYPE_MIN_BP` (above the comparison tier, so
+        // neither side tries to consume a `<`/`=` itself) sidesteps the
+        // ambiguity entirely.
+        let where_span = self.cur_span();
+        let bound = if self.at_ident_text("where") {
+            self.bump();
+            let bound_lo = self.cur_span().start;
+            let lhs = self.parse_expr(TYPE_MIN_BP)?;
+            self.expect(TokenKind::Lt, "`<` after `where <ident>`")
+                .ok()?;
+            let rhs = self.parse_expr(TYPE_MIN_BP)?;
+            Some(self.ast.push_expr(
+                Expr::Binary {
+                    op: BinOp::Lt,
+                    lhs,
+                    rhs,
+                },
+                bound_lo..self.prev_end,
+            ))
+        } else {
+            None
+        };
+        if bound.is_some() && keyword != TokenKind::Reg {
+            self.errors.push(ParseError {
+                span: where_span.clone(),
+                message: "`where` is only allowed on `reg` declarations (v0 restriction)"
+                    .to_string(),
+            });
+        }
         let item = match keyword {
             TokenKind::Reg | TokenKind::Output => {
                 if ty.is_none() && !self.at(TokenKind::Eq) {
@@ -423,6 +463,15 @@ impl<'a> Parser<'a> {
                         span: self.cur_span(),
                         message: "expected `:` before type, or `=` with a sized-literal \
                                   initializer to infer it"
+                            .to_string(),
+                    });
+                    return None;
+                }
+                if bound.is_some() && !self.at(TokenKind::Eq) {
+                    self.errors.push(ParseError {
+                        span: where_span,
+                        message: "a `where` bound requires an explicit `= init` value (v0 \
+                                  restriction) -- the declared bound needs a verified base case"
                             .to_string(),
                     });
                     return None;
@@ -437,7 +486,12 @@ impl<'a> Parser<'a> {
                     None => self.infer_ty_from_sized_literal(init.unwrap())?,
                 };
                 if keyword == TokenKind::Reg {
-                    Item::Reg { name, ty, init }
+                    Item::Reg {
+                        name,
+                        ty,
+                        init,
+                        bound,
+                    }
                 } else {
                     Item::Output { name, ty, init }
                 }
@@ -699,6 +753,7 @@ impl<'a> Parser<'a> {
                 name: prev_name.clone(),
                 ty: reg_ty,
                 init: Some(one),
+                bound: None,
             },
             span.clone(),
         );
@@ -942,6 +997,20 @@ impl<'a> Parser<'a> {
         }
         self.expect(TokenKind::Gt, "`>` closing effect list").ok()?;
         Some(effects)
+    }
+
+    /// Whether the current token is a plain identifier spelled exactly
+    /// `text` — used for contextual keywords that only shape ONE
+    /// existing construct (`where`, matching this file's own precedent
+    /// for `urgency`/`mutually_exclusive`/`conflict_free`: the reserved-
+    /// keyword set holds only words that open or shape a construct on
+    /// their own, not every word that ever appears in a fixed position).
+    fn at_ident_text(&self, text: &str) -> bool {
+        self.at(TokenKind::Ident)
+            && self
+                .tokens
+                .get(self.pos)
+                .is_some_and(|t| self.text(&t.span) == text)
     }
 
     /// Name positions accept `reg`/`mem`/`fifo`/`in`/`out`/`io` too: they

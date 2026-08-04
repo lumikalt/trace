@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod bounds;
 pub mod effects;
 pub mod elaborate;
 pub mod firrtl;

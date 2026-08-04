@@ -1,5 +1,7 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{effects, elaborate, firrtl, fmt, lexer, lower, parser, resolve, schedule, types};
+use trace::{
+    bounds, effects, elaborate, firrtl, fmt, lexer, lower, parser, resolve, schedule, types,
+};
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -124,7 +126,15 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (bounds, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    for err in &bounds_errors {
+        report(&path, &src, err.span.clone(), &err.message);
+    }
+    if !bounds_errors.is_empty() {
+        return std::process::ExitCode::FAILURE;
+    }
+
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &bounds);
     for err in &schedule_errors {
         report(&path, &src, err.span.clone(), &err.message);
     }

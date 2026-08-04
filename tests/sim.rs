@@ -14,7 +14,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use trace::{effects, elaborate, lexer, lower, parser, resolve, schedule, types};
+use trace::{bounds, effects, elaborate, lexer, lower, parser, resolve, schedule, types};
 
 fn tool_available(name: &str) -> bool {
     Command::new(name).arg("--version").output().is_ok()
@@ -79,7 +79,12 @@ fn generate_firrtl(tr_src: &str) -> String {
     );
     let (ty2, type_errors2) = types::check(&ast2, &res2, &fx2);
     assert!(type_errors2.is_empty(), "{type_errors2:?}\n{lowered_src}");
-    let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2, &ty2);
+    let (b2, bounds_errors2) = bounds::check(&ast2, &res2, &fx2, &ty2);
+    assert!(
+        bounds_errors2.is_empty(),
+        "{bounds_errors2:?}\n{lowered_src}"
+    );
+    let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2, &ty2, &b2);
     assert!(
         schedule_errors2.is_empty(),
         "{schedule_errors2:?}\n{lowered_src}"
@@ -605,7 +610,9 @@ fn extmodule_tribuf_runs_a_real_bidirectional_bus() {
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
     let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
         .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
@@ -646,7 +653,9 @@ fn accumulator_runs_through_real_ports() {
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
     let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
         .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
@@ -694,7 +703,9 @@ fn optional_rule_sugar_runs_through_real_reset_and_edges() {
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
     let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
         .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
@@ -744,7 +755,9 @@ fn optional_chain_sugar_runs_through_a_genuinely_absent_intermediate_hop() {
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
     let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
         .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
@@ -1865,6 +1878,44 @@ fn mem_disjoint_banked_runs_through_real_ports() {
     );
 }
 
+/// v5 of the mem-disjointness proof, and the actual driving example
+/// `bounds.rs` exists for: `m`'s depth (10) is deliberately NOT a power
+/// of two, so neither v2 nor v3 (both gated on `pow2_addr_width`) could
+/// prove `write`/`read` disjoint here -- only `i`'s STATICALLY PROVEN
+/// bound (`where i < 9`, proven by induction over `bump`'s own `if i <
+/// 8` guard) makes it provable at all, via schedule.rs's own real-
+/// integer disjointness argument. Confirmed via `git stash` (self-
+/// verification, not asserted in this test) that dropping the `where`
+/// clause reproduces the exact old-conservative-model failure this
+/// feature fixes: `write_count` climbs but `read_count` gets stuck at 0
+/// forever, since `write` never blocks or idles for `read` to catch a
+/// derived-stall turn.
+#[test]
+fn mem_disjoint_bounded_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/mem_disjoint_bounded.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/mem_disjoint_bounded_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: write_count=10 read_count=10 y=aa Memory[0]=aa"),
+        "mem_disjoint_bounded result did not match expectations:\n{output}"
+    );
+}
+
 /// Proves DESIGN.md's own `<elaborates>` example (`AdderTree`, compile-
 /// time tree recursion over a `list` with one-sided slices) through real
 /// firtool and Icarus: `elaborate.rs`'s pre-pass unrolls `AdderTree([a,
@@ -2416,7 +2467,9 @@ fn accumulator_runs_through_real_ports_under_verilator() {
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
     let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
         .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
@@ -2494,7 +2547,9 @@ fn extmodule_tribuf_runs_a_real_bidirectional_bus_under_verilator() {
     assert!(effect_errors.is_empty(), "{effect_errors:?}");
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty);
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
+    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
     assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
     let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
         .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
