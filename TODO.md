@@ -2391,7 +2391,11 @@ manually in the meantime.
   `--explain-schedule` diff across every existing example came back
   byte-identical. Explicitly still NOT done: whether the interval-set
   domain is worth building now that `Mul` exists to make it non-inert
-  remains open, not yet decided as of this entry.
+  remains open, not yet decided as of this entry — resolved by v15,
+  several entries below: still provably inert (for a broader reason
+  than just "Mul specifically"), with `else`-branch negated-condition
+  narrowing built instead as the actual non-inert capture of the same
+  underlying idea.
 - **RESOLVED (v12) — cross-boundary bound propagation: a `fn`/`impl`
   PARAMETER can carry a `where` bound, checked as an obligation at
   every CALL site** (`examples/param_bound_check.tr`). Lumi asked to
@@ -2794,6 +2798,29 @@ manually in the meantime.
   interval-set domain Lumi originally asked about, but by finding and
   building the concrete, non-inert capability sitting next to it once
   the inertness was actually checked rather than assumed either way.
+- **RESOLVED — `Expr::Bracket` (a mem/fifo access) now recurses into
+  `callee`/`args` for the side effect of checking any nested `Call`**
+  (`examples/mem_read_call_check.tr`). Found empirically while
+  designing a follow-up feature (exporting this pass's own per-site
+  facts to `schedule.rs`, not yet built as of this entry):
+  `Bracket` had no arm in `expr_bound` at all through v15, falling to
+  the catch-all `_ => None` with ZERO recursion — so a mem access used
+  as a VALUE, not an assignment target (`y := m[Bump(50)]`, `return m
+  [Bump(50)]`, `Outer(m[Bump(50)])` as a call argument), silently
+  skipped a nested call's own argument obligations entirely, since
+  every one of those positions routes through this same shallow
+  `expr_bound` call. Confirmed via a driving scratch file (0 errors on
+  all three sibling positions) before fixing, per advisor's explicit
+  direction to ship this as its own small commit rather than bundle it
+  into the larger feature it was found while designing (the same call
+  made at v10 for the `Ne`-commuted-order fix). Fix: the arm still
+  composes to `None` (a mem access's own value has no provable bound,
+  unchanged) but now calls `check_calls_in` — the established "find
+  every outermost Call, check it, discard the bound" idiom already used
+  elsewhere in this file — on `callee` and every arg first. 3 new tests
+  (`tests/bounds.rs`, file's own total 64), each bug-reintroduction-
+  verified (reverting the arm to `Expr::Bracket { .. } => None` flips
+  all three from passing to a spurious accept).
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

@@ -3138,6 +3138,20 @@ v0 restrictions, all deliberate scope cuts:
   `--explain-schedule` diff across every existing example came back
   byte-identical except the new driving example, and
   a `--firrtl` sanity check confirmed clean codegen.
+- **`Expr::Bracket` (a mem/fifo access) now recurses into `callee`/
+  `args` for the side effect of checking any nested `Call`**
+  (`examples/mem_read_call_check.tr`), found empirically while
+  designing a follow-up feature (exporting this pass's own per-site
+  facts to `schedule.rs`, not yet built as of this entry), not
+  assumed: a mem
+  access used as a VALUE, not an assignment target (`y := m[Bump(50)]`,
+  `return m[Bump(50)]`, `Outer(m[Bump(50)])` as a call argument),
+  silently skipped a nested call's own argument obligations entirely —
+  `Bracket` had no arm in `expr_bound` at all through v15, falling to
+  the catch-all `_ => None` with zero recursion. The arm's own VALUE
+  still composes to `None`, unchanged; `check_calls_in` (the established
+  idiom already used elsewhere in this file) is reused rather than
+  duplicated. 3 new tests, each bug-reintroduction-verified.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"

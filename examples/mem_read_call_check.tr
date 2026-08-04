@@ -1,0 +1,12 @@
+module MemReadCallCheck {
+    mem m : [8][4]
+    reg y : [8] = 0
+
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+
+    rule step {
+        y := m[Bump(50)]
+    }
+}

@@ -1447,3 +1447,78 @@ module M {
 ";
     assert!(run(src).is_empty(), "{:?}", run(src));
 }
+
+// `Expr::Bracket` (a mem/fifo access) had no arm in `expr_bound` at all
+// through v15 -- it fell to the catch-all `_ => None` with ZERO
+// recursion into `callee`/`args`, so a call NESTED inside a mem access
+// used as a VALUE (not an assignment target) never had its own argument
+// obligations checked. Found empirically while designing a later
+// feature (exporting bounds.rs's own per-site facts to schedule.rs),
+// not assumed -- confirmed via a driving scratch file showing 0 errors
+// on pre-fix code for all three sibling positions below.
+
+#[test]
+fn call_argument_in_a_mem_read_used_as_a_value_is_checked() {
+    // `examples/mem_read_call_check.tr`'s own driving shape: `y := m
+    // [Bump(50)]` is a mem READ, not a write target, so `Stmt::Assign`'s
+    // existing LHS-focused fix (the mem-write-index gap) never covered
+    // it -- this is the RHS side of the same underlying hole.
+    let src = "\
+module M {
+    mem m : [8][4]
+    reg y : [8] = 0
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    rule step {
+        y := m[Bump(50)]
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_a_mem_read_inside_a_return_is_checked() {
+    let src = "\
+module M {
+    mem m : [8][4]
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    Get() : [8] {
+        return m[Bump(50)]
+    }
+    rule step {
+        Get()
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
+#[test]
+fn call_argument_in_a_mem_read_as_a_call_argument_is_checked() {
+    let src = "\
+module M {
+    mem m : [8][4]
+    Bump(i : [8] where i < 10) : [8] {
+        return i
+    }
+    Outer(x : [8]) : [8] where result < 40 {
+        return 0
+    }
+    reg total : [8] where total < 40 = 0
+    rule step {
+        total := Outer(m[Bump(50)])
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}

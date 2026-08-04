@@ -218,6 +218,22 @@
 //!   inverted `(20, 10)`), pre-existing since v9, but the same dead-
 //!   branch/false-premise argument makes it just as harmless there, and
 //!   no example depends on tightening it.
+//! - **`Expr::Bracket` (a mem/fifo access) now recurses into `callee`/
+//!   `args` for the side effect of checking any nested `Call`**
+//!   (`examples/mem_read_call_check.tr`), instead of falling to the
+//!   catch-all `_ => None` with ZERO recursion as it did through v15.
+//!   Found empirically while designing a later feature (exporting this
+//!   pass's own per-site facts to `schedule.rs`), not assumed: a mem
+//!   access used as a VALUE, not an assignment target (`y := m[Bump
+//!   (50)]`, `return m[Bump(50)]`, `Outer(m[Bump(50)])` as a call
+//!   argument), silently skipped the nested call's own argument
+//!   obligations entirely, since every one of those positions routes
+//!   through this same shallow `expr_bound` call and `Bracket` had no
+//!   arm at all. A mem/fifo access's own VALUE still has no provable
+//!   bound — this arm still returns `None`, unchanged — `check_calls_in`
+//!   (the established "find every outermost Call, check it, discard
+//!   the bound" idiom already used elsewhere in this file) is reused
+//!   here rather than duplicated.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -989,6 +1005,21 @@ impl<'a> Checker<'a> {
     /// anything, and `else_state` is cloned and discarded at the end of
     /// the branch, so nothing about a missed narrowing opportunity here
     /// ever escapes into the surrounding walk.
+    ///
+    /// Soundness here rests on one precondition `narrow_for_condition`
+    /// doesn't need: `ident_const_operands` only ever recognizes a bare
+    /// bounded ident and a const-foldable literal, both TOTAL
+    /// expressions that can't themselves fail. In this language a
+    /// comparison is a fallible operation — "else taken" means the
+    /// comparison FAILED, which equals "the predicate is false" only
+    /// when nothing else in the condition could have failed instead.
+    /// `narrow_for_condition`'s own THEN-branch narrowing doesn't need
+    /// this: success already implies the predicate held, regardless of
+    /// what else is in the condition. If `ident_const_operands` is ever
+    /// widened to accept a fallible operand (a call, an optional) for
+    /// the then-branch's benefit, `narrow_for_condition` stays sound but
+    /// `narrow_for_else` would silently stop being sound — worth
+    /// re-checking this function specifically before any such widening.
     fn narrow_for_else(
         &self,
         cond: ExprId,
@@ -1241,6 +1272,29 @@ impl<'a> Checker<'a> {
                 self.fn_ret_bound
                     .get(&fn_def)
                     .map(|bounded| (bounded.lower, bounded.upper))
+            }
+            // A mem/fifo access's own VALUE has no provable bound here
+            // -- composes to `None`, unchanged from before this arm
+            // existed. But `callee`/`args` can still contain a nested
+            // `Call` whose own argument obligations need checking:
+            // without this arm, `Expr::Bracket` fell through to the
+            // catch-all below with ZERO recursion, so `y := m[Bump(50)]`
+            // (a mem READ used as a value, not an assignment target)
+            // silently skipped `Bump`'s own argument check entirely --
+            // found empirically while designing a later feature, not
+            // assumed, and confirmed to be the same gap at `return m
+            // [Bump(50)]` and `Outer(m[Bump(50)])` (a call argument)
+            // too, since all three route through this same shallow
+            // `expr_bound` call. `check_calls_in` is exactly the
+            // established "find every outermost Call and check it,
+            // discard the returned bound" idiom already used elsewhere
+            // in this file, reused here rather than duplicating it.
+            Expr::Bracket { callee, args } => {
+                self.check_calls_in(*callee, state, locals);
+                for arg in args {
+                    self.check_calls_in(*arg, state, locals);
+                }
+                None
             }
             _ => None,
         }
