@@ -1274,6 +1274,144 @@ module M {
 }
 
 #[test]
+fn mem_disjoint_v7_mirrored_odd_offset_is_proven() {
+    // `examples/mirrored_index_disjoint.tr`'s own driving case: `m[i]`
+    // vs `m[7 - i]`, SAME base `i`. `2*i (mod 16)` is always even, and
+    // `7` is odd, so there is NO `i` for which `i = 7 - i (mod 16)` --
+    // provable with no power-of-two DEPTH requirement at all (unlike the
+    // v1/v3 arguments), since the argument only needs the base's own
+    // width to be a power of two, which every bit-width already is.
+    //
+    // Naming note: this file's `v6`/`v7` test-name prefixes already
+    // diverge from `forms_differ`'s own doc comment, which calls the
+    // range-disjointness argument the "FIFTH" and this one the "SIXTH"
+    // -- the test prefix counts shipped FEATURES chronologically (`v6`
+    // covers what the doc calls the fourth AND fifth arguments, shipped
+    // together at v16), the doc comment counts independent PROOF
+    // ARGUMENTS. Both are internally consistent; they just don't share
+    // one counter.
+    let src = "\
+module M {
+    mem m : [8][8]
+    reg i : [4] where i < 8 = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[7 - i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v7_mirrored_even_offset_stays_unprovable() {
+    // The discriminating negative case, and the one that actually proves
+    // the `negated`-flag guard on the OTHER arguments is load-bearing,
+    // not just cautious: `m[i]` vs `m[2 - i]` genuinely COLLIDES at
+    // `i = 1` (`2 - 1 = 1`), a real runtime aliasing this proof must NOT
+    // claim disjoint. Before the `same_base_and_multiplier` check
+    // required `a.negated == b.negated`, this exact pair was wrongly
+    // proven disjoint (confirmed by temporarily removing the guard
+    // during development): `i`'s offset (0) and `2 - i`'s offset (2)
+    // differ mod 8, which the pre-existing same-base argument reads as
+    // "same shape, offsets differ" -- true for two ADDING forms, but
+    // false here, since one side's base term is negated and the two
+    // don't cancel in the subtraction the way the argument assumes.
+    let src = "\
+module M {
+    mem m : [8][8]
+    reg i : [4] where i < 8 = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[2 - i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v7_mirrored_even_offset_stays_unprovable_under_a_narrow_bound() {
+    // A SECOND, differently-shaped discriminating negative case (an
+    // advisor follow-up, since the test above uses `i < 8` -- wide
+    // enough that `i`'s own range `[0,8)` and `2 - i`'s computed range
+    // overlap so broadly it doesn't discriminate the RANGE-based
+    // arguments specifically): here `i < 2` is narrow enough that
+    // `bounds.rs`'s own `Sub` arm proves a real range for `2 - i` too
+    // (`[1,3)`), which could in principle let the FOURTH/FIFTH
+    // (range-disjointness) arguments fire independently of the mirrored
+    // one -- confirming they don't, since `i`'s range `[0,2)` and
+    // `2 - i`'s range `[1,3)` genuinely overlap at the real collision
+    // point (`i = 1`, `2 - 1 = 1`). See `forms_differ`'s own doc comment
+    // for why a SOUND range can never be disjoint at a point it actually
+    // achieves.
+    let src = "\
+module M {
+    mem m : [8][10]
+    reg i : [4] where i < 2 = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[2 - i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
+fn mem_disjoint_v7_mirrored_different_bases_stays_unprovable() {
+    // The mirrored argument requires the SAME base on both sides (it
+    // reasons about `2*base`, a single-variable equation) -- `m[i]` vs
+    // `m[7 - j]` for two DIFFERENT registers stays exactly as unprovable
+    // as `mem_disjoint_v2_different_bases_stay_unprovable`, regardless
+    // of the odd offset: `i` and `j` could still coincide with `7 - j`.
+    let src = "\
+module M {
+    mem m : [8][8]
+    reg i : [4] where i < 8 = 0
+    reg j : [4] where j < 8 = 0
+    in x : [8]
+    out y : [8] = 0
+    rule p {
+        m[i] := x
+    }
+    rule q {
+        y := m[7 - j]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}
+
+#[test]
 fn mem_disjoint_v3_banked_non_power_of_two_multiplier_stays_unprovable() {
     // `3*i` isn't a power of two, so the banking argument's `M.is_
     // power_of_two()` guard rejects it outright -- and since the bases

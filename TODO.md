@@ -3358,6 +3358,48 @@ manually in the meantime.
   struct-field feature entirely — its own unit of work in this arc's
   numbering, per advisor guidance, since the bug predates v18 and isn't
   about struct fields at all.
+- **RESOLVED (v7 of the mem-disjointness proof) — the mirrored-index
+  half of tier-3's two motivating examples, `examples/mirrored_index_
+  disjoint.tr` (`m[i]` vs `m[7 - i]`).** Lumi asked "time for the type
+  system?" once more; checked against the actual example suite first
+  rather than surveying past decision points in the abstract — every
+  mem-related stall/`conflict_free` case across all 82 examples as of
+  that survey was either a same-base ordering hazard or an inherently
+  unbounded base (an `in` port or a mem-loaded value), so nothing
+  EXISTING needed tier 3. Wrote two new, deliberately different
+  synthetic cases instead of designing against nothing: this one (a
+  purely algebraic parity fact, no state history involved) and
+  `examples/circular_buffer_disjoint.tr` (a genuinely relational
+  invariant across four registers' write histories — STILL OPEN, see
+  below). `IndexForm` gained a `negated: bool` flag (`c - base` is a
+  genuinely different shape from a signed `multiplier`) and
+  `forms_differ` gained a new argument: same base, both multipliers 1,
+  opposite `negated`, provable whenever the two offsets differ by an
+  ODD amount (`2*base` can never be odd mod any power-of-two width).
+  Every EXISTING symbolic argument needed an `a.negated == b.negated`
+  guard added to `same_base_and_multiplier` — without it, `i` and
+  `7 - i` look like "same shape, offsets differ," which is UNSOUND (the
+  shared term doubles instead of cancelling when negated); confirmed
+  load-bearing by constructing a genuinely colliding pair (`m[i]` vs
+  `m[2 - i]`, real collision at `i = 1`) that the unguarded code wrongly
+  proved disjoint before the guard was added. The range-based arguments
+  needed no such guard — they reason over achievable value sets, and a
+  real collision point is always inside both sides' independently sound
+  ranges — confirmed with a second negative test narrow enough
+  (`i < 2`) that `bounds.rs` proves a real range for `2 - i` too. 4 new
+  tests in `tests/schedule.rs`, each bug-reintroduction-verified;
+  `--explain-schedule` byte-diff came back identical across every OTHER
+  existing example; `--firrtl` sanity check confirmed clean codegen.
+  See `schedule.rs`'s own module doc, "A seventh case," for the full
+  writeup.
+- **OPEN — the relational half of tier-3, `examples/circular_buffer_
+  disjoint.tr` (`push`/`pop`'s disjointness depends on the joint write
+  history of four registers), is still NOT built.** Closing it for real
+  needs either a bound that can reference OTHER registers (real
+  dependent/refinement types) or a purpose-built cross-register
+  invariant check across write sites, the way `bounds.rs` already
+  checks scalar bounds — a meaningfully bigger undertaking than the
+  mirrored-index case above, deliberately left as its own next step.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

@@ -1,0 +1,68 @@
+-- A SECOND, differently-shaped driving example for DESIGN.md's "Tier 3,
+-- not v0" -- unlike `circular_buffer_disjoint.tr`'s RELATIONAL,
+-- stateful invariant (disjointness depends on the joint history of
+-- FOUR registers' writes), this one is a purely ALGEBRAIC fact about
+-- two INDEX EXPRESSIONS, no state history involved at all: `write`
+-- accesses `m[i]`, `read` accesses `m[7 - i]` -- for ANY integer `i` in
+-- `[0, 8)`, `i` and `7 - i` can NEVER be equal, since `i = 7 - i` would
+-- require `2*i = 7`, impossible for an integer (7 is odd). This holds
+-- for every possible value of `i` simultaneously -- not just the ones
+-- `i` happens to take on at runtime -- so it's a strictly STRONGER,
+-- simpler claim than the FIFO's, provable (in principle) from `i`'s
+-- declared type alone, with no need to track how `i` got there.
+--
+-- Confirmed empirically, not assumed: `--explain-schedule` reports
+-- `rule write conflicts with rule read: write meets read on {m}`, a
+-- derived stall, exactly as conservative as if `i`/`7 - i` shared no
+-- relationship at all. `advance` (which both `write` and `read` also
+-- depend on, for `i` itself) is deliberately isolated via two
+-- `conflict_free` directives, the same pattern `mem_disjoint_ranges.tr`
+-- uses for its own `bump_i`/`bump_j` -- leaving `write`/`read`'s
+-- conflict on `m` as the ONE thing left unresolved, cleanly isolated
+-- from any register-sharing noise.
+--
+-- Why today's checker can't close this: `schedule.rs`'s `IndexForm`
+-- recognizes a base plus a CONSTANT multiplier and offset (`k*base +
+-- c`), composed through `+`/`-`/`*` -- but `7 - i` isn't `i` scaled by
+-- a constant, it's a constant MINUS `i` (`i` negated, then offset) --
+-- a shape `index_form`'s own recursion doesn't handle today (confirmed:
+-- this file's `write`/`read` are NOT reported disjoint, unlike
+-- `mem_disjoint_rw.tr`'s literal addresses or `mem_disjoint_affine.tr`'s
+-- `base + k` shape). Unlike `circular_buffer_disjoint.tr`, this gap
+-- does NOT need real dependent/refinement types or relational
+-- reasoning across multiple registers -- it needs `IndexForm` extended
+-- with a NEGATION case (`c - base` as `multiplier = -1, offset = c`)
+-- plus a parity argument (`base` and `c - base` coincide only when `c`
+-- is even, at `base = c/2`; for odd `c` -- as here, `c = 7` -- they
+-- NEVER coincide, for ANY `base`). A meaningfully SMALLER, more
+-- tractable slice of "tier 3" than the FIFO's own case: an `IndexForm`
+-- extension, not a new proof engine.
+module MirroredIndex {
+    mem m : [8][8]
+
+    reg i : [4] where i < 8 = 0
+
+    in x : [8]
+    out y : [8] = 0
+
+    rule write {
+        m[i] := x
+    }
+
+    rule read {
+        y := m[7 - i]
+    }
+
+    rule advance {
+        if i < 7 {
+            i := i + 1
+        } else {
+            i := 0
+        }
+    }
+
+    schedule {
+        conflict_free { write, advance }
+        conflict_free { read, advance }
+    }
+}

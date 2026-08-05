@@ -3823,6 +3823,59 @@ The genuinely general case — two arbitrary, unrelated, unscaled, UNANNOTATED
 bases — stays exactly as unprovable as before; nothing in this section closes
 it.
 
+**Motivating examples, added when Lumi asked "time for the type system?" once
+more and the answer this time was checked against the actual example suite
+first** (every mem-related stall/`conflict_free` case across all 82 examples
+as of that survey was either a same-base ordering hazard or an inherently
+unbounded base — an `in` port or a mem-loaded value — so nothing EXISTING
+needed tier 3; the ask was to write a synthetic case that would, not to start
+designing against nothing). Two, deliberately different shapes:
+
+- `examples/circular_buffer_disjoint.tr`: `push` writes `m[head]`, `pop`
+  reads `m[tail]` — two registers each ranging over the FULL address space
+  (no static partition works), disjoint only because of a RELATIONAL
+  invariant across all four of `head`/`tail`/`push_count`/`pop_count`'s own
+  write histories, not a fact about any one or two registers' own values.
+  This is the genuinely general tier-3 shape — closing it for real needs
+  either a bound that can reference OTHER registers (real dependent/
+  refinement types) or a purpose-built invariant check across write sites
+  the way `bounds.rs` already checks scalar bounds.
+- `examples/mirrored_index_disjoint.tr`: `write` accesses `m[i]`, `read`
+  accesses `m[7 - i]` — a purely ALGEBRAIC fact (odd `7` means `i` and
+  `7 - i` can never coincide for any integer `i`), no state history involved
+  at all. A meaningfully SMALLER slice than the first: `schedule.rs`'s
+  `IndexForm` already recognizes `k*base + c`, just not `c - base` (`base`
+  negated, then offset) — this is an `IndexForm` extension plus a parity
+  argument, not a new proof engine. **RESOLVED**, a `IndexForm` gained a
+  `negated: bool` flag (`c - base` is a genuinely different shape from
+  negating `multiplier` itself, per `IndexForm::sub`'s own doc comment) and
+  `forms_differ` gained a seventh argument: same base, both multipliers 1,
+  opposite `negated`, provable whenever the two offsets' difference is ODD
+  (`2*base` can never be odd mod any power-of-two width, wraparound
+  included). Every EXISTING symbolic argument (v1-v4) needed an `a.negated
+  == b.negated` guard added to `same_base_and_multiplier` — without it,
+  `i` and `7 - i` look like "same shape, offsets differ" to those
+  arguments, which is UNSOUND (the shared term doubles instead of
+  cancelling when one side is negated); confirmed load-bearing by
+  constructing a genuinely colliding pair (`m[i]` vs `m[2 - i]`, real
+  collision at `i = 1`) that the unguarded code wrongly proved disjoint.
+  The range-based arguments (fourth/fifth/sixth case) needed no such
+  guard — they reason over achievable value sets, not a cancelling
+  symbolic term, and a real collision point is always inside both sides'
+  independently sound ranges — confirmed with a second negative test
+  narrow enough (`i < 2`) that `bounds.rs` proves a real range for
+  `2 - i` too. 4 new tests in `tests/schedule.rs`, each bug-
+  reintroduction-verified; `--explain-schedule` byte-diff came back
+  identical across every OTHER existing example; `--firrtl` sanity check
+  confirmed clean codegen. See `schedule.rs`'s own module doc, "A seventh
+  case," for the full writeup.
+
+`examples/circular_buffer_disjoint.tr` (the genuinely relational half) is
+still NOT built — this exists to give a FUTURE "time for the type system?"
+ask an actual program to point at, rather than resolving to nothing (as
+the previous six asks did) or building real dependent/refinement types
+against no motivating case at all.
+
 The checked `conflict_free` assertion above is not a smaller version of this
 tier, and does not retire it: it checks a runtime PRECONDITION (do these two
 addresses happen to differ THIS cycle), not a static proof (do they ALWAYS

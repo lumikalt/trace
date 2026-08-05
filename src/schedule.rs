@@ -159,6 +159,43 @@
 //! rule's own access site is just as true a fact about that shared
 //! value as the def's flat declared range is — not a weaker, rule-local
 //! claim.
+//!
+//! # A seventh case: a MIRRORED index (`examples/mirrored_index_
+//! disjoint.tr`)
+//!
+//! Every case above reasons about either a SHARED symbolic term (same
+//! base, same multiplier — v1-v3) or an independently-computed real
+//! range (fourth/fifth/sixth). `m[i]` against `m[7 - i]` is neither: the
+//! SAME base `i` appears on both sides, but negated on one — `IndexForm`
+//! gained a `negated: bool` flag to represent `c - base` (a genuinely
+//! different shape from `(-1)*base + c` composed the normal way, per
+//! `IndexForm::sub`'s own doc comment) rather than trying to make
+//! `multiplier` signed. `i` and `7 - i` can never coincide (mod any
+//! power-of-two width, including wraparound) whenever `7` is ODD:
+//! doubling a value and reducing mod a power of two can never produce
+//! an odd result, so `2*i ≡ 7 (mod 2^W)` has no solution. This is a
+//! PURELY ALGEBRAIC fact about the two index expressions themselves —
+//! no state-write history involved at all, unlike a genuinely relational
+//! invariant (DESIGN.md's own "Tier 3, not v0" section still has an
+//! OPEN example, `examples/circular_buffer_disjoint.tr`, needing exactly
+//! that: `head`/`tail`/`push_count`/`pop_count`'s joint write history,
+//! not a fact about any one or two registers' values). Every EXISTING
+//! argument above had to be re-checked for a `negated`-shaped blind
+//! spot: the symbolic ones (v1-v3, and the fourth case) all assumed a
+//! shared term cancels exactly in the subtraction, which is false when
+//! one side is negated (it DOUBLES instead) — found and fixed by adding
+//! an `a.negated == b.negated` requirement to `same_base_and_multiplier`,
+//! confirmed load-bearing by constructing a genuinely colliding pair
+//! (`m[i]` vs `m[2 - i]`, real collision at `i = 1`) that the unguarded
+//! code wrongly proved disjoint before the guard was added. The
+//! range-based arguments (fourth/fifth/sixth) needed NO such guard: they
+//! reason over achievable value SETS computed independently by
+//! `bounds.rs`'s own interval arithmetic, and a real collision point is
+//! by construction inside both sides' soundly-computed ranges, so a
+//! range-overlap test can't misfire regardless of symbolic shape — see
+//! `forms_differ`'s own doc comment for the full argument and its own
+//! empirical confirmation (`i < 2`, narrow enough that `bounds.rs`
+//! proves a real range for `2 - i` too, still correctly unprovable).
 
 use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, ScheduleDirective};
 use crate::bounds::Bounds;
@@ -673,11 +710,29 @@ fn rule_name(ast: &Ast, id: ItemId) -> &str {
 /// which multiplier — it cancels in the subtraction), or by SAME
 /// power-of-two multiplier alone regardless of base identity (the
 /// banking argument — see `forms_differ`).
+///
+/// `negated` (added for `examples/mirrored_index_disjoint.tr`'s own
+/// gap): when `true`, this form represents `offset - multiplier * base`
+/// instead of `multiplier * base + offset` — a genuinely different
+/// shape from negating `multiplier` itself (`c - base` isn't `(-1)*base
+/// + c` composed the normal way; it's `base` subtracted FROM a
+/// constant, not a translation of `base`), which is why this is a
+/// separate flag rather than a signed `multiplier`. Every EXISTING
+/// disjointness argument in `forms_differ` requires both sides' own
+/// `negated` flags to match before treating two forms as "the same
+/// shape" — a negated and non-negated form sharing a base and
+/// multiplier are NOT
+/// interchangeable (`i` and `7 - i` share `base = i, multiplier = 1`
+/// but are never equal, while `i` and `i` obviously always are), so
+/// conflating them would be a real soundness bug, not just an
+/// imprecision. See `forms_differ`'s own "mirrored/negated" argument
+/// for the one case that specifically NEEDS `negated` to differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndexForm {
     base: Option<DefId>,
     multiplier: u64,
     offset: u64,
+    negated: bool,
 }
 
 impl IndexForm {
@@ -686,6 +741,7 @@ impl IndexForm {
             base: None,
             multiplier: 0,
             offset,
+            negated: false,
         }
     }
 
@@ -694,6 +750,7 @@ impl IndexForm {
             base: Some(def),
             multiplier: 1,
             offset: 0,
+            negated: false,
         }
     }
 
@@ -714,11 +771,16 @@ impl IndexForm {
         }
     }
 
-    /// `self - other`. Only `base - k` is representable (`k - base`
-    /// negates the base, not a translation of it — a genuinely
-    /// different shape, not the same "runtime value shifted by a known
-    /// amount" this proof reasons about; `base1 - base2` is two-variable,
-    /// same reason as `add`).
+    /// `self - other`. `base - k` is `base`'s own form with the offset
+    /// shifted (unaffected by `negated` — a negated `base` translated by
+    /// a further constant is still negated, just at a new offset). `k -
+    /// base` NEGATES `other`'s form rather than composing it the normal
+    /// way (`c - (m*base + o) = -m*base + (c - o)`) — flips `negated`
+    /// rather than requiring `other` start out non-negated, so a second
+    /// subtraction correctly un-negates a form that was already negated
+    /// (`c - (d - base) = base + (c - d)`). `base1 - base2` (two
+    /// DIFFERENT bases) is still two-variable and stays unrepresentable
+    /// regardless of either side's `negated` flag.
     fn sub(self, other: Self) -> Option<Self> {
         match (self.base, other.base) {
             (None, None) => Some(Self::constant(self.offset.wrapping_sub(other.offset))),
@@ -726,7 +788,13 @@ impl IndexForm {
                 offset: self.offset.wrapping_sub(other.offset),
                 ..self
             }),
-            _ => None,
+            (None, Some(_)) => Some(Self {
+                base: other.base,
+                multiplier: other.multiplier,
+                offset: self.offset.wrapping_sub(other.offset),
+                negated: !other.negated,
+            }),
+            (Some(_), Some(_)) => None,
         }
     }
 
@@ -874,6 +942,51 @@ fn base_width(ty: &Types, def: DefId) -> Option<u64> {
 /// neither pow2-gated nor same-base argument can: two independently
 /// bounded, unrelated bases (`schedule.rs`'s own "A fifth case" doc
 /// comment has the full motivating example).
+///
+/// A SIXTH, independent argument (`examples/mirrored_index_disjoint.tr`'s
+/// own driving case) needs neither `pow2_width` nor a proven range at
+/// all: SAME base, both multipliers exactly 1, but OPPOSITE `negated`
+/// (`base + oa` against `oc - base`). These coincide iff `2*base ≡ oc -
+/// oa (mod 2^W)` for `base`'s own declared width `W` — and `2*base mod
+/// 2^W` is ALWAYS even (doubling, then reducing mod a power of two,
+/// can't touch bit 0), so there's no solution whenever `oc - oa` is
+/// ODD. Unlike every argument above, this one needs no width GUARD at
+/// all: bit 0 of a difference is invariant under truncation to any
+/// narrower power-of-two width (truncation only drops HIGH bits), so
+/// the parity check is correct whether it's evaluated at the base's own
+/// declared width, the mem's address width, or plain `u64` wraparound —
+/// confirmed via the CLI that a literal not fitting the base's own
+/// declared width is a compile error (`1000 - i` against a 4-bit `i`
+/// rejected outright), so `oc`/`oa` are always the SAME literal value
+/// the base's own width would produce, never a wider-then-truncated one
+/// the way the banking argument's multiplier is. This is why `negated`
+/// must otherwise GATE every argument above it (`same_base_and_
+/// multiplier` now requires `a.negated == b.negated`): without that
+/// guard, `i` and `7 - i` (same base, same multiplier magnitude 1)
+/// would wrongly look like "the same shape, offsets differ" to the
+/// fourth/same-base arguments, an actual soundness bug, not just an
+/// imprecision — the `M*base` term does NOT cancel in the subtraction
+/// when one side is negated, it DOUBLES instead. The banking argument
+/// is the one exception needing no such guard: its own claim (`M*x`
+/// contributes 0 to the low `log2(M)` bits regardless of `x`) holds
+/// identically whether that term is added or subtracted.
+///
+/// Why the FOURTH/FIFTH (range-based) arguments above need NO `negated`
+/// guard at all, unlike the symbolic ones: they reason over ACHIEVABLE
+/// VALUE SETS, computed independently by `bounds.rs`'s own interval
+/// arithmetic (`real_range`/`site_ranges`, gated on genuine underflow
+/// safety), not over a shared symbolic term that's assumed to cancel.
+/// If `i` and `c - i` really do collide at some reachable `i = k`, then
+/// `k` is by construction an achievable value of BOTH expressions, so
+/// `k` lies inside both of their soundly-computed intervals — the
+/// `a_hi <= b_lo || b_hi <= a_lo` disjointness test can never pass at a
+/// point both ranges actually contain. Confirmed, not just argued: `m[i]`
+/// vs `m[2 - i]` under a narrow `where i < 2` (small enough that
+/// `bounds.rs`'s own `Sub` arm proves a real range for `2 - i` too) still
+/// correctly fails to prove disjoint, even though `i`'s range `[0,2)`
+/// and `2 - i`'s range `[1,3)` are each independently sound — they
+/// overlap at `1`, the actual collision point, so the range argument
+/// declines exactly where it must.
 fn forms_differ(
     ty: &Types,
     a: IndexForm,
@@ -896,7 +1009,16 @@ fn forms_differ(
     match (a.base, b.base) {
         (None, None) => a.offset != b.offset,
         (Some(da), Some(db)) => {
-            let same_base_and_multiplier = da == db && a.multiplier == b.multiplier;
+            let mirrored_argument =
+                da == db && a.multiplier == 1 && b.multiplier == 1 && a.negated != b.negated && {
+                    let (neg, pos) = if a.negated { (a, b) } else { (b, a) };
+                    neg.offset.wrapping_sub(pos.offset) & 1 == 1
+                };
+            if mirrored_argument {
+                return true;
+            }
+            let same_base_and_multiplier =
+                da == db && a.multiplier == b.multiplier && a.negated == b.negated;
             let proven_bound_argument = same_base_and_multiplier
                 && a.offset != b.offset
                 && real_depth.is_some_and(|depth| {

@@ -1,0 +1,90 @@
+-- A driving example for DESIGN.md's "Tier 3, not v0": `push` writes
+-- `m[head]`, `pop` reads `m[tail]` -- two DIFFERENT registers, neither
+-- one a scaled/offset function of the other (unlike v1/v2's same-base
+-- affine case), and NEITHER individually bounded to a sub-range of the
+-- other's (unlike `mem_disjoint_ranges.tr`'s `v6` proof): `head` and
+-- `tail` each independently range over the FULL `[0, 8)` address space,
+-- so no static partition of that space could ever separate them.
+--
+-- `push_count`/`pop_count` (each wrapping mod 16, the standard "extra
+-- bit" FIFO pointer-counter technique -- capacity 8 < the counters' own
+-- modulus 16, so `push_count - pop_count` unambiguously reads back the
+-- true occupancy) are split so `push`/`pop` each only ever WRITE their
+-- own counter (`push` never writes `pop_count`, `pop` never writes
+-- `push_count`) -- but each rule's own fullness/emptiness guard
+-- necessarily READS the OTHER rule's counter too (`push`'s guard needs
+-- BOTH counts to compute occupancy; so does `pop`'s), which is not an
+-- artifact of this example's construction -- it's inherent to any
+-- correct FIFO: the producer genuinely cannot know "is there room"
+-- without observing consumer progress, and vice versa. Confirmed
+-- empirically, not assumed: `--explain-schedule` on this file reports
+-- `rule push conflicts with rule pop: write meets read on {m,
+-- push_count, pop_count}`, THREE shared facts, not just `m` -- and all
+-- three are manifestations of the SAME underlying relational invariant
+-- (see below), not independent confounds to be engineered away.
+--
+-- The actual reason `push`/`pop` never touch the same mem address
+-- (while the buffer is neither empty nor full) is a RELATIONAL
+-- invariant across the whole quadruple `(head, tail, push_count,
+-- pop_count)` -- how far `head` has advanced past `tail` (mod 8) is
+-- exactly `push_count - pop_count` (mod 16) -- not a fact about `head`
+-- or `tail`'s own value in isolation. Every disjointness argument
+-- `schedule.rs`/`bounds.rs` can make today (shared base, shared
+-- power-of-two multiplier, one proven per-register interval, two
+-- non-overlapping proven intervals) is a claim about ONE OR TWO
+-- registers' own possible values; none of them can express "these two
+-- registers' values are related by the history of writes to two OTHER
+-- registers." This falls back to a real derived stall (`pop` only
+-- fires when `push` is blocked or idle), exactly as conservative as if
+-- `head`/`tail` had no `where` bound at all.
+--
+-- This is the genuinely general tier-3 shape DESIGN.md describes --
+-- unlike `mem_disjoint_ranges.tr`'s note that "`m[i]` vs `m[j]` for two
+-- arbitrary UNANNOTATED registers stays exactly as unprovable," this
+-- case can't be closed by annotating `head`/`tail` with a TIGHTER
+-- `where` bound either, since their full, correct range really is
+-- `[0, 8)` each -- the missing fact is relational, not a tighter
+-- per-register interval. Proving it needs either real dependent/
+-- refinement types (a bound that can reference OTHER registers, not
+-- just literal constants) or a purpose-built invariant like "head -
+-- tail == push_count - pop_count (mod depth)" checked across every
+-- write site the way `bounds.rs` already checks scalar bounds --
+-- exactly the kind of capability this arc has never built, and the
+-- concrete motivating case for building it.
+module CircularBufferDisjoint {
+    mem m : [8][8]
+
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+
+    in push_en : [1]
+    in push_data : [8]
+    in pop_en : [1]
+    out pop_data : [8] = 0
+
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count < 8)?
+        m[head] := push_data
+        if head < 7 {
+            head := head + 1
+        } else {
+            head := 0
+        }
+        push_count := push_count + 1
+    }
+
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_data := m[tail]
+        if tail < 7 {
+            tail := tail + 1
+        } else {
+            tail := 0
+        }
+        pop_count := pop_count + 1
+    }
+}
