@@ -4216,6 +4216,52 @@ half — `m[head] != m[tail]` via the one generic disjointness query,
 `schedule.rs`'s own bespoke `provably_disjoint_under_joint_guards`
 retired — is stage 4's work, not started.
 
+**Stage 2, first sub-step done: the provenance judgment is now a real
+type, not a naming convention.** An advisor review of the original
+stage-2 plan (which read "unify the six maps" literally, splitting the
+work into "merge three maps behind an enum key" then "fold `bounded` in"
+then "add provenance last") flagged two problems: first, a bare
+`RefinementTarget` enum key change collapses nothing real — it renames
+four `HashMap` lookups into enum-variant constructions and adds
+variant-filtering to every iteration site, a net-negative commit on its
+own, since the actual duplication this stage exists to remove lives in
+`check_stmt`'s `Stmt::Assign` arm (three structurally identical branches
+— bare-Ident/`self.bounded`, `Bracket`+Mem-kind/`mem_bounds`,
+struct-typed-Ident/`struct_field_bounds`, each: look up a declared bound,
+compute the written value, `found_writes.insert`, `check_against_bound`)
+— not in the maps' own shape. Second, the provenance judgment was
+scheduled LAST, but it constrains the unified value type (if a proven
+fact and an assumed one are different types, `BoundedDef` alone isn't
+the map's value type) — discovering that after merging the maps would
+mean redoing the merge.
+
+Reordered: provenance first. `Proven<T>` now lives in its own child
+submodule (`mod refinement` inside `bounds/mod.rs`) with a private
+field — the ONLY way code elsewhere in `bounds.rs`/`smt.rs` can build one
+is `Proven::checked`, called exclusively by the four `collect_one_*`
+collectors right after their own const-fold/width verification. This is
+the structural version of what was previously true only by convention
+(every insert site happened to be inside a verifying collector, but
+nothing enforced that a future edit couldn't construct a raw `BoundedDef`
+ad hoc and insert an unchecked fact). `self.bounded`/`mem_bounds`/
+`struct_field_bounds`/`fn_ret_bound` now store `Proven<BoundedDef>`;
+every read site derefs through it (`Deref` impl for field access,
+explicit `*`/`.map(|b| **b)` where a bare `BoundedDef` value is needed by
+`check_against_bound`/`shadow_compare`). Confirmed byte-identical
+`--explain-schedule` output across all 84 examples (pinned pre-change
+binary vs. post-change binary) and zero regressions across the full
+test suite (838 tests) — pure type-safety addition, no behavior change,
+as this sub-step's own success criterion demands.
+
+Next: fold `check_stmt`'s three parallel write-obligation branches into
+one loop over "obligations this LHS carries," done in the SAME commit as
+merging the four maps (not split by map — the advisor's second
+correction: splitting `bounded` out from the other three "buys nothing
+and costs a stale intermediate state"). The map shape should fall out of
+what that unification actually needs, not be decided upfront.
+`relational_bounds` stays a separate mechanism throughout (multi-def, no
+single owning type — DESIGN.md's own reasoning above still holds).
+
 ## Combinational loops
 
 Inside one `combines` scope, no forward reference is allowed, so a local cycle

@@ -96,7 +96,23 @@ consults it; deletion rides along with `real_range`'s own retirement at stage 4.
 2–4 (unify the six `bounds.rs` maps into one representation, generalize the surface
 predicate grammar, then — separately, since it proves strictly more and changes generated
 hardware — collapse `schedule.rs`'s eight mem-disjointness arguments into one generic
-query, deleting the old engine alongside it) are ordered but not started.
+query, deleting the old engine alongside it) are ordered.
+
+**Stage 2 started, reordered on advisor review.** The original plan read "unify the six
+maps" literally (merge three maps behind an enum key, fold `bounded` in separately, add
+the proven/assumed provenance judgment last) — an advisor pass caught that this collapses
+nothing real (a bare enum key just renames `HashMap` lookups into enum-variant
+constructions) and that provenance constrains the value type, so doing it last risks
+redoing the merge. Reordered: provenance first, done — `Proven<T>` now lives in its own
+child submodule with a private field, so `Proven::checked` (called only by the four
+`collect_one_*` collectors right after their own const-fold/width verification) is the
+ONLY way to construct one; `self.bounded`/`mem_bounds`/`struct_field_bounds`/`fn_ret_bound`
+now store `Proven<BoundedDef>` instead of a bare struct anyone in the module could build ad
+hoc. Confirmed byte-identical `--explain-schedule` across all 84 examples and zero
+regressions across the full test suite. Next: fold `check_stmt`'s three parallel
+write-obligation branches (bare-Ident/mem-Bracket/struct-typed-Ident) into one loop, in the
+SAME commit as merging the four maps (not split by map) — see DESIGN.md's stage-2 entry
+for the full reasoning.
 
 ## Emission (`src/firrtl/`)
 

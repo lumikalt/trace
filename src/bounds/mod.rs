@@ -728,6 +728,50 @@ pub struct RelationalFact {
     pub upper: u64,
 }
 
+/// The provenance judgment (DESIGN.md's stage 2 "toward a dependent/
+/// refinement type system" section) as a real TYPE distinction, not a
+/// naming convention: every value ever stored in `self.bounded`/
+/// `mem_bounds`/`struct_field_bounds`/`fn_ret_bound` is, today, only
+/// ever inserted by one of the four `collect_one_*` collectors, each of
+/// which const-folds the declared bound and resolves a concrete width
+/// FIRST -- but nothing stops a future edit from constructing a raw
+/// `BoundedDef { lower, upper, width }` ad hoc elsewhere in this module
+/// (its fields are private to `bounds`, not to any one function) and
+/// inserting an unchecked/assumed fact into one of those maps by
+/// accident.
+///
+/// `Proven` lives in its own child submodule specifically so `value` is
+/// private to THAT submodule, not merely to `bounds` -- `checked` is the
+/// only way code outside `refinement` can ever build one, and every
+/// caller of it is a `collect_one_*` collector immediately after its own
+/// verification. An assumed fact (an `in` port's declared type, an
+/// unwritten mem read, ...) is never representable by this type at all,
+/// structurally, regardless of anyone's discipline.
+mod refinement {
+    #[derive(Clone, Copy)]
+    pub(super) struct Proven<T> {
+        value: T,
+    }
+
+    impl<T> Proven<T> {
+        /// Called ONLY by a `collect_one_*` collector, immediately after
+        /// it has confirmed `value` came from a const-folded, width-
+        /// checked declaration -- see each call site for its own specific
+        /// verification.
+        pub(super) fn checked(value: T) -> Self {
+            Proven { value }
+        }
+    }
+
+    impl<T> std::ops::Deref for Proven<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.value
+        }
+    }
+}
+use refinement::Proven;
+
 /// One bounded def's (a `reg`, `out`, or fn/impl param, v12) own
 /// declared facts, collected once up front.
 #[derive(Clone, Copy)]
@@ -1010,7 +1054,7 @@ struct Checker<'a> {
     res: &'a Resolution,
     fx: &'a Effects,
     ty: &'a Types,
-    bounded: HashMap<DefId, BoundedDef>,
+    bounded: HashMap<DefId, Proven<BoundedDef>>,
     /// Every `Item::Fn`'s own `DefId` (from `res.item_defs`) mapped to
     /// its cloned `params` list (v12) — consulted at each `Expr::Call`
     /// site to check the corresponding argument's own provable range
@@ -1024,7 +1068,7 @@ struct Checker<'a> {
     /// Consulted at each `Expr::Call` site to let a caller compose with
     /// the call's own provable range, and at the top of `check_item` to
     /// check every `Stmt::Return` in the callee's OWN body against it.
-    fn_ret_bound: HashMap<DefId, BoundedDef>,
+    fn_ret_bound: HashMap<DefId, Proven<BoundedDef>>,
     /// Every `fn_ret_bound` entry's own declaration span — kept
     /// separate from `BoundedDef` (which has no span field, and is
     /// shared with reg/out/param bounds that don't need one) purely so
@@ -1092,7 +1136,7 @@ struct Checker<'a> {
     /// about what an uninitialized or not-yet-written READ returns (a
     /// mem has no `init`/reset the way a reg/out does) -- see that arm's
     /// own doc comment for the soundness hole this avoided.
-    mem_bounds: HashMap<DefId, BoundedDef>,
+    mem_bounds: HashMap<DefId, Proven<BoundedDef>>,
     /// Every `mem_bounds` entry's own declaration span -- mirrors `ret_
     /// bound_span` exactly, needed by `check_mem_bound_is_proven` to
     /// point an error at a declared bound with no write site to prove it
@@ -1116,7 +1160,7 @@ struct Checker<'a> {
     /// the DefKind gate this soundness argument depends on (an `in`/
     /// mem/fifo-typed struct value never passes through a checked
     /// `StructLit` at all, exactly like an unwritten mem address).
-    struct_field_bounds: HashMap<(DefId, String), BoundedDef>,
+    struct_field_bounds: HashMap<(DefId, String), Proven<BoundedDef>>,
     /// Every declared `invariant` (DESIGN.md's "Tier 3, not v0"
     /// circular-buffer case) recognized by `collect_relational_bounds`
     /// -- an item that FAILED to recognize (an unsupported shape,
@@ -1267,11 +1311,11 @@ impl<'a> Checker<'a> {
         };
         self.bounded.insert(
             def,
-            BoundedDef {
+            Proven::checked(BoundedDef {
                 lower: lower_val,
                 upper,
                 width,
-            },
+            }),
         );
     }
 
@@ -1319,11 +1363,11 @@ impl<'a> Checker<'a> {
         };
         self.fn_ret_bound.insert(
             fn_def,
-            BoundedDef {
+            Proven::checked(BoundedDef {
                 lower: lower_val,
                 upper,
                 width,
-            },
+            }),
         );
         self.ret_bound_span
             .insert(fn_def, self.ast.expr_spans[bound.0 as usize].clone());
@@ -1388,11 +1432,11 @@ impl<'a> Checker<'a> {
         };
         self.mem_bounds.insert(
             def,
-            BoundedDef {
+            Proven::checked(BoundedDef {
                 lower: lower_val,
                 upper,
                 width,
-            },
+            }),
         );
         self.mem_bound_span
             .insert(def, self.ast.expr_spans[bound.0 as usize].clone());
@@ -1471,11 +1515,11 @@ impl<'a> Checker<'a> {
         };
         self.struct_field_bounds.insert(
             (struct_def, field_name.to_string()),
-            BoundedDef {
+            Proven::checked(BoundedDef {
                 lower: lower_val,
                 upper,
                 width,
-            },
+            }),
         );
     }
 
@@ -1563,7 +1607,7 @@ impl<'a> Checker<'a> {
                     };
                     let init = *init;
                     for field_name in fields {
-                        let bounded = self.struct_field_bounds[&(struct_def, field_name.clone())];
+                        let bounded = *self.struct_field_bounds[&(struct_def, field_name.clone())];
                         let computed = self.struct_field_bound(
                             init,
                             &field_name,
@@ -2272,7 +2316,7 @@ impl<'a> Checker<'a> {
         let item_def = self.res.item_defs.get(&id).copied();
         self.current_ret_bound = item_def
             .and_then(|def| self.fn_ret_bound.get(&def))
-            .copied();
+            .map(|b| **b);
         self.current_fn_def = item_def;
         self.check_body(&body, &mut state, &mut locals, &mut struct_origins);
     }
@@ -2328,7 +2372,7 @@ impl<'a> Checker<'a> {
                 if let (Some(def), Some(bounded)) = (def, bounded) {
                     self.found_writes.insert(def);
                     let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                    self.check_against_bound(computed, bounded, span, "write");
+                    self.check_against_bound(computed, *bounded, span, "write");
                 }
                 // v17: a mem write (`m[i] := rhs`) checks `rhs` against
                 // the mem's own declared elem bound, the same shape as
@@ -2342,7 +2386,7 @@ impl<'a> Checker<'a> {
                 {
                     self.found_writes.insert(mem_def);
                     let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                    self.check_against_bound(computed, bounded, span, "write");
+                    self.check_against_bound(computed, *bounded, span, "write");
                 }
                 // v18: a struct-typed reg/out write (`p := Pair{...}`)
                 // checks EVERY bounded field of `p`'s own struct type
@@ -2367,7 +2411,7 @@ impl<'a> Checker<'a> {
                         .map(|(_, name)| name.clone())
                         .collect();
                     for field_name in fields {
-                        let bounded = self.struct_field_bounds[&(struct_def, field_name.clone())];
+                        let bounded = *self.struct_field_bounds[&(struct_def, field_name.clone())];
                         let field_computed = self.struct_field_bound(
                             rhs,
                             &field_name,
@@ -3061,7 +3105,7 @@ impl<'a> Checker<'a> {
                         if let Some(bounded) = bounded {
                             let span = self.ast.expr_spans[arg.0 as usize].clone();
                             let context = format!("argument for parameter `{}`", param.name);
-                            self.check_against_bound(computed, bounded, span, &context);
+                            self.check_against_bound(computed, *bounded, span, &context);
                         }
                     }
                 }
@@ -3389,7 +3433,7 @@ impl<'a> Checker<'a> {
                 .item_defs
                 .get(&id)
                 .and_then(|def| self.fn_ret_bound.get(def))
-                .copied();
+                .map(|b| **b);
             self.shadow_walk_body(
                 &body,
                 &state,
@@ -3547,7 +3591,7 @@ impl<'a> Checker<'a> {
                         state,
                         struct_field_bounds_by_def,
                         fn_ret_bounds_by_def,
-                        bound,
+                        *bound,
                         guards,
                         guards_negated,
                         arg,
@@ -3784,7 +3828,7 @@ impl<'a> Checker<'a> {
                             state,
                             struct_field_bounds_by_def,
                             fn_ret_bounds_by_def,
-                            bound,
+                            *bound,
                             guards,
                             guards_negated,
                             rhs,
@@ -3807,7 +3851,7 @@ impl<'a> Checker<'a> {
                             state,
                             struct_field_bounds_by_def,
                             fn_ret_bounds_by_def,
-                            bound,
+                            *bound,
                             guards,
                             guards_negated,
                             rhs,
@@ -3843,7 +3887,8 @@ impl<'a> Checker<'a> {
                             else {
                                 continue; // `..base`-sourced -- see doc comment above
                             };
-                            let bound = self.struct_field_bounds[&(struct_def, field_name.clone())];
+                            let bound =
+                                *self.struct_field_bounds[&(struct_def, field_name.clone())];
                             self.shadow_compare(
                                 state,
                                 struct_field_bounds_by_def,
