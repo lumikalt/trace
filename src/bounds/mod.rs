@@ -667,6 +667,8 @@
 //! false proof. Extending this to a real branch-merge/join would need
 //! more machinery than any current example motivates.
 
+mod smt;
+
 use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
 use crate::effects::Effects;
 use crate::lexer::Span;
@@ -815,6 +817,24 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
     checker.check_write_site_exhaustiveness();
     checker.check_return_site_exhaustiveness();
     checker.check_mem_bound_is_proven();
+    // Stage 1 of DESIGN.md's SMT-backed type-system plan: shadow-check
+    // every scalar write obligation this pass just verified via interval
+    // arithmetic, independently via Z3. Panics on a real disagreement
+    // (not a `Skipped` site) -- see `shadow_check_scalar_bounds`'s own
+    // doc comment for why this is safe to run unconditionally rather
+    // than gated behind a flag.
+    let mismatches = checker.shadow_check_scalar_bounds();
+    if let Some(first) = mismatches.first() {
+        panic!(
+            "bounds.rs internal error: the SMT shadow check (DESIGN.md's stage 1) disagrees \
+             with the interval-arithmetic engine on {} site(s) -- first, at {:?}: interval \
+             engine says in-bound = {}, SMT says {:?}",
+            mismatches.len(),
+            first.span,
+            first.interval_says_in_bound,
+            first.smt
+        );
+    }
     let bounds = Bounds {
         ranges: checker
             .bounded
@@ -3263,6 +3283,159 @@ impl<'a> Checker<'a> {
                      the program, but bounds.rs's own exhaustive walk found no Stmt::Assign to \
                      it anywhere — its own write-site walk is not actually exhaustive"
                 );
+            }
+        }
+    }
+
+    /// Stage 1 of DESIGN.md's "Toward a dependent/refinement type
+    /// system (SMT-backed, planned)": re-derive every scalar reg/out/
+    /// param write obligation this pass already checks via interval
+    /// arithmetic, independently via Z3 (`smt::check_write_obligation`),
+    /// and panic on any REAL disagreement -- the same "two independent
+    /// oracles must agree" idiom `check_write_site_exhaustiveness`
+    /// above already uses against `effects.rs`, just against a
+    /// from-scratch SMT re-derivation instead of a second static pass.
+    /// A `Skipped` verdict is not a disagreement (see `smt`'s own
+    /// module doc for exactly what v1 does and doesn't translate yet)
+    /// -- only a site both engines actually judged, with different
+    /// answers, panics.
+    ///
+    /// Walks bodies independently from `check_stmt`/`check_body` rather
+    /// than reusing them: this pass needs only the textual guard
+    /// history to a write site (a `Vec<ExprId>` of enclosing
+    /// conditions, negated for an `else`), not `check_stmt`'s own
+    /// `state`/`locals`/`struct_origins` narrowing machinery, which
+    /// exists to support composition shapes (cross-def reads, `Mul`,
+    /// `<>` edge narrowing, ...) this v1 encoding doesn't attempt yet.
+    fn shadow_check_scalar_bounds(&mut self) -> Vec<smt::Mismatch> {
+        let mut mismatches = Vec::new();
+        for id in self.collect_bodied_items() {
+            let body = match self.ast.item(id) {
+                Item::Rule { body, .. } => body.clone(),
+                Item::Fn { body, .. } => body.clone(),
+                _ => continue,
+            };
+            // Seeded exactly like `check_item`'s own `state` -- every
+            // bounded def's flat declared range -- so `narrow_for_
+            // condition`/`narrow_for_else` below narrow the SAME
+            // starting point the real pass narrows, not this walker's
+            // own approximation of it.
+            let state: HashMap<DefId, (u64, u64)> = self
+                .bounded
+                .iter()
+                .map(|(d, b)| (*d, (b.lower, b.upper)))
+                .collect();
+            self.shadow_walk_body(&body, &state, &[], &[], &mut mismatches);
+        }
+        mismatches
+    }
+
+    /// `state` mirrors `check_stmt`'s own narrowed-range map exactly
+    /// (seeded from `self.bounded`, narrowed per-branch via `narrow_
+    /// for_condition`/`narrow_for_else`) -- used ONLY to reproduce the
+    /// interval engine's own verdict for comparison, via `expr_bound`.
+    /// `guards`/`guards_negated` carry the SAME branch history as
+    /// `ExprId`s instead, for `smt::check_write_obligation`'s own
+    /// from-scratch translation -- two representations of one fact,
+    /// not two independent sources of truth: both are derived from the
+    /// exact same `cond` at the exact same `Stmt::If`, one line apart,
+    /// below.
+    fn shadow_walk_body(
+        &mut self,
+        body: &[StmtId],
+        state: &HashMap<DefId, (u64, u64)>,
+        guards: &[ExprId],
+        guards_negated: &[ExprId],
+        out: &mut Vec<smt::Mismatch>,
+    ) {
+        for &stmt in body {
+            match self.ast.stmt(stmt).clone() {
+                Stmt::Assign { lhs, rhs } => {
+                    let Expr::Ident(_) = self.ast.expr(lhs) else {
+                        continue;
+                    };
+                    let Some(&def) = self.res.expr_defs.get(&lhs) else {
+                        continue;
+                    };
+                    let Some(bound) = self.bounded.get(&def).copied() else {
+                        continue;
+                    };
+                    let verdict = smt::check_write_obligation(
+                        self.ast,
+                        self.res,
+                        def,
+                        bound,
+                        guards,
+                        guards_negated,
+                        rhs,
+                    );
+                    if matches!(verdict, smt::SmtVerdict::Skipped(_)) {
+                        continue;
+                    }
+                    // Safe to call unconditionally: `check_write_
+                    // obligation` only returns a non-`Skipped` verdict
+                    // when `translate_expr` accepted `rhs` -- which
+                    // means, by that function's own structural
+                    // induction, `rhs`'s whole subtree contains only
+                    // `Int`/`SizedInt`/self-`Ident`/`Add`/`Sub`/`Mul`
+                    // nodes and no `Expr::Call` at all, so `expr_bound`
+                    // cannot reach its own call-argument-checking arm
+                    // here and this can never double-push an error
+                    // `check_stmt`'s own real pass already recorded.
+                    let locals = HashMap::new();
+                    let struct_origins = HashMap::new();
+                    let computed = self.expr_bound(rhs, state, &locals, &struct_origins);
+                    // Mirrors `check_against_bound`'s own three-way
+                    // check exactly (width overflow, upper violation,
+                    // lower violation) -- NOT just a bare `[lower,
+                    // upper)` comparison, which would silently miss the
+                    // width-overflow rejection `check_against_bound`
+                    // reports as a real error (found via a real
+                    // disagreement this shadow check itself surfaced,
+                    // `multiplication_composed_bound_exceeding_the_
+                    // declared_width_is_rejected`).
+                    let width_limit = 1u64.checked_shl(bound.width as u32).unwrap_or(u64::MAX);
+                    let interval_says_in_bound = matches!(
+                        computed,
+                        Some((lo, hi)) if hi <= width_limit && hi <= bound.upper && lo >= bound.lower
+                    );
+                    let smt_says_in_bound = matches!(verdict, smt::SmtVerdict::Proved);
+                    if interval_says_in_bound != smt_says_in_bound {
+                        let span = self.ast.expr_spans[rhs.0 as usize].clone();
+                        out.push(smt::Mismatch {
+                            span,
+                            interval_says_in_bound,
+                            smt: verdict,
+                        });
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_state = self.narrow_for_condition(cond, state);
+                    let mut then_guards = guards.to_vec();
+                    then_guards.push(cond);
+                    self.shadow_walk_body(
+                        &then_body,
+                        &then_state,
+                        &then_guards,
+                        guards_negated,
+                        out,
+                    );
+                    if let Some(else_body) = else_body {
+                        let else_state = self.narrow_for_else(cond, state);
+                        let mut else_negated = guards_negated.to_vec();
+                        else_negated.push(cond);
+                        self.shadow_walk_body(&else_body, &else_state, guards, &else_negated, out);
+                    }
+                }
+                // v1: `While`/`IfLet`/`WhileLet` bodies are out of
+                // scope for this shadow check (see `smt`'s own module
+                // doc) -- neither walked into nor treated as a
+                // disagreement.
+                _ => {}
             }
         }
     }

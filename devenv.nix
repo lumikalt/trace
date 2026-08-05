@@ -8,7 +8,18 @@
   # `python3`: not itself a simulator, but `verilator --binary`'s own build
   # step (`verilator_includer`) shells out to it, and it's not on PATH by
   # default in this shell otherwise.
-  packages = [pkgs.circt pkgs.iverilog pkgs.verilator pkgs.python3];
+  #
+  # `z3`: the SMT backend for the dependent/refinement type system
+  # (DESIGN.md's "Toward a dependent/refinement type system (SMT-backed,
+  # planned)"). Linked dynamically via the `z3` crate against THIS
+  # package, not the crate's own `bundled` feature (which compiles Z3
+  # from source and pulls in a C++ toolchain this project doesn't
+  # otherwise need) -- see that DESIGN.md section's "Build integration"
+  # for why. `devenv.lock`'s pinned nixpkgs revision is what keeps proof
+  # results deterministic across machines/time (a query provable under
+  # one Z3 version can return `unknown` under another) -- load-bearing,
+  # the same as the firtool/iverilog/verilator version pins below.
+  packages = [pkgs.circt pkgs.iverilog pkgs.verilator pkgs.python3 pkgs.z3];
 
   languages.rust = {
     enable = true;

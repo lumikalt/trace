@@ -2,15 +2,26 @@
 
 ## Dependent/refinement type system (Lumi's most immediate large-scale goal, 2026-08-05)
 
-The recurring "time for the type system?" question has resolved into a scoped `bounds.rs`
-feature seven-plus times running (per-register bounds, guard narrowing, param/return
-propagation, mem/struct-field bounds, and the relational-bounds/`invariant` mechanism most
-recently) rather than a real dependent/refinement type system — see DESIGN.md's "Tier 3, not
-v0" section for the clearest statement of the gap each of those resolutions left open. Lumi
-has now named this explicitly as the actual near-term priority, not another scoped
-workaround. No design committed yet — `bounds.rs`'s existing induction-over-write-sites
-machinery, the relational-bounds mechanism, and per-site proven ranges are candidate
-building blocks, not already the answer.
+Design committed — see DESIGN.md's "Toward a dependent/refinement type system
+(SMT-backed, planned)" section (right after "Statically proven register bounds"). SMT
+(Z3, QF_BV), chosen directly by Lumi over a hand-rolled generalization of `bounds.rs`'s
+own interval engine, for the generality: it can plausibly prove
+`examples/circular_buffer_disjoint.tr` as an ordinary refinement composition instead of
+the bespoke `invariant`/joint-guards mechanism that currently exists.
+
+Stage 1 (faithfulness) is IN PROGRESS — `bounds.rs` split into `src/bounds/{mod.rs,
+smt.rs}` (it was the clear size outlier) to make room for this. `pkgs.z3`/the `z3` crate
+are wired in (`tests/z3_smoke.rs` pins the linking); the scalar reg/out/param slice
+(self-reference/literal/`Add`/`Sub`/`Mul` writes, `Lt`/`Gt`/`Ge`/`Ne`-at-a-constant guard
+hypotheses) is shadow-checked against the existing interval engine on every `bounds::check`
+call, zero mismatches across the whole suite. See DESIGN.md's own stage-1 entry for the two
+real bugs this surfaced (both in the shadow check's own reconstruction, not in `bounds.rs`).
+Still needed before stage 1 is COMPLETE: mem-element bounds, struct-field bounds,
+param/return bounds, and the relational invariant (`circular_buffer_disjoint.tr`). Stages
+2–4 (unify the six `bounds.rs` maps into one representation, generalize the surface
+predicate grammar, then — separately, since it proves strictly more and changes generated
+hardware — collapse `schedule.rs`'s eight mem-disjointness arguments into one generic
+query) are ordered but not started.
 
 ## Emission (`src/firrtl/`)
 
@@ -96,8 +107,8 @@ building blocks, not already the answer.
   "Locals" section, `examples/reassigned_local.tr` +
   `sim/reassigned_local_tb.v`.
 - A memory written to more than once (unconditionally) in one rule is a
-  compile-time error, closing a real silent-miscompile gap the recent
-  fifo/spawn audit found. See DESIGN.md's "Memory, fifo, and submodule
+  compile-time error, closing a real silent-miscompile gap a fifo/spawn
+  audit found. See DESIGN.md's "Memory, fifo, and submodule
   declarations" section. (Its erstwhile companion gap — a `let`-bound
   value crossing a `tick` being rejected — is gone entirely now; see
   below.)
@@ -551,6 +562,16 @@ implementation file, entirely a downstream build/simulation concern.
   firtool's `CheckCombLoops`, run only by `devenv.nix`'s `simulate`
   script and `tests/sim.rs` — never by `trace` itself, and its
   diagnostics are never remapped to `.tr` source spans.
+
+## Milestone: SUBLEQ
+
+- `sim/subleq_tb.v`'s driven program is deliberately minimal (one
+  `subleq` arithmetic instruction, one unconditional jump, one
+  self-loop halt) — enough to discriminate the branch-vs-fallthrough
+  mux, not much more. Running something that actually computes (a
+  short counted loop, or a multiply via repeated subtraction) would be
+  a more convincing real workload than the current three-instruction
+  proof-of-concept. A nice-to-have, not blocking anything.
 
 ## Editor tooling (`editors/vscode/`)
 

@@ -3587,6 +3587,306 @@ whose own base case is the verified init) — repeated across every item in
 the program, that's the whole proof; no global fixpoint across items is
 needed.
 
+## Toward a dependent/refinement type system (SMT-backed, planned)
+
+Not built yet — this section is a committed plan, not a shipped feature.
+Lumi named a real dependent/refinement type system as the actual near-term
+goal (2026-08-05), explicitly distinguishing it from the pattern the last
+seven-plus "time for the type system?" conversations fell into: another
+narrow, scoped `bounds.rs` feature (v5 through the `invariant`/joint-guards
+mechanism just above). This section is that real thing's design, not v20.
+
+**The tell that this is one missing abstraction, not six features.**
+`bounds.rs` today carries six separate maps — `ranges` (scalar reg/out),
+`site_ranges` (per-`ExprId` narrowing), `mem_bounds`, `struct_field_bounds`,
+`fn_ret_bound`, `relational_bounds` — each with its own collection pass,
+its own induction argument, and (v14/v17/v18) its own version of "which AST
+positions does this actually reach." v13/v17/v18 independently converged on
+`_` as the self-reference placeholder and then retrofitted the earlier ones
+to match (`result`→`_`, `elem`→`_`) — three features discovering the same
+shape from three different directions is the signal that `[N] where P(_)`
+wants to be a property of a TYPE, attachable anywhere a type appears (reg,
+out, param, return, mem element, struct field, local), not six bespoke
+per-def-kind mechanisms. Likewise, v17 (mem read has no checked base case),
+v18 (struct-typed `in` port never passes through a checked `StructLit`),
+v18-post-ship (struct reg with no init resets to zero), and v19 (reassigned
+local keeps a stale bound) are the SAME question — is this value's history
+covered by a checked induction? — asked and separately patched four times.
+
+**Engine: SMT (Z3, QF_BV theory), not a hand-rolled decision procedure —
+decided directly by Lumi.** The hand-rolled alternative (generalizing
+`bounds.rs`'s own interval/case-split style) was the more conservative
+option and would have stayed closer to this project's existing "narrow,
+fail-closed, confirmed empirically" engineering character; SMT was chosen
+anyway, for the generality: it can plausibly prove
+`examples/circular_buffer_disjoint.tr`'s `m[head] != m[tail]` as an
+ORDINARY refinement composition, with no bespoke `Item::Invariant`/
+`check_relational_bound_induction`/`provably_disjoint_under_joint_guards`
+machinery at all — which is this design's own acid test (see below). The
+real costs this buys — solver `unknown`/timeouts, harder diagnostics,
+a new build dependency — are accepted, not overlooked; see "Diagnostics"
+and "Build integration" below for how each is handled.
+
+### Core representation
+
+One refinement concept, not six: a `[N]` type may carry a boolean predicate
+over its own value, written `[N] where <expr>` with `_` denoting the value
+itself — the same surface form `where`/mem-element/struct-field bounds
+already converged on, now the ONLY form. It attaches anywhere a type
+already appears: `reg`/`out` declarations, fn/impl params and return types,
+mem element types, struct fields, and (new) plain locals. A standalone
+module-level `invariant <expr>` (today's `Item::Invariant`) becomes sugar
+for registering a predicate that isn't carried by any single type — a fact
+about a COMBINATION of defs — against the same obligation machinery, not a
+separate induction.
+
+`<expr>` is an ordinary expression in this language's existing
+combinational grammar (arithmetic/bitwise/compare/`%`), not a new
+mini-language — v1 through v19's hand-picked recognized shapes (`Lt`/`Gt`/
+`Ge`/`Ne`-at-an-edge, `Add`/`Sub`/`Mul` composition, the 4-term ±1-only
+relational shape) were the hand-rolled engine's own decidability limits
+leaking into the surface syntax; an SMT backend has no reason to keep that
+restriction; see "Scope" below for what v1 of the NEW system restricts
+instead (rule-body shape, which guards count as hypotheses — orthogonal
+concerns from the predicate grammar itself).
+
+### The provenance judgment (the load-bearing one)
+
+A fact is either **proven** (its base case is checked, AND every write
+site that can affect it is checked, by the induction below) or
+**assumed** (arrives from outside this program's own control: an `in`
+port, an unwritten mem address, a `Call`-sourced struct write, or any
+value whose full write history this pass didn't verify). **Only proven
+facts may ever enter an SMT query's hypothesis set.** This is the one
+judgment v17/v18/v18-post-ship/v19 each rediscovered and patched
+separately (a mem read, a struct-typed `in` port, a struct reg with no
+init, a reassigned local) — with a hand-rolled engine, each miss was a
+bounded wrong interval; feeding an unproven fact to a solver as a
+hypothesis makes the hypothesis set inconsistent, and an inconsistent
+premise proves EVERYTHING, silently, with no wrong-looking interval to
+catch it. So this has to be structural, not a `DefKind` match repeated at
+every call site: the obligation-generation layer should be built so an
+assumed fact is never representable as a hypothesis in the first place —
+a proven fact and an assumed one should be different types in the
+implementation, not the same map with a convention about which entries to
+trust.
+
+### Obligation generation and the SMT encoding
+
+For each declared refinement: one **base-case** query (does the declared
+init/construction literal satisfy the predicate — unsat-the-negation, or
+just direct evaluation when the init is a literal, as today) and one
+**inductive-step** query per rule whose write-set intersects the
+refinement's support.
+
+The inductive step is a single transition-relation query, not an
+enumerate-every-subset-in-Rust loop: give each candidate-writing rule a
+boolean `fired` variable, implied by its own (leading, v1) guard; assert
+that co-firing rules write disjoint register sets (the conflict matrix's
+own single-writer-per-reg-per-cycle guarantee — asserted as a precondition
+of the encoding, not assumed silently, since summing per-rule deltas is
+only valid because of it); model the post-state as the pre-state plus each
+fired rule's own delta; and check the validity of `Inv(pre) ∧ guards ⊨
+Inv(post)`. **Quantify conservatively over every subset of rules whose
+guards are simultaneously satisfiable — do not consult `schedule.rs` to
+narrow which subsets can really co-fire.** `bounds.rs` → `schedule.rs` is
+a one-way producer/consumer relationship today (verified facts flow one
+direction, `real_range`/`provably_disjoint_under_joint_guards` read them);
+asking the scheduler which subsets are reachable would make it
+bidirectional. Over-approximating "simultaneously satisfiable" instead of
+"schedulably co-fireable" is sound (fails closed on a subset that's
+actually unreachable) and keeps the dependency graph a DAG.
+
+This one mechanism is every current mechanism's general case: a scalar
+reg/out bound is the one-rule-in-the-support instance; mem-element and
+struct-field bounds are the same induction one layer inside a `Bracket`/
+`Field`; param/return bounds are the same obligation checked at a call/
+return site instead of a write site; and a relational multi-reg invariant
+(today's `invariant` item) is the SAME query with a support of more than
+one def and no distinguished "owning" type to hang it off of. `bounds.rs`
+today caps this at two rules and ±1 coefficients (`circular_buffer_
+disjoint.tr`'s own v1 restriction) purely because the hand-rolled mask
+loop doesn't generalize past that cheaply — an SMT encoding lifts both
+caps for free, since "more fired-variables" and "arbitrary integer
+coefficients" cost the solver nothing structurally new.
+
+### `schedule.rs`: one generic disjointness query, staged separately
+
+`real_range` and the eight hand-built mem-disjointness arguments
+(same-base-affine, banking, proven-bound, independent-ranges, joint-guards,
+...) collapse to one call: given two mem-index expressions under two
+rules' own guards, plus every proven refinement/invariant in scope, is
+`idx_a == idx_b` satisfiable when both rules fire the same cycle? UNSAT
+means disjoint. Bitvector theory natively handles the wraparound reasoning
+`IndexForm`'s hand-built `negated`/parity argument exists for, so the
+affine and banking cases fall out of the SAME query, not separate
+short-circuits — though keeping the cheap syntactic checks as a
+performance pre-check (skip the solver call when a fast, purely syntactic
+argument already decides it) is a reasonable optimization with identical
+semantics, not a v1 requirement.
+
+**This proves strictly more than today's eight arguments, which means
+fewer derived stalls on some existing designs — a real behavioral change
+to generated hardware, not a pure refactor.** It is staged separately from
+the rest of this plan (see below) specifically so that change is a
+deliberate, reviewed decision, never a side effect riding along inside a
+stage whose whole point is proving nothing changed.
+
+### Scope: explicit in/out for v1
+
+- **Rule-body shape**: the inductive step covers exactly the shape
+  `check_relational_bound_induction` covers today — zero-or-more `let`s
+  and writes, `if`/`else` branching. `while`/`sequences`/`if let`/`while
+  let` rule bodies are OUT: a multi-cycle rule isn't one atomic
+  pre→post transition, so proving an invariant over one needs the
+  LOWERED state machine (`lower/plan.rs`), not the surface body — a
+  separate, later effort, not assumed to fall out of the SMT move for
+  free.
+- **Which guards are hypotheses**: v1 uses only LEADING guards, matching
+  today's `leading_guards`. A guard nested inside an `if` branch, and the
+  implicit reachability conditions a fifo op (`Deq` requires non-empty)
+  or a fallible comparison carries, are real facts the current code
+  never uses — widening to them is genuine additional proving power, not
+  a decidability question, and is named here as a deliberate LATER
+  widening rather than something v1 quietly includes.
+- **Calls**: no new call-handling capability is implied by the SMT move
+  itself. A callee that fully inlines (per "Calling a function from a
+  rule") gets its body substituted before encoding, same as today; a
+  bounded param/return still needs the same call-site/return-site
+  obligation plumbing v12/v13 already established, just discharged by
+  the unified mechanism instead of a separate map.
+
+### Diagnostics
+
+A "can this be violated" query returning SAT yields a genuine
+counterexample: extract the model and report concrete values (e.g. "here:
+`head=3, tail=3, push_count=5, pop_count=1` violates the invariant") — a
+real upgrade over today's "cannot verify this invariant" messages, which
+name a shape but never a witness. UNSAT is silent success, as today. A
+solver timeout is `unknown`, not a proof failure, and gets its OWN wording
+distinct from the counterexample case ("the solver could not decide this
+within the time budget — this may be provable with a tighter restructuring,
+or may genuinely not hold; no counterexample was found") — conflating the
+two would either scare users off provable code or, worse, read like a
+confirmed proof of unsoundness when it's really just an unanswered
+question. A per-query timeout budget is a real, accepted cost of this
+design (unlike today's O(1) interval arithmetic) — pick a concrete number
+when implementing stage 1, not left implicit.
+
+### Build integration
+
+`z3` (Rust bindings), dynamically linked against `pkgs.z3`, added to
+`devenv.nix`'s `packages` — NOT the `bundled` feature (which compiles Z3
+from source and pulls in a C++ toolchain this project doesn't otherwise
+need). This matches the project's existing discipline of pinning exact
+tool versions via nix and checking them explicitly (`simulate.exec`'s
+firtool/iverilog/verilator version guards) rather than trusting whatever's
+on `PATH`. `devenv.lock`'s pinned nixpkgs revision is what keeps proof
+results deterministic across machines and time — load-bearing for this
+project's own "byte-identical `--explain-schedule` diff" discipline, since
+a query provable under one Z3 version can return `unknown` under another.
+Re-verify this pin whenever `devenv.lock` moves, the same as the existing
+tool-version checks already do.
+
+### Staged rollout
+
+1. **Faithfulness.** Encode every EXISTING obligation (every `where`/
+   `invariant` in `examples/`/`tests/bounds.rs`) via the transition-relation
+   encoding above, with NO new capability. Success is every example/test
+   passing or failing exactly as it does today, and a byte-identical
+   normalized `--explain-schedule` diff across the whole suite — the one
+   stage where "nothing changed" IS the discriminating result, proving the
+   encoding faithful before anything is built on top of it.
+
+   **In progress.** `z3` (dynamically linked against `pkgs.z3`, per "Build
+   integration" above) is wired in and confirmed working
+   (`tests/z3_smoke.rs`). The scalar reg/out/param slice is done: `src/
+   bounds/smt.rs`'s `check_write_obligation` re-derives a scalar write's
+   own base-case-plus-induction obligation via one Z3 QF_BV query per
+   site — self-reference/literal/`Add`/`Sub`/`Mul` RHS shapes, and a
+   `Lt`/`Gt`/`Ge`/`Ne`-at-a-constant leading guard/`if`-`else` branch
+   condition as a hypothesis, both matching `expr_bound`'s/`narrow_for_
+   condition`'s own v1 recognized shapes exactly — run as a SHADOW check
+   alongside the existing interval-arithmetic engine (`Checker::
+   shadow_check_scalar_bounds`, called from `bounds::check` itself, not
+   gated behind a flag), panicking on any site both engines judge with a
+   different verdict; a `Skipped` site (outside this slice's shape, e.g.
+   cross-def composition, `<>` edge narrowing, `While`/`IfLet`/`WhileLet`)
+   is not compared, per the "run alongside, not replace" plan above. Zero
+   mismatches across the whole existing suite (838 tests) as of this
+   writing — found and fixed two real bugs in the SHADOW CHECK's own
+   reconstruction while getting there, not in `bounds.rs` itself: (1) the
+   reconstructed "what does the interval engine say" verdict initially
+   ignored guard narrowing entirely (used the flat declared bound instead
+   of `narrow_for_condition`/`narrow_for_else`'s own narrowed state,
+   fixed by threading a real `state` map through the shadow walker
+   alongside the guard `ExprId` list used for SMT translation); (2) the
+   Z3 encoding initially computed in a `bound.width`-bit BV sort, which
+   silently wraps (bitvector arithmetic is modular) exactly where `check_
+   against_bound`'s own explicit "could reach or exceed the declared
+   width" check exists to catch a real overflow — found via a genuine
+   disagreement the shadow check itself surfaced
+   (`multiplication_composed_bound_exceeding_the_declared_width_is_
+   rejected`, a `[3]`-wide reg with a `where < 20` bound whose logical
+   limit exceeds its own storage width), fixed by computing at a fixed
+   wide `CALC_WIDTH` (64 bits, matching the interval engine's own `u64`
+   arithmetic) and checking the composed value against BOTH the logical
+   `[lower, upper)` bound and the width-overflow limit explicitly,
+   mirroring `check_against_bound`'s exact three-way check. Still to do
+   for stage 1 to be COMPLETE: mem-element bounds, struct-field bounds,
+   param/return bounds, and the relational invariant (`circular_buffer_
+   disjoint.tr`'s own case) — see the "What retires" list below for which
+   `bounds.rs` mechanism each maps to.
+2. **Unify the representation.** Collapse the six maps into one
+   refinement-carrying type representation plus the proven/assumed
+   provenance judgment (structural, per above) — still producing the same
+   obligations as stage 1, still expected byte-identical.
+3. **Generalize the surface.** Arbitrary boolean expressions as
+   refinements, collapsing the `where`/`invariant`/`_`-placeholder
+   distinctions into the one syntactic form above. This DOES change what's
+   expressible — expect genuinely NEW passing cases, not byte-identical.
+4. **`schedule.rs` collapse**, deliberately separate from 1–3: replace the
+   eight hand-built disjointness arguments with the one generic query.
+   Expect FEWER derived stalls on some existing examples — review this
+   diff by hand before accepting it, since it's the one stage whose
+   success criterion is a real behavioral change.
+
+Each stage bug-reintroduction-verified and `--firrtl`-sanity-checked (both
+this compiler's own emitter and real `firtool`) independently, per this
+arc's standing discipline.
+
+### What retires, per current mechanism
+
+- Scalar reg/out bound (v5+), guard narrowing (v7/v9/v10/v15), param/
+  return propagation (v12/v13), mem-element bound (v17), struct-field
+  bound (v18), reassigned-local exclusion (v19), and the relational-
+  invariant/joint-guards mechanism (current) all retire as BESPOKE
+  mechanisms — each becomes an instance of the one obligation-generation
+  argument above, not a separate map or a separate induction function.
+  Guard narrowing specifically has no successor at all: narrowing was
+  interval arithmetic's own way of encoding a hypothesis; SMT takes a
+  guard as a hypothesis directly, with nothing analogous to build.
+- The widened-checked-positions sweep (v14) and the four-way/three-way
+  "is any map non-empty" guards (v13/v17/v18) were symptoms of N parallel
+  maps needing N parallel completeness checks; the unified provenance
+  judgment applies by construction to every expression position, though
+  v1 of the new system should still carry an explicit coverage check
+  confirming this, per the provenance section's own caution above.
+- Per-site export to `schedule.rs` (v16, `site_ranges`/`real_range`'s
+  fallback) stays as-is through stage 3, then retires at stage 4 once the
+  one generic disjointness query replaces its only consumer.
+
+### The acid test
+
+`examples/circular_buffer_disjoint.tr` — both invariants proven, AND
+`m[head] != m[tail]` proven disjoint — with no `Item::Invariant`-specific
+induction function anywhere: `invariant` is ordinary surface sugar
+registering a predicate against the same machinery any `where` clause
+uses, and the disjointness proof is one call to the one generic query in
+"schedule.rs" above. If a candidate implementation still needs a bespoke
+code path for this example, it hasn't closed the gap this plan exists to
+close.
+
 ## Combinational loops
 
 Inside one `combines` scope, no forward reference is allowed, so a local cycle
