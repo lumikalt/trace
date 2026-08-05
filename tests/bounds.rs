@@ -166,6 +166,29 @@ module M {
 }
 
 #[test]
+fn where_bound_limit_composed_from_literal_arithmetic_is_still_enforced() {
+    // A regression pin: `bounds.rs`'s own `const_fold` used to handle
+    // only a bare literal, unlike `types.rs`'s `const_eval` (which
+    // folds `Add`/`Sub`/etc of literals too) -- so `where cnt < 8 + 2`
+    // used to type-check clean while the bound silently never made it
+    // into `self.bounded` at all, leaving `cnt`'s write completely
+    // unchecked with zero diagnostic. `8 + 2` here must behave exactly
+    // like the equivalent literal `10` does in `unguarded_increment_
+    // is_rejected` above -- same rejection, not a silent pass.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt < 8 + 2 = 0
+    rule bump {
+        cnt := cnt + 100
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("declared bound `0 <= _ < 10`"));
+}
+
+#[test]
 fn insufficiently_narrowed_guard_is_rejected() {
     // `if i < 9` doesn't narrow enough: the composed bound (9 + 2 - 1 =
     // 10) still exceeds the declared `< 9`. A regression here would

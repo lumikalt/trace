@@ -127,6 +127,33 @@ DESIGN.md's stage-2 entry for the full reasoning — worth reading before re-att
 merge here, since the concrete reasons it doesn't pay off are specific, not just "seemed
 like more code."
 
+**Stage 3 started — its own "arbitrary boolean expressions" bullet was under-specified,
+corrected before writing code.** The parser hardcodes `where`'s top-level relation to `Lt`
+at PARSE time (`parser.rs`'s `parse_where_bound`), and this language has no `&&`/`||` at
+all, so "arbitrary boolean expression" isn't reachable without a new grammar operator —
+out of scope for this stage. Corrected v1 scope: any single comparison (`<`/`<=`/`>`/`>=`/
+`==`/`!=`) over `_` and in-scope defs, with non-literal operands — still a real capability
+increase (commuted forms, arithmetic limits, cross-def bounds), no new operator needed.
+
+First landed: a real, currently-shipping soundness bug found while surveying the grammar,
+fixed standalone (not folded into the stage-3 diff). `bounds.rs`'s own `const_fold` handled
+only a bare literal, while `types/eval.rs`'s `const_eval` (used by the type-checker's own
+init-satisfies-bound check) also folds literal arithmetic — so `reg cnt : [8] where cnt <
+8 + 2 = 0` type-checked clean while the bound silently never got registered in `self.
+bounded` at all, leaving `cnt := cnt + 100` completely unchecked with zero diagnostic.
+Fixed by widening `const_fold` to match `const_eval`'s arithmetic exactly (`Add`/`Sub`/
+`Mul`/`Div`/`Rem`/`Shl`/`Shr`, `checked_*` semantics). One narrower residual, documented not
+silent: `const_eval`'s `clog2(..)` case still isn't recognized (no `Resolution` access to
+identify the builtin from a free function) — no test/example needs it in a where-bound
+today. Regression test added, byte-identical `--explain-schedule` (nothing in the existing
+suite used a non-literal where-bound), zero regressions.
+
+Not yet done: `_`-placeholder unification (reg/out/param require the literal name and
+reject `_`; mem/return/struct-field require `_` and reject a name) and the actual
+predicate-grammar widening (the four collectors reduce a where-bound to a plain `(lower,
+upper, width)` triple and discard the expression — no "carry the predicate forward" path
+exists yet, which is what a cross-def bound needs). See DESIGN.md's stage-3 entry.
+
 ## Emission (`src/firrtl/`)
 
 - Calling a user `fn`/`impl` from a rule inlines the callee at its call

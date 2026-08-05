@@ -4052,15 +4052,47 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// Fold a bare literal to a compile-time constant — deliberately NOT
-/// `types/eval.rs`'s fuller env-based `const_eval` (that one's for
-/// generic-param elaboration-time folding), same reasoning
-/// `schedule.rs`'s own `const_index`/`IndexForm` machinery already
-/// documents for the identical narrow need.
+/// Fold a literal, or arithmetic over literals, to a compile-time
+/// constant — deliberately NOT `types/eval.rs`'s fuller env-based
+/// `const_eval` (that one's for generic-param elaboration-time folding,
+/// via a non-empty `env`; a `where` bound's own limit is always checked
+/// against an EMPTY env — `types/stmt.rs`'s `check_where_bound_init`
+/// passes `&HashMap::new()` — so `Expr::Ident` never resolves there
+/// either). This must stay in sync with what an empty-env `const_eval`
+/// actually accepts: a where-bound whose limit/lower/init const_evals
+/// successfully in `types.rs` but fails to fold here silently never gets
+/// registered in `self.bounded`/etc at all (see each `collect_one_*`
+/// caller's own `// types.rs already reported this` comment, which is
+/// only true when the two folders agree) — found as a real, shipping
+/// gap: `where cnt < 8 + 2` used to type-check clean while leaving
+/// `cnt`'s bound completely unchecked, since this function handled only
+/// a bare literal. `Add`/`Sub`/`Mul`/`Div`/`Rem`/`Shl`/`Shr` now mirror
+/// `const_eval`'s own arithmetic exactly (same `checked_*` semantics,
+/// failing closed on overflow rather than wrapping). `Expr::Call`
+/// (`clog2`, `const_eval`'s one non-arithmetic case) deliberately still
+/// isn't recognized here — no `Resolution` is available to this free
+/// function to identify the builtin callee, and no test/example
+/// currently needs it in a where-bound position; a `where` bound built
+/// from `clog2(..)` still silently goes unchecked today, a narrower
+/// instance of the same gap this fix otherwise closes.
 fn const_fold(ast: &Ast, id: ExprId) -> Option<u64> {
     match ast.expr(id) {
         Expr::Int(v) => Some(*v),
         Expr::SizedInt { value, .. } => Some(*value),
+        Expr::Binary { op, lhs, rhs } => {
+            let l = const_fold(ast, *lhs)?;
+            let r = const_fold(ast, *rhs)?;
+            match op {
+                BinOp::Add => l.checked_add(r),
+                BinOp::Sub => l.checked_sub(r),
+                BinOp::Mul => l.checked_mul(r),
+                BinOp::Div => l.checked_div(r),
+                BinOp::Rem => l.checked_rem(r),
+                BinOp::Shl => l.checked_shl(r as u32),
+                BinOp::Shr => l.checked_shr(r as u32),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

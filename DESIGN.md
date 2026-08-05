@@ -4315,6 +4315,76 @@ unmerged because each has a real, distinct reason to. The provenance
 judgment (first sub-step, above) is the one part of the original
 six-maps framing that WAS worth building as a real type.
 
+**Stage 3 ("Generalize the surface") started — its own bullet above is
+under-specified, corrected here before any code.** An advisor pass,
+consulted before starting (per this arc's own "check before committing
+to a design" discipline), plus a research pass over the actual current
+grammar, found "arbitrary boolean expressions as refinements" isn't
+directly buildable as written: `parser.rs`'s `parse_where_bound` hardcodes
+the top-level relation to `Lt` (or `Le`-then-`Lt` for the two-sided form)
+at PARSE time, not just in `bounds.rs`'s semantic layer — and this
+language has no logical connective (`&&`/`||`) at all, so "arbitrary
+boolean expression" isn't reachable without also adding a new operator to
+the grammar, a language-surface change well beyond this stage's own
+scope. **Corrected v1 scope: any single comparison (`<`, `<=`, `>`, `>=`,
+`==`, `!=`) over `_` and in-scope defs, with non-literal operands** —
+subsumes commuted forms, arithmetic limits (`cnt < 8 + 2`), and cross-def
+bounds (referencing another reg/out), needs no new operator, and is a
+genuine capability increase. Conjunction/disjunction stays a later
+widening, or is expressed as it is today (multiple `where`-adjacent
+checks / nested `if` structure) — not assumed to fall out of this stage
+for free.
+
+Before any of that, the same research pass surfaced (and this stage's own
+first sub-step fixed) a real, currently-shipping soundness bug unrelated
+to the grammar widening itself, landed as its own standalone commit per
+advisor guidance ("don't let it ride along inside a large stage-3 diff
+where it'll be invisible"): `bounds.rs`'s own `const_fold` (used by all
+four `collect_one_*` collectors to reduce a where-bound's declared limit/
+lower to a `u64`) handled only a bare integer literal, while `types/
+eval.rs`'s `const_eval` (used by `types/stmt.rs`'s `check_where_bound_
+init`, the type-checker's own init-satisfies-bound check) folds literal
+`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Shl`/`Shr` too — both are called with an
+effectively empty environment for a where-bound's own limit (no `Ident`
+ever resolves), so the two SHOULD always agree, and each `collect_one_*`
+site's own `// types.rs already reported this` comment assumed they did.
+They didn't: `reg cnt : [8] where cnt < 8 + 2 = 0` type-checked with zero
+errors, but `const_fold` returned `None` on the `Add`, so the collector
+silently returned without ever inserting `cnt`'s bound into `self.
+bounded` at all — `cnt := cnt + 100` afterward compiled clean too, with
+NO diagnostic anywhere, a real hole in the shipped engine, not a
+hypothetical. Confirmed via a live repro (`8 + 2` vs. the literal `10`:
+identical semantics, only the literal form errored) before writing any
+fix. Fixed by widening `const_fold` to recognize the same `Binary`
+arithmetic `const_eval` does, recursively over `Int`/`SizedInt`, matching
+`checked_*` semantics exactly (fails closed on overflow, not wrapping) —
+closes the discovered gap completely for arithmetic. One narrower gap
+remains, deliberately not attempted here: `const_eval`'s one non-
+arithmetic case, `Expr::Call` to the builtin `clog2`, still isn't
+recognized by `const_fold` (a free function with no `Resolution` access
+to identify the builtin callee), so `where cnt < clog2(16) + 1` would
+still silently go unchecked — no test/example currently uses `clog2` in a
+where-bound position, so this is a documented, narrow residual, not a
+newly-introduced one. Regression test: `where_bound_limit_composed_from_
+literal_arithmetic_is_still_enforced` (`tests/bounds.rs`) — the `8 + 2`
+case now rejects `cnt := cnt + 100` identically to the `< 10` literal
+form. Byte-identical `--explain-schedule` across all 84 examples (none
+use a non-literal where-bound today, so nothing was expected to change),
+zero regressions.
+
+Not yet done: the `_`-placeholder unification (today, `_` is required at
+mem-element/return/struct-field positions but REJECTED at reg/out/param
+positions, which instead require the literal variable name — `check_
+bound_self_reference`, `resolve.rs`, vs. the three `check_*_bound_shape`
+functions there) and the actual predicate-grammar/representation widening
+(the four collectors currently reduce a where-bound to `(lower, upper,
+width)` and DISCARD the original expression entirely — there is no
+"carry the predicate forward" path yet; making a bound reference another
+def needs that representation change, which in turn means `Bounds.
+ranges`/`site_ranges` has nothing to export for a cross-def bound, and
+`schedule.rs`'s `real_range` consumers need confirming they degrade
+gracefully on a missing entry before that's implemented, not assumed).
+
 ## Combinational loops
 
 Inside one `combines` scope, no forward reference is allowed, so a local cycle
