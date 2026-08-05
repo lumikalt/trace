@@ -2078,6 +2078,112 @@ module M {
 }
 
 #[test]
+fn reassigned_scalar_local_read_is_deliberately_not_composed() {
+    // A THIRD real soundness hole, found by yet another advisor pass
+    // (called after the two struct-field fixes above had already
+    // shipped): `locals` -- the forward-flow map behind EVERY local's
+    // own provable bound, not just a struct field's -- is written ONLY
+    // at `Stmt::Let` and nowhere else, a gap present since the very
+    // first bounds.rs commit, predating v18 entirely. `x`'s stale
+    // `let`-time bound (`10`) kept composing at `total := x` even with
+    // a DIRECT, unbranched reassignment to an untrusted `in`-port value
+    // in between -- confirmed via direct reproduction: this exact
+    // source compiled with ZERO errors before the fix (a pre-scan,
+    // `collect_reassigned_locals`, that finds every `DefKind::Local`
+    // ever reassigned anywhere in a body and refuses to give it a
+    // trusted `locals`/`struct_origins` entry at all).
+    let src = "\
+module M {
+    in q : [8]
+    out total : [8] where total < 20 = 0
+    rule r {
+        let x = 10
+        x := q
+        total := x
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write stays within the declared bound")
+    );
+}
+
+#[test]
+fn reassigned_scalar_local_in_a_branch_is_deliberately_not_composed() {
+    // The same hole, reached through a branch: `locals`/`struct_
+    // origins` clone-and-discard per nested scope (so a bound LEARNED
+    // inside an `if` doesn't leak out), which made a first, narrower
+    // fix attempt (poison an outer entry on branch exit if the clone's
+    // value changed) look plausible -- but the pre-scan approach below
+    // makes this case unremarkable: `x` never gets an entry in the
+    // first place, in ANY scope, so there's nothing branch-local to
+    // leak or fail to poison.
+    let src = "\
+module M {
+    in cond : [1]
+    in q : [8]
+    out total : [8] where total < 20 = 0
+    rule r {
+        let x = 10
+        if cond = 1 {
+            x := q
+        }
+        total := x
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write stays within the declared bound")
+    );
+}
+
+#[test]
+fn reassigned_scalar_local_in_a_while_loop_is_deliberately_not_composed() {
+    // The case that rules out branch-exit poisoning as a fix entirely:
+    // a `while` loop's body is checked ONCE against its entry snapshot
+    // (DESIGN.md's `<sequences>` lowering -- each iteration is its own
+    // clock edge, but this pass doesn't unroll or fixed-point over
+    // iterations), so `total := x` here would be checked against
+    // iteration 1's `x` even though iteration 2+ actually has `x = q`.
+    // Confirmed via direct reproduction: this exact source compiled
+    // with ZERO errors before the pre-scan fix, with NO merge/poison
+    // logic able to fix it (there is no branch exit to poison at all
+    // here -- `x := q` and `total := x` are both inside the SAME loop
+    // body, checked in the same single pass).
+    let src = "\
+module M {
+    in q : [8]
+    reg i : [4] where i < 9 = 0
+    out total : [8] where total < 20 = 0
+    rule bump <sequences> {
+        let x = 10
+        while i < 3 {
+            total := x
+            x := q
+            i := i + 1
+            tick
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write stays within the declared bound")
+    );
+}
+
+#[test]
 fn mem_elem_read_value_is_deliberately_not_composed() {
     // A soundness-restriction regression guard, not a capability test: an
     // earlier version of this feature handed the mem's declared bound

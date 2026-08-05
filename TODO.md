@@ -3297,7 +3297,7 @@ manually in the meantime.
   regardless of whether the base case is checked at all — the two-
   sided form is the only shape that turns a MISSED check into an
   OBSERVABLE false proof, so `struct_field_two_sided_bound_composes_
-  through_a_reg` closes that gap in the suite itself (11 new tests in
+  through_a_reg` closes that gap in the suite itself (12 new tests in
   `tests/bounds.rs` total, not 9).
 
   A normalized `--explain-schedule` diff across every existing example
@@ -3309,6 +3309,55 @@ manually in the meantime.
   point — both halves are now built, with final shapes (mem: write-only;
   struct field: write AND sound read composition) neither v16 nor v17
   anticipated.
+- **RESOLVED (v19) — a reassigned local never invalidated its own
+  forward-flow bound**, found by a LATER advisor pass called over v18's
+  own local-reassignment fix, and turned out to be general — not
+  struct-field- or v18-specific at all, and present since bounds.rs's
+  very first commit (`bd109cc`, v5). `locals` (the forward-flow map
+  behind every `Stmt::Let` local's own bound) is written ONLY at
+  `Stmt::Let` — `Stmt::Assign` never updates it for a reassigned SCALAR
+  local either, so `let x = 10; x := untrusted_input; total := x`
+  composed `x` to its STALE `let`-time bound with no branch involved at
+  all. Confirmed by three escalating reproductions, each ZERO errors
+  before the fix: unbranched (as above); inside an `if` (v18's own
+  `Stmt::Assign` overwrite for struct locals only ever helped the
+  unbranched case, since a nested scope's clone is discarded when the
+  branch ends, leaving the outer map at its pre-branch value); and
+  inside a `while` loop, which rules out "poison the outer entry on
+  branch exit" as a complete fix entirely — the loop body is checked
+  ONCE against its entry snapshot, so a reassignment on iteration 1 is
+  invisible when checking iteration 2's own read of the same local.
+
+  Fixed with `collect_reassigned_locals`: a pre-scan, run once per
+  rule/fn body before any bound tracking begins, that finds every
+  `DefKind::Local` ever targeted by a `Stmt::Assign` anywhere in that
+  body (including nested inside `if`/`while`/`if let`/`while let`) and
+  excludes it from EVER getting a `locals`/`struct_origins` entry, in
+  any scope — the same "conservatively refuse rather than build
+  merge/poisoning machinery" call this arc already made for v17's mem
+  reads and v18's `Call`-sourced struct writes. Supersedes v18's own
+  `Stmt::Assign` overwrite (removed — actively wrong to keep once the
+  pre-scan exists, since inserting a trusted entry there would reopen a
+  narrower, still-unsound window between one reassignment and the
+  next). A sweep of every existing test/example found nothing relying
+  on a reassigned local's bound composing at an assignment-shaped
+  bounded position (`total := x`). The exclusion itself is syntax-
+  position-agnostic by construction, not just by sweep coverage —
+  `expr_bound`'s `Expr::Ident` arm is the single lookup path `locals`
+  is ever read through, whether the local is an assignment's rhs, a
+  call argument, or nested inside arithmetic — confirmed with a
+  dedicated call-argument repro (an advisor follow-up question) in
+  addition to the sweep, so this costs zero expressiveness against the
+  current suite in every checked position.
+
+  3 new tests in `tests/bounds.rs` (unbranched, inside an `if`, inside a
+  `while`), each bug-reintroduction-verified independently. A
+  normalized `--explain-schedule` diff came back byte-identical and a
+  `--firrtl` sanity check confirmed clean codegen through both the
+  compiler's own emitter and real `firtool`. Independent of v18 and the
+  struct-field feature entirely — its own unit of work in this arc's
+  numbering, per advisor guidance, since the bug predates v18 and isn't
+  about struct fields at all.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

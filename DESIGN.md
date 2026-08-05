@@ -3502,6 +3502,59 @@ v0 restrictions, all deliberate scope cuts:
   meaningfully different final shapes (mem: write-only; struct field:
   write AND sound read composition) neither v16 nor v17 anticipated at
   the time.
+- **A reassigned local never invalidates its own forward-flow bound
+  (v19)** — found by a LATER advisor pass called over v18's own
+  local-reassignment fix, and turned out to be general, not
+  struct-field- or v18-specific at all, and present since bounds.rs's
+  very first commit (`bd109cc`, v5): `locals` (the forward-flow map
+  behind every `Stmt::Let` local's own provable bound) is written
+  ONLY at `Stmt::Let` and nowhere else. `Stmt::Assign` never updates
+  it for a reassigned SCALAR local either, so `let x = 10; x :=
+  untrusted_input; total := x` composed `x` to its STALE `let`-time
+  bound with no branch involved at all — confirmed by direct
+  reproduction (0 errors) before touching anything. v18's own fix
+  (overwriting `struct_origins` in `Stmt::Assign`) only ever helped
+  the unbranched case: inside an `if`/`while` the overwrite lands on
+  a clone that's discarded when the branch ends, so the outer map
+  still has the pre-branch value — confirmed with a branched repro,
+  also 0 errors. A `while` loop rules out "poison the outer entry on
+  branch exit" as a complete fix too: the body is checked ONCE
+  against its entry snapshot, so a reassignment on iteration 1 is
+  invisible when checking iteration 2's own read of the same local —
+  confirmed with a third repro, also 0 errors, before choosing a
+  different fix shape entirely.
+
+  Fixed with `collect_reassigned_locals`: a pre-scan, run once per
+  rule/fn body before any bound tracking begins, that finds every
+  `DefKind::Local` ever targeted by a `Stmt::Assign` anywhere in that
+  body (including nested inside `if`/`while`/`if let`/`while let`) and
+  excludes it from EVER getting a `locals`/`struct_origins` entry, in
+  any scope — the same "conservatively refuse rather than build
+  merge/poisoning machinery" call this arc already made for v17's mem
+  reads and v18's `Call`-sourced struct writes. This supersedes v18's
+  own `Stmt::Assign` overwrite (removed — not just redundant but
+  actively wrong to keep, since inserting a trusted entry there would
+  reopen a narrower, still-unsound window between one reassignment and
+  the next). A sweep of every existing test and example first found
+  nothing relying on a reassigned local's bound composing at an
+  assignment-shaped bounded position (`total := x`). The exclusion
+  itself is syntax-position-agnostic by construction, not just by
+  sweep coverage — `expr_bound`'s `Expr::Ident` arm is the single
+  lookup path `locals` is ever read through, whether the local is an
+  assignment's rhs, a call argument, or nested inside arithmetic —
+  confirmed with a dedicated call-argument repro (an advisor follow-up
+  question) in addition to the sweep, so this costs zero
+  expressiveness against the current suite in every checked position.
+
+  3 new tests in `tests/bounds.rs` (unbranched, inside an `if`, inside
+  a `while` — mirroring the three escalating repros above), each
+  bug-reintroduction-verified independently. A normalized
+  `--explain-schedule` diff across every existing example came back
+  byte-identical, and a `--firrtl` sanity check (both the compiler's
+  own emitter and real `firtool`) confirmed clean codegen. Independent
+  of v18 and the struct-field feature entirely — its own unit of work
+  in this arc's numbering, per advisor guidance, since the bug predates
+  v18 and isn't about struct fields at all.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"
@@ -3509,7 +3562,9 @@ v0 restrictions, all deliberate scope cuts:
   language follows (a write earlier in the SAME body is never visible to
   a later read in that body). Only a `Stmt::Let` local
   gets real (blocking) forward-flow tracking, needed for `let next = i + 1;
-  i := next`. Entering ANY nested scope (`if`/`while`/`if let`/`while let`)
+  i := next` — EXCEPT a local ever reassigned via `Stmt::Assign` anywhere
+  in its own body (v19, above), which never gets a tracked bound at all,
+  in any scope. Entering ANY nested scope (`if`/`while`/`if let`/`while let`)
   clones both the frozen bound map and the locals map and discards the clone
   once that scope ends — conservative, not unsound: a local whose bound
   really would still be known after a branch (per this language's own

@@ -446,6 +446,55 @@
 //!   verified, both closed by a dedicated `tests/bounds.rs` regression
 //!   test.
 //!
+//! - **Reassigned locals never invalidate their forward-flow bound
+//!   (v19)**: found by a LATER advisor pass over v18's own local-
+//!   reassignment fix above, and turned out to be general — not
+//!   struct-field- or v18-specific at all, and present since bounds.rs's
+//!   very first commit (`bd109cc`). `locals` (the forward-flow map
+//!   behind EVERY local's own bound, not just a struct field's origin)
+//!   is written ONLY at `Stmt::Let` — `Stmt::Assign` never updates it
+//!   for a reassigned SCALAR local either, so `let x = 10; x :=
+//!   untrusted_input; total := x` composed `x` to its stale `let`-time
+//!   bound with no branch involved at all. v18's own fix (overwrite
+//!   `struct_origins` in `Stmt::Assign`) only ever helped the UNBRANCHED
+//!   case anyway: inside an `if`/`while` the overwrite lands on a clone
+//!   (`then_origins`/`loop_origins`, ...) that gets discarded when the
+//!   branch ends, so the outer map still has the pre-branch value. A
+//!   `while` loop rules out "poison the outer entry on branch exit" as a
+//!   complete fix too: the body is checked ONCE against its entry
+//!   snapshot, so a reassignment on iteration 1 is invisible when
+//!   checking iteration 2's own read of the same local — confirmed via a
+//!   driving repro before choosing a different shape. Fixed with
+//!   `collect_reassigned_locals`: a pre-scan, run once per rule/fn body
+//!   before any bound tracking begins, that finds every `DefKind::Local`
+//!   ever targeted by a `Stmt::Assign` anywhere in that body (including
+//!   nested inside `if`/`while`/`if let`/`while let`) and excludes it
+//!   from EVER getting a `locals`/`struct_origins` entry, in any scope —
+//!   the same "conservatively refuse rather than build merge/poisoning
+//!   machinery" call already made for v17's mem reads and v18's `Call`-
+//!   sourced struct writes. This SUPERSEDES v18's own `Stmt::Assign`
+//!   overwrite (removed — it's not just redundant but actively wrong to
+//!   keep: inserting a trusted entry there would reopen a narrower,
+//!   still-unsound window between one reassignment and the next).
+//!   Swept every existing test and example first for a `let`-bound
+//!   local later reassigned AND read in an ASSIGNMENT-shaped bounded
+//!   position (`total := x`) — nothing relies on it. The exclusion
+//!   itself is syntax-position-agnostic by construction, not just by
+//!   sweep coverage: `expr_bound`'s `Expr::Ident` arm is the SINGLE
+//!   lookup path `locals` is ever read through, used identically
+//!   whether the local appears as an assignment's rhs, a `Bump(x)`
+//!   call argument, or nested inside arithmetic — there is no separate
+//!   call-argument code path the exclusion could fail to reach.
+//!   Confirmed with a dedicated call-argument repro (advisor follow-up)
+//!   in addition to the sweep, so this costs zero expressiveness
+//!   against the current suite in every checked position, not just the
+//!   swept one. Confirmed via three escalating repros (unbranched,
+//!   inside an `if`, inside a `while`) before fixing, bug-
+//!   reintroduction-verified, closed by three dedicated `tests/
+//!   bounds.rs` regression tests. `--explain-schedule` byte-diff and a
+//!   `--firrtl` sanity check (both the compiler's own emitter and real
+//!   `firtool`) came back clean.
+//!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
 //! `types/collect.rs`'s `WIDEN_CAP` loop exists because a WIDTH is one
@@ -476,7 +525,11 @@
 //! def> < <const>` guard's own branch, and reverted once that branch
 //! ends. Writes are CHECKED against it, never allowed to update it.
 //! Only `Stmt::Let` locals get real (blocking) forward-flow tracking,
-//! needed for the realistic `let next = i + 1; i := next` shape.
+//! needed for the realistic `let next = i + 1; i := next` shape — EXCEPT
+//! a local ever reassigned via `Stmt::Assign` anywhere in its own body,
+//! which `collect_reassigned_locals` excludes from tracking entirely
+//! (v19, see above): its bound is never trusted at any read, in any
+//! scope, once reassigned even once.
 //!
 //! # Branch/loop scoping (a deliberate v1 simplification)
 //!
@@ -553,6 +606,7 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         ret_bound_span: HashMap::new(),
         current_ret_bound: None,
         current_fn_def: None,
+        current_reassigned_locals: HashSet::new(),
         found_writes: HashSet::new(),
         found_returns: HashSet::new(),
         site_ranges: HashMap::new(),
@@ -628,6 +682,14 @@ struct Checker<'a> {
     /// returns` WHICH fn actually had a checked return site, not just
     /// that some `Stmt::Return` was seen somewhere.
     current_fn_def: Option<DefId>,
+    /// Every `DefKind::Local` the CURRENT item ever reassigns via
+    /// `Stmt::Assign`, anywhere in its body -- set once at the top of
+    /// `check_item` via `collect_reassigned_locals`, read by `Stmt::
+    /// Let`'s own arm to decide whether a local's bound is trustworthy
+    /// to record at all. See `collect_reassigned_locals`'s own doc
+    /// comment for why this exists (a pre-existing, pre-v18 hole where
+    /// a reassigned local's STALE bound kept composing).
+    current_reassigned_locals: HashSet<DefId>,
     /// Every bounded def this pass found an ACTUAL `Stmt::Assign` for,
     /// anywhere in the program — cross-checked against `fx`'s own
     /// per-item write sets once the whole walk finishes (defense in
@@ -1153,6 +1215,72 @@ impl<'a> Checker<'a> {
         out
     }
 
+    /// Every `DefKind::Local` this pass finds as a `Stmt::Assign` LHS
+    /// anywhere in a body -- including nested inside `if`/`while`/`if
+    /// let`/`while let` -- computed ONCE per rule/fn body, before any
+    /// bound tracking begins. `locals`/`struct_origins` deliberately
+    /// never learn an entry for any def in this set (see `Stmt::Let`'s
+    /// own arm below): found by a post-ship advisor pass that a local
+    /// reassigned via `:=` gets NO forward-flow update at all --
+    /// `locals`/`struct_origins` are written only at `Stmt::Let` -- so
+    /// `let x = 10; x := untrusted; total := x` composed `x` to its
+    /// STALE `let`-time bound even with no branch involved (predates
+    /// v18 entirely, present since the very first bounds.rs commit).
+    /// Branch-exit poisoning (invalidate an outer entry whenever a
+    /// clone's value changed) looked like a fix but a `while` loop
+    /// defeats it too: the loop body is checked once against the ENTRY
+    /// snapshot, so a reassignment on iteration 1 is never visible when
+    /// checking iteration 2's own read of the same local -- confirmed
+    /// empirically with a driving repro before choosing this shape
+    /// instead. So this pass conservatively refuses to trust ANY local
+    /// ever reassigned ANYWHERE in its own body, rather than building
+    /// merge/poisoning machinery a loop would still defeat -- the same
+    /// "refuse rather than build merge machinery" call this arc already
+    /// made for v17's mem reads and v18's `Call`-sourced struct writes.
+    /// Swept against every existing test/example first: nothing relies
+    /// on a reassigned local's bound composing in a bounded position,
+    /// so this costs zero expressiveness against the current suite.
+    fn collect_reassigned_locals(&self, body: &[StmtId]) -> HashSet<DefId> {
+        let mut out = HashSet::new();
+        let mut stack: Vec<StmtId> = body.to_vec();
+        while let Some(id) = stack.pop() {
+            match self.ast.stmt(id) {
+                Stmt::Assign { lhs, .. } => {
+                    if let Expr::Ident(_) = self.ast.expr(*lhs)
+                        && let Some(def) = self.res.expr_defs.get(lhs).copied()
+                        && self.res.def(def).kind == crate::resolve::DefKind::Local
+                    {
+                        out.insert(def);
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    stack.extend(then_body.iter().copied());
+                    if let Some(else_body) = else_body {
+                        stack.extend(else_body.iter().copied());
+                    }
+                }
+                Stmt::IfLet {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    stack.extend(then_body.iter().copied());
+                    if let Some(else_body) = else_body {
+                        stack.extend(else_body.iter().copied());
+                    }
+                }
+                Stmt::While { body, .. } => stack.extend(body.iter().copied()),
+                Stmt::WhileLet { body, .. } => stack.extend(body.iter().copied()),
+                _ => {}
+            }
+        }
+        out
+    }
+
     fn check_item(&mut self, id: ItemId) {
         // v17: widened to a three-way check -- a program with ONLY a
         // bounded mem and no bounded reg/out/param/return anywhere would
@@ -1183,6 +1311,7 @@ impl<'a> Checker<'a> {
             .map(|(d, b)| (*d, (b.lower, b.upper)))
             .collect();
         let mut locals: HashMap<DefId, Option<(u64, u64)>> = HashMap::new();
+        self.current_reassigned_locals = self.collect_reassigned_locals(&body);
         // v18: which expression each struct-typed LOCAL was bound to
         // (its own `Stmt::Let` init) -- threaded and cloned/discarded
         // per nested scope exactly like `locals`, NOT a flat `self`-
@@ -1307,48 +1436,49 @@ impl<'a> Checker<'a> {
                         self.check_against_bound(field_computed, bounded, span, &context);
                     }
                 }
-                // v18, caught by advisor review AFTER this feature had
-                // already shipped: a struct-typed LOCAL can be
-                // REASSIGNED via `:=` (unlike a reg/out, `types/stmt.rs`
-                // places no "must be a StructLit or Call" restriction on
-                // a `DefKind::Local` target), so `struct_origins`'s entry
-                // from this local's OWN `Stmt::Let` would otherwise keep
-                // pointing at its ORIGINAL binding forever -- `let p =
-                // Pair{data:15}; p := q; total := p.data` traced `p.data`
-                // back to the stale, already-superseded literal instead
-                // of `q` (an untrusted `in`-port value), letting an
-                // unproven value through as a false proof. Fixed by
-                // overwriting `struct_origins` with the NEW rhs on every
-                // reassignment, exactly like `Stmt::Let` already does for
-                // the initial binding -- `struct_field_bound`'s own
-                // recursive trace then correctly follows the CURRENT
-                // value, whether that's another checked literal (still
-                // composes) or an untrusted origin (correctly stops
-                // composing, the same mechanism an aliased `let` already
-                // relies on).
-                if let Some(def) = def
-                    && self.res.def(def).kind == crate::resolve::DefKind::Local
-                    && matches!(self.ty.expr_tys.get(&rhs), Some(Ty::Struct { .. }))
-                {
-                    struct_origins.insert(def, rhs);
-                }
+                // v18 originally patched a struct-typed LOCAL reassign
+                // (`p := q`) by overwriting `struct_origins` with the new
+                // rhs right here, so `p.data` would keep tracing to the
+                // CURRENT value instead of the stale `Stmt::Let` one. A
+                // later advisor pass found that fix incomplete: it only
+                // held outside a branch/loop, since a nested scope's own
+                // clone-and-discard treatment (see `Stmt::If`/`While`
+                // below) meant the overwrite never escaped the branch it
+                // ran in, and a `while` loop's single-pass body check
+                // couldn't see iteration N's reassignment when checking
+                // iteration N+1's own read. Superseded by `current_
+                // reassigned_locals` (see its own doc comment): any local
+                // ever reassigned anywhere in this body never gets a
+                // `locals`/`struct_origins` entry in the first place, so
+                // there is nothing to overwrite here -- inserting one
+                // would in fact reintroduce a narrower, still-unsound
+                // window of trust between this reassignment and the next
+                // one.
             }
             Stmt::Let { name, init } => {
                 let def = def_of_name(self.res, &name);
                 let b = self.expr_bound(init, state, locals, struct_origins);
-                locals.insert(def, b);
-                // v18: a struct-typed local's own SINGLE binding site is
-                // recorded so `struct_field_bound`'s `DefKind::Local` arm
-                // can trace `p.data` back to whatever `init` actually was
-                // -- sound because a struct-typed local can only ever be
-                // bound directly to a literal in this language (aliasing
-                // another struct-typed value, `let p2 = q`, is a separate
-                // v0 restriction enforced elsewhere); an untrusted origin
-                // (an `in`-port/mem/fifo-derived value) still correctly
-                // fails to compose once `struct_field_bound` recurses
-                // into it and hits its own `DefKind` gate.
-                if matches!(self.ty.expr_tys.get(&init), Some(Ty::Struct { .. })) {
-                    struct_origins.insert(def, init);
+                // A local this pass's own pre-scan (`current_reassigned_
+                // locals`, computed once at the top of `check_item`)
+                // found reassigned via `Stmt::Assign` SOMEWHERE in this
+                // body never gets an entry here at all -- see that set's
+                // own doc comment for why a reassigned local's bound
+                // can't be trusted at all, not just per-branch.
+                if !self.current_reassigned_locals.contains(&def) {
+                    locals.insert(def, b);
+                    // v18: a struct-typed local's own SINGLE binding site
+                    // is recorded so `struct_field_bound`'s `DefKind::
+                    // Local` arm can trace `p.data` back to whatever
+                    // `init` actually was -- sound because a struct-typed
+                    // local bound here is, by construction, never
+                    // reassigned later in this body (the reassigned case
+                    // is excluded above) -- an untrusted origin (an `in`-
+                    // port/mem/fifo-derived value) still correctly fails
+                    // to compose once `struct_field_bound` recurses into
+                    // it and hits its own `DefKind` gate.
+                    if matches!(self.ty.expr_tys.get(&init), Some(Ty::Struct { .. })) {
+                        struct_origins.insert(def, init);
+                    }
                 }
             }
             Stmt::If {
