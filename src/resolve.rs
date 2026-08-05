@@ -510,10 +510,29 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(*lower, false);
                 }
             }
-            Item::Mem { ty, .. }
-            | Item::Fifo { ty, .. }
-            | Item::Input { ty, .. }
-            | Item::Io { ty, .. } => {
+            Item::Mem {
+                ty, bound, lower, ..
+            } => {
+                self.resolve_expr(*ty, false);
+                // v17: mirrors `Item::Fn`'s own `ret_bound` handling
+                // below exactly -- the self-reference placeholder
+                // (`elem`) is never a real scoped binding (a mem
+                // element has no `DefId` of its own), so only the
+                // bound's own constant RHS is resolved normally; the
+                // placeholder itself is checked by TEXT in `check_mem_
+                // bound_shape`, not passed through `resolve_expr`
+                // (which would otherwise error "cannot find `elem`").
+                if let Some(bound) = bound {
+                    self.check_mem_bound_shape(*bound);
+                    if let Expr::Binary { rhs, .. } = self.ast.expr(*bound).clone() {
+                        self.resolve_expr(rhs, false);
+                    }
+                }
+                if let Some(lower) = lower {
+                    self.resolve_expr(*lower, false);
+                }
+            }
+            Item::Fifo { ty, .. } | Item::Input { ty, .. } | Item::Io { ty, .. } => {
                 self.resolve_expr(*ty, false);
             }
             // The one legal place to reference an `io` port: `resolve_
@@ -1156,6 +1175,33 @@ impl<'a> Resolver<'a> {
                 self.ast.expr_spans[lhs.0 as usize].clone(),
                 "a return bound must reference the return value via the placeholder `result` \
                  (e.g. `where result < 20`)"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// v17's own sibling of `check_ret_bound_shape` immediately above --
+    /// same reasoning, same shape, a different placeholder: a mem's
+    /// element has no scoped `DefId` either (unlike a reg/out/param's
+    /// own bound, checked by `check_bound_self_reference` against a
+    /// real binding), so the self-reference position is checked by TEXT
+    /// against the literal placeholder `elem`, kept as its own small
+    /// function rather than generalizing `check_ret_bound_shape` to take
+    /// a placeholder string -- this file's own convention (see `bounds.
+    /// rs`'s `collect_one_ret_bound` doc comment) is to only share a
+    /// helper across near-identical branches within one function, not
+    /// force a shared abstraction across two conceptually separate
+    /// checks like these.
+    fn check_mem_bound_shape(&mut self, bound: ExprId) {
+        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+            return;
+        };
+        let is_elem = matches!(self.ast.expr(lhs), Expr::Ident(name) if name == "elem");
+        if !is_elem {
+            self.error(
+                self.ast.expr_spans[lhs.0 as usize].clone(),
+                "a mem bound must reference each element via the placeholder `elem` (e.g. \
+                 `where elem < 20`)"
                     .to_string(),
             );
         }

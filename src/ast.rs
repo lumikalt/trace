@@ -426,6 +426,22 @@ pub enum Item {
     Mem {
         name: Name,
         ty: ExprId,
+        /// `where elem < <const>` — an optional, statically PROVEN bound
+        /// (`bounds.rs`, v17) on every value ever stored in this mem,
+        /// checked at every write site via the same per-site induction
+        /// argument a reg/out's own bound already uses, and handed back
+        /// at every READ site too (a mem read composes to `None`
+        /// otherwise). The self-reference placeholder is the literal
+        /// identifier `elem`, not this mem's own name -- a mem element
+        /// has no scoped `DefId` of its own to compare against, the same
+        /// situation `ret_bound`'s `result` placeholder is in, unlike a
+        /// reg/out/param's bound (which references a real binding
+        /// already in scope). Checked by TEXT in `resolve.rs`'s
+        /// `check_mem_bound_shape`, mirroring `check_ret_bound_shape`.
+        bound: Option<ExprId>,
+        /// `where <const> <= elem < <const>` — the same bound's optional
+        /// LOWER end, mirroring `Item::Reg`'s own `lower` field exactly.
+        lower: Option<ExprId>,
     },
     Fifo {
         name: Name,
@@ -722,8 +738,24 @@ impl Ast {
                 }
                 out.push('\n');
             }
-            Item::Mem { name, ty } => {
-                out.push_str(&format!("{pad}mem {name} : {}\n", self.expr_sexpr(*ty)));
+            Item::Mem {
+                name,
+                ty,
+                bound,
+                lower,
+            } => {
+                out.push_str(&format!("{pad}mem {name} : {}", self.expr_sexpr(*ty)));
+                if let Some(bound) = bound {
+                    match lower {
+                        Some(lower) => out.push_str(&format!(
+                            " where {} <= {}",
+                            self.expr_sexpr(*lower),
+                            self.expr_sexpr(*bound)
+                        )),
+                        None => out.push_str(&format!(" where {}", self.expr_sexpr(*bound))),
+                    }
+                }
+                out.push('\n');
             }
             Item::Fifo { name, ty } => {
                 out.push_str(&format!("{pad}fifo {name} : {}\n", self.expr_sexpr(*ty)));

@@ -1702,3 +1702,125 @@ module M {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("argument for parameter"));
 }
+
+#[test]
+fn mem_elem_write_within_bound_is_proven() {
+    let src = "\
+module M {
+    mem m : [8][10] where elem < 50
+    reg i : [8] where i < 10 = 0
+    rule write {
+        if i < 10 {
+            m[i] := 40
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn mem_elem_write_exceeding_bound_is_rejected() {
+    let src = "\
+module M {
+    mem m : [8][10] where elem < 50
+    reg i : [8] where i < 10 = 0
+    rule write {
+        if i < 10 {
+            m[i] := 60
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("computed value could reach 60"));
+}
+
+#[test]
+fn mem_elem_read_value_is_deliberately_not_composed() {
+    // A soundness-restriction regression guard, not a capability test: an
+    // earlier version of this feature handed the mem's declared bound
+    // back at a READ site too, composing `total := m[i]` cleanly. An
+    // advisor pass caught a real hole in that before it shipped -- a mem
+    // has no `init`/reset, so proving every WRITE stays in range says
+    // nothing about what an unwritten or not-yet-written READ returns,
+    // and that unproven value could otherwise reach `schedule.rs`'s own
+    // disjointness proof via `let a = m[pc]; m[a]`. So a mem read's own
+    // value must still compose to `None`, exactly as before this
+    // feature existed -- this test pins that restriction so a future
+    // change can't silently reintroduce the hole.
+    let src = "\
+module M {
+    mem m : [8][10] where elem < 50
+    reg i : [8] where i < 10 = 0
+    reg total : [8] where total < 50 = 0
+    rule write {
+        if i < 10 {
+            m[i] := 40
+        }
+    }
+    rule read {
+        total := m[i]
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write stays within the declared bound")
+    );
+}
+
+#[test]
+fn mem_bound_never_written_is_rejected() {
+    // v17's own sibling of v13's `check_return_site_exhaustiveness`,
+    // narrower in reach than v13's own version (see `check_mem_bound_is_
+    // proven`'s own doc comment: a mem read no longer trusts this bound
+    // at all, so this isn't closing a read-trust hole -- it's flagging
+    // dead, misleading metadata: a declared bound whose only real
+    // obligation, the write-site check, is never exercised). `y` is
+    // plain (no `where`), so this test isolates that one error, not a
+    // second, unrelated "cannot verify this write" from `y`'s own body.
+    let src = "\
+module M {
+    mem m : [8][10] where elem < 50
+    out y : [8] = 0
+    rule read {
+        y := m[0]
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("this mem bound is never checked against an actual write")
+    );
+}
+
+#[test]
+fn mem_elem_write_exceeding_bound_is_rejected_with_no_other_bounded_def() {
+    // Discriminates `check_item`'s own three-way early-return guard: this
+    // module has NO bounded reg/out/param/return anywhere, only the
+    // bounded mem -- if the guard were still the old two-way check (v16
+    // and earlier), `check_item` would bail out before ever walking this
+    // rule's body, and the out-of-range write below would be silently
+    // accepted instead of rejected.
+    let src = "\
+module M {
+    mem m : [8][10] where elem < 50
+    in i : [8]
+    rule write {
+        m[i] := 60
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("computed value could reach 60"));
+}

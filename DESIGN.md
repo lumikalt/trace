@@ -3215,6 +3215,124 @@ v0 restrictions, all deliberate scope cuts:
   `in`-port indices) was confirmed exactly — only the new driving
   example differed. A `--firrtl` sanity check confirmed clean codegen
   (a separate mem read port, no stall-mux serialization).
+- **`where` on mem elements, write-side only (v17)**. At v16's own
+  decision point, Lumi was offered "where on struct fields / mem
+  elements" as the alternative not picked; picked up directly here,
+  choosing mem elements over struct fields via AskUserQuestion (struct
+  fields are pure plumbing, the same shape as v8's `out` extension; mem
+  elements are a genuinely new capability). `mem m : [8][20] where elem
+  < K` declares a bound on every value ever WRITTEN to `m`, checked at
+  every write site via the identical per-site induction argument a
+  reg/out's own bound already uses.
+
+  The self-reference placeholder is the literal identifier `elem`, not
+  the mem's own name — the same situation `result` (v13) is in: a mem
+  element has no scoped `DefId` of its own to compare against, unlike a
+  reg/out/param's bound (a real binding already in scope). Checked by
+  TEXT in `resolve.rs`'s new `check_mem_bound_shape`, mirroring
+  `check_ret_bound_shape` exactly. Kept in its own map
+  (`bounds.rs`'s `mem_bounds`), not folded into the same map a
+  reg/out/param populates — a mem's bound is a flat, whole-array fact
+  checked at every write site, never narrowed per-branch, the same
+  reason `fn_ret_bound` is kept separate.
+
+  **A mem READ's own value deliberately still composes to `None` — not
+  the capability this feature first shipped with.** The first
+  implementation handed the declared bound back at read sites too
+  (composing through `Add`/`Sub`/`Mul`, a further write-site check,
+  etc., for free, since all of those already just call `expr_bound`
+  generically). An advisor pass caught a real soundness hole in that
+  before it shipped: the write-site induction proves "every WRITTEN
+  value satisfies the bound," which is not "every READ returns an
+  in-range value" — a mem has no `init`/reset at all (unlike a reg/out,
+  whose induction has a verified base case), so a read at an address
+  never written, or in an early cycle before the corresponding write
+  has happened, returns uninitialized data the write-site proof says
+  nothing about. Worse, that unproven value could reach `let a =
+  m[pc]`, then `m[a]`, exporting a FABRICATED "proven" range into
+  `Bounds.site_ranges` — `schedule.rs`'s own disjointness proof would
+  trust it, exactly `subleq.tr`'s own shape (an index loaded out of the
+  mem itself), turning a false compile-time proof into a real aliasing
+  bug in synthesized hardware. This section's own standing distinction
+  for `in` ports (a bound there would be a TRUSTED external contract,
+  "a different feature entirely" from this feature's proof-only
+  mandate) applies identically here: a mem's declared bound is only
+  ever a claim about what was WRITTEN, never a substitute for proving
+  what a read returns. So `total := m[i]` still fails as an unsupported
+  expression shape, exactly as before v17 — confirmed directly, not
+  just reasoned about: re-ran the advisor's own counterexample shape
+  (`let a = m[pc]; total := m[a]` with `m` written elsewhere) through
+  `--explain-schedule` and confirmed it falls back to a derived stall,
+  never a fabricated disjointness proof.
+
+  `check_item`'s own early-return guard widened to a THREE-way check
+  (bounded-def/return-bound/mem-bound maps all empty) — flagged
+  explicitly during planning as the same "gated the descent on the
+  wrong condition" class of bug v14 found four times in a row: a
+  program with ONLY a bounded mem would otherwise skip the whole body
+  walk, silently letting every mem write through unchecked. Discriminated
+  by a dedicated driving example with no other bounded def anywhere in
+  the module — confirmed by bug-reintroduction that reverting the guard
+  lets an out-of-range write through silently in that exact case.
+
+  A declared mem bound with zero write sites anywhere in the program is
+  dead, misleading metadata even with reads no longer trusting it at
+  all — the same "a declared contract with nothing to prove it
+  against" class v13 flagged for fn return bounds, though narrower in
+  reach than v13's own version (not closing a read-trust hole, since
+  there isn't one anymore). Closed the same way: a new `check_mem_
+  bound_is_proven`, a real user-facing error. `check_write_site_
+  exhaustiveness` (the existing internal-consistency panic, checked
+  against `effects.rs`'s own independent oracle) was also widened to
+  cover `mem_bounds`'s own keys, since a mem write is `sig.writes.
+  insert(mem_def)` there exactly like a reg/out's own write. Both
+  checks were bug-reintroduction-verified independently — and, found
+  empirically rather than planned, disabling either the write-site
+  check or the three-way guard trips the PANIC check first (`effects.
+  rs` says written, this pass's own walk disagrees), a stronger safety
+  net than expected.
+
+  `examples/mem_elem_bounded.tr` (a write within bound, an ordinary
+  unbounded read elsewhere — not composed into any proof) and
+  `examples/mem_elem_bounded_only.tr` (an out-of-range write with no
+  other bounded def in the module, to discriminate the three-way
+  guard) — both confirmed to fail on pre-feature code (`where` rejected
+  on `mem` at all) before implementing. 5 new tests in `tests/bounds.rs`
+  (including a dedicated regression guard pinning that a mem read still
+  does NOT compose, so a future change can't silently reintroduce the
+  soundness hole) and 2 in `tests/resolve.rs` (the `elem`-placeholder
+  shape check, mirroring `result`'s own coverage), every mechanism
+  bug-reintroduction-verified independently.
+
+  One more test, `tests/schedule.rs`'s `mem_read_derived_value_does_
+  not_feed_the_disjointness_proof` (`let a = m[pc]; total := m[a]`),
+  pins the same scenario at the scheduler level — but is honestly NOT
+  itself bug-reintroduction-verified: a `Local` is never recognized as
+  a valid `IndexForm` base (`state_base`'s `DefKind::is_state()`
+  excludes `Local`), so this specific shape structurally can't reach
+  `forms_differ`'s disjointness argument regardless of the read-
+  propagation bug. Chasing why surfaced a MORE severe variant that DOES
+  reach it: a bounded REG as the intermediate value instead of a
+  `Local` (`reg cached : [8] where 10 <= cached < 20 = 10; cached :=
+  m[pc]`) — a reg is a recognized state def, so its own pre-existing
+  declared range (v5-era, independent of `site_ranges`) would be
+  poisoned by the unproven read. Confirmed that variant DOES reproduce
+  the bug under reintroduction, and that the one shipped fix closes
+  both variants at their common source (neither a `Local` nor a `reg`
+  can receive a "proven" value from a mem read anymore) — so
+  `tests/bounds.rs`'s own regression test remains this feature's real
+  discriminating guard; the `tests/schedule.rs` test is a scheduler-
+  level sanity check on top, not a substitute.
+
+  A normalized `--explain-schedule` diff across every existing example
+  came back byte-identical (pure `parser.rs`/`resolve.rs`/`bounds.rs`
+  plumbing, no scheduling logic touched) and a `--firrtl` sanity check
+  (both the compiler's own emitter and real `firtool`) confirmed clean
+  codegen — the new AST fields are consumed only by `bounds.rs`. This
+  closes the mem-element half of the alternative left open at v16's own
+  decision point — a real, sound write-side proof, deliberately NOT a
+  read-side one; struct-field `where` remains the other half, still
+  unbuilt and undecided.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"
@@ -4748,6 +4866,12 @@ noted:
   DIFFERENT regs each be proven to occupy a disjoint sub-range. Exists to
   feed the mem-index disjointness proof above; see "Statically proven
   register bounds".
+- `mem m : elem_ty[depth] where elem < K` (v17): the same statically
+  PROVEN bound, but on every value ever WRITTEN to a mem, checked at
+  every write site — deliberately NOT handed back at read sites (a
+  read's own value still composes to `None`, unchanged; see "Statically
+  proven register bounds"'s own v17 entry for the soundness reason)
+  (`examples/mem_elem_bounded.tr`).
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/
@@ -4796,7 +4920,6 @@ Not yet implemented:
   is the real tier-3 gap, needing general range tracking, not a syntactic
   check or a narrow annotation — as does any write/write pair regardless of
   index shape.
-- **A Verilator simulation path.** Icarus only today.
 
 ## Prior art
 

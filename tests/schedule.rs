@@ -1405,3 +1405,43 @@ fn mem_site_narrowing_schedules_with_no_stall() {
     assert_eq!(group.conflicts.len(), 1);
     assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
 }
+
+#[test]
+fn mem_read_derived_value_does_not_feed_the_disjointness_proof() {
+    // v17's own regression guard for the soundness hole an advisor pass
+    // caught before the mem-elem-bound feature shipped: an earlier
+    // version of `expr_bound`'s `Bracket` arm handed a mem's declared
+    // elem bound back at READ sites too, which meant `let a = m[pc]`
+    // (composing `m`'s declared range onto `a`) then `m[a]` would export
+    // a FABRICATED range into `Bounds.site_ranges` -- exactly the shape
+    // `subleq.tr` itself has (an index loaded out of the mem). Chosen so
+    // the bug would have produced a FALSE proof, not just a missed one:
+    // `m`'s elem bound (`[10, 20)`) and the write index `pc`'s own range
+    // (`[0, 10)`) are DISJOINT, so if the buggy version were still
+    // shipping, `a` would carry `[10, 20)` and `forms_differ`'s
+    // non-overlapping-ranges argument would prove `write`/`read`
+    // disjoint -- a real false claim about synthesized hardware, since
+    // `a` is actually whatever garbage `m[pc]` returns, not a value
+    // provably confined to `[10, 20)`. Post-fix, `a` is a plain
+    // `Local` with no bound at all, so `real_range` misses and the pair
+    // falls back to the ordinary derived stall.
+    let src = "\
+module M {
+    mem m : [8][20] where 10 <= elem < 20
+    reg pc : [8] where pc < 10 = 0
+    reg total : [8] = 0
+    rule write {
+        m[pc] := 15
+    }
+    rule read {
+        let a = m[pc]
+        total := m[a]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+}

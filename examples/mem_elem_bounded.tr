@@ -1,0 +1,16 @@
+module MemElemBounded {
+    mem m : [8][10] where elem < 50
+
+    reg i : [8] where i < 10 = 0
+    out y : [8] = 0
+
+    rule write {
+        if i < 10 {
+            m[i] := 40
+        }
+    }
+
+    rule read {
+        y := m[i]
+    }
+}

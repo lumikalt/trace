@@ -463,20 +463,27 @@ impl<'a> Parser<'a> {
             }
             None
         };
-        // v0 restriction: `reg`/`out` only (an `in` has no write site at
-        // all to prove anything over, see DESIGN.md; `out` is register-
-        // backed and written via the same `Stmt::Assign` shape a `reg`
-        // is, so the identical induction argument applies unchanged).
-        // Parsed BEFORE `= init` (`resolve.rs`/`bounds.rs` validate the
-        // actual shape, same precedent as `IfLet`'s `init`) — see
-        // `parse_where_bound`'s own doc comment for why it's hand-rolled
-        // rather than a single `parse_expr(0)` call.
+        // v0 restriction: `reg`/`out`/`mem` only (an `in` has no write
+        // site at all to prove anything over, see DESIGN.md; `out` is
+        // register-backed and written via the same `Stmt::Assign` shape
+        // a `reg` is, so the identical induction argument applies
+        // unchanged; `mem`'s own bound is checked the same way at every
+        // `m[...] := ...` write site instead, v17). Parsed BEFORE
+        // `= init` (`resolve.rs`/`bounds.rs` validate the actual shape,
+        // same precedent as `IfLet`'s `init`) — see `parse_where_bound`'s
+        // own doc comment for why it's hand-rolled rather than a single
+        // `parse_expr(0)` call.
         let where_span = self.cur_span();
         let (bound, lower) = self.parse_where_bound()?;
-        if bound.is_some() && keyword != TokenKind::Reg && keyword != TokenKind::Output {
+        if bound.is_some()
+            && keyword != TokenKind::Reg
+            && keyword != TokenKind::Output
+            && keyword != TokenKind::Mem
+        {
             self.errors.push(ParseError {
                 span: where_span.clone(),
-                message: "`where` is only allowed on `reg`/`out` declarations (v0 restriction)"
+                message: "`where` is only allowed on `reg`/`out`/`mem` declarations (v0 \
+                          restriction)"
                     .to_string(),
             });
         }
@@ -530,6 +537,8 @@ impl<'a> Parser<'a> {
             TokenKind::Mem => Item::Mem {
                 name,
                 ty: ty.unwrap(),
+                bound,
+                lower,
             },
             TokenKind::Fifo => Item::Fifo {
                 name,

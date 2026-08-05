@@ -928,6 +928,36 @@ module M {
 }
 
 #[test]
+fn elem_placeholder_resolves_in_a_mem_bound() {
+    // v17's own sibling of `result_placeholder_resolves_in_a_return_
+    // bound` above -- `elem` is a textual placeholder for a mem's own
+    // element, not a real scoped binding (checked by `check_mem_bound_
+    // shape`, not ordinary identifier lookup).
+    let src = "\
+module M {
+    mem m : [8][10] where elem < 50
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn mem_bound_referencing_the_mem_s_own_name_is_an_error() {
+    let src = "\
+module M {
+    mem m : [8][10] where m < 50
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("must reference each element via the placeholder `elem`")
+    );
+}
+
+#[test]
 fn where_bound_referencing_the_same_output_resolves() {
     let src = "\
 module M {

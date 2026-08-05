@@ -275,6 +275,72 @@
 //!   own accessing rule, to a disjoint half — pre-fix, the scheduler
 //!   inserts a real stall between the two rules; post-fix, it proves
 //!   disjointness automatically and removes it, with no annotation.
+//! - **`where` on mem elements, write-side only (v17)**: at v16's own
+//!   decision point, "where on struct fields / mem elements" was the
+//!   alternative not picked; picked up directly here. `mem m : [8][20]
+//!   where elem < K` declares a bound on every value ever WRITTEN to
+//!   `m`, checked at every write site via the identical per-site
+//!   induction argument a reg/out's own bound already uses. The self-
+//!   reference placeholder is the literal identifier `elem`, not the
+//!   mem's own name — the same situation `result` (v13) is in: a mem
+//!   element has no scoped `DefId` of its own to compare against, unlike
+//!   a reg/out/param's bound (a real binding already in scope). Checked
+//!   by TEXT in `resolve.rs`'s `check_mem_bound_shape`, mirroring
+//!   `check_ret_bound_shape` exactly. Kept in its OWN map
+//!   (`self.mem_bounds`), not folded into `self.bounded`: a mem's bound
+//!   is a flat, whole-array fact checked at every write site, never
+//!   narrowed per-branch the way `self.bounded`'s per-item `state` map
+//!   is — the same reason `fn_ret_bound` is kept separate.
+//!
+//!   **A mem READ's own value still composes to `None`, deliberately —
+//!   not the capability this feature first shipped with.** An earlier
+//!   version handed the declared bound back at every read site too
+//!   (composing through `Add`/`Sub`/`Mul`, a further write-site check,
+//!   etc., for free). An advisor pass caught a real soundness hole in
+//!   that before it shipped: the write-site induction proves "every
+//!   WRITTEN value satisfies the bound," which is NOT "every read
+//!   returns an in-range value" — a mem has no `init`/reset at all
+//!   (unlike a reg/out, whose induction has a verified BASE case), so a
+//!   read at an address never written, or in an early cycle before the
+//!   corresponding write has happened, returns uninitialized data the
+//!   write-site proof says nothing about. Worse, that unproven value
+//!   could reach `Stmt::Let` (`let a = m[pc]`), then `m[a]`, exporting a
+//!   FABRICATED "proven" range into `Bounds.site_ranges` — `schedule.
+//!   rs`'s own disjointness proof would trust it, exactly `subleq.tr`'s
+//!   own shape (an index loaded out of the mem itself), turning a false
+//!   proof into a real aliasing bug in synthesized hardware. This
+//!   module's own standing distinction (a bound on an `in` port would be
+//!   a TRUSTED external contract, "a different feature entirely" from
+//!   this module's proof-only mandate) applies identically: a mem's
+//!   declared bound is only ever a claim about what was WRITTEN, never a
+//!   substitute for proving what a read returns. So `total := m[i]`
+//!   still fails as an unsupported expression shape, exactly as before
+//!   v17 — this feature's actual scope is narrower than first shipped:
+//!   catching an out-of-range WRITE, nothing about reads.
+//!
+//!   `check_item`'s own early-return guard widened to a THREE-way check
+//!   (`self.bounded`/`fn_ret_bound`/`mem_bounds` all empty) — flagged
+//!   explicitly during planning as the same "gated the descent on the
+//!   wrong condition" class of bug v14 found four times in a row: a
+//!   program with ONLY a bounded mem would otherwise skip the whole body
+//!   walk, silently letting every mem write through unchecked.
+//!   Discriminated by a dedicated driving example with no OTHER bounded
+//!   def anywhere in the module.
+//!
+//!   A declared mem bound with literally zero write sites anywhere in
+//!   the program is dead, misleading metadata even with reads no longer
+//!   trusting it — the same "a declared contract with nothing to prove
+//!   it against" class v13 flagged for fn return bounds. Closed the same
+//!   way: a new `check_mem_bound_is_proven`, a REAL user-facing error
+//!   (unlike `check_write_site_exhaustiveness`, which panics — that
+//!   one's an internal-consistency check against `effects.rs`'s own
+//!   independent oracle, extended to `self.mem_bounds`'s keys too, since
+//!   a mem write is `sig.writes.insert(mem_def)` there exactly like a
+//!   reg/out's own write). Both checks were bug-reintroduction-verified
+//!   independently, and — discovered empirically, not planned —
+//!   disabling either the write-site check OR the three-way guard trips
+//!   the PANIC check first (`effects.rs` says written, this pass's own
+//!   walk disagrees), a stronger safety net than the plan anticipated.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -386,16 +452,20 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         found_writes: HashSet::new(),
         found_returns: HashSet::new(),
         site_ranges: HashMap::new(),
+        mem_bounds: HashMap::new(),
+        mem_bound_span: HashMap::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
     checker.collect_bounded_params();
+    checker.collect_mem_bounds();
     let bodied = checker.collect_bodied_items();
     for id in &bodied {
         checker.check_item(*id);
     }
     checker.check_write_site_exhaustiveness();
     checker.check_return_site_exhaustiveness();
+    checker.check_mem_bound_is_proven();
     let bounds = Bounds {
         ranges: checker
             .bounded
@@ -473,6 +543,25 @@ struct Checker<'a> {
     /// more than once under a different `state` (see that arm's own
     /// doc comment for why).
     site_ranges: HashMap<ExprId, (u64, u64)>,
+    /// v17: every `mem` with a declared `where elem < K` bound, keyed by
+    /// its own `DefId` -- kept separate from `self.bounded` rather than
+    /// folded in, since a mem's bound is a flat, whole-array fact
+    /// checked at every write site (never narrowed per-branch the way
+    /// `self.bounded`'s per-item `state` map is), the same reasoning
+    /// `fn_ret_bound` is kept separate from `self.bounded` for. Consulted
+    /// ONLY at a `Stmt::Assign` write site (`m[i] := rhs` checks `rhs`
+    /// against it) -- deliberately NOT consulted by `expr_bound`'s own
+    /// `Expr::Bracket` arm at a mem READ, which still composes to `None`
+    /// unconditionally: proving every WRITE stays in range says nothing
+    /// about what an uninitialized or not-yet-written READ returns (a
+    /// mem has no `init`/reset the way a reg/out does) -- see that arm's
+    /// own doc comment for the soundness hole this avoided.
+    mem_bounds: HashMap<DefId, BoundedDef>,
+    /// Every `mem_bounds` entry's own declaration span -- mirrors `ret_
+    /// bound_span` exactly, needed by `check_mem_bound_is_proven` to
+    /// point an error at a declared bound with no write site to prove it
+    /// against.
+    mem_bound_span: HashMap<DefId, Span>,
     errors: Vec<BoundsError>,
 }
 
@@ -660,6 +749,75 @@ impl<'a> Checker<'a> {
             .insert(fn_def, self.ast.expr_spans[bound.0 as usize].clone());
     }
 
+    /// Every `mem` with a `where elem < K` bound (v17), collected the
+    /// same top-level-item-walk shape `collect_bounded_defs` uses for
+    /// reg/out.
+    fn collect_mem_bounds(&mut self) {
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            match self.ast.item(id) {
+                Item::Module { items, .. } => stack.extend(items.iter().copied()),
+                Item::Mem {
+                    bound: Some(bound),
+                    lower,
+                    ..
+                } => {
+                    if let Some(&def) = self.res.item_defs.get(&id) {
+                        self.collect_one_mem_bound(def, *bound, *lower);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The mem-bound sibling of `collect_one_ret_bound` immediately
+    /// above — same const-fold-and-report shape, but keyed by the MEM's
+    /// own `DefId` into `self.mem_bounds` rather than the fn's into
+    /// `fn_ret_bound`, and sourcing its width from `mem_elem_width` (the
+    /// mem's own ELEMENT type, read out of `Ty::Mem { elem, .. }` in
+    /// `state_tys`) rather than `ret_width` (a raw, unbound type
+    /// expression — a return value has no `DefId`/`state_tys` entry of
+    /// its own at all, unlike a mem). Kept as its own function for the
+    /// same reason `collect_one_ret_bound`'s own doc comment gives: the
+    /// width source genuinely differs each time, not worth forcing into
+    /// one shared helper across three top-level collectors.
+    fn collect_one_mem_bound(&mut self, def: DefId, bound: ExprId, lower: Option<ExprId>) {
+        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
+            return;
+        };
+        let Some(upper) = const_fold(self.ast, *rhs) else {
+            return; // types.rs already reported this
+        };
+        let lower_val = match lower {
+            Some(l) => match const_fold(self.ast, l) {
+                Some(v) => v,
+                None => return, // types.rs already reported this
+            },
+            None => 0,
+        };
+        let Some(width) = mem_elem_width(self.ty, def) else {
+            let span = self.ast.expr_spans[bound.0 as usize].clone();
+            self.error(
+                span,
+                "a mem bound needs a concretely-known `bits[N]` element type to check against \
+                 (v0 restriction)"
+                    .to_string(),
+            );
+            return;
+        };
+        self.mem_bounds.insert(
+            def,
+            BoundedDef {
+                lower: lower_val,
+                upper,
+                width,
+            },
+        );
+        self.mem_bound_span
+            .insert(def, self.ast.expr_spans[bound.0 as usize].clone());
+    }
+
     /// All rule/fn items, recursively through modules — the same
     /// exhaustive walk `types/collect.rs`'s `check_all` and
     /// `effects.rs`'s `collect_bodied_items` both already do; callees
@@ -681,7 +839,13 @@ impl<'a> Checker<'a> {
     }
 
     fn check_item(&mut self, id: ItemId) {
-        if self.bounded.is_empty() && self.fn_ret_bound.is_empty() {
+        // v17: widened to a three-way check -- a program with ONLY a
+        // bounded mem and no bounded reg/out/param/return anywhere would
+        // otherwise skip this whole body walk, silently letting every
+        // mem write through unchecked (the same "gated the descent on
+        // the wrong condition" class of bug v14 found four times in a
+        // row).
+        if self.bounded.is_empty() && self.fn_ret_bound.is_empty() && self.mem_bounds.is_empty() {
             return; // nothing to check anywhere in the program
         }
         let body = match self.ast.item(id) {
@@ -754,6 +918,20 @@ impl<'a> Checker<'a> {
                 let computed = self.expr_bound(rhs, state, locals);
                 if let (Some(def), Some(bounded)) = (def, bounded) {
                     self.found_writes.insert(def);
+                    let span = self.ast.expr_spans[rhs.0 as usize].clone();
+                    self.check_against_bound(computed, bounded, span, "write");
+                }
+                // v17: a mem write (`m[i] := rhs`) checks `rhs` against
+                // the mem's own declared elem bound, the same shape as
+                // the bare-Ident branch above but keyed by the callee's
+                // `DefId` instead -- reuses `computed`, already derived
+                // unconditionally above, no redundant `expr_bound` call.
+                if let Expr::Bracket { callee, .. } = self.ast.expr(lhs)
+                    && let Some(mem_def) = self.res.expr_defs.get(callee).copied()
+                    && self.res.def(mem_def).kind == crate::resolve::DefKind::Mem
+                    && let Some(bounded) = self.mem_bounds.get(&mem_def).copied()
+                {
+                    self.found_writes.insert(mem_def);
                     let span = self.ast.expr_spans[rhs.0 as usize].clone();
                     self.check_against_bound(computed, bounded, span, "write");
                 }
@@ -1362,12 +1540,11 @@ impl<'a> Checker<'a> {
                     .get(&fn_def)
                     .map(|bounded| (bounded.lower, bounded.upper))
             }
-            // A mem/fifo access's own VALUE has no provable bound here
-            // -- composes to `None`, unchanged from before this arm
-            // existed. But `callee`/`args` can still contain a nested
-            // `Call` whose own argument obligations need checking:
-            // without this arm, `Expr::Bracket` fell through to the
-            // catch-all below with ZERO recursion, so `y := m[Bump(50)]`
+            // A mem/fifo access's own VALUE composed to `None`
+            // unconditionally through v16 -- `callee`/`args` still need
+            // checking for a nested `Call`'s own argument obligations:
+            // without this arm at all, `Expr::Bracket` fell through to
+            // the catch-all below with ZERO recursion, so `y := m[Bump(50)]`
             // (a mem READ used as a value, not an assignment target)
             // silently skipped `Bump`'s own argument check entirely --
             // found empirically while designing v16 below, not assumed,
@@ -1412,6 +1589,30 @@ impl<'a> Checker<'a> {
                         self.site_ranges.insert(*arg, range);
                     }
                 }
+                // v17's own bound (`self.mem_bounds`) is deliberately
+                // NOT handed back here -- a mem read's own VALUE still
+                // composes to `None`, exactly as before v17. An earlier
+                // version of this arm returned the mem's declared bound
+                // on a read, but an advisor pass caught a real soundness
+                // hole before this shipped: the write-site induction
+                // proves "every WRITTEN value satisfies the bound," not
+                // "every READ returns an in-range value" -- a mem has no
+                // `init`/reset at all (unlike a reg/out), so a read at an
+                // address never written (or in an early cycle, before
+                // the corresponding write has happened) returns
+                // uninitialized data the write-site proof says nothing
+                // about. Worse, that unproven value could reach `Stmt::
+                // Let` (`let a = m[pc]`), then `m[a]`, exporting a
+                // fabricated "proven" range into `site_ranges` --
+                // `schedule.rs`'s own disjointness proof would trust it,
+                // exactly `subleq.tr`'s own shape (an index loaded out of
+                // the mem itself). This module's OWN standing distinction
+                // (a bound on an `in` port would be a TRUSTED external
+                // contract, "a different feature entirely" from this
+                // module's proof-only mandate) applies identically here:
+                // a mem's declared bound is only ever a claim about what
+                // was WRITTEN, never a substitute for proving what a read
+                // returns.
                 None
             }
             _ => None,
@@ -1438,8 +1639,17 @@ impl<'a> Checker<'a> {
     /// happens to contain it. Confirmed empirically, not just by
     /// reading the match arm: compiled a scratch module reassigning a
     /// bounded param inside its own fn body, no panic.
+    ///
+    /// v17: `self.mem_bounds`'s own keys are chained in too — a mem
+    /// write is `sig.writes.insert(mem_def)` in `effects.rs` exactly
+    /// like a reg/out (`state_def` accepts `DefKind::Mem`,
+    /// `effects.rs:486-489`), so the identical internal-consistency
+    /// argument applies: if `effects.rs` says a mem was written
+    /// somewhere but this pass's own (new) `Expr::Bracket`-write-
+    /// matching logic never recognized it, that's this pass's own bug,
+    /// not a user-facing diagnostic.
     fn check_write_site_exhaustiveness(&self) {
-        for def in self.bounded.keys() {
+        for def in self.bounded.keys().chain(self.mem_bounds.keys()) {
             let effects_says_written = self.fx.sigs.values().any(|s| s.writes.contains(def));
             if effects_says_written && !self.found_writes.contains(def) {
                 panic!(
@@ -1481,6 +1691,36 @@ impl<'a> Checker<'a> {
             }
         }
     }
+
+    /// v17's own sibling of `check_return_site_exhaustiveness` above --
+    /// a REAL user-facing check, not an internal invariant (that's
+    /// `check_write_site_exhaustiveness`'s job, extended to `mem_bounds`
+    /// above). Unlike a return bound (trusted at every call site with no
+    /// coupling to whether a `return` ever discharges it), a mem's
+    /// declared bound is no longer consulted at any read site at all
+    /// (see `expr_bound`'s `Expr::Bracket` arm's own doc comment) -- so
+    /// this isn't closing a "trusted with nothing verified" soundness
+    /// hole the way `check_return_site_exhaustiveness` does. It's a
+    /// smaller, still real problem: a declared `where elem < K` with
+    /// ZERO write sites anywhere in the program never gets its only
+    /// actual obligation (the write-site check) exercised even once --
+    /// dead, misleading metadata (a typo, or a sign the mem is only ever
+    /// boot-loaded through a port `bounds.rs` doesn't track) that would
+    /// otherwise compile silently with no diagnostic at all.
+    fn check_mem_bound_is_proven(&mut self) {
+        for mem_def in self.mem_bounds.keys().copied().collect::<Vec<_>>() {
+            if !self.found_writes.contains(&mem_def) {
+                let span = self.mem_bound_span[&mem_def].clone();
+                self.error(
+                    span,
+                    "this mem bound is never checked against an actual write (`m[...] := ...`) \
+                     anywhere in the program -- a declared bound needs at least one write to \
+                     prove it against, or this declaration has nothing to verify at all"
+                        .to_string(),
+                );
+            }
+        }
+    }
 }
 
 /// Fold a bare literal to a compile-time constant — deliberately NOT
@@ -1509,6 +1749,25 @@ fn base_width(ty: &Types, def: DefId) -> Option<u64> {
     let found = ty.state_tys.get(&def).or_else(|| ty.local_tys.get(&def))?;
     match found {
         Ty::Bits(Width::Known(w)) => Some(*w),
+        _ => None,
+    }
+}
+
+/// A mem's own ELEMENT type's declared bit width (v17), if it's a plain
+/// `bits[N]` (concretely known) — the mem-bound sibling of `base_width`
+/// immediately above, but reading through one extra layer: a mem's own
+/// `state_tys` entry is `Ty::Mem { elem, len }`, not a bare `Ty::Bits`
+/// directly (`base_width`'s own match would always miss it), so this
+/// unwraps `elem` first before checking the same `Ty::Bits(Width::
+/// Known(w))` shape. A mem whose element type is anything else (a
+/// struct, an unresolved width) falls closed to `None`, same convention
+/// `base_width`/`ret_width` both already follow.
+fn mem_elem_width(ty: &Types, def: DefId) -> Option<u64> {
+    match ty.state_tys.get(&def) {
+        Some(Ty::Mem { elem, .. }) => match elem.as_ref() {
+            Ty::Bits(Width::Known(w)) => Some(*w),
+            _ => None,
+        },
         _ => None,
     }
 }

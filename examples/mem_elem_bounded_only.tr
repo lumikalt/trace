@@ -1,0 +1,9 @@
+module MemElemBoundedOnly {
+    mem m : [8][10] where elem < 50
+
+    in i : [8]
+
+    rule write {
+        m[i] := 60
+    }
+}
