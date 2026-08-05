@@ -1583,3 +1583,152 @@ module M {
     assert_eq!(group.conflicts.len(), 1);
     assert_eq!(group.conflicts[0].exemption, Exemption::None);
 }
+
+// --- The `schedule.rs` consumer half of DESIGN.md's "Tier 3, not v0"
+// circular-buffer case (`bounds::provably_disjoint_under_joint_
+// guards`) ---
+
+#[test]
+fn circular_buffer_mem_drops_from_the_conflict_set_but_stall_persists() {
+    // The real driving example, verbatim: `push`/`pop` share `{m,
+    // push_count, pop_count}`. `m`'s own index proof (`m[head]` vs
+    // `m[tail]`, via the two declared `invariant`s and both rules' own
+    // joint guards) now succeeds, dropping `m` from the reported `on`
+    // set -- but `push_count`/`pop_count` are ordinary scalar regs, not
+    // mem, so the pair's overall exemption stays `None` and the derived
+    // stall persists exactly as before. This is the accounting DESIGN
+    // .md documents: the mem-disjointness proof's entire visible payoff
+    // on this example is `m` dropping out of the diagnostic, not the
+    // conflict itself clearing.
+    let src = "\
+module CircularBufferDisjoint {
+    mem m : [8][8]
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+    invariant push_count - pop_count < 9
+    invariant (head - tail - push_count + pop_count) % 8 = 0
+    in push_en : [1]
+    in push_data : [8]
+    in pop_en : [1]
+    out pop_data : [8] = 0
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count < 8)?
+        m[head] := push_data
+        if head < 7 {
+            head := head + 1
+        } else {
+            head := 0
+        }
+        push_count := push_count + 1
+    }
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_data := m[tail]
+        if tail < 7 {
+            tail := tail + 1
+        } else {
+            tail := 0
+        }
+        pop_count := pop_count + 1
+    }
+}
+";
+    let (ast, res, sched, errors) = run(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    let conflict = &group.conflicts[0];
+    assert_eq!(conflict.exemption, Exemption::None);
+    let on: std::collections::BTreeSet<&str> = conflict
+        .on
+        .iter()
+        .map(|d| res.def(*d).name.as_str())
+        .collect();
+    assert_eq!(
+        on,
+        ["push_count", "pop_count"].into_iter().collect(),
+        "`m` should have dropped out of the reported set"
+    );
+    assert_eq!(
+        rule_name(&ast, conflict.winner),
+        "push",
+        "declaration order still decides the winner"
+    );
+}
+
+#[test]
+fn circular_buffer_weakened_guard_never_drops_m_from_the_conflict_set() {
+    // The load-bearing negative, at the `schedule.rs` layer: with
+    // `push`'s guard weakened to admit occupancy 8, the occupancy
+    // invariant itself fails to verify in `bounds.rs` (a compile
+    // error), so `bounds.relational` never gets the fact this proof
+    // needs -- `m` stays in the reported conflict set exactly as it did
+    // before this feature existed.
+    let src = "\
+module CircularBufferDisjoint {
+    mem m : [8][8]
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+    invariant push_count - pop_count < 9
+    invariant (head - tail - push_count + pop_count) % 8 = 0
+    in push_en : [1]
+    in push_data : [8]
+    in pop_en : [1]
+    out pop_data : [8] = 0
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count <= 8)?
+        m[head] := push_data
+        if head < 7 {
+            head := head + 1
+        } else {
+            head := 0
+        }
+        push_count := push_count + 1
+    }
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_data := m[tail]
+        if tail < 7 {
+            tail := tail + 1
+        } else {
+            tail := 0
+        }
+        pop_count := pop_count + 1
+    }
+}
+";
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty());
+    let (ast, parse_errors) = parser::parse(src, &tokens);
+    assert!(parse_errors.is_empty());
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty());
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty());
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
+    assert!(type_errors.is_empty());
+    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert_eq!(bounds_errors.len(), 1); // the occupancy invariant fails to verify
+    let (sched, sched_errors) = schedule(&ast, &res, &fx, &ty, &b);
+    assert!(sched_errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    let on: std::collections::BTreeSet<&str> = group.conflicts[0]
+        .on
+        .iter()
+        .map(|d| res.def(*d).name.as_str())
+        .collect();
+    assert_eq!(
+        on,
+        ["m", "push_count", "pop_count"].into_iter().collect(),
+        "`m` should NOT drop out -- the occupancy invariant never verified"
+    );
+}

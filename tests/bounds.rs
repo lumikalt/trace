@@ -1,5 +1,7 @@
+use trace::ast::{Ast, Item, ItemId};
 use trace::bounds::{self, Bounds, BoundsError};
 use trace::effects::Effects;
+use trace::resolve::{DefId, Resolution};
 use trace::{effects, lexer, parser, resolve, types};
 
 fn run(src: &str) -> Vec<BoundsError> {
@@ -43,6 +45,59 @@ fn run_with_bounds(src: &str) -> (Effects, Bounds, Vec<BoundsError>) {
     assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
     let (bounds, errors) = bounds::check(&ast, &res, &fx, &ty);
     (fx, bounds, errors)
+}
+
+/// Full pipeline including `Ast`/`Resolution` -- `provably_disjoint_
+/// under_joint_guards` needs both (rule bodies for guards, a `DefId`
+/// for each mem-index base) alongside `Bounds` itself.
+fn run_full(src: &str) -> (Ast, Resolution, Bounds, Vec<BoundsError>) {
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (ast, parse_errors) = parser::parse(src, &tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(
+        resolve_errors.is_empty(),
+        "resolve errors: {resolve_errors:?}"
+    );
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty(), "effect errors: {effect_errors:?}");
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
+    assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
+    let (bounds, errors) = bounds::check(&ast, &res, &fx, &ty);
+    (ast, res, bounds, errors)
+}
+
+/// The one `DefId` whose own name matches `name` exactly -- panics on
+/// zero or multiple matches, same "keep the driving shape unambiguous"
+/// convention `the_only_mem_index` (above) already follows.
+fn def_named(res: &Resolution, name: &str) -> DefId {
+    let matches: Vec<DefId> = res
+        .defs
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.name == name)
+        .map(|(i, _)| DefId(i as u32))
+        .collect();
+    assert_eq!(matches.len(), 1, "expected exactly one def named `{name}`");
+    matches[0]
+}
+
+/// The one `Item::Rule` whose own name matches `name` exactly.
+fn rule_named(ast: &Ast, name: &str) -> ItemId {
+    fn walk(ast: &Ast, items: &[ItemId], name: &str, found: &mut Vec<ItemId>) {
+        for &id in items {
+            match ast.item(id) {
+                Item::Module { items, .. } => walk(ast, items, name, found),
+                Item::Rule { name: n, .. } if n.text == name => found.push(id),
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(ast, &ast.roots, name, &mut found);
+    assert_eq!(found.len(), 1, "expected exactly one rule named `{name}`");
+    found[0]
 }
 
 /// The one DISTINCT `ExprId` recorded across every item's own
@@ -2624,4 +2679,189 @@ module M {
             .message
             .contains("more than two rules write registers")
     );
+}
+
+// --- `provably_disjoint_under_joint_guards` (the `schedule.rs`
+// consumer half of DESIGN.md's "Tier 3, not v0" circular-buffer case)
+// ---
+//
+// Tested directly here, independent of `schedule.rs`'s own IndexForm
+// plumbing, since the function only needs `Bounds`/`Ast`/`Resolution`
+// and two `DefId`s/two rule `ItemId`s -- exactly what these helpers
+// build.
+
+#[test]
+fn circular_buffer_head_and_tail_are_provably_disjoint_under_joint_guards() {
+    let src = "\
+module CircularBufferDisjoint {
+    mem m : [8][8]
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+    invariant push_count - pop_count < 9
+    invariant (head - tail - push_count + pop_count) % 8 = 0
+    in push_en : [1]
+    in push_data : [8]
+    in pop_en : [1]
+    out pop_data : [8] = 0
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count < 8)?
+        m[head] := push_data
+        if head < 7 {
+            head := head + 1
+        } else {
+            head := 0
+        }
+        push_count := push_count + 1
+    }
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_data := m[tail]
+        if tail < 7 {
+            tail := tail + 1
+        } else {
+            tail := 0
+        }
+        pop_count := pop_count + 1
+    }
+}
+";
+    let (ast, res, bounds, errors) = run_full(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let head = def_named(&res, "head");
+    let tail = def_named(&res, "tail");
+    let push = rule_named(&ast, "push");
+    let pop = rule_named(&ast, "pop");
+    assert!(bounds::provably_disjoint_under_joint_guards(
+        &ast, &res, &bounds, head, tail, push, pop
+    ));
+    // Order-independence: the caller may pass the pair either way.
+    assert!(bounds::provably_disjoint_under_joint_guards(
+        &ast, &res, &bounds, tail, head, pop, push
+    ));
+}
+
+#[test]
+fn circular_buffer_push_count_and_pop_count_are_not_claimed_disjoint() {
+    // Sanity check that this function isn't vacuously true for ANY
+    // pair: `push_count`/`pop_count` themselves don't appear as the
+    // `idx_a`/`idx_b` cancelling pair in either invariant (they're part
+    // of the "other" side in the linking fact), so no rule of this
+    // function's own shape applies.
+    let src = "\
+module CircularBufferDisjoint {
+    mem m : [8][8]
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+    invariant push_count - pop_count < 9
+    invariant (head - tail - push_count + pop_count) % 8 = 0
+    in push_en : [1]
+    in push_data : [8]
+    in pop_en : [1]
+    out pop_data : [8] = 0
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count < 8)?
+        m[head] := push_data
+        if head < 7 {
+            head := head + 1
+        } else {
+            head := 0
+        }
+        push_count := push_count + 1
+    }
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_data := m[tail]
+        if tail < 7 {
+            tail := tail + 1
+        } else {
+            tail := 0
+        }
+        pop_count := pop_count + 1
+    }
+}
+";
+    let (ast, res, bounds, errors) = run_full(src);
+    assert!(errors.is_empty(), "{errors:?}");
+    let push_count = def_named(&res, "push_count");
+    let pop_count = def_named(&res, "pop_count");
+    let push = rule_named(&ast, "push");
+    let pop = rule_named(&ast, "pop");
+    assert!(!bounds::provably_disjoint_under_joint_guards(
+        &ast, &res, &bounds, push_count, pop_count, push, pop
+    ));
+}
+
+#[test]
+fn head_and_tail_not_disjoint_when_push_guard_is_weakened() {
+    // The load-bearing negative: weaken `push`'s guard from `< 8` to
+    // `<= 8` -- `push_count - pop_count < 9`'s OWN induction (see
+    // `circular_buffer_weakened_guard_fails_the_occupancy_invariant`
+    // above) already fails to verify under this change, so it never
+    // reaches `bounds.relational` at all -- confirming the consumer
+    // correctly has nothing to work with, rather than silently
+    // reporting disjoint anyway.
+    let src = "\
+module CircularBufferDisjoint {
+    mem m : [8][8]
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+    invariant push_count - pop_count < 9
+    invariant (head - tail - push_count + pop_count) % 8 = 0
+    in push_en : [1]
+    in push_data : [8]
+    in pop_en : [1]
+    out pop_data : [8] = 0
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count <= 8)?
+        m[head] := push_data
+        if head < 7 {
+            head := head + 1
+        } else {
+            head := 0
+        }
+        push_count := push_count + 1
+    }
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_data := m[tail]
+        if tail < 7 {
+            tail := tail + 1
+        } else {
+            tail := 0
+        }
+        pop_count := pop_count + 1
+    }
+}
+";
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty());
+    let (ast, parse_errors) = parser::parse(src, &tokens);
+    assert!(parse_errors.is_empty());
+    let (res, resolve_errors) = resolve::resolve(&ast);
+    assert!(resolve_errors.is_empty());
+    let (fx, effect_errors) = effects::check(&ast, &res);
+    assert!(effect_errors.is_empty());
+    let (ty, type_errors) = types::check(&ast, &res, &fx);
+    assert!(type_errors.is_empty());
+    let (bounds, errors) = bounds::check(&ast, &res, &fx, &ty);
+    assert_eq!(errors.len(), 1); // the occupancy invariant fails to verify
+    let head = def_named(&res, "head");
+    let tail = def_named(&res, "tail");
+    let push = rule_named(&ast, "push");
+    let pop = rule_named(&ast, "pop");
+    assert!(!bounds::provably_disjoint_under_joint_guards(
+        &ast, &res, &bounds, head, tail, push, pop
+    ));
 }

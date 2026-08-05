@@ -3939,33 +3939,106 @@ this check) would have wrongly rejected the example; the fix compares
 deltas modulo the bound's OWN declared modulus instead, since that's
 genuinely all the final arithmetic needs.
 
-`--explain-schedule` on the real example is UNCHANGED by this (byte-diff
-confirmed identical, along with every other example in the suite) —
-proving these two facts does NOT, by itself, retire the derived stall.
-That's expected, not a bug: `mem_disjoint` (`schedule.rs`) requires EVERY
-shared read/write def in a rule pair to be mem-kind before it even
-attempts an index-disjointness proof (`rw.iter().all(|def| kind == Mem &&
-...)`) — and `push`/`pop`'s shared set is `{m, push_count, pop_count}`,
-where the latter two are plain scalar regs, not mem. So even a complete
-`m[head]` vs `m[tail]` index proof would be COMPLETELY INERT on this
-example: not merely low-payoff, but never even consulted, since the
-all-mem gate fails before `one_mem_disjoint` is ever called. Verified
-directly (not assumed) by deleting `m` and its two accesses from a
-scratch copy of the example: `--explain-schedule` still reports `write
-meets read on {push_count, pop_count}`, an ordinary scalar write-meets-
-read hazard (each rule's OWN guard reads the OTHER rule's counter — see
-the example's own comment for why that's inherent to any producer/
-consumer pair, not an artifact of this construction) with nothing to do
-with mem indexing at all.
+At the time the `bounds.rs` half above shipped, `--explain-schedule` on the
+real example was UNCHANGED by it (byte-diff confirmed identical, along
+with every other example in the suite) — proving these two facts did NOT,
+by itself, retire the derived stall. That was expected, not a bug:
+`mem_disjoint` (`schedule.rs`) required EVERY shared read/write def in a
+rule pair to be mem-kind before it even attempted an index-disjointness
+proof (`rw.iter().all(|def| kind == Mem && ...)`) — and `push`/`pop`'s
+shared set is `{m, push_count, pop_count}`, where the latter two are plain
+scalar regs, not mem. So a complete `m[head]` vs `m[tail]` index proof was
+COMPLETELY INERT on this example at that point: not merely low-payoff, but
+never even consulted, since the all-mem gate failed before `one_mem_
+disjoint` was ever called. Verified directly (not assumed) by deleting `m`
+and its two accesses from a scratch copy of the example: `--explain-
+schedule` still reported `write meets read on {push_count, pop_count}`, an
+ordinary scalar write-meets-read hazard (each rule's OWN guard reads the
+OTHER rule's counter — see the example's own comment for why that's
+inherent to any producer/consumer pair, not an artifact of this
+construction) with nothing to do with mem indexing at all.
 
-Building the `schedule.rs` consumer (per-def partial exemption replacing
-`mem_disjoint`'s current all-or-nothing gate, plus threading two rules'
-guards into the index-disjointness path) is therefore DEFERRED — its
-entire payoff on this example would be dropping `m` from the reported
-`on` set while the stall itself persists regardless, a much smaller win
-than the `bounds.rs` half's own soundness argument. Left as its own,
-separate future undertaking, should a driving case ever need it (unlike
-this example, where the win doesn't materialize).
+**The `schedule.rs` consumer half, RESOLVED.** Two changes, scoped exactly
+to what advisor review recommended rather than restructuring `Exemption`
+into a set:
+
+1. `bounds.rs` exports only VERIFIED relational bounds — `Bounds.
+   relational: Vec<RelationalFact>` — via a new `Checker::failed_
+   relational: HashSet<usize>` tracked alongside `relational_bounds`
+   itself. Flagged and fixed BEFORE any consumer existed to exploit it:
+   `relational_bounds` had held every recognized invariant regardless of
+   whether the base case or inductive step actually verified (an error
+   surfaced, but the entry stayed); exporting that list unfiltered to a
+   `schedule.rs` consumer would have been a live fail-open — a genuinely
+   unproven fact trusted the instant something started reading it.
+2. A new, genuinely general mem-disjointness argument, `bounds::provably_
+   disjoint_under_joint_guards(ast, res, bounds, idx_a, idx_b, rule_a,
+   rule_b) -> bool` — the EIGHTH argument this arc has built (after v1-v7's
+   `forms_differ` cases), and the first that needs no shared base, no
+   shared multiplier, no per-register proven range at all: it needs only a
+   RELATIONAL fact linking `idx_a`/`idx_b` to two OTHER defs this module
+   can independently bound. Consulted from `mem_accesses_disjoint`
+   (`schedule.rs`) as an `||` alternative whenever `forms_differ` itself
+   returns false, scoped to BARE-IDENT indices only (no scaled/offset
+   transform — the exported fact is about the bases' own raw values).
+
+   The derivation, worked out from `link` (an equality-to-zero fact naming
+   `idx_a`/`idx_b` as a cancelling `±1` pair plus exactly one further
+   cancelling pair, `other`) and `range_fact` (a SECOND verified fact whose
+   own terms equal `other`, or its negation, carrying a REAL absolute
+   range rather than just a congruence): `idx_a == idx_b` iff `other_expr
+   ≡ link.lower (mod link.modulus)` — notably independent of which sign
+   `idx_a`'s own coefficient carries, so no interval negation is ever
+   needed; only the TARGET value flips (`link.lower` vs `link.modulus -
+   link.lower`) depending on whether `range_fact` matched `other` directly
+   or negated. `range_fact`'s own declared range, narrowed by BOTH rules'
+   own joint guards (`narrow_combo_range`, re-run here rather than cached
+   from `bounds.rs`'s own internal induction), gives a real range for
+   `other_expr`; if that range excludes the target, `idx_a != idx_b`
+   follows whenever both rules fire the same cycle. `circular_buffer_
+   disjoint.tr`'s own two invariants are exactly this shape: `link` =
+   `head - tail - push_count + pop_count ≡ 0 (mod 8)`, `other` =
+   `{push_count: -1, pop_count: +1}`, `range_fact` = `push_count -
+   pop_count < 9` (the SAME two defs, negated sign, modulus 16 — the
+   cross-modulus case: `range_fact`'s own guard-narrowed range `[1, 7]`
+   already fits within 8 without any wraparound, so the v1 restriction
+   `range_fits_modulus` (fails closed on a range that WOULD need actual
+   modular reduction, not attempted yet) doesn't even trigger here).
+
+   `linear_form`/`recognize_comparison`/`narrow_combo_range`/`leading_
+   guards` — all previously `Checker` methods reaching into `self.ast`/
+   `self.res` — were refactored into free functions (with thin `Checker`
+   wrappers kept for every existing in-file call site) so this new public
+   function, which has no `Checker` to call a method on, could reuse the
+   SAME modular-arithmetic reasoning rather than reimplementing it.
+
+`schedule.rs`'s own `mem_disjoint` (renamed `provably_disjoint_mem_defs`)
+changed from all-or-nothing to PER-DEF: it now returns the subset of a
+pair's shared defs that are BOTH mem-kind AND provably disjoint, rather
+than requiring the whole shared set to qualify. The reported `on` set
+drops exactly those proven defs — UNLESS doing so would empty the set
+entirely, in which case `on` keeps showing the FULL originally-shared set
+(matching every prior release's own diagnostic convention: `Exemption::
+Disjoint` is informational, "here's what was checked," not just "here's
+what's still a problem" — confirmed necessary the hard way, by an
+initial version of this change that blindly subtracted in all cases and
+broke six existing `mem_disjoint_*.tr`/`mirrored_index_disjoint.tr`
+examples' own diagnostic text from `{m}` to `{}`).
+
+`--explain-schedule` on `circular_buffer_disjoint.tr` now reports `write
+meets read on {push_count, pop_count}` — `m` dropped, exemption still
+`None`, stall still derived, exactly the accounting predicted above: the
+mem-disjointness proof's entire visible win on THIS example is one fewer
+name in a diagnostic string, not a cleared conflict. `--explain-schedule`
+byte-diff across every OTHER example came back identical; a `--firrtl`
+sanity check (real `firtool`) confirmed clean codegen; the load-bearing
+negative (weakening `push`'s guard, which already fails the occupancy
+invariant's own `bounds.rs` induction) confirmed `m` correctly stays in
+the reported set when the underlying fact never verifies. New tests: 3 in
+`tests/bounds.rs` (`provably_disjoint_under_joint_guards` exercised
+directly, independent of `schedule.rs`'s own plumbing) and 2 in `tests/
+schedule.rs` (the full pipeline, checking `Conflict.on`/`exemption`
+directly).
 
 The checked `conflict_free` assertion above is not a smaller version of this
 tier, and does not retire it: it checks a runtime PRECONDITION (do these two

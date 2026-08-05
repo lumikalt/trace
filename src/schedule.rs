@@ -176,10 +176,10 @@
 //! an odd result, so `2*i ≡ 7 (mod 2^W)` has no solution. This is a
 //! PURELY ALGEBRAIC fact about the two index expressions themselves —
 //! no state-write history involved at all, unlike a genuinely relational
-//! invariant (DESIGN.md's own "Tier 3, not v0" section still has an
-//! OPEN example, `examples/circular_buffer_disjoint.tr`, needing exactly
-//! that: `head`/`tail`/`push_count`/`pop_count`'s joint write history,
-//! not a fact about any one or two registers' values). Every EXISTING
+//! invariant (DESIGN.md's own "Tier 3, not v0" section has exactly that:
+//! `examples/circular_buffer_disjoint.tr`'s `head`/`tail`/`push_count`/
+//! `pop_count` joint write history — see "An eighth case" below). Every
+//! EXISTING
 //! argument above had to be re-checked for a `negated`-shaped blind
 //! spot: the symbolic ones (v1-v3, and the fourth case) all assumed a
 //! shared term cancels exactly in the subtraction, which is false when
@@ -196,6 +196,54 @@
 //! `forms_differ`'s own doc comment for the full argument and its own
 //! empirical confirmation (`i < 2`, narrow enough that `bounds.rs`
 //! proves a real range for `2 - i` too, still correctly unprovable).
+//!
+//! # An eighth case: a genuinely RELATIONAL fact (`bounds::provably_
+//! disjoint_under_joint_guards`)
+//!
+//! Every case above (v1-v7) reasons about the two index expressions
+//! THEMSELVES — a shared symbolic term, an independently-computed range,
+//! an algebraic parity fact. `examples/circular_buffer_disjoint.tr`'s
+//! `m[head]` vs `m[tail]` is different in kind: `head`/`tail` are two
+//! COMPLETELY UNRELATED bases (no shared base, no shared multiplier, no
+//! individually-provable sub-range — each independently ranges over the
+//! mem's FULL `[0, 8)` address space), disjoint ONLY because of a
+//! RELATIONAL invariant across FOUR registers' joint write history
+//! (`head - tail ≡ push_count - pop_count`, mod depth) — this is
+//! DESIGN.md's "Tier 3, not v0" case, and none of v1-v7 can express it:
+//! every one of them is a claim about one or two registers' own possible
+//! VALUES, never about a fact relating them to OTHER registers entirely.
+//!
+//! `bounds::provably_disjoint_under_joint_guards` (defined in `bounds
+//! .rs`, not here — the modular-arithmetic reasoning stays where the
+//! rest of this arc's induction machinery already lives) is called as an
+//! `||` alternative whenever `forms_differ` itself returns false, scoped
+//! to bare-ident indices only (`multiplier == 1`, `offset == 0`, not
+//! `negated` — no scaled/offset transform, since the underlying fact is
+//! about the bases' own raw values). It consumes `Bounds.relational` —
+//! `bounds.rs`'s own VERIFIED (not merely declared) `invariant` facts —
+//! plus BOTH accessing rules' own leading guards, re-derived here rather
+//! than cached from `bounds.rs`'s internal induction. See that function's
+//! own doc comment for the full derivation.
+//!
+//! This case changed `mem_disjoint` (renamed `provably_disjoint_mem_
+//! defs`) from ALL-OR-NOTHING to PER-DEF: `circular_buffer_disjoint.tr`'s
+//! `push`/`pop` share `{m, push_count, pop_count}`, and the old gate
+//! (`rw.iter().all(|def| kind == Mem && ...)`) rejected the WHOLE set the
+//! instant it saw a non-mem def, meaning `m`'s own index proof was never
+//! even ATTEMPTED regardless of whether this eighth argument existed —
+//! confirmed empirically (not assumed) by deleting `m` from a scratch
+//! copy of the example and observing the SAME `{push_count, pop_count}`
+//! conflict reported either way. Now, a mem def proven disjoint drops out
+//! of the reported `on` set — UNLESS doing so would empty it entirely, in
+//! which case `on` keeps the FULL set (matching every prior release's own
+//! diagnostic convention: `Exemption::Disjoint` says "here's what was
+//! checked," not just "here's what's still unresolved" — an initial
+//! version that always subtracted broke six EXISTING examples' own
+//! `{m}` → `{}` diagnostic text, caught by the full-suite byte-diff sweep
+//! before this shipped). `push_count`/`pop_count` are ordinary scalar
+//! regs, not mem, so they're never candidates for this drop at all — the
+//! pair's exemption stays `None` and the derived stall persists exactly
+//! as before, with `m` simply no longer named alongside it.
 
 use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, ScheduleDirective};
 use crate::bounds::Bounds;
@@ -412,27 +460,47 @@ impl<'a> Scheduler<'a> {
                 } else {
                     ConflictKind::WriteWrite
                 };
-                let on: Vec<DefId> = ww
-                    .iter()
-                    .copied()
-                    .chain(rw.iter().copied())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
+                let full_on: BTreeSet<DefId> =
+                    ww.iter().copied().chain(rw.iter().copied()).collect();
+                // Any mem def in `rw` whose own access sites provably
+                // touch different addresses is a candidate to drop from
+                // the REPORTED `on` set -- but only when the pair, taken
+                // as a whole, still has a REAL remaining hazard: when
+                // proving every mem def disjoint also empties the WHOLE
+                // set (today's existing `Exemption::Disjoint` case,
+                // unchanged), `on` keeps showing the FULL originally-
+                // shared set, matching every prior release's own
+                // diagnostic convention (informational -- "here's what
+                // was checked," not just "here's what's still a
+                // problem"). Scoped to ReadWrite pairs only (see this
+                // module's own doc comment for why WriteWrite can't
+                // benefit the same way in v0's emission model).
+                let provably_disjoint: BTreeSet<DefId> = if kind == ConflictKind::ReadWrite {
+                    self.provably_disjoint_mem_defs(&rw, sa, sb, *a, *b)
+                } else {
+                    BTreeSet::new()
+                };
+                let fully_resolved = kind == ConflictKind::ReadWrite
+                    && !rw.is_empty()
+                    && full_on.difference(&provably_disjoint).next().is_none();
+                let on: Vec<DefId> = if fully_resolved {
+                    full_on.into_iter().collect()
+                } else {
+                    full_on.difference(&provably_disjoint).copied().collect()
+                };
                 let matched = exempt_sets
                     .iter()
                     .find(|(_, set, _)| set.contains(a) && set.contains(b));
                 let exemption = matched.map_or(Exemption::None, |(kind, _, _)| *kind);
-                // No user annotation, but every shared def is a mem whose
-                // access sites provably touch different addresses: prove
-                // it automatically rather than requiring `conflict_free`.
-                // Scoped to ReadWrite pairs only (see this module's own
-                // doc comment for why WriteWrite can't benefit the same
-                // way in v0's emission model) and left alone if the user
-                // already wrote an annotation of their own.
+                // No user annotation, but every shared def is either a
+                // proven-disjoint mem access or (today's existing case)
+                // the set is entirely mem and entirely proven: exempt
+                // automatically rather than requiring `conflict_free`,
+                // left alone if the user already wrote an annotation of
+                // their own.
                 let exemption = if exemption == Exemption::None
                     && kind == ConflictKind::ReadWrite
-                    && self.mem_disjoint(&rw, sa, sb)
+                    && fully_resolved
                 {
                     Exemption::Disjoint
                 } else {
@@ -493,26 +561,53 @@ impl<'a> Scheduler<'a> {
         });
     }
 
-    /// Whether every def in `rw` (a pure read/write set — the caller
-    /// only calls this when the pair's overall `ww` is empty, so no def
-    /// here is written by both sides) is a `mem` whose access sites in
-    /// `sa`/`sb` provably touch different addresses. A single non-mem
-    /// def, or a mem def the proof can't close, fails the whole set —
-    /// see this module's own doc comment.
-    fn mem_disjoint(&self, rw: &BTreeSet<DefId>, sa: &EffectSig, sb: &EffectSig) -> bool {
-        !rw.is_empty()
-            && rw.iter().all(|def| {
-                self.res.def(*def).kind == DefKind::Mem && self.one_mem_disjoint(*def, sa, sb)
+    /// The SUBSET of `rw` (a pure read/write set — the caller only calls
+    /// this when the pair's overall `ww` is empty, so no def here is
+    /// written by both sides) that is BOTH a `mem` def AND provably
+    /// touched at different addresses by `sa`/`sb`'s own access sites —
+    /// per-def, not all-or-nothing: a non-mem def (an ordinary scalar
+    /// write-meets-read hazard, unrelated to mem indexing at all) or a
+    /// mem def the proof can't close is simply left OUT of the returned
+    /// set, not treated as failing the whole batch. This is the change
+    /// that makes DESIGN.md's "Tier 3" circular-buffer case's `bounds
+    /// .rs` half actually OBSERVABLE: `push`/`pop`'s shared `{m,
+    /// push_count, pop_count}` used to make the OLD all-or-nothing `mem
+    /// _disjoint` bail before even attempting `m`'s own index proof
+    /// (`push_count`/`pop_count` aren't mem-kind); this drops exactly
+    /// `m` from the reported set once its own indices verify disjoint,
+    /// leaving `{push_count, pop_count}` — the genuine, still-real
+    /// scalar hazard — as the pair's own `on` set and derived stall.
+    fn provably_disjoint_mem_defs(
+        &self,
+        rw: &BTreeSet<DefId>,
+        sa: &EffectSig,
+        sb: &EffectSig,
+        rule_a: ItemId,
+        rule_b: ItemId,
+    ) -> BTreeSet<DefId> {
+        rw.iter()
+            .copied()
+            .filter(|def| {
+                self.res.def(*def).kind == DefKind::Mem
+                    && self.one_mem_disjoint(*def, sa, sb, rule_a, rule_b)
             })
+            .collect()
     }
 
     /// One mem def's own proof: find which side writes it (the other
-    /// reads it, guaranteed by `mem_disjoint`'s caller), then check that
-    /// side's recorded write-index sites against the other's read-index
-    /// sites. Missing index data (a mem present in `reads`/`writes` with
-    /// no recorded site) is treated as an unknown index, not "no
-    /// access" — fails closed, never assumed disjoint.
-    fn one_mem_disjoint(&self, def: DefId, sa: &EffectSig, sb: &EffectSig) -> bool {
+    /// reads it, guaranteed by the caller), then check that side's
+    /// recorded write-index sites against the other's read-index sites.
+    /// Missing index data (a mem present in `reads`/`writes` with no
+    /// recorded site) is treated as an unknown index, not "no access" —
+    /// fails closed, never assumed disjoint.
+    fn one_mem_disjoint(
+        &self,
+        def: DefId,
+        sa: &EffectSig,
+        sb: &EffectSig,
+        rule_a: ItemId,
+        rule_b: ItemId,
+    ) -> bool {
         let (writer, reader) = if sa.writes.contains(&def) {
             (sa, sb)
         } else {
@@ -535,6 +630,8 @@ impl<'a> Scheduler<'a> {
             real_depth,
             w_idx,
             r_idx,
+            rule_a,
+            rule_b,
         )
     }
 
@@ -1084,6 +1181,8 @@ fn mem_accesses_disjoint(
     real_depth: Option<u64>,
     a: &BTreeSet<ExprId>,
     b: &BTreeSet<ExprId>,
+    rule_a: ItemId,
+    rule_b: ItemId,
 ) -> bool {
     // An `IndexForm` paired with its own `real_range` (`None` when
     // either recognition fails) — named here purely to keep the
@@ -1098,9 +1197,33 @@ fn mem_accesses_disjoint(
         return false;
     };
     a_forms.iter().all(|(fa, ra)| {
-        b_forms
-            .iter()
-            .all(|(fb, rb)| forms_differ(ty, *fa, *fb, pow2_width, *ra, *rb, real_depth))
+        b_forms.iter().all(|(fb, rb)| {
+            forms_differ(ty, *fa, *fb, pow2_width, *ra, *rb, real_depth)
+                // The eighth, genuinely general argument (DESIGN.md's
+                // "Tier 3, not v0"): two arbitrary, unrelated,
+                // UNANNOTATED bases — `forms_differ`'s own v1-v7
+                // arguments can never close this, since none of them
+                // reasons about a RELATIONAL fact spanning defs outside
+                // the two indices themselves. Scoped to BARE-IDENT
+                // indices only (multiplier 1, offset 0, not negated —
+                // no scaled/offset expression, since the exported fact
+                // is about the bases' own raw values, not a transform
+                // of them) and two DIFFERENT bases (same reasoning
+                // `forms_differ`'s own `(Some(da), Some(db))` match arm
+                // already keys off).
+                || (fa.base != fb.base
+                    && fa.multiplier == 1
+                    && fa.offset == 0
+                    && !fa.negated
+                    && fb.multiplier == 1
+                    && fb.offset == 0
+                    && !fb.negated
+                    && fa.base.zip(fb.base).is_some_and(|(da, db)| {
+                        crate::bounds::provably_disjoint_under_joint_guards(
+                            ast, res, bounds, da, db, rule_a, rule_b,
+                        )
+                    }))
+        })
     })
 }
 

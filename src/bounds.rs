@@ -581,17 +581,38 @@
 //!   RHS must be `<def> +/- <const>` or a literal under a branch that
 //!   pins `<def>` to an exact singleton (anything else fails closed); no
 //!   `While`/`IfLet`/`WhileLet` inside a contributing rule's body at all
-//!   (unconditional — no motivating example needs one). `--explain-
-//!   schedule` on `circular_buffer_disjoint.tr` is UNCHANGED by this
-//!   (byte-diff confirmed identical, across every OTHER example too):
-//!   proving these two facts does NOT retire the derived stall on its own
-//!   — verified directly that `schedule.rs`'s `mem_disjoint` requires
-//!   EVERY shared def in a rule pair to be mem-kind before attempting an
-//!   index proof at all, and `push`/`pop`'s shared set includes two plain
-//!   scalar regs, making an `m[head]` vs `m[tail]` proof completely INERT
-//!   here (not merely low-payoff) — see DESIGN.md's "Tier 3" section for
-//!   the full accounting of why the `schedule.rs` consumer half is
-//!   deferred rather than built.
+//!   (unconditional — no motivating example needs one).
+//!
+//! - **The `schedule.rs` consumer, `provably_disjoint_under_joint_
+//!   guards`**: only VERIFIED relational bounds are ever exported
+//!   (`Bounds.relational`, filtered by `Checker::failed_relational` — a
+//!   live fail-open closed before this consumer existed to exploit it: an
+//!   invariant that failed its base case or inductive step used to stay
+//!   in `relational_bounds` right alongside a verified one). The new
+//!   argument itself — the EIGHTH `forms_differ`-adjacent case, and the
+//!   first needing no shared base/multiplier/proven range at all — finds
+//!   a verified equality-to-zero fact naming the two mem-index bases as a
+//!   cancelling `±1` pair plus one further cancelling pair (`other`), a
+//!   SECOND verified fact bounding that same `other` pair with a REAL
+//!   absolute range, narrows it via both accessing rules' own joint
+//!   guards (`narrow_combo_range`, re-run here rather than cached from
+//!   this file's own internal induction), and concludes the two bases
+//!   differ whenever that narrowed range excludes the derived target
+//!   value. `linear_form`/`recognize_comparison`/`narrow_combo_range`/
+//!   `leading_guards` were refactored from `Checker` methods into free
+//!   functions (with thin wrappers kept for every existing in-file call
+//!   site) so this new public function — which has no `Checker` to call
+//!   a method on — could reuse the same reasoning rather than
+//!   reimplementing it. `--explain-schedule` on `circular_buffer_
+//!   disjoint.tr` now reports `{push_count, pop_count}` — `m` dropped,
+//!   stall still derived (an ordinary scalar hazard, unrelated to mem
+//!   indexing, exactly as documented) — byte-diff identical on every
+//!   OTHER example; an initial version that unconditionally subtracted
+//!   proven mem defs from the reported set broke six EXISTING examples'
+//!   own diagnostic text (`{m}` → `{}`) before `schedule.rs`'s own `on`
+//!   computation was fixed to keep the FULL set whenever the pair ends up
+//!   fully exempted anyway (see `schedule.rs`'s own doc comment). See
+//!   DESIGN.md's "Tier 3" section for the full accounting.
 //!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
@@ -681,6 +702,28 @@ pub struct Bounds {
     /// own `real_range` falls back to its independent walk whenever a
     /// lookup here misses.
     pub site_ranges: HashMap<ExprId, (u64, u64)>,
+    /// Every VERIFIED `invariant` (DESIGN.md's "Tier 3, not v0" circular-
+    /// buffer case) -- an `Item::Invariant` this pass recognized but
+    /// failed to prove (a bad base case, or a failed inductive step) is
+    /// deliberately NOT here, even though `recognize_invariant` accepted
+    /// its shape (see `Checker::failed_relational`'s own doc comment: a
+    /// live fail-open, closed before any consumer existed to exploit
+    /// it). Consumed by `schedule.rs`'s own `provably_disjoint_under_
+    /// joint_guards` -- see that function's own doc comment for how.
+    pub relational: Vec<RelationalFact>,
+}
+
+/// The exported (verified-only) form of a `RelationalBound` -- same
+/// fields, but a `pub` type so `schedule.rs` can read them without
+/// reaching into `bounds.rs`'s own private `Checker` state. No `span`:
+/// nothing outside `bounds.rs` itself ever needs to point an error at a
+/// declaration site through this type.
+#[derive(Clone, Debug)]
+pub struct RelationalFact {
+    pub terms: Vec<(DefId, i64)>,
+    pub modulus: u64,
+    pub lower: u64,
+    pub upper: u64,
 }
 
 /// One bounded def's (a `reg`, `out`, or fn/impl param, v12) own
@@ -739,6 +782,7 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         struct_field_bounds: HashMap::new(),
         relational_bounds: Vec::new(),
         reg_out_inits: HashMap::new(),
+        failed_relational: HashSet::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
@@ -778,8 +822,166 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
             .map(|(def, b)| (*def, (b.lower, b.upper)))
             .collect(),
         site_ranges: checker.site_ranges,
+        relational: checker
+            .relational_bounds
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !checker.failed_relational.contains(i))
+            .map(|(_, rb)| RelationalFact {
+                terms: rb.terms.clone(),
+                modulus: rb.modulus,
+                lower: rb.lower,
+                upper: rb.upper,
+            })
+            .collect(),
     };
     (bounds, checker.errors)
+}
+
+/// The `schedule.rs` consumer half of DESIGN.md's "Tier 3, not v0"
+/// circular-buffer case: whether `idx_a`/`idx_b` (two BARE-IDENT mem-
+/// index bases -- `schedule.rs`'s own `IndexForm` recognition already
+/// narrows to this shape before ever calling this) are PROVABLY
+/// DISTINCT whenever `rule_a`/`rule_b` (their own accessing rules) both
+/// fire the SAME cycle. This is the genuinely general argument every
+/// `forms_differ` case in `schedule.rs` (v1 through v7) can't make on
+/// its own: none of them need a shared base, a shared multiplier, or a
+/// per-register proven range the way this does -- this needs a
+/// RELATIONAL fact linking `idx_a`/`idx_b` to two OTHER defs this
+/// module can independently bound.
+///
+/// Recognizes exactly ONE shape (v1, deliberately narrow): a VERIFIED
+/// equality-to-zero fact (`link`, `bounds.relational`) naming `idx_a`/
+/// `idx_b` as a cancelling `+-1` pair (`ca == -cb`) plus EXACTLY one
+/// further cancelling pair (`other`); and a SECOND verified fact
+/// (`range_fact`) whose own terms equal `other` (or its negation),
+/// carrying a REAL absolute range (not just a congruence) for that
+/// same pair. `circular_buffer_disjoint.tr`'s own two invariants are
+/// exactly this: `link` = `head - tail - push_count + pop_count ≡ 0
+/// (mod 8)`, `other` = `{push_count: -1, pop_count: +1}`, `range_fact` =
+/// `push_count - pop_count < 9` (the SAME two defs, negated sign,
+/// modulus 16).
+///
+/// The derivation (`link`'s own equation, `cb = -ca`): `idx_a - idx_b ≡
+/// ca * (link.lower - other_expr) (mod link.modulus)`, so `idx_a ==
+/// idx_b` iff `other_expr ≡ link.lower (mod link.modulus)` -- notably
+/// INDEPENDENT of `ca`'s own sign, so `idx_a`/`idx_b`'s own coefficients
+/// never need to be untangled further. `range_fact`'s own guard-
+/// narrowed range (via `rule_a`'s and `rule_b`'s own leading guards,
+/// `narrow_combo_range` -- the SAME function `bounds.rs`'s own
+/// induction uses internally, re-run here rather than cached from it)
+/// gives a REAL range for `other_expr` (if `range_fact.terms ==
+/// other`) or for `-other_expr` (if `range_fact.terms == -other`, in
+/// which case the target flips to `(link.modulus - link.lower) %
+/// link.modulus` instead -- avoiding any interval negation, which the
+/// general case would otherwise need). Concludes `idx_a != idx_b` when
+/// that range excludes the target.
+///
+/// v1 restrictions (fails closed / `false`, never a silent gap): `link`
+/// must have exactly 4 terms (2 cancelling pairs, the FIFO pointer/
+/// counter shape -- no larger combination); `range_fact`'s own guard-
+/// narrowed range must already fit within `link.modulus` WITHOUT
+/// wraparound (`range_fits_modulus` -- a genuine cross-modulus
+/// reduction, needed whenever `range_fact`'s own native modulus differs
+/// from `link`'s, is not attempted); `idx_a`==`idx_b` (the SAME def) is
+/// never asked about -- callers already exclude that via `IndexForm`'s
+/// own base comparison.
+pub fn provably_disjoint_under_joint_guards(
+    ast: &Ast,
+    res: &Resolution,
+    bounds: &Bounds,
+    idx_a: DefId,
+    idx_b: DefId,
+    rule_a: ItemId,
+    rule_b: ItemId,
+) -> bool {
+    let rule_guards = |rule: ItemId| -> Vec<ExprId> {
+        match ast.item(rule) {
+            Item::Rule { body, .. } => leading_guards(ast, body),
+            _ => Vec::new(),
+        }
+    };
+    let guards_a = rule_guards(rule_a);
+    let guards_b = rule_guards(rule_b);
+
+    for link in &bounds.relational {
+        if link.terms.len() != 4 || link.upper != link.lower + 1 {
+            continue; // v1: exactly the 4-term, equality-to-zero shape
+        }
+        let ca = link
+            .terms
+            .iter()
+            .find(|(d, _)| *d == idx_a)
+            .map(|(_, c)| *c);
+        let cb = link
+            .terms
+            .iter()
+            .find(|(d, _)| *d == idx_b)
+            .map(|(_, c)| *c);
+        let (Some(ca), Some(cb)) = (ca, cb) else {
+            continue;
+        };
+        if ca != -cb {
+            continue;
+        }
+        let other: Vec<(DefId, i64)> = link
+            .terms
+            .iter()
+            .filter(|(d, _)| *d != idx_a && *d != idx_b)
+            .copied()
+            .collect();
+        if other.len() != 2 {
+            continue;
+        }
+        let negated_other: Vec<(DefId, i64)> = other.iter().map(|(d, c)| (*d, -c)).collect();
+
+        for range_fact in &bounds.relational {
+            let sign = if same_terms(&range_fact.terms, &other) {
+                1i64
+            } else if same_terms(&range_fact.terms, &negated_other) {
+                -1i64
+            } else {
+                continue;
+            };
+            let mut range = (range_fact.lower, range_fact.upper);
+            for &guard in guards_a.iter().chain(guards_b.iter()) {
+                range = narrow_combo_range(ast, res, &range_fact.terms, guard, range);
+            }
+            let Some((lo, hi)) = range_fits_modulus(range, link.modulus) else {
+                continue;
+            };
+            if lo >= hi {
+                continue; // an empty/vacuous range proves nothing about `other_expr`'s value
+            }
+            let lower_mod = link.lower % link.modulus;
+            let target = if sign == 1 {
+                lower_mod
+            } else {
+                (link.modulus - lower_mod) % link.modulus
+            };
+            if !(lo..hi).contains(&target) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `range` (a real, non-wrapping `[lo, hi)` in its own NATIVE
+/// modulus) can be trusted UNCHANGED as a range modulo `to_modulus` --
+/// true only when it already fits (`hi <= to_modulus`), i.e. no value
+/// in it is large enough to need actual modular reduction. A range that
+/// exceeds `to_modulus` fails closed (`None`) rather than attempting a
+/// genuine cross-modulus wraparound reduction (`shift_preserves`'s own
+/// "reduce by SOME multiple `k`, require no straddle" logic could be
+/// adapted for it, but no motivating case needs the extra generality
+/// yet -- v1 restriction, not an oversight).
+fn range_fits_modulus(range: (u64, u64), to_modulus: u64) -> Option<(u64, u64)> {
+    let (lo, hi) = range;
+    if lo >= hi {
+        return Some(range); // vacuous either way
+    }
+    if hi <= to_modulus { Some(range) } else { None }
 }
 
 struct Checker<'a> {
@@ -907,6 +1109,18 @@ struct Checker<'a> {
     /// `check_relational_bound_inits` has a reverse `DefId -> init`
     /// lookup; `res.item_defs` only maps the other direction.
     reg_out_inits: HashMap<DefId, Option<ExprId>>,
+    /// Indices into `relational_bounds` that FAILED either the base case
+    /// (`check_relational_bound_inits`) or the inductive step (`check_
+    /// relational_bound_induction`) -- flagged before any `schedule.rs`
+    /// consumer existed: without this, an unproven `RelationalBound`
+    /// would sit in `relational_bounds` right alongside a verified one,
+    /// indistinguishable to any downstream reader that didn't separately
+    /// re-run the whole induction. `Bounds.relational` (exported once
+    /// the whole walk finishes) includes ONLY the entries NOT in this
+    /// set -- a real, would-have-been-live fail-open closed before it
+    /// was ever exploitable, since nothing consumed `relational_bounds`
+    /// externally until this field existed.
+    failed_relational: HashSet<usize>,
     errors: Vec<BoundsError>,
 }
 
@@ -1524,88 +1738,12 @@ impl<'a> Checker<'a> {
     /// Decomposes an `Add`/`Sub` tree of `reg`/`out` idents into a
     /// signed sum of `(DefId, coefficient)` pairs (merging repeated
     /// occurrences of the same def) -- `None` for anything this v1
-    /// restriction doesn't recognize (a literal alone with no ident at
-    /// all, a `Mul`, a `Call`, an `in`/mem/fifo/local ident, ...). Shared
-    /// by `recognize_invariant` (the declaration itself) and
-    /// `recognize_comparison` (a candidate co-firing guard, matched
-    /// against a declared invariant's own terms).
+    /// Thin wrapper -- see the free function of the same name (kept
+    /// callable both as `self.linear_form(..)` from every existing site
+    /// in this file, and as a free function from `provably_disjoint_
+    /// under_joint_guards`, which has no `Checker` to call a method on).
     fn linear_form(&self, expr: ExprId) -> Option<Vec<(DefId, i64)>> {
-        match self.ast.expr(expr).clone() {
-            Expr::Ident(_) => {
-                let def = self.res.expr_defs.get(&expr).copied()?;
-                match self.res.def(def).kind {
-                    crate::resolve::DefKind::Reg | crate::resolve::DefKind::Output => {
-                        Some(vec![(def, 1)])
-                    }
-                    _ => None,
-                }
-            }
-            Expr::Binary {
-                op: BinOp::Add,
-                lhs,
-                rhs,
-            } => {
-                let mut l = self.linear_form(lhs)?;
-                l.extend(self.linear_form(rhs)?);
-                Some(merge_terms(l))
-            }
-            Expr::Binary {
-                op: BinOp::Sub,
-                lhs,
-                rhs,
-            } => {
-                let mut l = self.linear_form(lhs)?;
-                l.extend(self.linear_form(rhs)?.into_iter().map(|(d, c)| (d, -c)));
-                Some(merge_terms(l))
-            }
-            _ => None,
-        }
-    }
-
-    /// The GUARD-matching sibling of `recognize_invariant`: parses a
-    /// bare comparison (no `%` peeling -- an ordinary rule guard never
-    /// needs one) into `(op, terms, const)`, for `narrow_combo_range` to
-    /// compare against a declared invariant's own `terms`. Returns
-    /// `None` for any shape `recognize_invariant` would also reject --
-    /// silently, since a non-matching or unrecognized guard is simply
-    /// IGNORED by the induction (see `narrow_combo_range`'s own doc
-    /// comment for why that's always sound, never a soundness gap).
-    ///
-    /// Tries `<linear> <op> <const>` first (`push_count - pop_count <
-    /// 8`); a real rule guard just as often compares two BARE idents
-    /// directly (`push_count <> pop_count`, not `push_count - pop_count
-    /// <> 0`) -- confirmed against `circular_buffer_disjoint.tr`'s own
-    /// `pop` guard, which is exactly this shape -- so this also tries
-    /// `<linear> <op> <linear>`, folding both sides into `(lhs - rhs)
-    /// <op> 0`.
-    fn recognize_comparison(&self, expr: ExprId) -> Option<Comparison> {
-        let Expr::Binary { op, lhs, rhs } = self.ast.expr(expr).clone() else {
-            return None;
-        };
-        if !matches!(
-            op,
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
-        ) {
-            return None;
-        }
-        let valid = |terms: &[(DefId, i64)]| {
-            !terms.is_empty() && terms.iter().all(|(_, coeff)| coeff.abs() == 1)
-        };
-        if let Some(c) = const_fold(self.ast, rhs)
-            && let Some(terms) = self.linear_form(lhs)
-            && valid(&terms)
-        {
-            return Some((op, terms, c));
-        }
-        if let (Some(l), Some(r)) = (self.linear_form(lhs), self.linear_form(rhs)) {
-            let mut terms = l;
-            terms.extend(r.into_iter().map(|(d, c)| (d, -c)));
-            let terms = merge_terms(terms);
-            if valid(&terms) {
-                return Some((op, terms, 0));
-            }
-        }
-        None
+        linear_form(self.ast, self.res, expr)
     }
 
     /// The base case: every relational bound's own combination, folded
@@ -1616,7 +1754,8 @@ impl<'a> Checker<'a> {
     /// enforces, just checked against a combination instead of a single
     /// def.
     fn check_relational_bound_inits(&mut self) {
-        for rb in self.relational_bounds.clone() {
+        for index in 0..self.relational_bounds.len() {
+            let rb = self.relational_bounds[index].clone();
             let mut total: i64 = 0;
             let mut ok = true;
             for (def, coeff) in &rb.terms {
@@ -1637,6 +1776,7 @@ impl<'a> Checker<'a> {
                      a literal `= init`"
                         .to_string(),
                 );
+                self.failed_relational.insert(index);
                 continue;
             }
             let reduced = total.rem_euclid(rb.modulus as i64) as u64;
@@ -1649,6 +1789,7 @@ impl<'a> Checker<'a> {
                         rb.modulus, rb.lower, rb.upper
                     ),
                 );
+                self.failed_relational.insert(index);
             }
         }
     }
@@ -1729,6 +1870,7 @@ impl<'a> Checker<'a> {
                         self.rule_name(id)
                     ),
                 );
+                self.failed_relational.insert(index);
                 return;
             };
             let direct: HashSet<DefId> = deltas.keys().copied().collect();
@@ -1742,6 +1884,7 @@ impl<'a> Checker<'a> {
                         self.rule_name(id)
                     ),
                 );
+                self.failed_relational.insert(index);
                 return;
             }
             let delta: i64 = deltas
@@ -1769,6 +1912,7 @@ impl<'a> Checker<'a> {
                  (v1 restriction -- only a two-rule producer/consumer pair is supported)"
                     .to_string(),
             );
+            self.failed_relational.insert(index);
             return;
         }
 
@@ -1795,72 +1939,25 @@ impl<'a> Checker<'a> {
                         rb.lower, rb.upper, rb.modulus
                     ),
                 );
+                self.failed_relational.insert(index);
                 return;
             }
         }
     }
 
-    /// This rule's own leading `(cond)?` guard statements -- stops at
-    /// the first non-guard statement, a v1 restriction matching this
-    /// feature's own driving example (every guard in this language
-    /// convention sits at the top of a rule body). A guard appearing
-    /// later is simply never found here, which only means the induction
-    /// has less to narrow with -- always sound, never unsound, per
-    /// `narrow_combo_range`'s own "ignore what doesn't match" argument.
+    /// Thin wrapper -- see the free function of the same name.
     fn leading_guards(&self, body: &[StmtId]) -> Vec<ExprId> {
-        let mut out = Vec::new();
-        for &sid in body {
-            match self.ast.stmt(sid) {
-                Stmt::Expr(e) => match self.ast.expr(*e) {
-                    Expr::Guard(inner) => out.push(*inner),
-                    _ => break,
-                },
-                _ => break,
-            }
-        }
-        out
+        leading_guards(self.ast, body)
     }
 
-    /// Narrows `range` (a hypothesized `[lower, upper)` for `rb`'s own
-    /// combination, entering this cycle) using ONE firing rule's own
-    /// guard -- but ONLY when that guard's own linear form is EXACTLY
-    /// `rb`'s own terms (same defs, same coefficients): `push_count -
-    /// pop_count < 8` narrows Fact 1's own `push_count - pop_count`
-    /// combination directly; `head - tail - push_count + pop_count == 0`
-    /// (Fact 2) is untouched by either rule's guard, since neither
-    /// guard's terms match Fact 2's four-def combination at all.
-    ///
-    /// A non-matching guard is silently ignored, mirroring `narrow_for_
-    /// condition`'s own per-scalar-def narrowing formulas exactly (`Lt`/
-    /// `Le`/`Gt`/`Ge` narrow one end; `Ne` narrows an end ONLY when the
-    /// excluded constant sits exactly on it) -- always sound: ignoring a
-    /// true fact only leaves the induction with a WIDER hypothesis than
-    /// necessary, never a narrower one than justified.
+    /// Thin wrapper -- see the free function of the same name.
     fn narrow_combo_range(
         &self,
         rb: &RelationalBound,
         guard: ExprId,
         range: (u64, u64),
     ) -> (u64, u64) {
-        let Some((op, terms, c)) = self.recognize_comparison(guard) else {
-            return range;
-        };
-        if !same_terms(&terms, &rb.terms) {
-            return range;
-        }
-        let (lo, hi) = range;
-        match op {
-            BinOp::Lt => (lo, hi.min(c)),
-            BinOp::Le => (lo, hi.min(c.saturating_add(1))),
-            BinOp::Gt => match c.checked_add(1) {
-                Some(floor) => (floor.max(lo), hi),
-                None => range,
-            },
-            BinOp::Ge => (c.max(lo), hi),
-            BinOp::Ne if c == lo => (lo.saturating_add(1), hi),
-            BinOp::Ne if hi > 0 && c == hi - 1 => (lo, hi.saturating_sub(1)),
-            _ => range,
-        }
+        narrow_combo_range(self.ast, self.res, &rb.terms, guard, range)
     }
 
     /// One rule body's own NET delta to every def in `relevant`, as
@@ -3333,6 +3430,166 @@ fn def_of_name(res: &Resolution, name: &crate::ast::Name) -> DefId {
         .find(|(_, d)| d.span == name.span)
         .map(|(i, _)| DefId(i as u32))
         .expect("a resolved binding name always has a matching def")
+}
+
+/// Decomposes an `Add`/`Sub` tree of `reg`/`out` idents into a signed
+/// sum of `(DefId, coefficient)` pairs (merging repeated occurrences of
+/// the same def) -- `None` for anything this v1 restriction doesn't
+/// recognize (a literal alone with no ident at all, a `Mul`, a `Call`,
+/// an `in`/mem/fifo/local ident, ...). A free function (not a `Checker`
+/// method) so `provably_disjoint_under_joint_guards` -- the `schedule
+/// .rs` consumer, which has no `Checker` to call a method on, only
+/// `ast`/`res` -- can reuse it directly; `Checker::linear_form` is a
+/// thin wrapper kept for every existing in-file call site.
+fn linear_form(ast: &Ast, res: &Resolution, expr: ExprId) -> Option<Vec<(DefId, i64)>> {
+    match ast.expr(expr).clone() {
+        Expr::Ident(_) => {
+            let def = res.expr_defs.get(&expr).copied()?;
+            match res.def(def).kind {
+                crate::resolve::DefKind::Reg | crate::resolve::DefKind::Output => {
+                    Some(vec![(def, 1)])
+                }
+                _ => None,
+            }
+        }
+        Expr::Binary {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => {
+            let mut l = linear_form(ast, res, lhs)?;
+            l.extend(linear_form(ast, res, rhs)?);
+            Some(merge_terms(l))
+        }
+        Expr::Binary {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        } => {
+            let mut l = linear_form(ast, res, lhs)?;
+            l.extend(
+                linear_form(ast, res, rhs)?
+                    .into_iter()
+                    .map(|(d, c)| (d, -c)),
+            );
+            Some(merge_terms(l))
+        }
+        _ => None,
+    }
+}
+
+/// The GUARD-matching sibling of `recognize_invariant`: parses a bare
+/// comparison (no `%` peeling -- an ordinary rule guard never needs
+/// one) into `(op, terms, const)`, for `narrow_combo_range` to compare
+/// against a declared invariant's own `terms`. Returns `None` for any
+/// shape `recognize_invariant` would also reject -- silently, since a
+/// non-matching or unrecognized guard is simply IGNORED by the
+/// induction (see `narrow_combo_range`'s own doc comment for why
+/// that's always sound, never a soundness gap).
+///
+/// Tries `<linear> <op> <const>` first (`push_count - pop_count < 8`);
+/// a real rule guard just as often compares two BARE idents directly
+/// (`push_count <> pop_count`, not `push_count - pop_count <> 0`) --
+/// confirmed against `circular_buffer_disjoint.tr`'s own `pop` guard,
+/// which is exactly this shape -- so this also tries `<linear> <op>
+/// <linear>`, folding both sides into `(lhs - rhs) <op> 0`. A free
+/// function for the same reason `linear_form` is.
+fn recognize_comparison(ast: &Ast, res: &Resolution, expr: ExprId) -> Option<Comparison> {
+    let Expr::Binary { op, lhs, rhs } = ast.expr(expr).clone() else {
+        return None;
+    };
+    if !matches!(
+        op,
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+    ) {
+        return None;
+    }
+    let valid = |terms: &[(DefId, i64)]| {
+        !terms.is_empty() && terms.iter().all(|(_, coeff)| coeff.abs() == 1)
+    };
+    if let Some(c) = const_fold(ast, rhs)
+        && let Some(terms) = linear_form(ast, res, lhs)
+        && valid(&terms)
+    {
+        return Some((op, terms, c));
+    }
+    if let (Some(l), Some(r)) = (linear_form(ast, res, lhs), linear_form(ast, res, rhs)) {
+        let mut terms = l;
+        terms.extend(r.into_iter().map(|(d, c)| (d, -c)));
+        let terms = merge_terms(terms);
+        if valid(&terms) {
+            return Some((op, terms, 0));
+        }
+    }
+    None
+}
+
+/// This rule's own leading `(cond)?` guard statements -- stops at the
+/// first non-guard statement, a v1 restriction matching this feature's
+/// own driving example (every guard in this language convention sits
+/// at the top of a rule body). A guard appearing later is simply never
+/// found here, which only means the induction has less to narrow with
+/// -- always sound, never unsound, per `narrow_combo_range`'s own
+/// "ignore what doesn't match" argument. A free function for the same
+/// reason `linear_form` is.
+fn leading_guards(ast: &Ast, body: &[StmtId]) -> Vec<ExprId> {
+    let mut out = Vec::new();
+    for &sid in body {
+        match ast.stmt(sid) {
+            Stmt::Expr(e) => match ast.expr(*e) {
+                Expr::Guard(inner) => out.push(*inner),
+                _ => break,
+            },
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Narrows `range` (a hypothesized `[lower, upper)` for `terms`' own
+/// combination, entering this cycle) using ONE firing rule's own guard
+/// -- but ONLY when that guard's own linear form is EXACTLY `terms`
+/// (same defs, same coefficients): `push_count - pop_count < 8` narrows
+/// Fact 1's own `push_count - pop_count` combination directly; `head -
+/// tail - push_count + pop_count == 0` (Fact 2) is untouched by either
+/// rule's guard, since neither guard's terms match Fact 2's four-def
+/// combination at all.
+///
+/// A non-matching guard is silently ignored, mirroring `narrow_for_
+/// condition`'s own per-scalar-def narrowing formulas exactly (`Lt`/
+/// `Le`/`Gt`/`Ge` narrow one end; `Ne` narrows an end ONLY when the
+/// excluded constant sits exactly on it) -- always sound: ignoring a
+/// true fact only leaves the induction with a WIDER hypothesis than
+/// necessary, never a narrower one than justified. A free function
+/// (taking `terms` directly, not a whole `RelationalBound`) so `provably
+/// _disjoint_under_joint_guards` can narrow an arbitrary linear
+/// combination, not just a declared invariant's own.
+fn narrow_combo_range(
+    ast: &Ast,
+    res: &Resolution,
+    terms: &[(DefId, i64)],
+    guard: ExprId,
+    range: (u64, u64),
+) -> (u64, u64) {
+    let Some((op, guard_terms, c)) = recognize_comparison(ast, res, guard) else {
+        return range;
+    };
+    if !same_terms(&guard_terms, terms) {
+        return range;
+    }
+    let (lo, hi) = range;
+    match op {
+        BinOp::Lt => (lo, hi.min(c)),
+        BinOp::Le => (lo, hi.min(c.saturating_add(1))),
+        BinOp::Gt => match c.checked_add(1) {
+            Some(floor) => (floor.max(lo), hi),
+            None => range,
+        },
+        BinOp::Ge => (c.max(lo), hi),
+        BinOp::Ne if c == lo => (lo.saturating_add(1), hi),
+        BinOp::Ne if hi > 0 && c == hi - 1 => (lo, hi.saturating_sub(1)),
+        _ => range,
+    }
 }
 
 /// Sums coefficients for repeated occurrences of the same `DefId`

@@ -46,12 +46,11 @@
 -- `[0, 8)` each -- the missing fact is relational, not a tighter
 -- per-register interval.
 --
--- RESOLVED (bounds.rs's own half, the `mem_disjoint`/`schedule.rs`
--- consumer half is a SEPARATE, still-open undertaking -- see DESIGN.md):
--- the two `invariant` declarations below are exactly the relational
--- facts described above, checked by induction across every write site
--- in `push`/`pop` (including both firing the SAME cycle) the way
--- `bounds.rs` already checks an ordinary scalar `where` bound:
+-- RESOLVED, both halves. The two `invariant` declarations below are
+-- exactly the relational facts described above, checked by induction
+-- across every write site in `push`/`pop` (including both firing the
+-- SAME cycle) the way `bounds.rs` already checks an ordinary scalar
+-- `where` bound:
 --
 --   invariant push_count - pop_count < 9
 --
@@ -66,17 +65,22 @@
 -- guards as a hypothesis (proven via a NEW argument recognizing a
 -- guard's own linear form, not just a bare `<def> < <const>` shape);
 -- the second's deltas cancel to zero on every write site regardless of
--- either guard. `--explain-schedule` on this file is UNCHANGED by this
--- (still reports the same three-way conflict) -- proving these two
--- facts doesn't, by itself, retire the `push_count`/`pop_count` write-
--- meets-read hazard (an ordinary scalar hazard, unrelated to mem index
--- reasoning at all: each rule's guard reads the OTHER rule's counter).
--- The `schedule.rs`-side consumer that would use these facts to prove
--- `m[head]` vs `m[tail]` disjoint (and which, even then, would only
--- drop `m` from the reported conflict set, not clear the stall) is
--- deferred -- see DESIGN.md's "Tier 3" section for the full accounting
--- of why that consumer's payoff on THIS example is much smaller than
--- the bounds.rs half's own soundness argument.
+-- either guard.
+--
+-- `schedule.rs`'s own consumer (`bounds::provably_disjoint_under_joint_
+-- guards`, the EIGHTH mem-disjointness argument this arc has built)
+-- combines both verified facts with `push`'s/`pop`'s own joint guards to
+-- prove `m[head] != m[tail]` whenever both rules fire the same cycle --
+-- so `--explain-schedule` on this file NOW reports only
+-- `write meets read on {push_count, pop_count}`, `m` dropped from the
+-- set. The derived stall itself still persists: `push_count`/
+-- `pop_count` are ordinary scalar regs, not mem, so proving `m` disjoint
+-- can only ever remove `m` from the diagnostic, never clear the
+-- `push_count`/`pop_count` write-meets-read hazard (each rule's guard
+-- genuinely needs to read the OTHER rule's counter -- see above). See
+-- DESIGN.md's "Tier 3, not v0" section for the full derivation and the
+-- soundness argument's own accounting of why that's the whole visible
+-- win on this example.
 module CircularBufferDisjoint {
     mem m : [8][8]
 
