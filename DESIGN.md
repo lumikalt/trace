@@ -3800,43 +3800,199 @@ tool-version checks already do.
 
    **In progress.** `z3` (dynamically linked against `pkgs.z3`, per "Build
    integration" above) is wired in and confirmed working
-   (`tests/z3_smoke.rs`). The scalar reg/out/param slice is done: `src/
-   bounds/smt.rs`'s `check_write_obligation` re-derives a scalar write's
-   own base-case-plus-induction obligation via one Z3 QF_BV query per
-   site — self-reference/literal/`Add`/`Sub`/`Mul` RHS shapes, and a
-   `Lt`/`Gt`/`Ge`/`Ne`-at-a-constant leading guard/`if`-`else` branch
-   condition as a hypothesis, both matching `expr_bound`'s/`narrow_for_
-   condition`'s own v1 recognized shapes exactly — run as a SHADOW check
-   alongside the existing interval-arithmetic engine (`Checker::
-   shadow_check_scalar_bounds`, called from `bounds::check` itself, not
-   gated behind a flag), panicking on any site both engines judge with a
-   different verdict; a `Skipped` site (outside this slice's shape, e.g.
-   cross-def composition, `<>` edge narrowing, `While`/`IfLet`/`WhileLet`)
-   is not compared, per the "run alongside, not replace" plan above. Zero
-   mismatches across the whole existing suite (838 tests) as of this
-   writing — found and fixed two real bugs in the SHADOW CHECK's own
-   reconstruction while getting there, not in `bounds.rs` itself: (1) the
+   (`tests/z3_smoke.rs`). `src/bounds/smt.rs`'s `check_bound_obligation`
+   re-derives a write's own base-case-plus-induction obligation via one Z3
+   QF_BV query per site — a reference to any currently-bounded def (self or
+   otherwise)/literal/`Add`/`Sub`/`Mul` RHS shapes, and a `Lt`/`Gt`/`Ge`/
+   `Ne`-at-a-constant guard/`if`-`else` branch condition as a hypothesis,
+   both matching `expr_bound`'s/`narrow_for_condition`'s own v1 recognized
+   shapes exactly — run as a SHADOW check alongside the existing
+   interval-arithmetic engine (`Checker::shadow_check_bounds`, called from
+   `bounds::check` itself, not gated behind a flag), panicking on any site
+   both engines judge with a different verdict; a `Skipped` site (outside
+   this slice's shape, e.g. `<>` edge narrowing, `While`/`IfLet`/
+   `WhileLet`, a `..base`-sourced struct field) is not compared, per the
+   "run alongside, not replace" plan above. Covers scalar reg/out/param
+   bounds (v5+), mem-element bounds (v17, write-side only, matching that
+   feature's own scope), and struct-field bounds (v18) when the field is
+   named DIRECTLY in a `StructLit` — the `..base` fallback is a deliberate,
+   separate v1 scope cut for this shadow check specifically, since it needs
+   its own structural walk mirroring `struct_field_bound`'s `DefKind`-gated
+   provenance trace rather than a plain value expression to translate.
+   Zero mismatches across the whole existing suite (838 tests) as of this
+   writing.
+
+   Three real bugs found and fixed along the way, all in the SHADOW
+   CHECK's own reconstruction, not in `bounds.rs` itself: (1) the
    reconstructed "what does the interval engine say" verdict initially
-   ignored guard narrowing entirely (used the flat declared bound instead
-   of `narrow_for_condition`/`narrow_for_else`'s own narrowed state,
-   fixed by threading a real `state` map through the shadow walker
-   alongside the guard `ExprId` list used for SMT translation); (2) the
-   Z3 encoding initially computed in a `bound.width`-bit BV sort, which
-   silently wraps (bitvector arithmetic is modular) exactly where `check_
-   against_bound`'s own explicit "could reach or exceed the declared
-   width" check exists to catch a real overflow — found via a genuine
-   disagreement the shadow check itself surfaced
+   ignored guard narrowing entirely (fixed by threading a real `state` map
+   through the shadow walker, narrowed via the SAME `narrow_for_condition`/
+   `narrow_for_else` the real pass uses, alongside the guard `ExprId` list
+   used for SMT translation); (2) the Z3 encoding initially computed in a
+   width-bit BV sort, which silently wraps (bitvector arithmetic is
+   modular) exactly where `check_against_bound`'s own explicit "could reach
+   or exceed the declared width" check exists to catch a real overflow —
+   found via a genuine disagreement the shadow check itself surfaced
    (`multiplication_composed_bound_exceeding_the_declared_width_is_
    rejected`, a `[3]`-wide reg with a `where < 20` bound whose logical
-   limit exceeds its own storage width), fixed by computing at a fixed
-   wide `CALC_WIDTH` (64 bits, matching the interval engine's own `u64`
+   limit exceeds its own storage width), fixed by computing at a fixed wide
+   `CALC_WIDTH` (64 bits, matching the interval engine's own `u64`
    arithmetic) and checking the composed value against BOTH the logical
-   `[lower, upper)` bound and the width-overflow limit explicitly,
-   mirroring `check_against_bound`'s exact three-way check. Still to do
-   for stage 1 to be COMPLETE: mem-element bounds, struct-field bounds,
-   param/return bounds, and the relational invariant (`circular_buffer_
-   disjoint.tr`'s own case) — see the "What retires" list below for which
-   `bounds.rs` mechanism each maps to.
+   `[lower, upper)` bound and the width-overflow limit explicitly; (3) an
+   UNSATISFIABLE hypothesis set (an unreachable branch, e.g. `else` of an
+   always-true unsigned `cnt >= 0`, whose negation `cnt < 0` is a flat
+   contradiction over a bitvector with no sign) made every later claim
+   vacuously "Proved" for free, regardless of what the write actually
+   computes — exactly the hazard flagged before any of this was built (an
+   inconsistent hypothesis set proves everything, silently) — found via
+   `else_branch_of_an_always_true_condition_stays_conservatively_
+   unnarrowed` disagreeing (the interval engine's own `narrow_for_else`
+   deliberately does NOT exploit an unreachable branch's vacuous truth; see
+   that function's own doc comment), fixed by checking the hypothesis set
+   alone for satisfiability BEFORE asserting the negated claim, reporting
+   `Skipped` (an unreachable site is genuinely "not compared," not
+   "verified") rather than `Proved` when it's already inconsistent.
+
+   Param bounds (v12) and return bounds (v13) are now covered too. Return:
+   `Stmt::Return`'s own `e` is checked against the enclosing fn's declared
+   postcondition (`fn_ret_bound`, looked up once per item and threaded
+   through the shadow walker as a plain parameter — mirrors `check_item`'s
+   own `current_ret_bound`, just not a `self` field, since this walker
+   never needs to change it mid-body) — the exact same `check_bound_
+   obligation` machinery a scalar write already uses, just a different
+   `target`. Param: a call's own arguments are checked against the
+   callee's declared param bounds (`shadow_check_call_params`), but ONLY
+   when the call is the WHOLE of a statement/assign-rhs/return-value
+   position (`Stmt::Expr(Call(..))`, `x := Bump(y)`, `return Bump(y)`) —
+   a call nested inside arithmetic, a condition, or another call's own
+   argument (`total := Bump(3) + Bump(4)`, `Outer(Bump(50))`) is a real,
+   separate v1 scope cut for this shadow check, not attempted, since
+   covering it would mean reproducing `check_calls_in`'s own full
+   position sweep rather than this narrower slice. Confirmed empirically
+   that real comparisons fire here (not silently all-`Skipped`): traced a
+   debug counter through `param_bound_check.tr`'s and `return_bound_
+   check.tr`'s own driving examples before removing it. Zero mismatches
+   across the whole suite (838 tests) once wired in — no new bugs
+   surfaced by this slice specifically, unlike the three above.
+
+   **The relational invariant (`circular_buffer_disjoint.tr`'s own
+   case) is now covered too — the first half of this plan's own acid
+   test.** `smt::check_relational_obligation` builds the general `fire_R`
+   transition encoding DESIGN.md's own design section describes: one
+   boolean `fired` var per contributing rule, each `ite`-selecting its
+   own already-computed delta into the total, checked as ONE query
+   rather than `check_relational_bound_induction`'s hand-rolled
+   `0..2^n` mask-enumeration loop. Both of `circular_buffer_disjoint.tr`'s
+   invariants (`push_count - pop_count < 9` and `(head - tail -
+   push_count + pop_count) % 8 = 0`) are independently PROVEN by this
+   encoding, confirmed by tracing a debug counter through the driving
+   example before removing it — and the negative tests (`circular_
+   buffer_push_count_and_pop_count_are_not_claimed_disjoint`, `head_and_
+   tail_not_disjoint_when_push_guard_is_weakened`,
+   `invariant_fails_with_the_same_delta_under_a_satisfiable_guard`) are
+   correctly DISPROVEN too, each with a real, sensible counterexample
+   (e.g. "combination 8 shifts to 9 mod 16, outside [0, 9)"). Zero
+   mismatches once wired in.
+
+   `contributions` (each rule's own net delta and leading guards) are
+   recomputed via the SAME `walk_deltas`/`leading_guards` helpers the
+   real induction itself calls, deliberately NOT re-derived independently
+   here — those are this module's shared, trusted AST-recognition front
+   end (matching how every other obligation in this plan trusts
+   `Checker::bounded`/the AST itself as shared substrate); what this
+   encoding re-verifies independently is the subset/modular-shift
+   REASONING built on top of those deltas — exactly the part with the
+   straddle-avoidance subtlety `shift_preserves`'s own doc comment
+   describes, and the part most worth a second, differently-shaped
+   proof of. The `fire_R` encoding itself has no structural cap on the
+   number of contributing rules (a real generalization over today's
+   hard `n <= 2` restriction, achieved for free by using boolean `fired`
+   variables instead of enumerating masks) — but this shadow check
+   still reports `Skipped` for `n > 2`, a deliberate stage-1 discipline
+   so it doesn't silently prove MORE than the mechanism it's shadowing;
+   lifting that cap is a real, separate capability increase reserved
+   for a later stage.
+
+   **Not yet done: the SECOND half of the acid test** — collapsing
+   `schedule.rs`'s `provably_disjoint_under_joint_guards`/`m[head] !=
+   m[tail]` disjointness proof into the one generic query. That's stage
+   4's own work, deliberately kept separate (see "Staged rollout" above)
+   since it proves strictly more and changes generated hardware.
+
+   **Byte-identical `--explain-schedule` confirmed.** All 84
+   `examples/*.tr` produce byte-for-byte identical `--explain-schedule`
+   output comparing this stage's HEAD against `6d5f203` (the design
+   commit immediately before any of this stage's code existed) — this
+   stage's own stated success criterion, actually run rather than assumed
+   from "no scheduling code was touched."
+
+   **The `Skipped` census (measured, not guessed).** A temporary debug
+   counter (added, run once across the whole suite, then removed —
+   same discipline as the two earlier debug-trace checks above) recorded
+   every `Skipped` site's reason AND whether the interval engine's own
+   `expr_bound` independently proved a real bound there anyway. Result:
+   every `Skipped` site falls into one of three buckets, and only one is
+   a real gap.
+   - **Not a gap, working as designed:** the unreachable-hypothesis case
+     (bug 3 above) fired twice in the suite, and the relational `n > 2`
+     cap fired once (`invariant_with_more_than_two_contributing_rules_
+     is_rejected`) — both deliberate, already-documented scope cuts.
+   - **Not a gap, nothing to compare:** roughly half the `rhs`-shape
+     `Skipped` sites had `expr_bound` ALSO return `None` (a genuinely
+     unbounded/unprovable expression) — no disagreement is possible
+     when neither engine has a verdict.
+   - **Real gaps — the interval engine proves something at these sites
+     that this encoding can't even attempt yet:** (1) a **commuted**
+     guard comparison (`10 > i` rather than `i < 10`) — `translate_guard`
+     only recognizes one operand order, so `commuted_lt_is_not_
+     recognized`, `else_branch_of_a_commuted_ne_also_narrows_to_the_
+     singleton`, `ne_commuted_lower_edge_subtraction_is_proven`, and
+     both call-argument-in-a-condition tests all skip past a real,
+     narrowly-scoped translation gap (this one looks cheap to close —
+     just a second match arm with the operands swapped — unlike the
+     other two); (2) a **struct-field READ composed into an rhs
+     expression** — `translate_expr` only recognizes `Int`/`SizedInt`/
+     a bounded `Ident`/`Add`/`Sub`/`Mul`, nothing that reaches into a
+     struct field at all, so `struct_field_read_composes_through_a_
+     dotdot_base_spread` (the `..base` case flagged as a scope cut
+     above), `struct_field_read_value_composes_through_a_reg`, and
+     `struct_field_two_sided_bound_composes_through_a_reg` all skip; (3)
+     a **call nested inside arithmetic or another call's own argument**
+     rather than at the top-level positions already covered —
+     `call_argument_as_an_argument_to_another_call_is_still_checked`,
+     `call_argument_in_a_mem_read_as_a_call_argument_is_checked`, and
+     `call_result_composes_into_a_bounded_write_via_declared_ret_bound`
+     all skip for this reason (the gap already named above, now
+     confirmed to be real and exercised rather than hypothetical).
+
+   Still to do for stage 1 to be COMPLETE (in ascending order of how
+   contained each looks): commuted guard comparisons, struct-field reads
+   composed into an rhs expression (which subsumes the `..base` case —
+   it's one instance of "reaches into a struct field," not a separate
+   mechanism), and a call nested deeper than the top-level positions
+   already covered — see the "What retires" list below for which
+   `bounds.rs` mechanism each maps to. None of these were attempted this
+   round; each is a real, scoped translation-coverage gap, not a design
+   question.
+
+   **z3's own version is pinned** (`tests/z3_smoke.rs`'s
+   `z3_linked_version_matches_the_devenv_pin`, mirroring the firtool/
+   iverilog/verilator pins in `devenv.nix`'s `simulate` script — z3 is a
+   linked library rather than a subprocess, so the check lives in Rust
+   instead of the shell script, but the hazard and the discipline are
+   the same).
+
+   **Retiring the old interval-arithmetic path is NOT a stage-1 action,
+   even once the three gaps above close.** `site_ranges` (the "Scope:
+   explicit in/out for v1" decision above, and "What retires" below) is
+   populated as a side effect of `expr_bound` itself — its `Bracket` arm
+   and `check_calls_in`'s widened stop-list — and `schedule.rs`'s
+   `real_range` still consults it. `expr_bound` can't be deleted while
+   that export is stage 1's own explicit scope cut; at most `check_
+   against_bound`'s comparison/error-emission layer could be split off,
+   which is messy surgery for no benefit and contradicts "run alongside,
+   not replace." Deletion belongs to stage 4, alongside `real_range`'s
+   own retirement — see "What retires" below.
 2. **Unify the representation.** Collapse the six maps into one
    refinement-carrying type representation plus the proven/assumed
    provenance judgment (structural, per above) — still producing the same
@@ -3886,6 +4042,18 @@ uses, and the disjointness proof is one call to the one generic query in
 "schedule.rs" above. If a candidate implementation still needs a bespoke
 code path for this example, it hasn't closed the gap this plan exists to
 close.
+
+**First half done (stage 1, "Staged rollout" above): both invariants are
+independently proven by `smt::check_relational_obligation`'s general
+`fire_R` encoding**, a shadow check running alongside — not yet
+replacing — `check_relational_bound_induction`'s own bespoke induction.
+The `Item::Invariant`-specific machinery still exists in `bounds.rs`
+today (stage 1 doesn't delete anything yet, per its own "run alongside"
+discipline); this is evidence the REPLACEMENT is sound before stage 2
+attempts unifying the representation, not the replacement itself. Second
+half — `m[head] != m[tail]` via the one generic disjointness query,
+`schedule.rs`'s own bespoke `provably_disjoint_under_joint_guards`
+retired — is stage 4's work, not started.
 
 ## Combinational loops
 

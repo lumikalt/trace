@@ -23,6 +23,26 @@ fn z3_proves_x_plus_one_is_never_equal_to_x() {
     assert_eq!(solver.check(), SatResult::Unsat);
 }
 
+/// Mirrors the `firtool`/`iverilog`/`verilator` version pins in
+/// `devenv.nix`'s `simulate` script -- z3 is a linked library, not a
+/// subprocess, so there's no CLI `--version` to shell out to, but the
+/// same hazard applies: a `devenv update` silently bumping `pkgs.z3`
+/// could shift solver behavior (a query that used to time out starts
+/// returning `Unknown`, or vice versa) with nothing pointing at the
+/// cause. Fail loudly here instead of discovering it as a flaky
+/// obligation query someday.
+#[test]
+fn z3_linked_version_matches_the_devenv_pin() {
+    let want = "4.16.0.0";
+    let got = z3::full_version();
+    assert_eq!(
+        got, want,
+        "linked z3 full_version() is {got:?}, expected {want:?} -- devenv.nix's pkgs.z3 pin may \
+         have drifted (see devenv.nix's own comment next to it); re-verify solver behavior is \
+         unchanged before updating this pin"
+    );
+}
+
 #[test]
 fn z3_finds_a_real_counterexample_when_a_claim_is_false() {
     let solver = Solver::new();

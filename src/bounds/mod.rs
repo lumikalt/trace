@@ -820,10 +820,11 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
     // Stage 1 of DESIGN.md's SMT-backed type-system plan: shadow-check
     // every scalar write obligation this pass just verified via interval
     // arithmetic, independently via Z3. Panics on a real disagreement
-    // (not a `Skipped` site) -- see `shadow_check_scalar_bounds`'s own
+    // (not a `Skipped` site) -- see `shadow_check_bounds`'s own
     // doc comment for why this is safe to run unconditionally rather
     // than gated behind a flag.
-    let mismatches = checker.shadow_check_scalar_bounds();
+    let mut mismatches = checker.shadow_check_bounds();
+    mismatches.extend(checker.shadow_check_relational_bounds());
     if let Some(first) = mismatches.first() {
         panic!(
             "bounds.rs internal error: the SMT shadow check (DESIGN.md's stage 1) disagrees \
@@ -3289,25 +3290,26 @@ impl<'a> Checker<'a> {
 
     /// Stage 1 of DESIGN.md's "Toward a dependent/refinement type
     /// system (SMT-backed, planned)": re-derive every scalar reg/out/
-    /// param write obligation this pass already checks via interval
-    /// arithmetic, independently via Z3 (`smt::check_write_obligation`),
-    /// and panic on any REAL disagreement -- the same "two independent
-    /// oracles must agree" idiom `check_write_site_exhaustiveness`
-    /// above already uses against `effects.rs`, just against a
-    /// from-scratch SMT re-derivation instead of a second static pass.
-    /// A `Skipped` verdict is not a disagreement (see `smt`'s own
-    /// module doc for exactly what v1 does and doesn't translate yet)
-    /// -- only a site both engines actually judged, with different
-    /// answers, panics.
+    /// param, mem-element, and (named-field) struct-field write
+    /// obligation this pass already checks via interval arithmetic,
+    /// independently via Z3 (`smt::check_bound_obligation`), and panic
+    /// on any REAL disagreement -- the same "two independent oracles
+    /// must agree" idiom `check_write_site_exhaustiveness` above already
+    /// uses against `effects.rs`, just against a from-scratch SMT
+    /// re-derivation instead of a second static pass. A `Skipped`
+    /// verdict is not a disagreement (see `smt`'s own module doc for
+    /// exactly what v1 does and doesn't translate yet) -- only a site
+    /// both engines actually judged, with different answers, panics.
     ///
     /// Walks bodies independently from `check_stmt`/`check_body` rather
     /// than reusing them: this pass needs only the textual guard
     /// history to a write site (a `Vec<ExprId>` of enclosing
     /// conditions, negated for an `else`), not `check_stmt`'s own
-    /// `state`/`locals`/`struct_origins` narrowing machinery, which
-    /// exists to support composition shapes (cross-def reads, `Mul`,
-    /// `<>` edge narrowing, ...) this v1 encoding doesn't attempt yet.
-    fn shadow_check_scalar_bounds(&mut self) -> Vec<smt::Mismatch> {
+    /// `locals`/`struct_origins` narrowing machinery, which exists to
+    /// support composition shapes (`<>` edge narrowing, a `let`-bound
+    /// local, a `..base`-sourced struct field, ...) this v1 encoding
+    /// doesn't attempt yet.
+    fn shadow_check_bounds(&mut self) -> Vec<smt::Mismatch> {
         let mut mismatches = Vec::new();
         for id in self.collect_bodied_items() {
             let body = match self.ast.item(id) {
@@ -3325,88 +3327,327 @@ impl<'a> Checker<'a> {
                 .iter()
                 .map(|(d, b)| (*d, (b.lower, b.upper)))
                 .collect();
-            self.shadow_walk_body(&body, &state, &[], &[], &mut mismatches);
+            // v13: this item's own declared return postcondition, if
+            // any -- mirrors `check_item`'s own `current_ret_bound`
+            // exactly (`None` for a `rule`, or a `fn` with no `where _ <
+            // N`), just threaded as a plain parameter instead of a
+            // `self` field, since (unlike the real pass) this walker
+            // never needs to change it mid-body.
+            let ret_bound = self
+                .res
+                .item_defs
+                .get(&id)
+                .and_then(|def| self.fn_ret_bound.get(def))
+                .copied();
+            self.shadow_walk_body(&body, &state, &[], &[], ret_bound, &mut mismatches);
         }
         mismatches
+    }
+
+    /// The relational-invariant half of stage 1 (DESIGN.md's own acid
+    /// test): re-derives every `invariant` fact's own inductive step
+    /// via `smt::check_relational_obligation`'s general `fire_R`
+    /// transition encoding, instead of `check_relational_bound_
+    /// induction`'s hand-rolled `0..2^n` mask enumeration -- and
+    /// compares against THAT function's own already-recorded verdict
+    /// (`self.failed_relational`, populated earlier in `bounds::check`,
+    /// before this runs).
+    ///
+    /// Recomputes `contributions` by calling the exact same `walk_
+    /// deltas`/`leading_guards` helpers `check_relational_bound_
+    /// induction` itself calls -- these are this module's shared,
+    /// trusted AST-recognition front end (see `smt::check_relational_
+    /// obligation`'s own doc comment for why reusing them here doesn't
+    /// undermine this shadow check's independence: what's re-verified
+    /// independently is the subset/modular-shift REASONING built on top
+    /// of them, not the recognition of what counts as a delta in the
+    /// first place). Recomputing rather than storing them from the
+    /// earlier real pass keeps this function self-contained and mirrors
+    /// how every other `shadow_*` method in this file works from a
+    /// fresh walk, not a cached one.
+    fn shadow_check_relational_bounds(&mut self) -> Vec<smt::Mismatch> {
+        let mut mismatches = Vec::new();
+        for index in 0..self.relational_bounds.len() {
+            let rb = self.relational_bounds[index].clone();
+            let relevant: HashSet<DefId> = rb.terms.iter().map(|(d, _)| *d).collect();
+            let base_state: HashMap<DefId, (u64, u64)> = self
+                .bounded
+                .iter()
+                .map(|(d, b)| (*d, (b.lower, b.upper)))
+                .collect();
+
+            let mut contributions: Vec<(i64, Vec<ExprId>)> = Vec::new();
+            let mut recognized = true;
+            for id in self.collect_bodied_items() {
+                let Item::Rule { body, .. } = self.ast.item(id).clone() else {
+                    continue;
+                };
+                let Some(sig) = self.fx.sigs.get(&id) else {
+                    continue;
+                };
+                let sig_writes: HashSet<DefId> = sig
+                    .writes
+                    .iter()
+                    .filter(|d| relevant.contains(d))
+                    .copied()
+                    .collect();
+                if sig_writes.is_empty() {
+                    continue;
+                }
+                let Some(deltas) = self.walk_deltas(&body, &relevant, &base_state, rb.modulus)
+                else {
+                    recognized = false;
+                    break;
+                };
+                let direct: HashSet<DefId> = deltas.keys().copied().collect();
+                if direct != sig_writes {
+                    recognized = false;
+                    break;
+                }
+                let delta: i64 = deltas
+                    .iter()
+                    .map(|(d, v)| {
+                        let coeff = rb
+                            .terms
+                            .iter()
+                            .find(|(td, _)| td == d)
+                            .map(|(_, c)| *c)
+                            .unwrap_or(0);
+                        coeff * v
+                    })
+                    .sum();
+                contributions.push((delta, self.leading_guards(&body)));
+            }
+            if !recognized {
+                continue; // the real pass ALSO couldn't recognize this -- not comparable, not a disagreement
+            }
+
+            let verdict = smt::check_relational_obligation(self.ast, self.res, &rb, &contributions);
+            if matches!(verdict, smt::SmtVerdict::Skipped(_)) {
+                continue;
+            }
+            let interval_says_proven = !self.failed_relational.contains(&index);
+            let smt_says_proven = matches!(verdict, smt::SmtVerdict::Proved);
+            if interval_says_proven != smt_says_proven {
+                mismatches.push(smt::Mismatch {
+                    span: rb.span.clone(),
+                    interval_says_in_bound: interval_says_proven,
+                    smt: verdict,
+                });
+            }
+        }
+        mismatches
+    }
+
+    /// v12: every declared-bounded parameter of a DIRECTLY-called fn/
+    /// impl, checked against its own actual argument -- the call-site
+    /// half of param-bound propagation, mirroring `expr_bound`'s own
+    /// `Expr::Call` arm. v1 scope cut for this shadow check: only a
+    /// call that IS `id` itself (a bare call statement, or the WHOLE of
+    /// an assign's rhs/a return's value) is checked here -- a call
+    /// nested inside arithmetic, a condition, or another call's own
+    /// argument (`total := Bump(3) + Bump(4)`, `if Bump(5) < 3`, `Outer
+    /// (Bump(50))`) is a real, separate gap, not attempted, since
+    /// covering it exhaustively would mean reproducing `check_calls_
+    /// in`'s own full position sweep rather than this narrower slice.
+    fn shadow_check_call_params(
+        &mut self,
+        state: &HashMap<DefId, (u64, u64)>,
+        guards: &[ExprId],
+        guards_negated: &[ExprId],
+        id: ExprId,
+        out: &mut Vec<smt::Mismatch>,
+    ) {
+        let Expr::Call { callee, args } = self.ast.expr(id).clone() else {
+            return;
+        };
+        let Some(&fn_def) = self.res.expr_defs.get(&callee) else {
+            return;
+        };
+        let Some(params) = self.fn_params.get(&fn_def).cloned() else {
+            return;
+        };
+        for (param, &arg) in params.iter().zip(&args) {
+            if param.bound.is_none() {
+                continue;
+            }
+            let def = def_of_name(self.res, &param.name);
+            let Some(bound) = self.bounded.get(&def).copied() else {
+                continue;
+            };
+            self.shadow_compare(state, bound, guards, guards_negated, arg, out);
+        }
+    }
+
+    /// One write site's own obligation, checked both ways and compared
+    /// -- shared by the scalar/mem-element/struct-field call sites in
+    /// `shadow_walk_body` below, since the comparison logic (call SMT
+    /// first, skip if it didn't translate, ONLY THEN call the interval
+    /// engine, compare, record a mismatch) is identical for all three.
+    /// A struct field's own call site already resolves `rhs` down to
+    /// the field's OWN value expression before calling this (the
+    /// `StructLit`'s own named-field value) -- exactly what `Checker::
+    /// struct_field_bound`'s `Expr::StructLit` arm does internally when
+    /// the field IS named directly, so `expr_bound` alone reproduces
+    /// the same "old" verdict for all three cases uniformly; no
+    /// separate `struct_field_bound` call needed here.
+    ///
+    /// Calling `expr_bound` only AFTER confirming the SMT verdict isn't
+    /// `Skipped` is load-bearing, not incidental: `check_bound_
+    /// obligation` only returns a non-`Skipped` verdict when
+    /// `translate_expr` accepted `rhs`, which means (by that function's
+    /// own structural induction) `rhs`'s whole subtree contains only
+    /// `Int`/`SizedInt`/bounded-`Ident`/`Add`/`Sub`/`Mul` nodes and no
+    /// `Expr::Call` at all -- so `expr_bound` cannot reach its own
+    /// call-argument-checking code here, and this can never double-push
+    /// an error `check_stmt`'s own real pass already recorded.
+    fn shadow_compare(
+        &mut self,
+        bounds_by_def: &HashMap<DefId, (u64, u64)>,
+        target: BoundedDef,
+        guards: &[ExprId],
+        guards_negated: &[ExprId],
+        rhs: ExprId,
+        out: &mut Vec<smt::Mismatch>,
+    ) {
+        let verdict = smt::check_bound_obligation(
+            self.ast,
+            self.res,
+            bounds_by_def,
+            target,
+            guards,
+            guards_negated,
+            rhs,
+        );
+        if matches!(verdict, smt::SmtVerdict::Skipped(_)) {
+            return;
+        }
+        let locals = HashMap::new();
+        let struct_origins = HashMap::new();
+        let computed = self.expr_bound(rhs, bounds_by_def, &locals, &struct_origins);
+        // Mirrors `check_against_bound`'s own three-way check exactly
+        // (width overflow, upper violation, lower violation) -- NOT
+        // just a bare `[lower, upper)` comparison, which would silently
+        // miss the width-overflow rejection `check_against_bound`
+        // reports as a real error (found via a real disagreement this
+        // shadow check itself surfaced,
+        // `multiplication_composed_bound_exceeding_the_declared_width_
+        // is_rejected`).
+        let width_limit = 1u64.checked_shl(target.width as u32).unwrap_or(u64::MAX);
+        let interval_says_in_bound = matches!(
+            computed,
+            Some((lo, hi)) if hi <= width_limit && hi <= target.upper && lo >= target.lower
+        );
+        let smt_says_in_bound = matches!(verdict, smt::SmtVerdict::Proved);
+        if interval_says_in_bound != smt_says_in_bound {
+            let span = self.ast.expr_spans[rhs.0 as usize].clone();
+            out.push(smt::Mismatch {
+                span,
+                interval_says_in_bound,
+                smt: verdict,
+            });
+        }
     }
 
     /// `state` mirrors `check_stmt`'s own narrowed-range map exactly
     /// (seeded from `self.bounded`, narrowed per-branch via `narrow_
     /// for_condition`/`narrow_for_else`) -- used ONLY to reproduce the
-    /// interval engine's own verdict for comparison, via `expr_bound`.
-    /// `guards`/`guards_negated` carry the SAME branch history as
-    /// `ExprId`s instead, for `smt::check_write_obligation`'s own
-    /// from-scratch translation -- two representations of one fact,
-    /// not two independent sources of truth: both are derived from the
-    /// exact same `cond` at the exact same `Stmt::If`, one line apart,
-    /// below.
+    /// interval engine's own verdict for comparison. `guards`/`guards_
+    /// negated` carry the SAME branch history as `ExprId`s instead, for
+    /// `smt::check_bound_obligation`'s own from-scratch translation --
+    /// two representations of one fact, not two independent sources of
+    /// truth: both are derived from the exact same `cond` at the exact
+    /// same `Stmt::If`, one line apart, below.
     fn shadow_walk_body(
         &mut self,
         body: &[StmtId],
         state: &HashMap<DefId, (u64, u64)>,
         guards: &[ExprId],
         guards_negated: &[ExprId],
+        ret_bound: Option<BoundedDef>,
         out: &mut Vec<smt::Mismatch>,
     ) {
         for &stmt in body {
             match self.ast.stmt(stmt).clone() {
+                // v12: a bare call statement (a void fn/impl call, made
+                // purely for its `writes` effect) -- the ONLY position
+                // `Stmt::Expr` itself can hold a call directly.
+                Stmt::Expr(e) => {
+                    self.shadow_check_call_params(state, guards, guards_negated, e, out);
+                }
                 Stmt::Assign { lhs, rhs } => {
-                    let Expr::Ident(_) = self.ast.expr(lhs) else {
-                        continue;
-                    };
-                    let Some(&def) = self.res.expr_defs.get(&lhs) else {
-                        continue;
-                    };
-                    let Some(bound) = self.bounded.get(&def).copied() else {
-                        continue;
-                    };
-                    let verdict = smt::check_write_obligation(
-                        self.ast,
-                        self.res,
-                        def,
-                        bound,
-                        guards,
-                        guards_negated,
-                        rhs,
-                    );
-                    if matches!(verdict, smt::SmtVerdict::Skipped(_)) {
-                        continue;
+                    // v12: `rhs` may itself be a bare call (`x :=
+                    // Bump(y)`, `writes`-only or otherwise) regardless
+                    // of whether `lhs` is itself bounded.
+                    self.shadow_check_call_params(state, guards, guards_negated, rhs, out);
+                    // Scalar reg/out/param: same shape as v5's own
+                    // induction (`self.bounded`), self-reference in
+                    // `rhs` resolves via `state` (which already
+                    // includes `def`'s own entry, seeded above).
+                    if let Expr::Ident(_) = self.ast.expr(lhs)
+                        && let Some(&def) = self.res.expr_defs.get(&lhs)
+                        && let Some(bound) = self.bounded.get(&def).copied()
+                    {
+                        self.shadow_compare(state, bound, guards, guards_negated, rhs, out);
                     }
-                    // Safe to call unconditionally: `check_write_
-                    // obligation` only returns a non-`Skipped` verdict
-                    // when `translate_expr` accepted `rhs` -- which
-                    // means, by that function's own structural
-                    // induction, `rhs`'s whole subtree contains only
-                    // `Int`/`SizedInt`/self-`Ident`/`Add`/`Sub`/`Mul`
-                    // nodes and no `Expr::Call` at all, so `expr_bound`
-                    // cannot reach its own call-argument-checking arm
-                    // here and this can never double-push an error
-                    // `check_stmt`'s own real pass already recorded.
-                    let locals = HashMap::new();
-                    let struct_origins = HashMap::new();
-                    let computed = self.expr_bound(rhs, state, &locals, &struct_origins);
-                    // Mirrors `check_against_bound`'s own three-way
-                    // check exactly (width overflow, upper violation,
-                    // lower violation) -- NOT just a bare `[lower,
-                    // upper)` comparison, which would silently miss the
-                    // width-overflow rejection `check_against_bound`
-                    // reports as a real error (found via a real
-                    // disagreement this shadow check itself surfaced,
-                    // `multiplication_composed_bound_exceeding_the_
-                    // declared_width_is_rejected`).
-                    let width_limit = 1u64.checked_shl(bound.width as u32).unwrap_or(u64::MAX);
-                    let interval_says_in_bound = matches!(
-                        computed,
-                        Some((lo, hi)) if hi <= width_limit && hi <= bound.upper && lo >= bound.lower
-                    );
-                    let smt_says_in_bound = matches!(verdict, smt::SmtVerdict::Proved);
-                    if interval_says_in_bound != smt_says_in_bound {
-                        let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                        out.push(smt::Mismatch {
-                            span,
-                            interval_says_in_bound,
-                            smt: verdict,
-                        });
+                    // v17: a mem write (`m[i] := rhs`) checks `rhs`
+                    // against the mem's own flat declared elem bound --
+                    // `mem_bounds` never narrows per-branch (mirrors
+                    // `check_stmt`'s own real check, which reads it the
+                    // same flat way), so `state` (already narrowed for
+                    // SCALAR defs) is still the right hypothesis source
+                    // for anything else `rhs` might reference.
+                    if let Expr::Bracket { callee, .. } = self.ast.expr(lhs)
+                        && let Some(&mem_def) = self.res.expr_defs.get(callee)
+                        && self.res.def(mem_def).kind == crate::resolve::DefKind::Mem
+                        && let Some(bound) = self.mem_bounds.get(&mem_def).copied()
+                    {
+                        self.shadow_compare(state, bound, guards, guards_negated, rhs, out);
+                    }
+                    // v18: a struct-typed write (`p := Pair{...}`)
+                    // checks each bounded field's own value against its
+                    // declared bound -- ONLY when `rhs` is a `StructLit`
+                    // naming that field DIRECTLY. A `..base`-sourced
+                    // field (the field omitted, filled from `base`'s
+                    // own same-named field) is a deliberate v1 scope cut
+                    // for this shadow check (see `smt`'s own module
+                    // doc) -- `Checker::struct_field_bound`'s own
+                    // `DefKind`-gated provenance trace isn't reproduced
+                    // here yet, so that case is silently left
+                    // un-compared, not attempted and potentially wrong.
+                    if let Expr::Ident(_) = self.ast.expr(lhs)
+                        && let Some(&def) = self.res.expr_defs.get(&lhs)
+                        && let Some(Ty::Struct {
+                            def: struct_def, ..
+                        }) = self.ty.state_tys.get(&def).cloned()
+                        && let Expr::StructLit { fields, .. } = self.ast.expr(rhs).clone()
+                    {
+                        let bounded_fields: Vec<String> = self
+                            .struct_field_bounds
+                            .keys()
+                            .filter(|(sd, _)| *sd == struct_def)
+                            .map(|(_, name)| name.clone())
+                            .collect();
+                        for field_name in bounded_fields {
+                            let Some((_, value)) = fields.iter().find(|(n, _)| *n == field_name)
+                            else {
+                                continue; // `..base`-sourced -- see doc comment above
+                            };
+                            let bound = self.struct_field_bounds[&(struct_def, field_name.clone())];
+                            self.shadow_compare(state, bound, guards, guards_negated, *value, out);
+                        }
+                    }
+                }
+                // v13: only meaningful when the enclosing fn declared a
+                // postcondition (`ret_bound`, computed once per item in
+                // `shadow_check_bounds`) -- mirrors `check_stmt`'s own
+                // `Stmt::Return` arm exactly. `e` may also itself be a
+                // bare call (v12's own obligation, checked the same way
+                // a bare call statement/assign-rhs is above).
+                Stmt::Return(Some(e)) => {
+                    self.shadow_check_call_params(state, guards, guards_negated, e, out);
+                    if let Some(bound) = ret_bound {
+                        self.shadow_compare(state, bound, guards, guards_negated, e, out);
                     }
                 }
                 Stmt::If {
@@ -3422,13 +3663,21 @@ impl<'a> Checker<'a> {
                         &then_state,
                         &then_guards,
                         guards_negated,
+                        ret_bound,
                         out,
                     );
                     if let Some(else_body) = else_body {
                         let else_state = self.narrow_for_else(cond, state);
                         let mut else_negated = guards_negated.to_vec();
                         else_negated.push(cond);
-                        self.shadow_walk_body(&else_body, &else_state, guards, &else_negated, out);
+                        self.shadow_walk_body(
+                            &else_body,
+                            &else_state,
+                            guards,
+                            &else_negated,
+                            ret_bound,
+                            out,
+                        );
                     }
                 }
                 // v1: `While`/`IfLet`/`WhileLet` bodies are out of

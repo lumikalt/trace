@@ -18,7 +18,12 @@
   # for why. `devenv.lock`'s pinned nixpkgs revision is what keeps proof
   # results deterministic across machines/time (a query provable under
   # one Z3 version can return `unknown` under another) -- load-bearing,
-  # the same as the firtool/iverilog/verilator version pins below.
+  # the same as the firtool/iverilog/verilator version pins below. Unlike
+  # those three, z3 is a linked library, not a subprocess, so its pin is
+  # enforced in Rust rather than in the `simulate` script below --
+  # `tests/z3_smoke.rs`'s `z3_linked_version_matches_the_devenv_pin` --
+  # keep that test's expected string in sync with whatever `pkgs.z3`
+  # actually resolves to here.
   packages = [pkgs.circt pkgs.iverilog pkgs.verilator pkgs.python3 pkgs.z3];
 
   languages.rust = {

@@ -11,17 +11,50 @@ the bespoke `invariant`/joint-guards mechanism that currently exists.
 
 Stage 1 (faithfulness) is IN PROGRESS — `bounds.rs` split into `src/bounds/{mod.rs,
 smt.rs}` (it was the clear size outlier) to make room for this. `pkgs.z3`/the `z3` crate
-are wired in (`tests/z3_smoke.rs` pins the linking); the scalar reg/out/param slice
-(self-reference/literal/`Add`/`Sub`/`Mul` writes, `Lt`/`Gt`/`Ge`/`Ne`-at-a-constant guard
-hypotheses) is shadow-checked against the existing interval engine on every `bounds::check`
-call, zero mismatches across the whole suite. See DESIGN.md's own stage-1 entry for the two
-real bugs this surfaced (both in the shadow check's own reconstruction, not in `bounds.rs`).
-Still needed before stage 1 is COMPLETE: mem-element bounds, struct-field bounds,
-param/return bounds, and the relational invariant (`circular_buffer_disjoint.tr`). Stages
+are wired in (`tests/z3_smoke.rs` pins the linking); scalar reg/out/param bounds (v5+),
+mem-element bounds (write-side, v17), struct-field bounds (v18, named-field-only — the
+`..base` fallback is its own deferred slice), param bounds at a top-level call site (v12),
+return bounds (v13), AND the relational invariant (`circular_buffer_disjoint.tr`'s own
+case, v20) are all shadow-checked against the existing interval engine on every
+`bounds::check` call, zero mismatches across the whole suite. The relational invariant is
+checked via a genuinely general `fire_R` transition encoding (`smt::check_relational_
+obligation`) rather than mirroring the hand-rolled mask-enumeration loop — this is the
+FIRST half of DESIGN.md's own acid test passing (both of `circular_buffer_disjoint.tr`'s
+invariants independently proven by Z3); the second half (collapsing `schedule.rs`'s own
+`m[head] != m[tail]` proof into one generic query) is stage 4's separate work, not
+started. See DESIGN.md's own stage-1 entry for the three real bugs found extending
+mem/struct-field/scalar coverage (all in the shadow check's own reconstruction, not in
+`bounds.rs`) — including a genuine vacuous-hypothesis hazard (an unreachable `else`
+branch's contradictory guard made the SMT query "prove" anything for free) caught exactly
+as the pre-implementation review warned it could be.
+
+A `Skipped`-site census (a temporary debug counter, run once across the whole suite then
+removed) turned "still needed" from a guess into a measured list: every `Skipped` site is
+either a deliberate scope cut already working as designed (the unreachable-hypothesis case;
+the relational invariant's `n <= 2` cap, which the `fire_R` encoding itself doesn't need but
+this shadow check still honors on purpose — NOT something to lift for stage 1, see
+DESIGN.md), or nothing-to-compare (the interval engine also returns no bound there), or one
+of three real, confirmed-exercised translation gaps: (1) a commuted guard comparison (`10 >
+i` vs `i < 10` — looks cheap to close), (2) a struct-field READ composed into an rhs
+expression (subsumes the `..base` case — one instance of "reaches into a struct field," not
+a separate mechanism), (3) a call nested inside arithmetic/another call's argument rather
+than a top-level position. None of these three were attempted this round. See DESIGN.md's
+own stage-1 entry for the full census breakdown and exact test names.
+
+Z3's own linked version is now pinned too (`tests/z3_smoke.rs`'s `z3_linked_version_matches_
+the_devenv_pin`, mirroring the firtool/iverilog/verilator pins in `devenv.nix`'s `simulate`
+script), and `--explain-schedule` is confirmed byte-identical across all 84 examples against
+the pre-stage-1 baseline commit — stage 1's own stated success criterion, actually run.
+
+**Retiring the old interval-arithmetic engine is stage 4's work, not stage 1's** — even
+once the three gaps above close. `expr_bound` can't be deleted in stage 1 regardless of
+shadow-check coverage, because `site_ranges` (stage 1's own explicit scope cut) is
+populated as a side effect of `expr_bound` itself and `schedule.rs`'s `real_range` still
+consults it; deletion rides along with `real_range`'s own retirement at stage 4. Stages
 2–4 (unify the six `bounds.rs` maps into one representation, generalize the surface
 predicate grammar, then — separately, since it proves strictly more and changes generated
 hardware — collapse `schedule.rs`'s eight mem-disjointness arguments into one generic
-query) are ordered but not started.
+query, deleting the old engine alongside it) are ordered but not started.
 
 ## Emission (`src/firrtl/`)
 
