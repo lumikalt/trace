@@ -863,6 +863,19 @@ module M {
 }
 
 #[test]
+fn where_bound_referencing_a_commuted_reg_resolves() {
+    // Stage 3's own operator generalization: `parse_where_bound` parses
+    // positionally, so self may land on either side -- `check_bound_
+    // self_reference` must check both, not just `lhs`.
+    let src = "\
+module M {
+    reg i : [4] where 10 > i = 0
+}
+";
+    run_ok(src);
+}
+
+#[test]
 fn where_bound_referencing_a_different_reg_is_an_error() {
     let src = "\
 module M {

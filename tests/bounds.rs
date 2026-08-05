@@ -209,6 +209,149 @@ module M {
     assert!(errors[0].message.contains("cannot verify"));
 }
 
+// Stage 3's own operator generalization (v21): `parse_where_bound` used
+// to hardcode the top-level relation to `Lt`; it now accepts `<`/`<=`/
+// `>`/`>=`, normalized by `ast::normalize_where_relation` (shared with
+// `types/stmt.rs`'s own init-value check) into the same `[lower, upper)`
+// interval shape the engine already understood. The following pin each
+// operator, plus commutation (self on either side) and the width-
+// boundary case the normalization itself is riskiest at.
+
+#[test]
+fn where_bound_ge_operator_is_recognized() {
+    let src = "\
+module M {
+    reg cnt : [8] where cnt >= 5 = 5
+    rule step {
+        cnt := 3
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("declared bound `5 <= _ < 256`"));
+    assert!(errors[0].message.contains("could go below 5"));
+}
+
+#[test]
+fn where_bound_gt_operator_is_recognized() {
+    let src = "\
+module M {
+    reg cnt : [8] where cnt > 5 = 6
+    rule step {
+        cnt := 5
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("declared bound `6 <= _ < 256`"));
+}
+
+#[test]
+fn where_bound_le_operator_is_recognized() {
+    let src = "\
+module M {
+    reg cnt : [8] where cnt <= 5 = 0
+    rule step {
+        cnt := cnt + 6
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("declared bound `0 <= _ < 6`"));
+}
+
+#[test]
+fn where_bound_le_operator_accepts_a_write_at_the_inclusive_limit() {
+    // The other side of `where_bound_le_operator_is_recognized`: `<= 5`
+    // normalizes to `[0, 6)`, so writing exactly 5 (the inclusive limit
+    // itself) must be accepted, not rejected off-by-one.
+    let src = "\
+module M {
+    reg cnt : [8] where cnt <= 5 = 0
+    rule step {
+        cnt := 5
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn commuted_where_bound_operator_is_recognized() {
+    // `parse_where_bound` parses positionally and doesn't track which
+    // operand the user meant as self -- `10 > cnt` must be recognized
+    // exactly as `cnt < 10` is, self on the RHS this time.
+    let src = "\
+module M {
+    reg cnt : [8] where 10 > cnt = 0
+    rule step {
+        cnt := cnt + 20
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("declared bound `0 <= _ < 10`"));
+}
+
+#[test]
+fn where_bound_ge_zero_at_full_width_still_catches_width_overflow() {
+    // The riskiest boundary case in `normalize_where_relation`: `_ >=
+    // 0` on a `[4]`-wide reg normalizes to `[0, 16)` -- `upper == 2^
+    // width` EXACTLY, not greater than it, so this must NOT spuriously
+    // trip `check_against_bound`'s separate width-overflow check (`hi >
+    // 2^width`); it must behave byte-identically to the equivalent `_ <
+    // 16` form, which correctly rejects an unguarded `cnt + 1` near the
+    // storage boundary (verified by hand against the `< 16` form before
+    // writing this test: same error, same message).
+    let src = "\
+module M {
+    reg cnt : [4] where cnt >= 0 = 0
+    rule step {
+        cnt := cnt + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("could reach or exceed the declared width")
+    );
+}
+
+#[test]
+fn where_bound_ge_operator_is_recognized_on_a_param_bound() {
+    // Confirms the operator generalization applies uniformly to all
+    // four `collect_one_*` collectors, not just the scalar reg/out
+    // case above -- this one exercises `collect_one_bounded_def`'s own
+    // PARAM path (v12's own attachment point). `Bump`'s own body is
+    // deliberately trivial (no arithmetic on `i`): `i`'s own declared
+    // bound (`>= 5`, no upper) is intentionally wide open on top, so
+    // composing `i` further here would trip the SEPARATE width-overflow
+    // check for an unrelated reason -- this test isolates the one
+    // thing it's actually pinning, the call-site argument check.
+    let src = "\
+module M {
+    reg y : [8] where y < 3 = 0
+    reg cnt : [8] = 0
+    Bump(i : [8] where i >= 5) {
+        cnt := 0
+    }
+    rule step {
+        Bump(y)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("argument for parameter"));
+}
+
 #[test]
 fn insufficiently_narrowed_guard_is_rejected() {
     // `if i < 9` doesn't narrow enough: the composed bound (9 + 2 - 1 =

@@ -657,50 +657,88 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// A `where [<const> <=] <ident> < <const>` bound's own base case:
-    /// the declared init value must itself satisfy the bound, via the
-    /// SAME `const_eval` `check_literal_fits` already uses. The parser
-    /// only ever constructs `bound`'s shape as `Binary { Lt, lhs, rhs }`
-    /// (`where` hard-requires the literal `<` token, so no other
-    /// comparison operator can reach here), and `resolve.rs` already
-    /// requires `lhs` self-reference the declared reg — so the only
-    /// thing left to verify here is the numeric relationship. `lower`
-    /// (`None` for the one-sided surface form) defaults to 0, the
-    /// implicit floor of an unsigned `bits[N]` value. An un-evaluable
-    /// limit/lower/init, or a `lower >= limit` (an empty range that no
-    /// init could ever satisfy), is ALSO an error, not silently
-    /// skipped: the whole induction argument (`bounds.rs`) needs a
-    /// verified starting point, and there's nothing to induct from
-    /// otherwise.
+    /// A `where` bound's own base case: the declared init value must
+    /// itself satisfy the bound, via the SAME `const_eval` `check_
+    /// literal_fits` already uses. `resolve.rs` already requires self
+    /// (the def's own name, or `_`) appear on exactly one side; `bound`
+    /// (`op`/`lhs`/`rhs`) plus `lower` (the two-sided form's own
+    /// explicit lower end, `None` for the one-sided surface form) are
+    /// reduced to a `[lower, upper)` interval via `ast::normalize_
+    /// where_relation` (v21) — the SAME shared function `bounds.rs`'s
+    /// own `where_bound_interval` calls, so a where-bound with a non-
+    /// `Lt`/commuted operator gets the identical numeric reading here
+    /// as it does when `bounds.rs` later checks writes against it; see
+    /// that function's own doc comment for why sharing this specific
+    /// piece matters (this project already shipped one bug from two
+    /// independent folders silently drifting apart, `const_fold` vs
+    /// `const_eval` — this is the same risk one layer up, for the
+    /// RELATION itself rather than just the constant-folding). An
+    /// un-evaluable limit/lower/init, or a `lower >= limit` (an empty
+    /// range no init could ever satisfy), is ALSO an error, not
+    /// silently skipped: the whole induction argument (`bounds.rs`)
+    /// needs a verified starting point, and there's nothing to induct
+    /// from otherwise.
+    ///
+    /// `width`: `None` when the def's own type isn't a concretely-known
+    /// `bits[N]` (an unusual shape `check_literal_fits`/`bounds.rs`'s
+    /// own `base_width` already handle elsewhere) — only the `>`/`>=`
+    /// forms actually need it (to compute the open-ended `[K, 2^width)`
+    /// shape); when it's needed and missing, this silently defers to
+    /// `bounds.rs`'s own `collect_one_bounded_def`, which independently
+    /// reports "needs a concretely-known `bits[N]` width" when IT runs
+    /// — not a new silent gap, just not this function's job to report
+    /// twice.
     pub(crate) fn check_where_bound_init(
         &mut self,
+        self_def: DefId,
         init: ExprId,
         bound: ExprId,
         lower: Option<ExprId>,
+        width: Option<u64>,
     ) {
-        let Expr::Binary { rhs, .. } = self.ast.expr(bound).clone() else {
+        let Expr::Binary { op, lhs, rhs } = self.ast.expr(bound).clone() else {
             return;
         };
-        let Some(limit) = self.const_eval(rhs, &HashMap::new()) else {
-            self.error(
-                self.expr_span(rhs),
-                "a `where` bound's own limit must be a compile-time constant".to_string(),
-            );
-            return;
+        let is_self = |this: &Self, e: ExprId| {
+            matches!(this.ast.expr(e), Expr::Wildcard)
+                || this.res.expr_defs.get(&e).copied() == Some(self_def)
         };
-        let lower_val = match lower {
-            Some(lower) => match self.const_eval(lower, &HashMap::new()) {
-                Some(v) => v,
-                None => {
-                    self.error(
-                        self.expr_span(lower),
-                        "a `where` bound's own lower end must be a compile-time constant"
-                            .to_string(),
-                    );
-                    return;
-                }
-            },
-            None => 0,
+        let (lower_val, limit) = if let Some(l) = lower {
+            let Some(limit) = self.const_eval(rhs, &HashMap::new()) else {
+                self.error(
+                    self.expr_span(rhs),
+                    "a `where` bound's own limit must be a compile-time constant".to_string(),
+                );
+                return;
+            };
+            let Some(lower_val) = self.const_eval(l, &HashMap::new()) else {
+                self.error(
+                    self.expr_span(l),
+                    "a `where` bound's own lower end must be a compile-time constant".to_string(),
+                );
+                return;
+            };
+            (lower_val, limit)
+        } else {
+            let (limit_expr, self_on_lhs) = match (is_self(self, lhs), is_self(self, rhs)) {
+                (true, false) => (rhs, true),
+                (false, true) => (lhs, false),
+                _ => return, // resolve.rs already reported a malformed shape
+            };
+            let Some(limit_val) = self.const_eval(limit_expr, &HashMap::new()) else {
+                self.error(
+                    self.expr_span(limit_expr),
+                    "a `where` bound's own limit must be a compile-time constant".to_string(),
+                );
+                return;
+            };
+            let Some(width) = width else { return };
+            let Some((lower_val, upper)) =
+                crate::ast::normalize_where_relation(op, self_on_lhs, limit_val, width)
+            else {
+                return;
+            };
+            (lower_val, upper)
         };
         if lower_val >= limit {
             let span = lower

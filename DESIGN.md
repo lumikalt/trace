@@ -4393,18 +4393,95 @@ untouched and still pass, since the updated error message still contains
 the substring they assert on. Byte-identical `--explain-schedule` across
 all 84 examples, zero regressions (867 tests now).
 
-Not yet done: the actual predicate-grammar/representation widening (the
-four collectors currently reduce a where-bound to `(lower, upper, width)`
-and DISCARD the original expression entirely — there is no "carry the
-predicate forward" path yet; making a bound reference another def needs
-that representation change, which in turn means `Bounds.ranges`/
-`site_ranges` has nothing to export for a cross-def bound, and
-`schedule.rs`'s `real_range` consumers need confirming they degrade
-gracefully on a missing entry before that's implemented, not assumed).
-This is the one piece of stage 3 that actually changes what's provable —
-needs its own advisor pass on the concrete representation before code,
-per this session's discipline (every prior sub-step in stages 2–3 was
-mis-scoped on the first pass and corrected by advisor review).
+**Stage 3's real capability increase is now done too — comparison-
+operator generalization, scoped correctly on a THIRD advisor pass.** The
+first attempt at scoping this (see the correction above) said "cross-def
+bounds (referencing another reg/out)" was in scope; a follow-up advisor
+consultation (prompted by noticing this would require the SAME
+transition-relation/co-firing-subset machinery `invariant`'s own
+induction uses, not a plain interval) retracted that: `where _ < other_
+reg` isn't a bound in this system's sense at all — a mutable def's value
+varies per cycle, so there's no fixed `[lower, upper)` for the interval
+engine to check or for `Bounds.ranges` to export, and routing `where`
+into `invariant`'s own `fire_R` machinery is the END-STATE unification
+DESIGN.md describes for the whole system, not a stage-3 sub-step. A
+`where` bound referencing a mutable def is deliberately OUT of stage 3's
+scope for this reason — confirmed via `real_range`'s own code (`Option`-
+returning, degrades to "no known range" on a missing `Bounds.ranges`
+entry, exactly like an unbounded def today) that this isn't a soundness
+concern to defer, just a genuinely different, larger mechanism.
+
+The corrected, actually-implemented v1 scope: `parser.rs`'s `parse_
+where_bound` used to hardcode the one-sided form's top-level relation to
+`Lt` — it now accepts `<`/`<=`/`>`/`>=` (v21), normalized by a new shared
+function, `ast::normalize_where_relation`, into the SAME `[lower,
+upper)` interval `BoundedDef` already stores — no new representation, no
+change to `check_against_bound`/`Bounds.ranges`/the shadow check at all.
+Self may land on EITHER side of the comparison (the parser parses
+positionally and doesn't track which operand was meant as self — `_ > K`
+and `K < _` both reach the normalizer as equivalent), so commuted forms
+fall out for free once `resolve.rs`'s self-reference checks test both
+sides instead of just `lhs`. `==`/`!=` deliberately NOT accepted — cut
+from v1 as the fiddliest, narrowest-gain case (only sensible at a width
+edge).
+
+Two real bugs found empirically while implementing this (both fixed
+before this was considered done, not left as follow-ups):
+1. **A real parsing ambiguity**, not anticipated in the design: `<=` is
+   now BOTH a valid one-sided top-level operator (`where cnt <= 5`) AND
+   the two-sided form's own lower-bound separator (`where 0 <= cnt <
+   10`), and nothing before the SECOND operand distinguishes them — both
+   start `<expr> <= <expr>`. Found by a test that failed to parse at
+   all. Fixed via lookahead: parse the second operand, then check
+   whether a `<` follows; if not, reinterpret `first <= second` as the
+   one-sided form's own relation instead of erroring. A pre-existing
+   test (`where_clause_two_sided_form_still_requires_the_lt_after_the_
+   ident`) pinned the OLD, now-superseded restriction (`where 5 <= j`
+   with no trailing `< K` had to be a parse error) — renamed and
+   rewritten to pin the new, deliberately more permissive behavior
+   instead, since that restriction was exactly the thing this stage
+   exists to relax.
+2. **`types/stmt.rs`'s `check_where_bound_init` (the type-checker's own
+   init-value check) silently used the OLD, `Lt`-only reading** even
+   after `bounds.rs`'s own collectors were generalized — it hardcoded
+   `rhs` as the limit and never knew about the new operators or
+   commutation at all, so `where cnt >= 5 = 3` and `where 10 > cnt = 12`
+   both produced WRONG diagnostics (checking the init against the wrong
+   interval, or reporting "must be a compile-time constant" for a
+   perfectly valid commuted bound) until this was caught by manually
+   testing the new operators end-to-end rather than trusting the test
+   suite alone. This is the SAME two-folders-drift-apart risk this arc
+   already shipped once (`const_fold` vs `const_eval`, closed earlier
+   this stage) — fixed by moving `normalize_where_relation` itself into
+   `ast.rs` as one shared, pure function both `bounds.rs` and `types/
+   stmt.rs` call, rather than letting either module keep its own copy
+   of "what interval does this relation mean."
+
+New regression tests: every operator (`<`/`<=`/`>`/`>=`) on a scalar
+reg bound, a commuted form, the param-bound attachment point (confirming
+the generalization applies uniformly across all four `collect_one_*`
+collectors, not just the scalar case), the width-EXACT-boundary case
+(`_ >= 0` on a `[4]`-wide reg normalizes to `upper == 2^width` exactly —
+confirmed this does NOT spuriously trip `check_against_bound`'s separate
+width-overflow check, by comparing byte-for-byte against the equivalent
+literal `< 16` form), and the init-value check's own operator/commutation
+coverage. Byte-identical `--explain-schedule` across all 84 examples
+(none use a non-`Lt` where-bound today), zero regressions (878 tests
+now) — plus zero panics from the SMT shadow check, which is the
+strongest confirmation available that the new operator-normalized
+bounds are read identically by both engines: the shadow check consumes
+the already-normalized `(lower, upper)` `self.bounded` entry, never the
+raw operator, so it was operator-agnostic already and needed no changes
+of its own.
+
+**Stage 3 is now complete.** What remains genuinely out of scope,
+deliberately: `==`/`!=` operators (cut, narrow gain), non-literal-but-
+still-constant limits (elaboration/generic params — no example currently
+needs this), and a `where` bound referencing a mutable def (that's
+`invariant`'s own mechanism; unifying the two surface forms is the
+end-state goal DESIGN.md's "Core representation" section describes, not
+this stage's). Stage 4 (`schedule.rs` collapse, retiring the old
+interval engine) remains ordered, not started.
 
 ## Combinational loops
 

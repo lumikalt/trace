@@ -9,7 +9,7 @@
 //! own doc comment, mod.rs) since it needs every body's `expr_tys`
 //! already populated.
 
-use super::{OPTION_FIELDS, Ty, TypeChecker, WIDEN_CAP};
+use super::{OPTION_FIELDS, Ty, TypeChecker, WIDEN_CAP, Width};
 use crate::ast::{Expr, ExprId, ExtPortDir, Item, ItemId};
 use crate::resolve::{DefId, DefKind};
 use std::collections::HashMap;
@@ -84,7 +84,11 @@ impl<'a> TypeChecker<'a> {
                             self.check_literal_fits(init, &ty);
                         }
                         if let Some(bound) = bound {
-                            self.check_where_bound_init(init, bound, lower);
+                            let width = match &ty {
+                                Ty::Bits(Width::Known(w)) => Some(*w),
+                                _ => None,
+                            };
+                            self.check_where_bound_init(def, init, bound, lower, width);
                         }
                     }
                     self.state_tys.insert(def, ty);
@@ -178,7 +182,11 @@ impl<'a> TypeChecker<'a> {
                             self.check_literal_fits(init, &ty);
                         }
                         if let Some(bound) = bound {
-                            self.check_where_bound_init(init, bound, lower);
+                            let width = match &ty {
+                                Ty::Bits(Width::Known(w)) => Some(*w),
+                                _ => None,
+                            };
+                            self.check_where_bound_init(def, init, bound, lower, width);
                         }
                     }
                     self.state_tys.insert(def, ty);

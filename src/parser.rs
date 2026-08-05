@@ -398,21 +398,54 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// Parses an optional `where <ident> < <const>` or `where <const>
-    /// <= <ident> < <const>` clause, returning `(bound, lower)` (`(None,
-    /// None)` if no `where` is present at all). Shared by
+    /// Parses an optional `where <ident> <OP> <const>` (`<OP>` one of
+    /// `<`/`<=`/`>`/`>=`, v21 — was `<`-only through v20) or `where
+    /// <const> <= <ident> < <const>` clause, returning `(bound, lower)`
+    /// (`(None, None)` if no `where` is present at all). Shared by
     /// `parse_state_decl` (reg/out, which additionally restricts WHERE
     /// the result may be non-`None`) and `parse_fn`'s param loop (v12,
     /// unconditionally allowed on any param). Built manually rather
     /// than via a single `self.parse_expr(0)` call on the whole clause:
     /// `=` is ALSO a comparison operator (`BinOp::Eq`) at the identical
-    /// binding-power tier as `<`/`<=`, so a full low-bp parse would
-    /// greedily chain straight into a following `= init` as `(i < 10) =
-    /// 0` instead of stopping at `10` — and a chained `L <= i < K`
+    /// binding-power tier as `<`/`<=`/`>`/`>=`, so a full low-bp parse
+    /// would greedily chain straight into a following `= init` as `(i <
+    /// 10) = 0` instead of stopping at `10` — and a chained `L <= i < K`
     /// would itself parse as `(L <= i) < K` under the general grammar.
     /// Parsing every operand separately at `TYPE_MIN_BP` (above the
     /// comparison tier, so no operand ever tries to consume a
-    /// `<`/`<=`/`=` itself) sidesteps both ambiguities.
+    /// `<`/`<=`/`>`/`>=`/`=` itself) sidesteps both ambiguities.
+    ///
+    /// The two-sided form's own second relation stays hardcoded to `<`
+    /// (`L <= i < K`, unchanged since v0) — it's a distinct, fixed
+    /// three-part shape (an explicit `lower` plus a relation), not the
+    /// single comparison this v21 generalization targets. Only the
+    /// ONE-sided form's own single operator generalizes: DESIGN.md's
+    /// stage-3 corrected scope (an advisor pass caught that "arbitrary
+    /// boolean expressions" isn't reachable without a new logical
+    /// connective this language doesn't have) is exactly "any single
+    /// comparison over `_` and in-scope defs" — normalizing `>`/`>=`/
+    /// commuted-`<`/commuted-`<=` into the SAME `(lower, upper)` shape
+    /// the interval engine already understands is `bounds.rs`'s own job
+    /// (`collect_one_bounded_def` etc.), not this layer's; the parser's
+    /// only job is to stop hardcoding which operator is even reachable.
+    /// `==`/`!=` are deliberately NOT accepted here — cut from v1 as the
+    /// fiddliest, narrowest-gain case (an equality/inequality bound
+    /// only makes sense at a width edge; see DESIGN.md).
+    ///
+    /// A real ambiguity this generalization introduces, found empirically
+    /// (a test written against the naive "eat `<=`, assume two-sided"
+    /// version failed to parse `where cnt <= 5` at all): `<=` is now
+    /// BOTH a valid one-sided top-level operator or (`where cnt <= 5`)
+    /// AND the two-sided form's own lower-bound separator (`where 0 <=
+    /// cnt < 10`), and nothing before the SECOND operand disambiguates
+    /// them — both start `<expr> <= <expr>`. Resolved by lookahead: parse
+    /// the second operand, THEN check whether a `<` follows it. If it
+    /// does, this was genuinely the two-sided form (`first <= second <
+    /// rhs`). If it doesn't, `first <= second` was actually the whole
+    /// bound, using `<=` as its own one-sided operator — reinterpreted
+    /// as such rather than erroring, so `where cnt <= 5` and `where 5 >=
+    /// cnt` both parse (the latter never hits this branch at all, since
+    /// it doesn't start with `<=`).
     fn parse_where_bound(&mut self) -> Option<(Option<ExprId>, Option<ExprId>)> {
         if !self.at_ident_text("where") {
             return Some((None, None));
@@ -420,24 +453,55 @@ impl<'a> Parser<'a> {
         self.bump();
         let bound_lo = self.cur_span().start;
         let first = self.parse_expr(TYPE_MIN_BP)?;
-        let (lower, ident) = if self.eat(TokenKind::Le) {
-            let ident = self.parse_expr(TYPE_MIN_BP)?;
-            (Some(first), ident)
+        if self.eat(TokenKind::Le) {
+            let second = self.parse_expr(TYPE_MIN_BP)?;
+            if self.eat(TokenKind::Lt) {
+                // Genuinely the two-sided form: `first <= second < rhs`.
+                let rhs = self.parse_expr(TYPE_MIN_BP)?;
+                let bound = self.ast.push_expr(
+                    Expr::Binary {
+                        op: BinOp::Lt,
+                        lhs: second,
+                        rhs,
+                    },
+                    bound_lo..self.prev_end,
+                );
+                return Some((Some(bound), Some(first)));
+            }
+            // No `<` follows -- `<=` was actually the one-sided form's
+            // own top-level operator all along.
+            let bound = self.ast.push_expr(
+                Expr::Binary {
+                    op: BinOp::Le,
+                    lhs: first,
+                    rhs: second,
+                },
+                bound_lo..self.prev_end,
+            );
+            return Some((Some(bound), None));
+        }
+        let op = if self.eat(TokenKind::Gt) {
+            BinOp::Gt
+        } else if self.eat(TokenKind::Ge) {
+            BinOp::Ge
         } else {
-            (None, first)
-        };
-        self.expect(TokenKind::Lt, "`<` after `where <ident>`")
+            self.expect(
+                TokenKind::Lt,
+                "`<`, `<=`, `>`, or `>=` after `where <ident>`",
+            )
             .ok()?;
+            BinOp::Lt
+        };
         let rhs = self.parse_expr(TYPE_MIN_BP)?;
         let bound = self.ast.push_expr(
             Expr::Binary {
-                op: BinOp::Lt,
-                lhs: ident,
+                op,
+                lhs: first,
                 rhs,
             },
             bound_lo..self.prev_end,
         );
-        Some((Some(bound), lower))
+        Some((Some(bound), None))
     }
 
     /// `reg name : ty (= init)?` / `mem name : ty` / `fifo name : ty` /

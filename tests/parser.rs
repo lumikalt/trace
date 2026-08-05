@@ -1279,12 +1279,20 @@ fn where_clause_parses_the_two_sided_form() {
 }
 
 #[test]
-fn where_clause_two_sided_form_still_requires_the_lt_after_the_ident() {
-    // `where L <= i` with no trailing `< K` must still be a clean parse
-    // error, not silently accepted as a bound with no upper end.
+fn where_clause_le_with_no_trailing_lt_is_a_one_sided_bound_not_an_error() {
+    // Through v20, `where L <= i` with no trailing `< K` was a hard
+    // parse error -- `parse_where_bound` assumed ANY `<=` right after
+    // the first operand could only be the two-sided form's own
+    // separator, so a missing `<` afterward was treated as malformed.
+    // v21's operator generalization changes this ON PURPOSE: `where 5
+    // <= j` is now a perfectly sensible ONE-sided bound in its own
+    // right (self commuted to the RHS, meaning `j >= 5`), disambiguated
+    // from the two-sided form by lookahead (see `parse_where_bound`'s
+    // own doc comment) -- it must parse cleanly now, not error. This
+    // test used to pin the OLD restriction; it now pins the new,
+    // intentionally more permissive behavior instead.
     let src = "module M {\n reg j : [4] where 5 <= j = 5\n}\n";
     let (tokens, _) = lexer::lex(src);
     let (_, errors) = parser::parse(src, &tokens);
-    assert!(!errors.is_empty());
-    assert!(errors[0].message.contains("`<` after `where"));
+    assert!(errors.is_empty(), "{errors:?}");
 }

@@ -156,10 +156,28 @@ collectors never read the bound's LHS once resolve.rs approves it, so this was a
 resolve.rs change. Six new tests, byte-identical `--explain-schedule`, zero regressions
 (867 tests now).
 
-Not yet done: the actual predicate-grammar widening (the four collectors reduce a
-where-bound to a plain `(lower, upper, width)` triple and discard the expression — no
-"carry the predicate forward" path exists yet, which is what a cross-def bound needs). See
-DESIGN.md's stage-3 entry.
+**Stage 3 is DONE.** Its real capability increase turned out to be comparison-operator
+generalization, not "cross-def bounds" as first scoped — a follow-up advisor pass caught
+that `where _ < other_reg` isn't a bound at all (a mutable def's value varies per cycle, no
+fixed interval to check or export), it's `invariant`'s own mechanism; unifying the two
+surface forms is the end-state goal, not this stage. `parser.rs`'s `parse_where_bound` now
+accepts `<`/`<=`/`>`/`>=` (was `<`-only), normalized by a new shared `ast::normalize_where_
+relation` into the same `(lower, upper)` `BoundedDef` already stores — no representation
+change. Self may be on either side (commuted forms fall out for free once `resolve.rs`
+checks both, not just `lhs`). Two real bugs found and fixed along the way: a genuine parse
+ambiguity (`<=` is now both a one-sided operator AND the two-sided form's own separator,
+fixed via lookahead — an existing test pinning the old restriction was rewritten, since that
+restriction was exactly what this stage relaxes), and `types/stmt.rs`'s own init-value check
+silently using the stale `Lt`-only reading (fixed by sharing the normalization function
+instead of letting two modules keep independent copies — the same class of bug as the
+`const_fold`/`const_eval` drift closed earlier this stage). Byte-identical `--explain-
+schedule`, zero regressions, zero shadow-check panics (878 tests now). See DESIGN.md's
+stage-3 entry for the full detail.
+
+Deliberately still out of scope: `==`/`!=` operators, non-literal-but-constant limits
+(elaboration params — no example needs this), and any bound referencing a mutable def (see
+above). Stage 4 (`schedule.rs` collapse, retiring the old interval engine) is next, not
+started.
 
 ## Emission (`src/firrtl/`)
 

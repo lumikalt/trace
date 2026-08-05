@@ -1034,3 +1034,45 @@ pub fn effects_str(effects: &[Effect]) -> String {
         .join(", ");
     format!(" <{inner}>")
 }
+
+/// Stage 3's own operator generalization (v21, DESIGN.md's "Toward a
+/// dependent/refinement type system"): given a `where` bound's own
+/// comparison operator, which side is the self-reference, the OTHER
+/// side's own folded constant value, and the def's declared bit width,
+/// returns the `[lower, upper)` interval that comparison expresses.
+/// `parser.rs`'s `parse_where_bound` parses positionally and doesn't
+/// track which operand the user meant as self, so `_ > K` and `K < _`
+/// both reach a caller as `(Gt, self_on_lhs: true)`/`(Lt, self_on_lhs:
+/// false)` respectively — both mean "self must exceed K", and both
+/// normalize to the SAME interval here, which is the whole point:
+/// whichever side self landed on, and whichever of the four operators
+/// was used, this collapses back to the one interval shape both
+/// `bounds.rs` (checking writes against the declared bound) and
+/// `types/stmt.rs` (checking a reg/out's own init value against it)
+/// need — kept here, shared, specifically because those two call sites
+/// used to duplicate the (much narrower) `_ < K`-only version of this
+/// same math independently, and a where-bound with a non-`Lt` operator
+/// silently reaching only ONE of the two checkers is exactly the kind
+/// of two-folders-drift-apart bug this project has already shipped once
+/// (see `bounds.rs`'s own `const_fold` vs `types/eval.rs`'s
+/// `const_eval` history).
+///
+/// `None` on `limit + 1` overflowing `u64` (only reachable at `limit ==
+/// u64::MAX`, already wider than any real `bits[N]` this compiler
+/// supports) or `1 << width` overflowing (`width >= 64`, same
+/// reasoning) — neither is a case worth its own diagnostic.
+pub fn normalize_where_relation(
+    op: BinOp,
+    self_on_lhs: bool,
+    limit: u64,
+    width: u64,
+) -> Option<(u64, u64)> {
+    let ceiling = 1u64.checked_shl(width as u32)?;
+    match (op, self_on_lhs) {
+        (BinOp::Lt, true) | (BinOp::Gt, false) => Some((0, limit)),
+        (BinOp::Le, true) | (BinOp::Ge, false) => limit.checked_add(1).map(|u| (0, u)),
+        (BinOp::Gt, true) | (BinOp::Lt, false) => limit.checked_add(1).map(|l| (l, ceiling)),
+        (BinOp::Ge, true) | (BinOp::Le, false) => Some((limit, ceiling)),
+        _ => None,
+    }
+}

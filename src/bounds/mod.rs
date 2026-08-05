@@ -669,7 +669,9 @@
 
 mod smt;
 
-use crate::ast::{Ast, BinOp, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId};
+use crate::ast::{
+    Ast, BinOp, Expr, ExprId, Item, ItemId, Param, Stmt, StmtId, normalize_where_relation,
+};
 use crate::effects::Effects;
 use crate::lexer::Span;
 use crate::resolve::{DefId, Resolution};
@@ -1287,19 +1289,6 @@ impl<'a> Checker<'a> {
     /// here — see those functions' own doc comments). Takes the def
     /// directly (not an `ItemId`) since a param has none of its own.
     fn collect_one_bounded_def(&mut self, def: DefId, bound: ExprId, lower: Option<ExprId>) {
-        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
-            return;
-        };
-        let Some(upper) = const_fold(self.ast, *rhs) else {
-            return; // types.rs already reported this
-        };
-        let lower_val = match lower {
-            Some(l) => match const_fold(self.ast, l) {
-                Some(v) => v,
-                None => return, // types.rs already reported this
-            },
-            None => 0,
-        };
         let Some(width) = base_width(self.ty, def) else {
             // A concretely-known `bits[N]` width is exactly what every
             // check below needs to clamp a composed bound against — an
@@ -1307,7 +1296,13 @@ impl<'a> Checker<'a> {
             // expression, silently `Ty::Bits(Width::Unknown)` per
             // `types/eval.rs`, with no error of its own) must not let
             // the whole `where` clause go unchecked with zero
-            // diagnostic.
+            // diagnostic. Checked BEFORE folding `bound` itself (v21,
+            // was after through v20): `where_bound_interval`'s own
+            // operator normalization needs `width` regardless of which
+            // operand ends up unfoldable, so there's no longer a
+            // meaningful "which failure happens first" order to
+            // preserve — an unknown width is its own, independent
+            // failure either way.
             let span = self.ast.expr_spans[bound.0 as usize].clone();
             self.error(
                 span,
@@ -1316,6 +1311,14 @@ impl<'a> Checker<'a> {
                     .to_string(),
             );
             return;
+        };
+        let is_self = |ast: &Ast, e: ExprId| {
+            matches!(ast.expr(e), Expr::Wildcard)
+                || self.res.expr_defs.get(&e).copied() == Some(def)
+        };
+        let Some((lower_val, upper)) = where_bound_interval(self.ast, bound, lower, width, is_self)
+        else {
+            return; // types.rs/resolve.rs already reported this
         };
         self.bounded.insert(
             def,
@@ -1346,19 +1349,6 @@ impl<'a> Checker<'a> {
         bound: ExprId,
         lower: Option<ExprId>,
     ) {
-        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
-            return;
-        };
-        let Some(upper) = const_fold(self.ast, *rhs) else {
-            return; // types.rs already reported this
-        };
-        let lower_val = match lower {
-            Some(l) => match const_fold(self.ast, l) {
-                Some(v) => v,
-                None => return, // types.rs already reported this
-            },
-            None => 0,
-        };
         let Some(width) = ret_width(self.ast, ret_ty) else {
             let span = self.ast.expr_spans[bound.0 as usize].clone();
             self.error(
@@ -1368,6 +1358,14 @@ impl<'a> Checker<'a> {
                     .to_string(),
             );
             return;
+        };
+        // No real `DefId` for a return value (see this fn's own doc
+        // comment) -- self is recognized by SHAPE (`_`) only, same as
+        // `resolve.rs`'s own `check_ret_bound_shape`.
+        let is_self = |ast: &Ast, e: ExprId| matches!(ast.expr(e), Expr::Wildcard);
+        let Some((lower_val, upper)) = where_bound_interval(self.ast, bound, lower, width, is_self)
+        else {
+            return; // types.rs/resolve.rs already reported this
         };
         self.fn_ret_bound.insert(
             fn_def,
@@ -1415,19 +1413,6 @@ impl<'a> Checker<'a> {
     /// width source genuinely differs each time, not worth forcing into
     /// one shared helper across three top-level collectors.
     fn collect_one_mem_bound(&mut self, def: DefId, bound: ExprId, lower: Option<ExprId>) {
-        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
-            return;
-        };
-        let Some(upper) = const_fold(self.ast, *rhs) else {
-            return; // types.rs already reported this
-        };
-        let lower_val = match lower {
-            Some(l) => match const_fold(self.ast, l) {
-                Some(v) => v,
-                None => return, // types.rs already reported this
-            },
-            None => 0,
-        };
         let Some(width) = mem_elem_width(self.ty, def) else {
             let span = self.ast.expr_spans[bound.0 as usize].clone();
             self.error(
@@ -1437,6 +1422,14 @@ impl<'a> Checker<'a> {
                     .to_string(),
             );
             return;
+        };
+        // No real `DefId` for a mem element -- self is recognized by
+        // SHAPE (`_`) only, same as `resolve.rs`'s own `check_mem_
+        // bound_shape`.
+        let is_self = |ast: &Ast, e: ExprId| matches!(ast.expr(e), Expr::Wildcard);
+        let Some((lower_val, upper)) = where_bound_interval(self.ast, bound, lower, width, is_self)
+        else {
+            return; // types.rs/resolve.rs already reported this
         };
         self.mem_bounds.insert(
             def,
@@ -1498,19 +1491,6 @@ impl<'a> Checker<'a> {
         bound: ExprId,
         lower: Option<ExprId>,
     ) {
-        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
-            return;
-        };
-        let Some(upper) = const_fold(self.ast, *rhs) else {
-            return; // types.rs already reported this
-        };
-        let lower_val = match lower {
-            Some(l) => match const_fold(self.ast, l) {
-                Some(v) => v,
-                None => return, // types.rs already reported this
-            },
-            None => 0,
-        };
         let Some(width) = struct_field_width(self.ty, struct_def, field_name) else {
             let span = self.ast.expr_spans[bound.0 as usize].clone();
             self.error(
@@ -1520,6 +1500,14 @@ impl<'a> Checker<'a> {
                     .to_string(),
             );
             return;
+        };
+        // No real `DefId` for a struct field -- self is recognized by
+        // SHAPE (`_`) only, same as `resolve.rs`'s own `check_struct_
+        // field_bound_shape`.
+        let is_self = |ast: &Ast, e: ExprId| matches!(ast.expr(e), Expr::Wildcard);
+        let Some((lower_val, upper)) = where_bound_interval(self.ast, bound, lower, width, is_self)
+        else {
+            return; // types.rs/resolve.rs already reported this
         };
         self.struct_field_bounds.insert(
             (struct_def, field_name.to_string()),
@@ -4095,6 +4083,54 @@ fn const_fold(ast: &Ast, id: ExprId) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Shared by all four `collect_one_*` collectors: reduces a where-
+/// bound's own declared expression down to the `[lower, upper)`
+/// interval `BoundedDef` stores, given a way to test which operand (if
+/// either) is the self-reference (`is_self` — a `DefId`-or-`_` test for
+/// a scalar reg/out/param bound, a `_`-only test for the other three,
+/// which have no real `DefId` to compare against; `resolve.rs`'s own
+/// `check_bound_self_reference`/`check_*_bound_shape` already validated
+/// self appears on exactly one side before this ever runs). `None`
+/// means nothing here reduces to a constant — a malformed shape (self
+/// on neither/both sides) or a non-const-foldable operand, both cases
+/// `resolve.rs`/`types.rs` already reported on their own terms, per
+/// each `collect_one_*` call site's own `// types.rs already reported
+/// this` comment.
+///
+/// The two-sided form (`explicit_lower.is_some()`) does NOT run through
+/// the operator-normalization step below — `parse_where_bound` fixes
+/// that form's own shape (`op` is always `Lt`, self is always `lhs`),
+/// so its `[lower, upper)` reading has always just been "const-fold
+/// both operands directly"; unchanged here, since generalizing an
+/// already-unambiguous fixed shape would only add risk for no gain (see
+/// `check_bound_self_reference`'s own doc comment for why checking
+/// self on either side is very slightly too permissive for THIS form
+/// specifically, and why that's still safe).
+fn where_bound_interval(
+    ast: &Ast,
+    bound: ExprId,
+    explicit_lower: Option<ExprId>,
+    width: u64,
+    is_self: impl Fn(&Ast, ExprId) -> bool,
+) -> Option<(u64, u64)> {
+    let Expr::Binary { op, lhs, rhs } = ast.expr(bound) else {
+        return None;
+    };
+    let (op, lhs, rhs) = (*op, *lhs, *rhs);
+    if let Some(l) = explicit_lower {
+        let upper = const_fold(ast, rhs)?;
+        let lower_val = const_fold(ast, l)?;
+        return Some((lower_val, upper));
+    }
+    let (limit, self_on_lhs) = match (is_self(ast, lhs), is_self(ast, rhs)) {
+        (true, false) => (rhs, true),
+        (false, true) => (lhs, false),
+        _ => return None,
+    };
+    let limit_val = const_fold(ast, limit)?;
+    normalize_where_relation(op, self_on_lhs, limit_val, width)
 }
 
 /// A state def's own declared bit width, if it's a plain `bits[N]`

@@ -1998,6 +1998,46 @@ fn where_bound_init_satisfying_the_bound_is_accepted() {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
+// Stage 3's own operator generalization (v21): `check_where_bound_init`
+// used to assume `bound`'s own shape was always `Binary { Lt, self, K
+// }` (the parser's own v0-through-v20 restriction) -- it now shares
+// `ast::normalize_where_relation` with `bounds.rs`, so the init-value
+// check must read `>=`/`>`/commuted forms with the SAME numeric
+// interpretation `bounds.rs` later checks writes against. Found and
+// fixed empirically, not just designed: the first version of this
+// generalization left `check_where_bound_init` untouched, and it
+// silently mis-evaluated `where cnt >= 5`'s own init check against the
+// wrong (pre-generalization) interval before this was caught.
+#[test]
+fn where_bound_ge_init_satisfying_the_bound_is_accepted() {
+    let (_, _, errors) = run("module M {\n reg i : [4] where i >= 5 = 5\n}\n");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn where_bound_ge_init_violating_the_bound_is_an_error() {
+    let (_, _, errors) = run("module M {\n reg i : [4] where i >= 5 = 3\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("does not satisfy the declared bound")
+    );
+}
+
+#[test]
+fn commuted_where_bound_init_is_checked_with_the_correct_interval() {
+    // `10 > cnt` means `cnt < 10`, self on the RHS -- the init check
+    // must recognize this, not just the LHS-self case.
+    let (_, _, errors) = run("module M {\n reg i : [4] where 10 > i = 12\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("does not satisfy the declared bound")
+    );
+}
+
 #[test]
 fn where_bound_init_violating_the_bound_is_an_error() {
     let (_, _, errors) = run("module M {\n reg i : [4] where i < 10 = 12\n}\n");

@@ -1181,13 +1181,34 @@ impl<'a> Resolver<'a> {
     /// `bounds.rs`'s own collector (`collect_one_bounded_def` etc.)
     /// never reads `lhs` at all once this check passes, so there is no
     /// downstream reason to prefer one form over the other.
+    ///
+    /// Stage 3's own operator generalization (`parser.rs`'s `parse_
+    /// where_bound`, v21): the self-reference may now be on EITHER side
+    /// of the comparison, not just `lhs` — `parse_where_bound` doesn't
+    /// distinguish which side the user wrote self on, it just parses
+    /// positionally, so `where 5 > cnt` produces `Binary { Gt, lhs: 5,
+    /// rhs: cnt }` exactly as validly as `where cnt < 5` does, and both
+    /// must be accepted (`bounds.rs`'s own collector normalizes either
+    /// shape into the same `(lower, upper)` — see its own doc comment).
+    /// This check doesn't distinguish the two-sided `L <= i < K` form
+    /// (where self is positionally fixed at the MIDDLE operand, i.e.
+    /// `lhs`, not commutable) from the one-sided form here — checking
+    /// either side is very slightly too permissive for a malformed
+    /// two-sided bound with self on the wrong side (`where 0 <= 5 <
+    /// cnt`), but that shape still gets a real, correct rejection from
+    /// `types.rs`'s own `check_where_bound_init` (its `const_eval` on
+    /// `rhs` fails when `rhs` is a bare `Ident` under an empty env), so
+    /// this is a slightly less specific error message on an already-
+    /// wrong program, never a silently-accepted one.
     fn check_bound_self_reference(&mut self, self_def: DefId, bound: ExprId) {
-        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+        let Expr::Binary { lhs, rhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
-        let is_same_def = self.res.expr_defs.get(&lhs).copied() == Some(self_def);
-        if !is_placeholder && !is_same_def {
+        let is_self = |e: ExprId, this: &Self| {
+            matches!(this.ast.expr(e), Expr::Wildcard)
+                || this.res.expr_defs.get(&e).copied() == Some(self_def)
+        };
+        if !is_self(lhs, self) && !is_self(rhs, self) {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
                 "a `where` bound must reference the same reg/out/param it's declared on \
@@ -1210,10 +1231,15 @@ impl<'a> Resolver<'a> {
     /// error; `bounds.rs` reports the precise shape complaint
     /// separately.
     fn check_ret_bound_shape(&mut self, bound: ExprId) {
-        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+        let Expr::Binary { lhs, rhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
+        // Stage 3's own operator generalization (see `check_bound_self_
+        // reference`'s own doc comment for the full reasoning): `_` may
+        // now be on either side, since the parser parses positionally
+        // and doesn't know which operand is meant as self.
+        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard)
+            || matches!(self.ast.expr(rhs), Expr::Wildcard);
         if !is_placeholder {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
@@ -1236,10 +1262,13 @@ impl<'a> Resolver<'a> {
     /// branches within one function, not force a shared abstraction
     /// across two conceptually separate checks like these.
     fn check_mem_bound_shape(&mut self, bound: ExprId) {
-        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+        let Expr::Binary { lhs, rhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
+        // Stage 3's own operator generalization -- see `check_bound_
+        // self_reference`'s own doc comment.
+        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard)
+            || matches!(self.ast.expr(rhs), Expr::Wildcard);
         if !is_placeholder {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
@@ -1256,10 +1285,13 @@ impl<'a> Resolver<'a> {
     /// checked by SHAPE against `_` too, for the same consistency this
     /// whole retrofit exists for.
     fn check_struct_field_bound_shape(&mut self, bound: ExprId) {
-        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+        let Expr::Binary { lhs, rhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
+        // Stage 3's own operator generalization -- see `check_bound_
+        // self_reference`'s own doc comment.
+        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard)
+            || matches!(self.ast.expr(rhs), Expr::Wildcard);
         if !is_placeholder {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
