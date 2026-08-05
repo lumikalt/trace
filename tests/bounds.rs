@@ -2269,3 +2269,359 @@ module M {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("computed value could reach 60"));
 }
+
+// --- `invariant` (relational bounds, DESIGN.md's "Tier 3, not v0") ---
+//
+// A whole separate mechanism from every scalar/mem/struct-field bound
+// above: a fact about a COMBINATION of several `reg`/`out` defs,
+// checked by its own dedicated induction (`check_relational_bound_
+// induction` in bounds.rs) rather than the ordinary per-item `check_
+// body` walk. `circular_buffer_disjoint.tr` (the FIFO push/pop example)
+// is the real motivating case; these tests isolate each individual
+// soundness gate with the smallest possible fixture.
+
+#[test]
+fn circular_buffer_disjoint_example_verifies_both_invariants() {
+    // The actual driving example, verbatim: `push_count - pop_count <
+    // 9` (occupancy never exceeds capacity) and `(head - tail -
+    // push_count + pop_count) % 8 = 0` (the real FIFO pointer/counter
+    // invariant) both check clean.
+    let src = "\
+module CircularBufferDisjoint {
+    mem m : [8][8]
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+    invariant push_count - pop_count < 9
+    invariant (head - tail - push_count + pop_count) % 8 = 0
+    in push_en : [1]
+    in push_data : [8]
+    in pop_en : [1]
+    out pop_data : [8] = 0
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count < 8)?
+        m[head] := push_data
+        if head < 7 {
+            head := head + 1
+        } else {
+            head := 0
+        }
+        push_count := push_count + 1
+    }
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_data := m[tail]
+        if tail < 7 {
+            tail := tail + 1
+        } else {
+            tail := 0
+        }
+        pop_count := pop_count + 1
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn circular_buffer_weakened_guard_fails_the_occupancy_invariant() {
+    // The load-bearing negative: this feature's own `m[i]` vs `m[2-i]`
+    // analogue. Weakening `push`'s guard from `< 8` to `<= 8` lets
+    // occupancy reach 8 -- `push_count - pop_count < 9` no longer
+    // verifies, confirming the induction genuinely NEEDS the guard as a
+    // hypothesis rather than trivially passing regardless.
+    let src = "\
+module M {
+    reg head : [4] where head < 8 = 0
+    reg tail : [4] where tail < 8 = 0
+    reg push_count : [4] = 0
+    reg pop_count : [4] = 0
+    invariant push_count - pop_count < 9
+    in push_en : [1]
+    in pop_en : [1]
+    rule push {
+        (push_en = 1)?
+        (push_count - pop_count <= 8)?
+        push_count := push_count + 1
+    }
+    rule pop {
+        (pop_en = 1)?
+        (push_count <> pop_count)?
+        pop_count := pop_count + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this invariant is preserved")
+    );
+}
+
+#[test]
+fn invariant_only_module_with_no_other_bounded_def_still_verifies() {
+    // Discriminates `check_item`'s own five-way early-return guard: `a`
+    // has no `where` bound of its own, and nothing else in this module
+    // is bounded either -- only `bump`'s own guard keeps `a - b`'s
+    // induction sound. Not actually load-bearing for THIS feature's own
+    // soundness (its induction is a separate pass, independent of `check
+    // _item`), but pins the guard at five-way anyway, matching this
+    // arc's own established discipline (see bounds.rs's own comment on
+    // that guard).
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant a - b < 9
+    rule bump {
+        (a - b < 8)?
+        a := a + 1
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn invariant_fails_with_no_guard_at_all() {
+    // Without ANY guard limiting it, `a` increments forever -- `a - b`
+    // eventually leaves the declared `[0, 9)` range. Confirms the
+    // induction doesn't just trivially pass regardless of whether a
+    // guard exists.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant a - b < 9
+    rule bump {
+        a := a + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this invariant is preserved")
+    );
+}
+
+#[test]
+fn invariant_modulus_not_dividing_native_width_is_rejected() {
+    // Side-condition negative: 3 doesn't divide 2^4 = 16, so reducing a
+    // mod-16 wrapping computation to mod 3 isn't congruence-preserving
+    // -- rejected at declaration time, not silently mis-proven later.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant (a - b) % 3 < 2
+    rule bump {
+        a := a + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("must be a power of two dividing")
+    );
+}
+
+#[test]
+fn invariant_range_exceeding_its_own_modulus_is_rejected() {
+    // Side-condition negative: a declared upper bound above the
+    // modulus is meaningless (would accept anything once reduced) --
+    // rejected at declaration time.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant a - b < 20
+    rule bump {
+        a := a + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("must fit within its own modulus")
+    );
+}
+
+#[test]
+fn invariant_write_in_only_one_if_branch_with_no_else_is_rejected() {
+    // Post-ship advisor follow-up: `a`'s only write to a relevant def
+    // sits inside an `if` with no `else` -- the TRUE delta is either
+    // `+1` (branch taken) or `0` (branch skipped) depending on a runtime
+    // input, and this pass has no per-path story for that; it must fail
+    // closed rather than silently pick one delta (`deltas_agree` compares
+    // the `then` branch's `{a: 1}` against the implicit `else` branch's
+    // `{}` -- 1 and 0 disagree mod 16).
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant a - b < 9
+    in flag : [1]
+    rule bump {
+        (a - b < 8)?
+        if flag = 1 {
+            a := a + 1
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this invariant: rule")
+    );
+}
+
+#[test]
+fn invariant_verifies_when_a_rules_own_guards_are_jointly_unsatisfiable() {
+    // Post-ship advisor follow-up: `bump`'s own two guards (`a - b < 3`
+    // and `a - b > 5`) can never BOTH hold, so `narrow_combo_range`'s
+    // sequential intersection collapses to an empty `(lo, hi)` with
+    // `lo >= hi` -- `shift_preserves` correctly treats that as vacuously
+    // safe (an unreachable rule proves anything), regardless of how
+    // large the delta is. Paired with the NEXT test (the same delta
+    // under a SATISFIABLE guard) to confirm this isn't just "the check
+    // never runs" -- the delta genuinely would fail if reachable.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant a - b < 9
+    rule bump {
+        (a - b < 3)?
+        (a - b > 5)?
+        a := a + 10
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn invariant_fails_with_the_same_delta_under_a_satisfiable_guard() {
+    // The control for the test above: same `a := a + 10`, but with only
+    // the FIRST guard (satisfiable on its own) -- confirms the induction
+    // genuinely checks the arithmetic rather than always passing.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant a - b < 9
+    rule bump {
+        (a - b < 3)?
+        a := a + 10
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this invariant is preserved")
+    );
+}
+
+#[test]
+fn invariant_coefficient_other_than_plus_or_minus_one_is_rejected() {
+    // v1 restriction: no scalar multiplication in an invariant's own
+    // linear combination.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant 2 * a - b < 9
+    rule bump {
+        a := a + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("coefficient exactly +-1"));
+}
+
+#[test]
+fn invariant_write_hidden_behind_a_call_is_rejected() {
+    // Gate #1 (flagged before this feature was implemented): a rule
+    // writing a named register only through a `fn`/`impl` call -- never
+    // a directly-visible `Stmt::Assign` -- must fail this bound closed,
+    // not silently compute a delta of zero for a write that's actually
+    // there. Bug-reintroduction-style: this is exactly the shape that
+    // WOULD silently pass if `walk_deltas`'s own findings weren't cross-
+    // checked against `effects.rs`'s `sig.writes`.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    invariant a - b < 9
+    Bump() {
+        a := a + 1
+    }
+    rule bump {
+        (a - b < 8)?
+        Bump()
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("not through a directly-visible `Stmt::Assign`")
+    );
+}
+
+#[test]
+fn invariant_with_more_than_two_contributing_rules_is_rejected() {
+    // v1 restriction: at most two rules may write registers a single
+    // invariant names.
+    let src = "\
+module M {
+    reg a : [4] = 0
+    reg b : [4] = 0
+    reg c : [4] = 0
+    invariant a - b - c < 9
+    rule bump_a {
+        (a - b - c < 8)?
+        a := a + 1
+    }
+    rule bump_b {
+        (a <> b)?
+        b := b - 1
+    }
+    rule bump_c {
+        (a <> c)?
+        c := c - 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("more than two rules write registers")
+    );
+}

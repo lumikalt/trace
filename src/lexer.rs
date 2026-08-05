@@ -61,6 +61,11 @@ pub enum TokenKind {
     Schedule,
     #[token("struct")]
     Struct,
+    /// `invariant <expr>` — a module-level, statically PROVEN relational
+    /// fact spanning multiple `reg`/`out` defs (`bounds.rs`); see
+    /// `Item::Invariant`'s own doc comment (ast.rs).
+    #[token("invariant")]
+    Invariant,
     #[token("tick")]
     Tick,
     /// `break` -- exits the enclosing `while`/`while let` loop early,

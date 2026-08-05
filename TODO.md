@@ -3392,14 +3392,37 @@ manually in the meantime.
   existing example; `--firrtl` sanity check confirmed clean codegen.
   See `schedule.rs`'s own module doc, "A seventh case," for the full
   writeup.
-- **OPEN — the relational half of tier-3, `examples/circular_buffer_
-  disjoint.tr` (`push`/`pop`'s disjointness depends on the joint write
-  history of four registers), is still NOT built.** Closing it for real
-  needs either a bound that can reference OTHER registers (real
-  dependent/refinement types) or a purpose-built cross-register
-  invariant check across write sites, the way `bounds.rs` already
-  checks scalar bounds — a meaningfully bigger undertaking than the
-  mirrored-index case above, deliberately left as its own next step.
+- **RESOLVED (`bounds.rs` half) / OPEN (`schedule.rs` consumer half) —
+  the relational half of tier-3, `examples/circular_buffer_disjoint.tr`.**
+  A new `invariant <expr>` item declares a fact about a COMBINATION of
+  several `reg`/`out` defs (a signed ±1-coefficient sum, optionally
+  `% <const>`, compared against a literal), checked by its own dedicated
+  induction entirely separate from every scalar/mem/struct-field bound's
+  own `check_body` walk — base case from each involved def's own literal
+  init, inductive step covering every rule that writes an involved def
+  AND every subset of those rules co-firing the same cycle (sound only
+  because v0's scheduling model guarantees no two co-firing rules ever
+  write the same def — a `bounds.rs` soundness argument now depends on a
+  `schedule.rs` invariant, flagged explicitly in both files). The
+  example's own two facts (`push_count - pop_count < 9`,
+  `(head - tail - push_count + pop_count) % 8 = 0`) both verify;
+  load-bearing negative (weaken `push`'s guard to admit occupancy 8) and
+  side-condition negatives (a modulus not dividing the native width, a
+  declared range exceeding its own modulus, a coefficient other than
+  ±1, a write hidden behind a call, more than two contributing rules)
+  all confirmed rejected. **`--explain-schedule` on the real example is
+  UNCHANGED (byte-diff confirmed)** — proving these facts does NOT
+  retire the derived stall: verified directly that `mem_disjoint`
+  (`schedule.rs`) requires EVERY shared def in a rule pair to be
+  mem-kind before attempting an index proof at all, and `push`/`pop`'s
+  shared set includes two plain scalar regs (`push_count`/`pop_count`),
+  so an `m[head]` vs `m[tail]` proof would be completely INERT here, not
+  merely low-payoff. Building the `schedule.rs` consumer (per-def
+  partial exemption, guard-aware disjointness) is therefore DEFERRED —
+  its entire payoff on this example is dropping `m` from the reported
+  set while the stall persists regardless, left as its own future
+  undertaking should a different driving case ever need it. See
+  DESIGN.md's "Tier 3, not v0" section for the full writeup.
 - **RESOLVED — a `conflict_free` mem read/write pair the disjointness
   proof above can't close now gets a checked runtime assertion, not just
   a trusted claim** (`firrtl/module.rs`'s `conflict_free_mem_check_N`,

@@ -490,6 +490,7 @@ pub(crate) fn emit_module(
             | Item::Schedule { .. }
             | Item::Module { .. }
             | Item::Struct { .. }
+            | Item::Invariant { .. }
             | Item::ExtModule { .. } => {}
         }
     }

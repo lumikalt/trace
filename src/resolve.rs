@@ -467,6 +467,7 @@ impl<'a> Resolver<'a> {
             }
             Item::Struct { name, .. } => (name.clone(), DefKind::Struct),
             Item::Schedule { .. } => return,
+            Item::Invariant { .. } => return,
         };
         let def = self.declare(&name, kind);
         self.res
@@ -766,6 +767,15 @@ impl<'a> Resolver<'a> {
                         );
                     }
                 }
+            }
+            // Every ident inside an `invariant` expression already names
+            // a real, in-scope `reg`/`out` (there's no self-reference
+            // placeholder to special-case, unlike a `Reg`/`Mem`/`Fn`
+            // bound) -- an ordinary expression resolve. `bounds.rs`'s own
+            // `collect_relational_bounds` does the shape recognition and
+            // reports anything it doesn't recognize.
+            Item::Invariant { expr } => {
+                self.resolve_expr(*expr, false);
             }
         }
     }

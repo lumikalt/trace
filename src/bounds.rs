@@ -495,6 +495,104 @@
 //!   `--firrtl` sanity check (both the compiler's own emitter and real
 //!   `firtool`) came back clean.
 //!
+//! - **Relational bounds across MULTIPLE `reg`/`out` defs (`invariant
+//!   <expr>`)**: DESIGN.md's "Tier 3, not v0" circular-buffer case —
+//!   `push`/`pop`'s FIFO pointer/counter invariant (`head - tail ==
+//!   push_count - pop_count`, mod depth) is a fact about a COMBINATION of
+//!   four registers' joint write history, not any one or two registers'
+//!   own values, and every prior bound in this file is exactly that: a
+//!   single def's own range. A new item, `invariant <expr>` (a signed sum
+//!   of `reg`/`out` idents, coefficients restricted to exactly ±1 — v1, no
+//!   scalar multiplication — optionally reduced modulo an explicit `%
+//!   <const>`, an existing operator, no new grammar; compared via
+//!   `<`/`<=`/`=` against a literal), collected into `relational_bounds`
+//!   and checked by a DEDICATED induction (`check_relational_bound_
+//!   induction`) entirely separate from `check_item`/`check_body` — the
+//!   base case sums each involved def's own literal `= init`; the
+//!   inductive step finds every rule that writes an involved def
+//!   (`walk_deltas`, computing each rule's own NET signed delta to the
+//!   combination) and checks every SUBSET of those rules co-firing the
+//!   SAME cycle, not just each in isolation — a genuinely different
+//!   induction step than any single-def bound ever needed, since two
+//!   simultaneously-firing rules' deltas can stack in a way neither
+//!   alone would reveal. Sound only because v0's own scheduling model
+//!   guarantees no two co-firing rules ever write the SAME def (a
+//!   write-write conflict is rejected outright, `schedule.rs:451`), so
+//!   summing independently-computed deltas is exactly the joint effect —
+//!   a `bounds.rs` soundness argument now depending on a `schedule.rs`
+//!   invariant, flagged explicitly rather than left implicit.
+//!
+//!   A rule's own leading guard narrows the induction hypothesis, but
+//!   ONLY when its linear form EXACTLY matches the invariant's own terms
+//!   (same defs, same coefficients) — a non-matching guard is silently
+//!   ignored, always sound (a wider hypothesis than strictly justified is
+//!   still safe, never the reverse). `circular_buffer_disjoint.tr`'s own
+//!   `push_count - pop_count < 9` needs exactly this (both `push`'s `<
+//!   8` and `pop`'s `push_count <> pop_count` narrow it — the latter a
+//!   bare ident-vs-ident comparison, recognized by folding both sides into
+//!   `(lhs - rhs) <op> 0`, not `push_count - pop_count <> 0` literally);
+//!   its `(head - tail - push_count + pop_count) % 8 = 0` needs no guard
+//!   at all, since every rule's own delta to that combination cancels to
+//!   exactly zero. Confirmed genuinely different proof shapes, not
+//!   assumed: weakening `push`'s guard from `< 8` to `<= 8` (admitting the
+//!   exact occupancy-8 case it exists to rule out) makes the FIRST fact
+//!   fail to verify — the load-bearing negative, this feature's own
+//!   `m[i]` vs `m[2 - i]` analogue — while the second is unaffected either
+//!   way.
+//!
+//!   One subtlety caught before shipping: `head`'s own `else { head := 0
+//!   }` branch (taken when `head == 7`, via the SAME `where head < 8` +
+//!   negated-condition narrowing v15 already established) computes delta
+//!   `0 - 7 = -7`, but the `then` branch (`head := head + 1`) computes
+//!   `+1` — NOT equal as raw integers, but congruent mod 8 (the second
+//!   fact's own declared modulus). Requiring EXACT integer equality
+//!   between a branch pair's own deltas (checked first, before the
+//!   congruence relaxation) would have wrongly rejected the example's own
+//!   motivating case; `deltas_agree` compares modulo the bound's declared
+//!   modulus instead, since that's genuinely all the final arithmetic
+//!   ever needs (`shift_preserves`'s own final containment check already
+//!   reduces the combined delta mod `modulus`).
+//!
+//!   Gate #1 (flagged before implementation): a rule writing a named
+//!   register only through a `fn`/`impl` call — never a directly-visible
+//!   `Stmt::Assign` — must fail this bound closed, not silently compute a
+//!   delta of zero for a write that's actually there. `walk_deltas`'s own
+//!   findings are cross-checked against `effects.rs`'s `sig.writes`
+//!   (which already accounts for a write reached transitively through a
+//!   call, unlike this pass's own direct-assignment walk); any mismatch
+//!   fails the whole bound closed. Bug-reintroduction-verified with a
+//!   dedicated test.
+//!
+//!   Two side conditions rejected at DECLARATION time, not discovered
+//!   mid-induction: the declared modulus must be a power of two dividing
+//!   the involved defs' own native width (`M | 2^W` — reducing a mod-16
+//!   wrapping computation to a NON-divisor, e.g. mod 3, isn't congruence-
+//!   preserving); the declared range must fit within its own modulus
+//!   (`upper <= M` — a wider range would silently accept anything once
+//!   reduced). `check_item`'s own early-return guard widened again
+//!   (FIVE-way, `relational_bounds.is_empty()`) for consistency with this
+//!   arc's established discipline, though not actually load-bearing for
+//!   THIS feature's own soundness (its induction never depends on `check_
+//!   item` running at all).
+//!
+//!   v1 restrictions, deliberate scope cuts matching this file's existing
+//!   bar: at most TWO rules may write registers a single invariant names
+//!   (more fails closed — a real restriction, not a silent gap); a write's
+//!   RHS must be `<def> +/- <const>` or a literal under a branch that
+//!   pins `<def>` to an exact singleton (anything else fails closed); no
+//!   `While`/`IfLet`/`WhileLet` inside a contributing rule's body at all
+//!   (unconditional — no motivating example needs one). `--explain-
+//!   schedule` on `circular_buffer_disjoint.tr` is UNCHANGED by this
+//!   (byte-diff confirmed identical, across every OTHER example too):
+//!   proving these two facts does NOT retire the derived stall on its own
+//!   — verified directly that `schedule.rs`'s `mem_disjoint` requires
+//!   EVERY shared def in a rule pair to be mem-kind before attempting an
+//!   index proof at all, and `push`/`pop`'s shared set includes two plain
+//!   scalar regs, making an `m[head]` vs `m[tail]` proof completely INERT
+//!   here (not merely low-payoff) — see DESIGN.md's "Tier 3" section for
+//!   the full accounting of why the `schedule.rs` consumer half is
+//!   deferred rather than built.
+//!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
 //! `types/collect.rs`'s `WIDEN_CAP` loop exists because a WIDTH is one
@@ -594,6 +692,32 @@ struct BoundedDef {
     width: u64,
 }
 
+/// One `invariant` item's own declared fact (see `Item::Invariant`'s
+/// doc comment, ast.rs) -- a signed sum of `reg`/`out` `DefId`s (v1
+/// restriction: every coefficient is exactly +-1, no scalar
+/// multiplication -- matching this feature's only two motivating facts,
+/// `push_count - pop_count` and `head - tail - push_count + pop_count`),
+/// evaluated modulo `modulus` and declared to stay within `[lower,
+/// upper)`. Unlike `BoundedDef` (a single def's OWN range, narrowed
+/// per-branch in `self.bounded`'s `state` map), this is a flat,
+/// whole-program fact about a COMBINATION of defs, checked by a
+/// dedicated induction (`check_relational_bound_induction`) entirely
+/// separate from the ordinary per-item `check_body` walk -- see that
+/// function's own doc comment for the full argument.
+/// `recognize_comparison`'s own return shape: `(op, terms, const)` — a
+/// type alias purely to keep that signature (and its one call site)
+/// readable, per clippy's own suggestion; no behavior of its own.
+type Comparison = (BinOp, Vec<(DefId, i64)>, u64);
+
+#[derive(Clone)]
+struct RelationalBound {
+    terms: Vec<(DefId, i64)>,
+    modulus: u64,
+    lower: u64,
+    upper: u64,
+    span: Span,
+}
+
 pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, Vec<BoundsError>) {
     let mut checker = Checker {
         ast,
@@ -613,6 +737,8 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         mem_bounds: HashMap::new(),
         mem_bound_span: HashMap::new(),
         struct_field_bounds: HashMap::new(),
+        relational_bounds: Vec::new(),
+        reg_out_inits: HashMap::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
@@ -626,6 +752,18 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
     // that uses it, or forward-referenced across modules).
     checker.collect_struct_field_bounds();
     checker.check_struct_field_inits();
+    // Tier-3 relational bounds (`invariant`, DESIGN.md's "Tier 3, not
+    // v0" circular-buffer case): collected and checked entirely
+    // separately from every other bound above, via its own dedicated
+    // induction -- see `check_relational_bound_induction`'s own doc
+    // comment. Runs AFTER `collect_bounded_defs` so `self.bounded`
+    // (needed for a matching guard's own `where`-bound narrowing, e.g.
+    // `head`/`tail`'s `where < 8`) is already populated.
+    checker.collect_relational_bounds();
+    checker.check_relational_bound_inits();
+    for i in 0..checker.relational_bounds.len() {
+        checker.check_relational_bound_induction(i);
+    }
     let bodied = checker.collect_bodied_items();
     for id in &bodied {
         checker.check_item(*id);
@@ -756,6 +894,19 @@ struct Checker<'a> {
     /// mem/fifo-typed struct value never passes through a checked
     /// `StructLit` at all, exactly like an unwritten mem address).
     struct_field_bounds: HashMap<(DefId, String), BoundedDef>,
+    /// Every declared `invariant` (DESIGN.md's "Tier 3, not v0"
+    /// circular-buffer case) recognized by `collect_relational_bounds`
+    /// -- an item that FAILED to recognize (an unsupported shape,
+    /// reported at collection time) never gets an entry here at all,
+    /// same "collect only what was successfully validated" convention
+    /// `self.bounded`/`mem_bounds`/`struct_field_bounds` already follow.
+    relational_bounds: Vec<RelationalBound>,
+    /// Every `reg`/`out`'s own `= init` expression, keyed by `DefId` --
+    /// populated by `collect_relational_bounds`'s own walk (piggybacked
+    /// onto the same traversal, rather than a separate one) purely so
+    /// `check_relational_bound_inits` has a reverse `DefId -> init`
+    /// lookup; `res.item_defs` only maps the other direction.
+    reg_out_inits: HashMap<DefId, Option<ExprId>>,
     errors: Vec<BoundsError>,
 }
 
@@ -1195,6 +1346,671 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Every `Item::Invariant` (`DESIGN.md`'s "Tier 3, not v0"), plus
+    /// (piggybacked onto the same walk) every `reg`/`out`'s own `= init`
+    /// expression into `reg_out_inits` -- `check_relational_bound_inits`
+    /// needs a `DefId -> init` reverse lookup that nothing else in this
+    /// file maintains (`res.item_defs` only maps the other direction).
+    /// An `Item::Invariant` whose expression doesn't recognize as this
+    /// feature's one supported shape reports its own error here and
+    /// simply never gets a `relational_bounds` entry -- the same
+    /// "collect only what was successfully validated" convention every
+    /// other `collect_*` function in this file already follows.
+    fn collect_relational_bounds(&mut self) {
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            match self.ast.item(id).clone() {
+                Item::Module { items, .. } => stack.extend(items.iter().copied()),
+                Item::Reg { init, .. } | Item::Output { init, .. } => {
+                    if let Some(&def) = self.res.item_defs.get(&id) {
+                        self.reg_out_inits.insert(def, init);
+                    }
+                }
+                Item::Invariant { expr } => {
+                    if let Some(rb) = self.recognize_invariant(expr) {
+                        self.relational_bounds.push(rb);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Parses the TOP-LEVEL shape of an `invariant <expr>` item: an
+    /// optional `% <const>` modulus peeled off the LHS (an existing
+    /// binary operator, `BinOp::Rem` -- no new grammar), a comparison
+    /// (`<`/`<=`/`==`) against a literal constant, and a linear form
+    /// (`linear_form`) underneath. Every failure path reports its own
+    /// error and returns `None` -- there is no silent "collected but
+    /// inert" state for an unrecognized invariant, matching this file's
+    /// existing "fails closed, with a diagnostic" convention.
+    fn recognize_invariant(&mut self, expr: ExprId) -> Option<RelationalBound> {
+        let span = self.ast.expr_spans[expr.0 as usize].clone();
+        let unsupported = "an `invariant` must be a comparison (`<`, `<=`, or `==`) of a \
+                            signed sum of `reg`/`out` idents (each with coefficient exactly \
+                            +-1) -- optionally wrapped in `% <const>` -- against a literal \
+                            constant";
+        let Expr::Binary { op, lhs, rhs } = self.ast.expr(expr).clone() else {
+            self.error(span, unsupported.to_string());
+            return None;
+        };
+        let Some(c) = const_fold(self.ast, rhs) else {
+            self.error(span, unsupported.to_string());
+            return None;
+        };
+        // Peel an optional `% <const>` off the LHS -- the declared
+        // modulus, when the user wrote one explicitly (Fact 2's shape:
+        // `head - tail - push_count + pop_count) % 8 == 0`). Absent
+        // (Fact 1's shape: `push_count - pop_count < 9`), the modulus
+        // defaults to the involved defs' own native width below.
+        let (inner, modulus_expr) = match self.ast.expr(lhs).clone() {
+            Expr::Binary {
+                op: BinOp::Rem,
+                lhs: inner,
+                rhs: m,
+            } => (inner, Some(m)),
+            _ => (lhs, None),
+        };
+        let Some(terms) = self.linear_form(inner) else {
+            self.error(span, unsupported.to_string());
+            return None;
+        };
+        if terms.is_empty() {
+            self.error(span, unsupported.to_string());
+            return None;
+        }
+        if terms.iter().any(|(_, coeff)| coeff.abs() != 1) {
+            self.error(
+                span,
+                "each register in an `invariant`'s linear combination must appear with \
+                 coefficient exactly +-1 (v1 restriction: no scalar multiplication)"
+                    .to_string(),
+            );
+            return None;
+        }
+        let mut width = None;
+        for (def, _) in &terms {
+            let Some(w) = base_width(self.ty, *def) else {
+                self.error(
+                    span,
+                    "an `invariant` needs every named reg/out to have a concretely-known \
+                     `bits[N]` width (v0 restriction)"
+                        .to_string(),
+                );
+                return None;
+            };
+            match width {
+                None => width = Some(w),
+                Some(w0) if w0 != w => {
+                    self.error(
+                        span,
+                        "every reg/out named in the same `invariant` must share the same \
+                         declared width (v1 restriction)"
+                            .to_string(),
+                    );
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let width = width.expect("terms is non-empty, checked above");
+        let Some(natural) = 1u64.checked_shl(width as u32) else {
+            self.error(
+                span,
+                "this invariant's own native width is too wide to check".to_string(),
+            );
+            return None;
+        };
+        let modulus = match modulus_expr {
+            Some(m) => match const_fold(self.ast, m) {
+                Some(v) => v,
+                None => {
+                    self.error(span, unsupported.to_string());
+                    return None;
+                }
+            },
+            None => natural,
+        };
+        // Side condition (flagged before any of this was implemented):
+        // a modulus that doesn't divide the operands' own native
+        // wraparound isn't congruence-preserving -- reducing a mod-16
+        // wrapping computation to its low 3 bits is sound (8 | 16);
+        // reducing it to, say, mod 5 is not. Rejected HERE, at
+        // declaration time, rather than silently mis-proving later.
+        if modulus == 0 || !modulus.is_power_of_two() || natural % modulus != 0 {
+            self.error(
+                span,
+                format!(
+                    "an `invariant`'s declared modulus ({modulus}) must be a power of two \
+                     dividing the involved registers' own native width (2^{width} = \
+                     {natural}) -- a modulus that doesn't divide the native wraparound isn't \
+                     congruence-preserving"
+                ),
+            );
+            return None;
+        }
+        let (lower, upper) = match op {
+            BinOp::Lt => (0, c),
+            BinOp::Le => (0, c.saturating_add(1)),
+            BinOp::Eq => (c, c.saturating_add(1)),
+            _ => {
+                self.error(span, unsupported.to_string());
+                return None;
+            }
+        };
+        // A second side condition: a declared range that doesn't fit
+        // within its own modulus is meaningless (and would silently
+        // accept anything once reduced) -- rejected here, not
+        // discovered mid-induction.
+        if lower >= upper || upper > modulus {
+            self.error(
+                span,
+                format!(
+                    "this invariant's declared range [{lower}, {upper}) must fit within its \
+                     own modulus ({modulus})"
+                ),
+            );
+            return None;
+        }
+        Some(RelationalBound {
+            terms,
+            modulus,
+            lower,
+            upper,
+            span,
+        })
+    }
+
+    /// Decomposes an `Add`/`Sub` tree of `reg`/`out` idents into a
+    /// signed sum of `(DefId, coefficient)` pairs (merging repeated
+    /// occurrences of the same def) -- `None` for anything this v1
+    /// restriction doesn't recognize (a literal alone with no ident at
+    /// all, a `Mul`, a `Call`, an `in`/mem/fifo/local ident, ...). Shared
+    /// by `recognize_invariant` (the declaration itself) and
+    /// `recognize_comparison` (a candidate co-firing guard, matched
+    /// against a declared invariant's own terms).
+    fn linear_form(&self, expr: ExprId) -> Option<Vec<(DefId, i64)>> {
+        match self.ast.expr(expr).clone() {
+            Expr::Ident(_) => {
+                let def = self.res.expr_defs.get(&expr).copied()?;
+                match self.res.def(def).kind {
+                    crate::resolve::DefKind::Reg | crate::resolve::DefKind::Output => {
+                        Some(vec![(def, 1)])
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } => {
+                let mut l = self.linear_form(lhs)?;
+                l.extend(self.linear_form(rhs)?);
+                Some(merge_terms(l))
+            }
+            Expr::Binary {
+                op: BinOp::Sub,
+                lhs,
+                rhs,
+            } => {
+                let mut l = self.linear_form(lhs)?;
+                l.extend(self.linear_form(rhs)?.into_iter().map(|(d, c)| (d, -c)));
+                Some(merge_terms(l))
+            }
+            _ => None,
+        }
+    }
+
+    /// The GUARD-matching sibling of `recognize_invariant`: parses a
+    /// bare comparison (no `%` peeling -- an ordinary rule guard never
+    /// needs one) into `(op, terms, const)`, for `narrow_combo_range` to
+    /// compare against a declared invariant's own `terms`. Returns
+    /// `None` for any shape `recognize_invariant` would also reject --
+    /// silently, since a non-matching or unrecognized guard is simply
+    /// IGNORED by the induction (see `narrow_combo_range`'s own doc
+    /// comment for why that's always sound, never a soundness gap).
+    ///
+    /// Tries `<linear> <op> <const>` first (`push_count - pop_count <
+    /// 8`); a real rule guard just as often compares two BARE idents
+    /// directly (`push_count <> pop_count`, not `push_count - pop_count
+    /// <> 0`) -- confirmed against `circular_buffer_disjoint.tr`'s own
+    /// `pop` guard, which is exactly this shape -- so this also tries
+    /// `<linear> <op> <linear>`, folding both sides into `(lhs - rhs)
+    /// <op> 0`.
+    fn recognize_comparison(&self, expr: ExprId) -> Option<Comparison> {
+        let Expr::Binary { op, lhs, rhs } = self.ast.expr(expr).clone() else {
+            return None;
+        };
+        if !matches!(
+            op,
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+        ) {
+            return None;
+        }
+        let valid = |terms: &[(DefId, i64)]| {
+            !terms.is_empty() && terms.iter().all(|(_, coeff)| coeff.abs() == 1)
+        };
+        if let Some(c) = const_fold(self.ast, rhs)
+            && let Some(terms) = self.linear_form(lhs)
+            && valid(&terms)
+        {
+            return Some((op, terms, c));
+        }
+        if let (Some(l), Some(r)) = (self.linear_form(lhs), self.linear_form(rhs)) {
+            let mut terms = l;
+            terms.extend(r.into_iter().map(|(d, c)| (d, -c)));
+            let terms = merge_terms(terms);
+            if valid(&terms) {
+                return Some((op, terms, 0));
+            }
+        }
+        None
+    }
+
+    /// The base case: every relational bound's own combination, folded
+    /// from each involved def's literal `= init` (via `reg_out_inits`),
+    /// must already lie in its declared `[lower, upper)` range mod
+    /// `modulus` -- the same "the induction needs a verified starting
+    /// point" requirement every other bound in this file already
+    /// enforces, just checked against a combination instead of a single
+    /// def.
+    fn check_relational_bound_inits(&mut self) {
+        for rb in self.relational_bounds.clone() {
+            let mut total: i64 = 0;
+            let mut ok = true;
+            for (def, coeff) in &rb.terms {
+                let Some(Some(init_expr)) = self.reg_out_inits.get(def).copied() else {
+                    ok = false;
+                    break;
+                };
+                let Some(v) = const_fold(self.ast, init_expr) else {
+                    ok = false;
+                    break;
+                };
+                total += coeff * (v as i64);
+            }
+            if !ok {
+                self.error(
+                    rb.span.clone(),
+                    "cannot verify this invariant's base case: every reg/out it names needs \
+                     a literal `= init`"
+                        .to_string(),
+                );
+                continue;
+            }
+            let reduced = total.rem_euclid(rb.modulus as i64) as u64;
+            if !(rb.lower..rb.upper).contains(&reduced) {
+                self.error(
+                    rb.span.clone(),
+                    format!(
+                        "this invariant's base case fails: at reset, the combination's value \
+                         is {reduced} (mod {}), outside the declared [{}, {}) range",
+                        rb.modulus, rb.lower, rb.upper
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The inductive step: every RULE that writes any def named in
+    /// `self.relational_bounds[index]` contributes its own NET delta to
+    /// the combination (`walk_deltas`); every SUBSET of these rules'
+    /// simultaneous firing is checked to keep the combination inside its
+    /// declared range (`shift_preserves`), using whichever of the
+    /// firing rules' own leading guards happen to match this
+    /// combination's exact shape to narrow the induction hypothesis
+    /// (`narrow_combo_range`) -- see DESIGN.md's "Tier 3" writeup for
+    /// the full worked example this mirrors (`circular_buffer_disjoint
+    /// .tr`'s `head - tail == push_count - pop_count` FIFO invariant).
+    ///
+    /// v1 restricts this to AT MOST TWO contributing rules, and requires
+    /// (gate #1, flagged before this was written) that `effects.rs`'s
+    /// own `sig.writes` for each contributing rule -- which already
+    /// accounts for a write reached transitively through a `fn`/`impl`
+    /// call, unlike this pass's own direct-`Stmt::Assign` walk -- agree
+    /// EXACTLY with what `walk_deltas` found: a rule that writes a named
+    /// def only through a call (never a directly-visible assignment)
+    /// fails this bound closed rather than silently computing a delta
+    /// of zero for it and proving something a real write could break.
+    ///
+    /// The co-fire enumeration (every subset of the contributing rules)
+    /// is sound only because v0's scheduling model guarantees no two
+    /// SIMULTANEOUSLY-firing rules ever write the SAME def: a write-
+    /// write conflict is rejected outright (`schedule.rs`'s own
+    /// `Exemption::ConflictFree`-on-`WriteWrite` error), so each
+    /// contributing rule's delta can be summed independently for
+    /// whichever subset actually fires, with no ordering or double-
+    /// counting question to resolve. This makes a `bounds.rs` soundness
+    /// argument depend on a `schedule.rs` invariant -- flagged
+    /// explicitly here (as the deferred `schedule.rs`-consumer half of
+    /// this feature already is in DESIGN.md) so a future change to that
+    /// scheduling model doesn't silently invalidate this one.
+    fn check_relational_bound_induction(&mut self, index: usize) {
+        let rb = self.relational_bounds[index].clone();
+        let relevant: HashSet<DefId> = rb.terms.iter().map(|(d, _)| *d).collect();
+        let base_state: HashMap<DefId, (u64, u64)> = self
+            .bounded
+            .iter()
+            .map(|(d, b)| (*d, (b.lower, b.upper)))
+            .collect();
+
+        struct Contribution {
+            guards: Vec<ExprId>,
+            delta: i64,
+        }
+        let mut contributions: Vec<Contribution> = Vec::new();
+
+        for id in self.collect_bodied_items() {
+            let Item::Rule { body, .. } = self.ast.item(id).clone() else {
+                continue; // a plain `fn`/`impl` never fires on its own
+            };
+            let Some(sig) = self.fx.sigs.get(&id) else {
+                continue;
+            };
+            let sig_writes: HashSet<DefId> = sig
+                .writes
+                .iter()
+                .filter(|d| relevant.contains(d))
+                .copied()
+                .collect();
+            if sig_writes.is_empty() {
+                continue; // this rule never touches anything this bound names
+            }
+            let Some(deltas) = self.walk_deltas(&body, &relevant, &base_state, rb.modulus) else {
+                self.error(
+                    rb.span.clone(),
+                    format!(
+                        "cannot verify this invariant: rule `{}` writes a register it names \
+                         through a shape this pass doesn't recognize -- only `<def> := <def> \
+                         +/- <const>`, a literal write under a branch that pins `<def>` to an \
+                         exact value, or matching if/else branches are supported (v1 \
+                         restriction)",
+                        self.rule_name(id)
+                    ),
+                );
+                return;
+            };
+            let direct: HashSet<DefId> = deltas.keys().copied().collect();
+            if direct != sig_writes {
+                self.error(
+                    rb.span.clone(),
+                    format!(
+                        "cannot verify this invariant: rule `{}` writes a register it names, \
+                         but not through a directly-visible `Stmt::Assign` -- likely through a \
+                         `fn`/`impl` call, which this pass doesn't trace into",
+                        self.rule_name(id)
+                    ),
+                );
+                return;
+            }
+            let delta: i64 = deltas
+                .iter()
+                .map(|(d, v)| {
+                    let coeff = rb
+                        .terms
+                        .iter()
+                        .find(|(td, _)| td == d)
+                        .map(|(_, c)| *c)
+                        .unwrap_or(0);
+                    coeff * v
+                })
+                .sum();
+            contributions.push(Contribution {
+                guards: self.leading_guards(&body),
+                delta,
+            });
+        }
+
+        if contributions.len() > 2 {
+            self.error(
+                rb.span.clone(),
+                "cannot verify this invariant: more than two rules write registers it names \
+                 (v1 restriction -- only a two-rule producer/consumer pair is supported)"
+                    .to_string(),
+            );
+            return;
+        }
+
+        let n = contributions.len();
+        for mask in 0u32..(1 << n) {
+            let mut delta = 0i64;
+            let mut range = (rb.lower, rb.upper); // the induction hypothesis
+            for (i, contribution) in contributions.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    delta += contribution.delta;
+                    for &guard in &contribution.guards {
+                        range = self.narrow_combo_range(&rb, guard, range);
+                    }
+                }
+            }
+            if !shift_preserves(range, delta, rb.modulus, rb.lower, rb.upper) {
+                self.error(
+                    rb.span.clone(),
+                    format!(
+                        "cannot verify this invariant is preserved (checked across every \
+                         subset of the rules that write registers it names, including all \
+                         firing the same cycle): the combination could reach a value outside \
+                         the declared [{}, {}) range (mod {})",
+                        rb.lower, rb.upper, rb.modulus
+                    ),
+                );
+                return;
+            }
+        }
+    }
+
+    /// This rule's own leading `(cond)?` guard statements -- stops at
+    /// the first non-guard statement, a v1 restriction matching this
+    /// feature's own driving example (every guard in this language
+    /// convention sits at the top of a rule body). A guard appearing
+    /// later is simply never found here, which only means the induction
+    /// has less to narrow with -- always sound, never unsound, per
+    /// `narrow_combo_range`'s own "ignore what doesn't match" argument.
+    fn leading_guards(&self, body: &[StmtId]) -> Vec<ExprId> {
+        let mut out = Vec::new();
+        for &sid in body {
+            match self.ast.stmt(sid) {
+                Stmt::Expr(e) => match self.ast.expr(*e) {
+                    Expr::Guard(inner) => out.push(*inner),
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Narrows `range` (a hypothesized `[lower, upper)` for `rb`'s own
+    /// combination, entering this cycle) using ONE firing rule's own
+    /// guard -- but ONLY when that guard's own linear form is EXACTLY
+    /// `rb`'s own terms (same defs, same coefficients): `push_count -
+    /// pop_count < 8` narrows Fact 1's own `push_count - pop_count`
+    /// combination directly; `head - tail - push_count + pop_count == 0`
+    /// (Fact 2) is untouched by either rule's guard, since neither
+    /// guard's terms match Fact 2's four-def combination at all.
+    ///
+    /// A non-matching guard is silently ignored, mirroring `narrow_for_
+    /// condition`'s own per-scalar-def narrowing formulas exactly (`Lt`/
+    /// `Le`/`Gt`/`Ge` narrow one end; `Ne` narrows an end ONLY when the
+    /// excluded constant sits exactly on it) -- always sound: ignoring a
+    /// true fact only leaves the induction with a WIDER hypothesis than
+    /// necessary, never a narrower one than justified.
+    fn narrow_combo_range(
+        &self,
+        rb: &RelationalBound,
+        guard: ExprId,
+        range: (u64, u64),
+    ) -> (u64, u64) {
+        let Some((op, terms, c)) = self.recognize_comparison(guard) else {
+            return range;
+        };
+        if !same_terms(&terms, &rb.terms) {
+            return range;
+        }
+        let (lo, hi) = range;
+        match op {
+            BinOp::Lt => (lo, hi.min(c)),
+            BinOp::Le => (lo, hi.min(c.saturating_add(1))),
+            BinOp::Gt => match c.checked_add(1) {
+                Some(floor) => (floor.max(lo), hi),
+                None => range,
+            },
+            BinOp::Ge => (c.max(lo), hi),
+            BinOp::Ne if c == lo => (lo.saturating_add(1), hi),
+            BinOp::Ne if hi > 0 && c == hi - 1 => (lo, hi.saturating_sub(1)),
+            _ => range,
+        }
+    }
+
+    /// One rule body's own NET delta to every def in `relevant`, as
+    /// exact signed integers reduced mod `modulus` -- `None` the instant
+    /// any write to a relevant def can't be pinned to an exact constant
+    /// delta, or any OTHER statement shape touches a relevant def at all
+    /// (a v1 restriction: `While`/`IfLet`/`WhileLet` are never supported
+    /// here, matching/motivated by nothing in `circular_buffer_disjoint
+    /// .tr` needing them). An `if`/`else` with MISMATCHED deltas (mod
+    /// `modulus`) on its two branches also fails closed -- this feature
+    /// needs ONE static delta per rule, not a per-path case split.
+    fn walk_deltas(
+        &self,
+        body: &[StmtId],
+        relevant: &HashSet<DefId>,
+        state: &HashMap<DefId, (u64, u64)>,
+        modulus: u64,
+    ) -> Option<HashMap<DefId, i64>> {
+        let mut deltas: HashMap<DefId, i64> = HashMap::new();
+        for &sid in body {
+            match self.ast.stmt(sid).clone() {
+                // A relevant def READ anywhere -- a guard, an `if`
+                // condition, a mem index, an ordinary RHS -- is always
+                // harmless to this delta walk; only a WRITE to a
+                // relevant def matters, and a def in `relevant` (always
+                // `DefKind::Reg | DefKind::Output`, per `linear_form`'s
+                // own gate) can only ever be WRITTEN via a bare `Ident`
+                // `Stmt::Assign` LHS -- a mem/fifo/struct-field write's
+                // own LHS shape (`Bracket`/`Field`) can reference a
+                // relevant def only as something being READ (an index,
+                // a base), never as the def being assigned. So nothing
+                // here needs a fail-closed check beyond `exact_delta`'s
+                // own restrictiveness for the one shape that DOES write
+                // a relevant def.
+                Stmt::Assign { lhs, rhs } => {
+                    if let Expr::Ident(_) = self.ast.expr(lhs)
+                        && let Some(def) = self.res.expr_defs.get(&lhs).copied()
+                        && relevant.contains(&def)
+                    {
+                        let d = self.exact_delta(def, rhs, state)?;
+                        *deltas.entry(def).or_insert(0) += d;
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_state = self.narrow_for_condition(cond, state);
+                    let then_deltas =
+                        self.walk_deltas(&then_body, relevant, &then_state, modulus)?;
+                    let else_deltas = match else_body {
+                        Some(else_body) => {
+                            let else_state = self.narrow_for_else(cond, state);
+                            self.walk_deltas(&else_body, relevant, &else_state, modulus)?
+                        }
+                        None => HashMap::new(),
+                    };
+                    if !deltas_agree(&then_deltas, &else_deltas, modulus) {
+                        return None;
+                    }
+                    for (d, v) in then_deltas {
+                        *deltas.entry(d).or_insert(0) += v;
+                    }
+                }
+                // `While`/`IfLet`/`WhileLet` are unconditionally
+                // unsupported here (v1 restriction) -- not because a
+                // relevant def read/written inside one is unsound to
+                // model, but because this pass has no per-iteration
+                // delta story for a loop at all, and no motivating
+                // example needs one. A rule using one of these for a
+                // reason UNRELATED to any relational bound still fails
+                // this bound closed (an honest, documented over-
+                // restriction, not a silent gap).
+                Stmt::While { .. } | Stmt::IfLet { .. } | Stmt::WhileLet { .. } => {
+                    return None;
+                }
+                Stmt::Expr(_) | Stmt::Let { .. } | Stmt::Return(_) | Stmt::Tick | Stmt::Break => {}
+            }
+        }
+        Some(deltas)
+    }
+
+    /// The exact signed delta `rhs` applies to `def`'s own current
+    /// value, given `def`'s bare write `def := rhs` -- recognizes
+    /// exactly two shapes: `def +/- <const>` (the delta IS the
+    /// constant, regardless of `def`'s own current value), or a bare
+    /// literal (the delta is `literal - def`'s CURRENT value, which
+    /// needs `def` pinned to an exact singleton in `state` -- e.g. the
+    /// `else { head := 0 }` branch of `if head < 7 {...} else {...}`,
+    /// where `narrow_for_else` (already applied by the caller) pins
+    /// `head` to exactly 7 via its own `where head < 8` bound). `None`
+    /// for anything else -- this pass's own fail-closed default.
+    fn exact_delta(
+        &self,
+        def: DefId,
+        rhs: ExprId,
+        state: &HashMap<DefId, (u64, u64)>,
+    ) -> Option<i64> {
+        match self.ast.expr(rhs).clone() {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } => {
+                if self.is_ident_for(lhs, def) {
+                    const_fold(self.ast, rhs).map(|k| k as i64)
+                } else if self.is_ident_for(rhs, def) {
+                    const_fold(self.ast, lhs).map(|k| k as i64)
+                } else {
+                    None
+                }
+            }
+            Expr::Binary {
+                op: BinOp::Sub,
+                lhs,
+                rhs,
+            } => {
+                if self.is_ident_for(lhs, def) {
+                    const_fold(self.ast, rhs).map(|k| -(k as i64))
+                } else {
+                    None
+                }
+            }
+            Expr::Int(k) => {
+                let (lo, hi) = state.get(&def).copied()?;
+                if lo + 1 == hi {
+                    Some(k as i64 - lo as i64)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn is_ident_for(&self, expr: ExprId, def: DefId) -> bool {
+        matches!(self.ast.expr(expr), Expr::Ident(_)) && self.res.expr_defs.get(&expr) == Some(&def)
+    }
+
+    /// `self.res.def(...).name`, given a rule/fn `ItemId` -- purely for
+    /// this feature's own diagnostics.
+    fn rule_name(&self, id: ItemId) -> &str {
+        self.res
+            .item_defs
+            .get(&id)
+            .map(|def| self.res.def(*def).name.as_str())
+            .unwrap_or("?")
+    }
+
     /// All rule/fn items, recursively through modules — the same
     /// exhaustive walk `types/collect.rs`'s `check_all` and
     /// `effects.rs`'s `collect_bodied_items` both already do; callees
@@ -1292,11 +2108,22 @@ impl<'a> Checker<'a> {
         // no other bounded reg/out/param/return/mem anywhere -- caught
         // by advisor review of this feature's own plan before any code
         // was written, the same bug class flagged (and discriminated
-        // with a dedicated driving example) at v17 above.
+        // with a dedicated driving example) at v17 above. Widened again
+        // (FIVE-way) for `relational_bounds` -- not actually load-bearing
+        // for that feature's own soundness (its induction, `check_
+        // relational_bound_induction`, is a fully separate pass that
+        // never depends on this per-item walk running at all), but kept
+        // consistent with this arc's own established discipline: the
+        // exact bug class this guard exists to close has been found four
+        // times running, and a module whose only bounded thing is an
+        // `invariant` is precisely the shape that would trip it if this
+        // guard were ever repurposed to gate something that DOES depend
+        // on it.
         if self.bounded.is_empty()
             && self.fn_ret_bound.is_empty()
             && self.mem_bounds.is_empty()
             && self.struct_field_bounds.is_empty()
+            && self.relational_bounds.is_empty()
         {
             return; // nothing to check anywhere in the program
         }
@@ -2506,4 +3333,88 @@ fn def_of_name(res: &Resolution, name: &crate::ast::Name) -> DefId {
         .find(|(_, d)| d.span == name.span)
         .map(|(i, _)| DefId(i as u32))
         .expect("a resolved binding name always has a matching def")
+}
+
+/// Sums coefficients for repeated occurrences of the same `DefId`
+/// (`a - a` cancels to nothing) and drops any zero-coefficient result —
+/// `linear_form`'s own normal form.
+fn merge_terms(terms: Vec<(DefId, i64)>) -> Vec<(DefId, i64)> {
+    let mut merged: Vec<(DefId, i64)> = Vec::new();
+    for (def, coeff) in terms {
+        if let Some(existing) = merged.iter_mut().find(|(d, _)| *d == def) {
+            existing.1 += coeff;
+        } else {
+            merged.push((def, coeff));
+        }
+    }
+    merged.retain(|(_, coeff)| *coeff != 0);
+    merged
+}
+
+/// Whether two linear forms name exactly the same defs with exactly the
+/// same coefficients — order-independent (`narrow_combo_range`'s own
+/// "does this guard match this invariant's combination" check).
+fn same_terms(a: &[(DefId, i64)], b: &[(DefId, i64)]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let bmap: HashMap<DefId, i64> = b.iter().copied().collect();
+    a.iter().all(|(d, c)| bmap.get(d) == Some(c))
+}
+
+/// Whether two branches' own per-def deltas agree MODULO `modulus` —
+/// deliberately NOT exact integer equality: `head`'s `if head < 7 {
+/// head := head + 1 } else { head := 0 }` yields delta `+1` on the THEN
+/// side but `-7` on the ELSE side (`0 - 7`, since `narrow_for_else`
+/// pins `head` to exactly 7 there) — genuinely different integers, but
+/// congruent mod 8 (the declared modulus for `circular_buffer_disjoint
+/// .tr`'s own invariant), which is all `shift_preserves` ever needs:
+/// its own final check already reduces the combined delta mod `rb.
+/// modulus`, so two per-def deltas differing by an exact multiple of it
+/// are interchangeable for that purpose. Missing on one side means 0.
+fn deltas_agree(a: &HashMap<DefId, i64>, b: &HashMap<DefId, i64>, modulus: u64) -> bool {
+    let defs: HashSet<DefId> = a.keys().chain(b.keys()).copied().collect();
+    defs.iter().all(|d| {
+        let av = a.get(d).copied().unwrap_or(0);
+        let bv = b.get(d).copied().unwrap_or(0);
+        (av - bv).rem_euclid(modulus as i64) == 0
+    })
+}
+
+/// Whether shifting every value in `range` (a hypothesized `[lo, hi)`,
+/// `hi` exclusive) by `delta`, then reducing modulo `modulus`, still
+/// lands entirely within the declared `[lower, upper)` range — the
+/// arithmetic core of `check_relational_bound_induction`'s inductive
+/// step. An EMPTY hypothesis range (`lo >= hi`, an unreachable
+/// combination of narrowing guards) is vacuously fine — a false premise
+/// proves anything, the same reasoning `narrow_for_else`'s own doc
+/// comment already relies on for an unreachable `else` branch.
+///
+/// Critically, this does NOT reduce `lo`/`hi` independently: it reduces
+/// `lo + delta` into `[0, modulus)` by SOME multiple `k` of `modulus`,
+/// then requires `hi - 1 + delta` to reduce by that SAME `k` — i.e. the
+/// shifted interval must not itself straddle a modulus boundary. A
+/// plain "reduce each endpoint independently" shift would wrongly
+/// accept a straddling interval (e.g. `[-8, -7)` naively "wrapping" to
+/// `[8, 9)` when reduced independently mod 8, even though `-8 mod 8 ==
+/// 0`, the two ends reducing by DIFFERENT multiples) — the exact
+/// mistake flagged before this was written, using `circular_buffer_
+/// disjoint.tr`'s own `head`-in-the-`else`-branch case (delta `-8` on
+/// the four-term Fact 2 combination, `M = 8`) as the worked example.
+fn shift_preserves(range: (u64, u64), delta: i64, modulus: u64, lower: u64, upper: u64) -> bool {
+    let (lo, hi) = range;
+    if lo >= hi {
+        return true;
+    }
+    let real_lo = lo as i64 + delta;
+    let real_hi_inclusive = hi as i64 - 1 + delta;
+    let k = real_lo.div_euclid(modulus as i64);
+    let reduced_lo = real_lo - k * modulus as i64;
+    let reduced_hi_inclusive = real_hi_inclusive - k * modulus as i64;
+    if reduced_hi_inclusive >= modulus as i64 {
+        return false; // straddles the modulus boundary -- can't soundly reduce
+    }
+    let reduced_lo = reduced_lo as u64;
+    let reduced_hi_exclusive = reduced_hi_inclusive as u64 + 1;
+    reduced_lo >= lower && reduced_hi_exclusive <= upper
 }

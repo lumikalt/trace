@@ -245,10 +245,11 @@ impl<'a> Parser<'a> {
                 self.parse_fn(FnFlavor::Impl).into_iter().collect()
             }
             Some(Schedule) => self.parse_schedule().into_iter().collect(),
+            Some(Invariant) => self.parse_invariant().into_iter().collect(),
             _ => {
                 self.error_here(
                     "expected an item (module, extmodule, struct, reg, mem, fifo, in, out, \
-                     io, attach, rule, schedule, or a function)"
+                     io, attach, rule, schedule, invariant, or a function)"
                         .to_string(),
                 );
                 self.sync();
@@ -983,6 +984,22 @@ impl<'a> Parser<'a> {
         Some(
             self.ast
                 .push_item(Item::Schedule { directives }, lo..self.prev_end),
+        )
+    }
+
+    /// `invariant <expr>` — a bare expression statement at module level,
+    /// no new grammar beyond the keyword itself: `bounds.rs`'s own
+    /// `collect_relational_bounds` recognizes the shape (a signed sum of
+    /// reg/out idents and literals, optionally `% <const>`, compared
+    /// against a literal) and rejects anything else.
+    fn parse_invariant(&mut self) -> Option<ItemId> {
+        let lo = self.cur_span().start;
+        self.bump(); // invariant
+        let expr = self.parse_expr(0)?;
+        self.expect_terminator();
+        Some(
+            self.ast
+                .push_item(Item::Invariant { expr }, lo..self.prev_end),
         )
     }
 

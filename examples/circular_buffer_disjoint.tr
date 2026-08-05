@@ -44,13 +44,39 @@
 -- case can't be closed by annotating `head`/`tail` with a TIGHTER
 -- `where` bound either, since their full, correct range really is
 -- `[0, 8)` each -- the missing fact is relational, not a tighter
--- per-register interval. Proving it needs either real dependent/
--- refinement types (a bound that can reference OTHER registers, not
--- just literal constants) or a purpose-built invariant like "head -
--- tail == push_count - pop_count (mod depth)" checked across every
--- write site the way `bounds.rs` already checks scalar bounds --
--- exactly the kind of capability this arc has never built, and the
--- concrete motivating case for building it.
+-- per-register interval.
+--
+-- RESOLVED (bounds.rs's own half, the `mem_disjoint`/`schedule.rs`
+-- consumer half is a SEPARATE, still-open undertaking -- see DESIGN.md):
+-- the two `invariant` declarations below are exactly the relational
+-- facts described above, checked by induction across every write site
+-- in `push`/`pop` (including both firing the SAME cycle) the way
+-- `bounds.rs` already checks an ordinary scalar `where` bound:
+--
+--   invariant push_count - pop_count < 9
+--
+-- ("occupancy" never exceeds capacity 8, so `push_count - pop_count`,
+-- computed mod 16, is exactly the true occupancy in `[0, 8]`), and
+--
+--   invariant (head - tail - push_count + pop_count) % 8 = 0
+--
+-- (the real FIFO invariant: `head` has advanced exactly `push_count -
+-- pop_count` positions past `tail`, mod 8). Both verify cleanly; the
+-- first's inductive step genuinely needs `push`'s and `pop`'s own
+-- guards as a hypothesis (proven via a NEW argument recognizing a
+-- guard's own linear form, not just a bare `<def> < <const>` shape);
+-- the second's deltas cancel to zero on every write site regardless of
+-- either guard. `--explain-schedule` on this file is UNCHANGED by this
+-- (still reports the same three-way conflict) -- proving these two
+-- facts doesn't, by itself, retire the `push_count`/`pop_count` write-
+-- meets-read hazard (an ordinary scalar hazard, unrelated to mem index
+-- reasoning at all: each rule's guard reads the OTHER rule's counter).
+-- The `schedule.rs`-side consumer that would use these facts to prove
+-- `m[head]` vs `m[tail]` disjoint (and which, even then, would only
+-- drop `m` from the reported conflict set, not clear the stall) is
+-- deferred -- see DESIGN.md's "Tier 3" section for the full accounting
+-- of why that consumer's payoff on THIS example is much smaller than
+-- the bounds.rs half's own soundness argument.
 module CircularBufferDisjoint {
     mem m : [8][8]
 
@@ -58,6 +84,9 @@ module CircularBufferDisjoint {
     reg tail : [4] where tail < 8 = 0
     reg push_count : [4] = 0
     reg pop_count : [4] = 0
+
+    invariant push_count - pop_count < 9
+    invariant (head - tail - push_count + pop_count) % 8 = 0
 
     in push_en : [1]
     in push_data : [8]

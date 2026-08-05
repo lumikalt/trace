@@ -534,6 +534,21 @@ pub enum Item {
         name: Name,
         fields: Vec<Param>,
     },
+    /// `invariant <expr>;` — a module-level, statically PROVEN relational
+    /// fact spanning MULTIPLE `reg`/`out` defs (`bounds.rs`), unlike
+    /// `Reg`/`Output`'s own `bound`, which is a single def's own range.
+    /// `expr` is parsed as an ordinary expression, no new grammar: a
+    /// signed sum of reg/out idents and integer literals, optionally
+    /// wrapped in `% <const>` (the declared modulus — an existing binary
+    /// operator, not new syntax), compared via `<`/`<=`/`==` against a
+    /// literal. `bounds.rs`'s `collect_relational_bounds` recognizes this
+    /// shape and rejects anything else; resolve.rs only resolves the
+    /// idents inside `expr` (ordinary variable references, no self-
+    /// reference placeholder — every ident here already names a real,
+    /// in-scope def, unlike `_` in a `Reg`/`Mem`/`Fn` bound).
+    Invariant {
+        expr: ExprId,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -885,6 +900,9 @@ impl Ast {
                         self.expr_sexpr(field.ty)
                     ));
                 }
+            }
+            Item::Invariant { expr } => {
+                out.push_str(&format!("{pad}invariant {}\n", self.expr_sexpr(*expr)));
             }
             Item::ExtModule { name, path, ports } => {
                 out.push_str(&format!("{pad}extmodule {name} from {path:?}\n"));

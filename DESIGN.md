@@ -3839,7 +3839,12 @@ designing against nothing). Two, deliberately different shapes:
   This is the genuinely general tier-3 shape — closing it for real needs
   either a bound that can reference OTHER registers (real dependent/
   refinement types) or a purpose-built invariant check across write sites
-  the way `bounds.rs` already checks scalar bounds.
+  the way `bounds.rs` already checks scalar bounds. **The `bounds.rs` half
+  RESOLVED** (a new `invariant` item, checked entirely separately from every
+  scalar/mem/struct-field bound above — see below); **the `schedule.rs`
+  consumer half deferred** (see the accounting after this list for why its
+  payoff on THIS example turned out much smaller than expected, once
+  actually checked rather than assumed).
 - `examples/mirrored_index_disjoint.tr`: `write` accesses `m[i]`, `read`
   accesses `m[7 - i]` — a purely ALGEBRAIC fact (odd `7` means `i` and
   `7 - i` can never coincide for any integer `i`), no state history involved
@@ -3870,11 +3875,97 @@ designing against nothing). Two, deliberately different shapes:
   confirmed clean codegen. See `schedule.rs`'s own module doc, "A seventh
   case," for the full writeup.
 
-`examples/circular_buffer_disjoint.tr` (the genuinely relational half) is
-still NOT built — this exists to give a FUTURE "time for the type system?"
-ask an actual program to point at, rather than resolving to nothing (as
-the previous six asks did) or building real dependent/refinement types
-against no motivating case at all.
+**`examples/circular_buffer_disjoint.tr`'s `bounds.rs` half, resolved.** A
+new item, `invariant <expr>`, declares a fact about a COMBINATION of
+several `reg`/`out` defs — a signed sum with coefficients exactly ±1
+(v1 restriction: no scalar multiplication), optionally reduced modulo an
+explicit `% <const>` (an existing operator, no new grammar), compared via
+`<`/`<=`/`=` against a literal. The example declares exactly the two facts
+its own comment describes:
+
+```
+invariant push_count - pop_count < 9
+invariant (head - tail - push_count + pop_count) % 8 = 0
+```
+
+Checked by a dedicated induction (`bounds.rs`'s `check_relational_bound_
+induction`), entirely SEPARATE from the ordinary per-item `check_body`
+walk every other bound in this file uses — a deliberate architectural
+split (flagged before any code was written): a relational bound spans
+MULTIPLE defs across potentially different rules, so its base case (every
+involved def's own literal `= init`, summed with signs) and inductive step
+(every RULE that writes an involved def contributes its own delta; every
+SUBSET of these rules firing the SAME cycle is checked, not just each
+alone) are both genuinely different shapes from a single scalar bound's
+own per-statement walk.
+
+The co-fire enumeration (checking `∅`, `{push}`, `{pop}`, `{push, pop}` —
+not just each rule in isolation) is sound only because v0's scheduling
+model guarantees no two SIMULTANEOUSLY-firing rules ever write the SAME
+def (a write-write conflict is rejected outright, `schedule.rs:451`), so
+each rule's own delta can be summed independently for whichever subset
+fires. This makes a `bounds.rs` soundness argument depend on a `schedule
+.rs` invariant — the same class of coupling as the deferred consumer half
+below, and worth re-checking if that scheduling model ever changes.
+
+A rule's own leading guard narrows the induction hypothesis on the
+combination's value — but ONLY when that guard's own linear form is
+EXACTLY the invariant's own terms (same defs, same coefficients): `push`'s
+`push_count - pop_count < 8` directly narrows the first invariant's own
+combination; `pop`'s `push_count <> pop_count` (a bare ident-vs-ident
+comparison, not `push_count - pop_count <> 0` — recognized by folding both
+sides into `(lhs - rhs) <op> 0`) narrows the other end. Neither rule's
+guard touches the second invariant's four-def combination at all, since
+neither guard's own terms match it — correctly ignored (never a soundness
+gap: ignoring a true fact only widens the hypothesis, never narrows it
+past what's justified).
+
+The two facts needed genuinely different proof shapes, confirmed rather
+than assumed: the first's inductive step depends on the guard hypothesis
+(weakening `push`'s guard from `< 8` to `<= 8` — admitting the exact
+occupancy-8 case the guard exists to rule out — makes it fail to verify,
+the load-bearing negative test, this feature's own `m[i]` vs `m[2 - i]`
+analogue); the second's every rule delta cancels to exactly zero
+regardless of any guard (`head`'s coefficient +1 delta +1 exactly offsets
+`push_count`'s coefficient −1 delta +1, and symmetrically for `pop`), so
+it verifies unconditionally. One subtlety that would have silently broken
+the second fact: `head`'s own `else { head := 0 }` branch (taken when
+`head == 7`, via the SAME `where head < 8` + negated-condition narrowing
+`schedule.rs`'s own v15 feature already established) computes a delta of
+`0 − 7 = −7` on that branch, but `+1` on the `then` branch — NOT equal as
+raw integers, but congruent mod 8 (the declared modulus). Requiring exact
+integer equality between a branch pair's own deltas (the first draft of
+this check) would have wrongly rejected the example; the fix compares
+deltas modulo the bound's OWN declared modulus instead, since that's
+genuinely all the final arithmetic needs.
+
+`--explain-schedule` on the real example is UNCHANGED by this (byte-diff
+confirmed identical, along with every other example in the suite) —
+proving these two facts does NOT, by itself, retire the derived stall.
+That's expected, not a bug: `mem_disjoint` (`schedule.rs`) requires EVERY
+shared read/write def in a rule pair to be mem-kind before it even
+attempts an index-disjointness proof (`rw.iter().all(|def| kind == Mem &&
+...)`) — and `push`/`pop`'s shared set is `{m, push_count, pop_count}`,
+where the latter two are plain scalar regs, not mem. So even a complete
+`m[head]` vs `m[tail]` index proof would be COMPLETELY INERT on this
+example: not merely low-payoff, but never even consulted, since the
+all-mem gate fails before `one_mem_disjoint` is ever called. Verified
+directly (not assumed) by deleting `m` and its two accesses from a
+scratch copy of the example: `--explain-schedule` still reports `write
+meets read on {push_count, pop_count}`, an ordinary scalar write-meets-
+read hazard (each rule's OWN guard reads the OTHER rule's counter — see
+the example's own comment for why that's inherent to any producer/
+consumer pair, not an artifact of this construction) with nothing to do
+with mem indexing at all.
+
+Building the `schedule.rs` consumer (per-def partial exemption replacing
+`mem_disjoint`'s current all-or-nothing gate, plus threading two rules'
+guards into the index-disjointness path) is therefore DEFERRED — its
+entire payoff on this example would be dropping `m` from the reported
+`on` set while the stall itself persists regardless, a much smaller win
+than the `bounds.rs` half's own soundness argument. Left as its own,
+separate future undertaking, should a driving case ever need it (unlike
+this example, where the win doesn't materialize).
 
 The checked `conflict_free` assertion above is not a smaller version of this
 tier, and does not retire it: it checks a runtime PRECONDITION (do these two
