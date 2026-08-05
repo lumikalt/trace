@@ -958,6 +958,47 @@ module M {
 }
 
 #[test]
+fn wildcard_placeholder_resolves_in_a_struct_field_bound() {
+    // v18's own sibling of the mem/return-bound placeholder tests above
+    // -- `_` is a shape placeholder for a struct field's own value, not
+    // a real scoped binding (checked by `check_struct_field_bound_
+    // shape`, not ordinary identifier lookup) -- a struct field has no
+    // `DefId` of its own at all (`DefKind::Struct`'s own doc comment).
+    let src = "\
+struct Pair {
+    valid : [1]
+    data : [8] where _ < 50
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn struct_field_bound_referencing_the_field_s_own_name_is_an_error() {
+    let src = "\
+struct Pair {
+    valid : [1]
+    data : [8] where data < 50
+}
+
+module M {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("must reference the field's own value via `_`")
+    );
+}
+
+#[test]
 fn where_bound_referencing_the_same_output_resolves() {
     let src = "\
 module M {

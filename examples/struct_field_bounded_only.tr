@@ -1,0 +1,17 @@
+-- Discriminates `check_item`'s own four-way early-return guard: no
+-- OTHER bounded reg/out/param/return/mem exists anywhere in this
+-- module, only a bounded struct field -- an out-of-range write here
+-- must still be rejected, the same driving shape v17's own
+-- `mem_elem_bounded_only.tr` uses for the analogous three-way guard.
+struct Pair {
+    valid : [1]
+    data : [8] where _ < 50
+}
+
+module StructFieldBoundedOnly {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+
+    rule write {
+        p := Pair{ valid: 1, data: 60 }
+    }
+}

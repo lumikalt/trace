@@ -1,0 +1,24 @@
+-- A struct field can declare its own `where` bound (v18), checked at
+-- every `StructLit` construction site -- a struct-typed reg/out's
+-- mandatory `= init` and every subsequent whole-value write, exactly
+-- the same "checked write, trusted read" induction v5's own scalar
+-- reg/out bound already rests on. Unlike v17's mem-element bound, this
+-- one's read side IS sound: `p`'s value only ever comes from a checked
+-- `StructLit`, never an unwritten address the way a mem read can be.
+struct Pair {
+    valid : [1]
+    data : [8] where _ < 50
+}
+
+module StructFieldBounded {
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    out y : [8] = 0
+
+    rule write {
+        p := Pair{ valid: 1, data: 40 }
+    }
+
+    rule read {
+        y := p.data
+    }
+}

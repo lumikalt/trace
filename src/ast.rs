@@ -312,12 +312,14 @@ pub struct Effect {
     pub args: Vec<Name>,
 }
 
-/// `bound`/`lower` (v12): only meaningful on an `Item::Fn`/`Impl`
-/// parameter, never on `Item::Struct`'s own `fields: Vec<Param>` (a
-/// struct field has no call site to check an obligation against) --
-/// always `None` there. Mirrors `Item::Reg`'s own `bound`/`lower`
-/// fields exactly; see `bounds.rs`'s module doc comment for how a
-/// bounded param is checked as an obligation at every call site.
+/// `bound`/`lower` (v12): on an `Item::Fn`/`Impl` parameter, a call-site
+/// obligation checked at every call (see `bounds.rs`'s module doc). On
+/// `Item::Struct`'s own `fields: Vec<Param>` (v18), a flat per-field
+/// value bound checked at every `StructLit` construction site and
+/// (soundly, for a reg/out or a struct-typed local bound directly to a
+/// literal) composed back at reads -- see `bounds.rs`'s `struct_field_
+/// bounds`/`struct_field_bound`. Mirrors `Item::Reg`'s own `bound`/
+/// `lower` fields in shape either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
     pub name: Name,

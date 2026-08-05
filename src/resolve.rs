@@ -548,9 +548,25 @@ impl<'a> Resolver<'a> {
             // implicit-param binding (`in_type: false`): a struct
             // declaration has no call site to infer a generic width
             // from, unlike a fn's params.
+            //
+            // v18: a field's own `where` bound mirrors `Item::Mem`'s own
+            // handling exactly -- the placeholder (`_`) is never a real
+            // scoped binding, so only the bound's constant RHS resolves
+            // normally; the placeholder itself is checked by SHAPE in
+            // `check_struct_field_bound_shape`, not passed through
+            // `resolve_expr`.
             Item::Struct { fields, .. } => {
                 for field in fields.clone() {
                     self.resolve_expr(field.ty, false);
+                    if let Some(bound) = field.bound {
+                        self.check_struct_field_bound_shape(bound);
+                        if let Expr::Binary { rhs, .. } = self.ast.expr(bound).clone() {
+                            self.resolve_expr(rhs, false);
+                        }
+                    }
+                    if let Some(lower) = field.lower {
+                        self.resolve_expr(lower, false);
+                    }
                 }
             }
             // Same shape as `Struct`'s fields: an extmodule's ports are
@@ -1202,6 +1218,28 @@ impl<'a> Resolver<'a> {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
                 "a mem bound must reference each element via `_` (e.g. `where _ < 20`)".to_string(),
+            );
+        }
+    }
+
+    /// v18's own sibling of `check_mem_bound_shape`/`check_ret_bound_
+    /// shape` immediately above -- same reasoning: a struct field has no
+    /// scoped `DefId` of its own (`DefKind::Struct`'s own doc comment:
+    /// field names are "never separately declared... resolved
+    /// contextually by types.rs"), so its self-reference position is
+    /// checked by SHAPE against `_` too, for the same consistency this
+    /// whole retrofit exists for.
+    fn check_struct_field_bound_shape(&mut self, bound: ExprId) {
+        let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
+            return;
+        };
+        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
+        if !is_placeholder {
+            self.error(
+                self.ast.expr_spans[lhs.0 as usize].clone(),
+                "a struct field bound must reference the field's own value via `_` (e.g. \
+                 `where _ < 20`)"
+                    .to_string(),
             );
         }
     }

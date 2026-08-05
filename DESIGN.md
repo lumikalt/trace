@@ -3339,6 +3339,169 @@ v0 restrictions, all deliberate scope cuts:
   decision point — a real, sound write-side proof, deliberately NOT a
   read-side one; struct-field `where` remains the other half, still
   unbuilt and undecided.
+- **`where` on struct fields, WITH sound read composition (v18)** — the
+  other half of v16's own left-open alternative, picked up directly
+  after Lumi asked for it by name. `struct Pair { data : [8] where _ <
+  50 }` declares a bound on the field, checked at every `StructLit`
+  construction site (a reg/out's mandatory `= init`, or any later
+  whole-value write — `types/stmt.rs` already requires a struct-typed
+  state write be a `StructLit` or a `Call`, nothing else) — the same
+  per-site induction v5's own scalar reg/out bound rests on, just one
+  layer deeper.
+
+  Investigation before implementing overturned v16/v17's own
+  characterization of this as "smaller, pure plumbing": a struct-typed
+  reg/out has exactly the checked-base-case-plus-checked-every-write
+  induction that already makes a SCALAR reg/out's bound sound (its
+  init is mandatory and checked; every subsequent write is ALSO always
+  a checked literal) — unlike a mem, there is no "unwritten address"
+  concept for a struct at all. So read composition (`total := p.data`)
+  is genuinely SOUND here, the opposite of what v17 found for mem
+  elements — this feature is actually the RICHER of the two
+  alternatives, not the smaller one.
+
+  That soundness argument has one real hole, found during design
+  review (before any code was written, unlike v17's mid-implementation
+  catch): `in q : Pair` — a struct-typed INPUT PORT — is real and
+  directly tested (`tests/firrtl.rs`'s `struct_typed_input_port_
+  flattens_and_reads_by_field`); its bits arrive over an external wire,
+  never through a checked `StructLit` at all, exactly as untrusted as
+  an unwritten mem address. So `q.data` must NOT compose, mirroring why
+  v17 kept a mem read composing to `None`. Closed by a `DefKind` gate
+  in the new `struct_field_bound` (`bounds.rs`) — the field is trusted
+  ONLY when the base expression is a bare `Reg`/`Output` ident (checked
+  against the flat `struct_field_bounds` declared fact directly, sound
+  per the induction above) or a `Local` this pass itself traced back to
+  a checked literal (`struct_origins`, populated at `Stmt::Let` — sound
+  because a struct-typed local can ONLY ever bind directly to a literal
+  in this language, aliasing another struct value being a separate v0
+  restriction); every other origin (`Input`, `Mem`, `Fifo`, `Io`,
+  `Param`, ...) falls through to `None` unconditionally. This is the
+  same class of hole v17 hit, found again here through a different
+  door, one design-review pass earlier in the process.
+
+  `struct_origins: HashMap<DefId, ExprId>` is threaded as a THIRD
+  parameter alongside `state`/`locals` through `expr_bound`/`check_
+  calls_in`/`check_body`/`check_stmt`, cloned and discarded on entry to
+  every nested scope exactly like `locals` already is — caught by
+  advisor review of this feature's own plan BEFORE implementation: a
+  flat `self`-field (the first design considered, reasoning from
+  `site_ranges`'s own "insert once, no merge needed" precedent) would
+  have silently leaked a branch-local struct binding's trust past the
+  branch it was computed in, since `site_ranges`'s own reasoning
+  (keyed by `ExprId`, read at the SAME site) doesn't transfer to
+  something keyed by `DefId` and read at a DIFFERENT program point —
+  exactly the shape `state`/`locals` already exist to handle correctly.
+
+  `check_item`'s own early-return guard widened to a FOUR-way check
+  (bounded-def/return-bound/mem-bound/struct-field-bound maps all
+  empty) — also caught by advisor review of the plan before any code
+  was written, the identical "gated the descent on the wrong condition"
+  bug class v14 found four times and v17 flagged again for its own
+  three-way guard. Discriminated by `examples/struct_field_bounded_
+  only.tr` (no other bounded def in the module) — confirmed by
+  bug-reintroduction that reverting the guard lets an out-of-range
+  struct write through silently.
+
+  Unlike v13/v17, this feature needs NO new exhaustiveness check for
+  "a declared bound with zero check sites": a struct-typed reg/out's
+  `= init` is mandatory (parser-enforced, same as a scalar reg/out), so
+  every such def always has at least one guaranteed, checked site —
+  structurally impossible to have zero. A struct type used ONLY via
+  `in`/mem/fifo (never any reg/out) has a field bound that's simply
+  inert for those instances: never checked, but also never TRUSTED at
+  any read (the `DefKind` gate above), so there's no "trusted with
+  nothing verified" gap to close the way v13/v17 needed to. Also unlike
+  the scalar reg/out bound (whose base case is checked in `types/
+  stmt.rs`, via `const_eval` — a types.rs-only capability), this
+  feature's init check (`check_struct_field_inits`) lives entirely in
+  `bounds.rs`: a struct field's init value is always a literal int,
+  which `expr_bound` already natively evaluates, so there's nothing
+  here that actually needs `types.rs`'s own machinery.
+
+  A `Call`-sourced struct write (`p := MakePair()`, the type-checker's
+  OTHER permitted struct-write shape) has no field-by-field
+  verification mechanism at all here and correctly, conservatively
+  fails — a documented v1 restriction, pinned by its own regression
+  test, not a silent skip. A nested struct-of-struct field chain
+  (`outer.inner.x`) is ALSO a documented, deferred v1 restriction:
+  `struct_field_bound`'s match doesn't special-case an `Expr::Field`
+  shape, so it safely composes to `None` rather than attempting a
+  chase that might get the wrong answer.
+
+  9 new tests in `tests/bounds.rs` at initial ship (write-within-bound,
+  write-exceeding-bound, read-composes-through-a-reg — the actual new
+  capability, since v17 shipped with read composition removed entirely
+  — the `in`-port negative test, `..base`-spread composition, the
+  aliased-local negative test, the `Call`-write rejection, the
+  four-way-guard driving case, and the bad-init base case), plus 3 more
+  added post-ship (see below) for 12 total, and 2 in `tests/resolve.rs`
+  (the `_`-placeholder shape check and its own negative case, mirroring
+  the mem/return-bound coverage exactly). Every mechanism bug-
+  reintroduction-verified independently, including — found empirically
+  during a first implementation attempt, not planned — `check_calls_
+  in`'s own stop-list: adding `Expr::Field` to it (reasoning by analogy
+  to `Bracket`'s own v16 addition) broke an EXISTING v16 regression
+  test (`call_argument_hidden_under_a_field_access_in_a_mem_index_is_
+  still_checked`), since `struct_field_bound` doesn't recurse into an
+  unrecognized `base` shape (a `Call`) the way the generic `sub_exprs`
+  walk does — reverted; a bare `Field` used as the WHOLE checked
+  position still composes correctly regardless, since `Stmt::Assign`/
+  `Stmt::Return`/etc. call `expr_bound` on their own top-level
+  expression unconditionally, never through this stop-list at all.
+
+  **Two more real soundness holes, found by an advisor pass AFTER this
+  feature had already shipped and been committed** — both in the base
+  case, both in areas the pre-implementation design review didn't
+  reach. (1) `check_struct_field_inits`'s own doc comment claimed a
+  struct-typed reg/out's `= init` is "mandatory, parser-enforced, same
+  as a scalar reg/out" — WRONG: the scalar init requirement is tied to
+  THAT def's OWN `where` clause (`parse_state_decl`'s own check); a
+  v18 bound lives on the FIELD, so `reg p : Pair` (no `where` on `p`
+  itself) needs no init at all, and the parser has no way to know at
+  parse time whether `Pair` has any bounded field. Confirmed by direct
+  reproduction before fixing anything (this arc's own standing
+  discipline): `reg p : Pair` with no init, `Pair`'s field bounded
+  `10 <= _ < 20`, `total := p.data` compiled with ZERO errors — a real
+  FALSE proof, since a struct-typed reg with no init resets to
+  all-zero fields in FIRRTL, violating any nonzero floor. Fixed by
+  widening `check_struct_field_inits` to reject a missing init
+  whenever the struct type has any bounded field, mirroring the
+  scalar `where_clause_requires_an_explicit_init` restriction exactly,
+  just triggered by the struct's own bounded fields instead of the
+  reg's own `where` clause. (2) A struct-typed LOCAL can be REASSIGNED
+  via `:=` — unlike a reg/out, `types/stmt.rs` places no "must be a
+  StructLit or Call" restriction on a `DefKind::Local` target — so
+  `struct_origins`'s entry from the local's own `Stmt::Let` kept
+  pointing at its ORIGINAL binding forever. Confirmed by direct
+  reproduction: `let p = Pair{data:15}; p := q; total := p.data` (`q`
+  an untrusted `in` port) also compiled with ZERO errors, `p.data`
+  tracing to the stale literal instead of `q`. Fixed by having `Stmt::
+  Assign` overwrite `struct_origins` with the new rhs on every
+  reassignment to a struct-typed local, exactly like `Stmt::Let`
+  already does for the initial binding — `struct_field_bound`'s own
+  recursive trace then correctly follows the CURRENT value. Both fixes
+  bug-reintroduction-verified via scratch files before formalizing
+  into `tests/bounds.rs` (`struct_field_missing_init_is_rejected`,
+  `struct_field_read_through_a_reassigned_local_is_deliberately_not_
+  composed`). A third addition, prompted by the same review: every
+  OTHER struct-field test in this file used a ONE-SIDED bound (`where
+  _ < 50`), where a default-0 value happens to satisfy the bound
+  regardless of whether the base case is actually checked — the
+  two-sided form is the only shape that turns a MISSED check into an
+  OBSERVABLE false proof, so `struct_field_two_sided_bound_composes_
+  through_a_reg` pins the ordinary positive case with a two-sided bound
+  specifically, closing that coverage gap in the test suite itself.
+
+  A normalized `--explain-schedule` diff across every existing example
+  came back byte-identical, and a `--firrtl` sanity check (both the
+  compiler's own emitter and real `firtool`) confirmed clean codegen —
+  re-run after these two post-ship fixes, not just before them. This
+  closes the struct-field half of the alternative left open at v16's
+  own decision point — both halves of that fork are now built, with
+  meaningfully different final shapes (mem: write-only; struct field:
+  write AND sound read composition) neither v16 nor v17 anticipated at
+  the time.
 - **Every `reg`/`out` read is FROZEN, not forward-mutated, for the whole
   body-walk of one item** — the same pre-edge-read invariant every other
   register (and, identically, `out` — DESIGN.md's own "Module ports"
@@ -4878,6 +5041,13 @@ noted:
   read's own value still composes to `None`, unchanged; see "Statically
   proven register bounds"'s own v17 entry for the soundness reason)
   (`examples/mem_elem_bounded.tr`).
+- `struct Name { field : ty where _ < K }` (v18): the same statically
+  PROVEN bound, on a struct field — checked at every `StructLit`
+  construction site, and (unlike v17's mem-element bound) SOUNDLY handed
+  back at read sites too, for a reg/out or a struct-typed local bound
+  directly to a literal (never for an `in`/mem/fifo-typed struct value;
+  see "Statically proven register bounds"'s own v18 entry for the full
+  soundness argument) (`examples/struct_field_bounded.tr`).
 - `elaborates`: compile-time tree recursion over a `list`, one-sided list
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/

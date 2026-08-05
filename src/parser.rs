@@ -318,11 +318,16 @@ impl<'a> Parser<'a> {
                     self.expect(TokenKind::Colon, "`:` before field type")
                         .ok()?;
                     let ty = self.parse_expr(TYPE_MIN_BP)?;
+                    // v18: a field may declare its own `where` bound
+                    // (`data : [8] where _ < 50`), reusing `parse_where_
+                    // bound` unchanged -- the same grammar a reg/out/mem
+                    // declaration already uses.
+                    let (bound, lower) = self.parse_where_bound()?;
                     fields.push(Param {
                         name: fname,
                         ty,
-                        bound: None,
-                        lower: None,
+                        bound,
+                        lower,
                     });
                     self.expect_terminator();
                 }

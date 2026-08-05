@@ -344,6 +344,108 @@
 //!   the PANIC check first (`effects.rs` says written, this pass's own
 //!   walk disagrees), a stronger safety net than the plan anticipated.
 //!
+//! - **`where` on struct fields, WITH sound read composition (v18)**:
+//!   the other half of v16's own left-open alternative, picked up
+//!   directly after Lumi asked for it by name. `struct Pair { data :
+//!   [8] where _ < 50 }` is checked at every `StructLit` construction
+//!   site (a reg/out's mandatory `= init`, or any later whole-value
+//!   write — `types/stmt.rs` requires a struct-typed state write be one
+//!   of those, or a `Call`, never a bare copy).
+//!
+//!   **This overturns v16/v17's own characterization of struct fields
+//!   as "smaller, pure plumbing."** A struct-typed reg/out has exactly
+//!   the checked-base-case-plus-checked-every-write induction that
+//!   already makes a SCALAR reg/out's own bound sound — no "unwritten
+//!   address" concept exists for a struct the way it does for a mem —
+//!   so read composition (`total := p.data`) IS sound here, the
+//!   opposite of what v17 found. Struct-field `where` turned out to be
+//!   the RICHER of the two v16 alternatives, not the smaller one.
+//!
+//!   That argument has one real hole, found during DESIGN REVIEW this
+//!   time (before any code was written — contrast v17, whose analogous
+//!   hole was only caught mid-implementation): `in q : Pair` (a
+//!   struct-typed input port, real and tested — `tests/firrtl.rs`'s
+//!   `struct_typed_input_port_flattens_and_reads_by_field`) never
+//!   passes through a checked `StructLit` at all, exactly as untrusted
+//!   as an unwritten mem address. Closed by a `DefKind` gate in the new
+//!   `struct_field_bound`: a struct value's field is trusted ONLY when
+//!   the base is a bare `Reg`/`Output` ident (against the flat `self.
+//!   struct_field_bounds` declared fact) or a `Local` this pass traced
+//!   back to a checked literal via a new `struct_origins: HashMap<
+//!   DefId, ExprId>` (sound because a struct-typed local can ONLY ever
+//!   bind directly to a literal in this language — aliasing another
+//!   struct value is a separate, pre-existing v0 restriction); every
+//!   OTHER `DefKind` (`Input`, `Mem`, `Fifo`, `Io`, `Param`, ...) falls
+//!   through to `None` unconditionally.
+//!
+//!   `struct_origins` is threaded as a THIRD parameter alongside
+//!   `state`/`locals` through `expr_bound`/`check_calls_in`/`check_
+//!   body`/`check_stmt`, cloned and discarded per nested scope exactly
+//!   like `locals` — caught by ADVISOR REVIEW OF THE PLAN, before any
+//!   code was written: a flat `self`-field (the first design, reasoning
+//!   by analogy to `site_ranges`'s own "insert once" precedent) would
+//!   have silently leaked a branch-local struct binding's trust past
+//!   its own branch, since `site_ranges`'s reasoning (keyed by
+//!   `ExprId`, read at the SAME site) doesn't transfer to something
+//!   keyed by `DefId` and read at a DIFFERENT program point.
+//!
+//!   `check_item`'s own guard widened to a FOUR-way check (`self.
+//!   bounded`/`fn_ret_bound`/`mem_bounds`/`struct_field_bounds` all
+//!   empty) — also caught by advisor review of the plan, the identical
+//!   bug class v14 found four times and v17 flagged again for its own
+//!   three-way guard.
+//!
+//!   Unlike v13/v17, no new "zero check sites" exhaustiveness check is
+//!   needed: a struct-typed reg/out's `= init` is mandatory, so every
+//!   such def always has at least one guaranteed, checked site — and a
+//!   struct type used ONLY via `in`/mem/fifo has a bound that's inert
+//!   for those instances (never checked, but also never TRUSTED at any
+//!   read), not a "trusted with nothing verified" gap. Also unlike the
+//!   scalar reg/out bound (base case checked in `types/stmt.rs`, via
+//!   `const_eval`), this feature's own init check (`check_struct_field_
+//!   inits`) lives entirely in `bounds.rs` — a struct field's init
+//!   value is always a literal int, which `expr_bound` already
+//!   natively evaluates, nothing here needs `types.rs`'s own machinery.
+//!
+//!   A `Call`-sourced struct write and a nested struct-of-struct field
+//!   chain (`outer.inner.x`) are both documented, deferred v1
+//!   restrictions — the former correctly fails (no field-by-field
+//!   mechanism exists for it), the latter safely composes to `None`
+//!   (`struct_field_bound`'s match doesn't special-case `Expr::Field`).
+//!
+//!   **A third finding, empirical, from a first implementation
+//!   attempt**: adding `Expr::Field` to `check_calls_in`'s stop-list
+//!   (by analogy to `Bracket`'s own v16 addition) broke an EXISTING
+//!   v16 regression test (`call_argument_hidden_under_a_field_access_
+//!   in_a_mem_index_is_still_checked`), since `struct_field_bound`
+//!   doesn't recurse into an unrecognized `base` (a `Call`) the way the
+//!   generic `sub_exprs` walk does — reverted immediately.
+//!
+//!   **Two more real holes, found by advisor review AFTER this feature
+//!   had already shipped and been committed — both in the base case,
+//!   neither caught by the pre-implementation plan review.** (1) A
+//!   struct-typed reg/out's `= init` is NOT actually mandatory the way
+//!   a scalar reg/out's is: the scalar requirement is tied to THAT
+//!   def's OWN `where` clause, but a v18 bound lives on the field, so
+//!   `reg p : Pair` (no `where` on `p` itself) needs no init at all —
+//!   `check_struct_field_inits` silently skipped it, unconditionally
+//!   trusting `p`'s field with NOTHING ever verified, a real false
+//!   proof for a two-sided bound (a no-init reg resets to all-zero
+//!   fields, violating a nonzero floor). Fixed by rejecting a missing
+//!   init whenever the struct type has any bounded field. (2) A
+//!   struct-typed LOCAL can be REASSIGNED via `:=` (`types/stmt.rs`'s
+//!   "must be a StructLit or Call" restriction only applies to a
+//!   state target, not a `DefKind::Local`), so `struct_origins`'s entry
+//!   from the local's own `Stmt::Let` kept pointing at its ORIGINAL
+//!   binding forever, tracing a REASSIGNED local's field back to a
+//!   stale, superseded value instead of whatever it was actually
+//!   reassigned to. Fixed by having `Stmt::Assign` overwrite `struct_
+//!   origins` on every reassignment to a struct-typed local, exactly
+//!   like `Stmt::Let` does for the initial binding. Both confirmed by
+//!   direct reproduction before fixing, both bug-reintroduction-
+//!   verified, both closed by a dedicated `tests/bounds.rs` regression
+//!   test.
+//!
 //! # Why a single forward walk, not a fixpoint (unlike `types.rs`'s Pass 2)
 //!
 //! `types/collect.rs`'s `WIDEN_CAP` loop exists because a WIDTH is one
@@ -456,11 +558,20 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         site_ranges: HashMap::new(),
         mem_bounds: HashMap::new(),
         mem_bound_span: HashMap::new(),
+        struct_field_bounds: HashMap::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
     checker.collect_bounded_params();
     checker.collect_mem_bounds();
+    // v18: collect every struct field's own declared bound FIRST, then
+    // check every struct-typed reg/out's `= init` against it in a
+    // second, separate pass -- interleaving collection with checking
+    // would risk checking a reg whose struct type's own fields haven't
+    // been collected yet (a struct declared textually after the reg
+    // that uses it, or forward-referenced across modules).
+    checker.collect_struct_field_bounds();
+    checker.check_struct_field_inits();
     let bodied = checker.collect_bodied_items();
     for id in &bodied {
         checker.check_item(*id);
@@ -564,6 +675,25 @@ struct Checker<'a> {
     /// point an error at a declared bound with no write site to prove it
     /// against.
     mem_bound_span: HashMap<DefId, Span>,
+    /// v18: every struct FIELD with a declared `where _ < K` bound,
+    /// keyed by `(struct's own DefId, field name)` -- a flat, per-
+    /// struct-TYPE declared fact, mirroring `mem_bounds` exactly (never
+    /// narrowed per-branch, since a struct has no per-field `DefId` to
+    /// key a `state`-style map by). Consulted at every `StructLit`
+    /// construction site (a reg/out write, a struct-typed local's own
+    /// binding, or a struct-typed reg/out's `= init`) via `struct_field_
+    /// bound`, and read back at `Expr::Field` -- SOUNDLY, unlike a mem
+    /// element: every struct value in this language is built by an
+    /// exhaustive `StructLit` (types/stmt.rs rejects any struct-typed
+    /// state write that isn't one, or a `Call`), so a struct-typed reg/
+    /// out has exactly the checked-init-plus-checked-every-write
+    /// induction that already makes a scalar reg/out's own bound sound
+    /// -- no "unwritten address" concept exists for a struct the way it
+    /// does for a mem. See `struct_field_bound`'s own doc comment for
+    /// the DefKind gate this soundness argument depends on (an `in`/
+    /// mem/fifo-typed struct value never passes through a checked
+    /// `StructLit` at all, exactly like an unwritten mem address).
+    struct_field_bounds: HashMap<(DefId, String), BoundedDef>,
     errors: Vec<BoundsError>,
 }
 
@@ -820,6 +950,189 @@ impl<'a> Checker<'a> {
             .insert(def, self.ast.expr_spans[bound.0 as usize].clone());
     }
 
+    /// Every struct FIELD with a declared `where _ < K` bound (v18),
+    /// walking every `Item::Struct` in the program directly -- unlike
+    /// `collect_bounded_defs`/`collect_mem_bounds`, this never needs
+    /// `res.item_defs` (a field has no `DefId` of its own to check
+    /// self-reference against; `resolve.rs`'s `check_struct_field_bound_
+    /// shape` already validated the shape by TEXT), just the struct
+    /// ITEM's own `DefId` (to key `struct_field_bounds` by) and its
+    /// `fields: Vec<Param>` directly off the AST.
+    fn collect_struct_field_bounds(&mut self) {
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            match self.ast.item(id) {
+                Item::Module { items, .. } => stack.extend(items.iter().copied()),
+                Item::Struct { fields, .. } => {
+                    let Some(&struct_def) = self.res.item_defs.get(&id) else {
+                        continue;
+                    };
+                    for field in fields.clone() {
+                        if let Some(bound) = field.bound {
+                            self.collect_one_struct_field_bound(
+                                struct_def,
+                                &field.name.text,
+                                bound,
+                                field.lower,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The struct-field sibling of `collect_one_mem_bound`/`collect_one_
+    /// ret_bound` immediately above — same const-fold-and-report shape,
+    /// but keyed by `(struct_def, field name)` into `struct_field_
+    /// bounds` rather than a single `DefId`, and sourcing its width from
+    /// `struct_field_width` (the field's own declared type, read out of
+    /// `Types.struct_fields`) rather than `mem_elem_width`/`ret_width`.
+    /// Kept as its own function for the same reason those two give: the
+    /// width SOURCE genuinely differs each time.
+    fn collect_one_struct_field_bound(
+        &mut self,
+        struct_def: DefId,
+        field_name: &str,
+        bound: ExprId,
+        lower: Option<ExprId>,
+    ) {
+        let Expr::Binary { rhs, .. } = self.ast.expr(bound) else {
+            return;
+        };
+        let Some(upper) = const_fold(self.ast, *rhs) else {
+            return; // types.rs already reported this
+        };
+        let lower_val = match lower {
+            Some(l) => match const_fold(self.ast, l) {
+                Some(v) => v,
+                None => return, // types.rs already reported this
+            },
+            None => 0,
+        };
+        let Some(width) = struct_field_width(self.ty, struct_def, field_name) else {
+            let span = self.ast.expr_spans[bound.0 as usize].clone();
+            self.error(
+                span,
+                "a struct field bound needs a concretely-known `bits[N]` field type to check \
+                 against (v0 restriction)"
+                    .to_string(),
+            );
+            return;
+        };
+        self.struct_field_bounds.insert(
+            (struct_def, field_name.to_string()),
+            BoundedDef {
+                lower: lower_val,
+                upper,
+                width,
+            },
+        );
+    }
+
+    /// The base case for every struct-typed reg/out's own bounded
+    /// field(s) (v18) — mirrors `types/stmt.rs`'s `check_where_bound_
+    /// init` in PURPOSE (an induction needs a verified starting point),
+    /// but lives entirely in `bounds.rs` rather than `types.rs`: unlike
+    /// a scalar bound, which needs `const_eval` (a types.rs-only
+    /// capability) to verify a compile-time-constant init, a struct
+    /// field's own init value is always a literal int
+    /// (`Expr::Int`/`SizedInt`), which `expr_bound`/`struct_field_bound`
+    /// already natively evaluate — so there's nothing here that needs
+    /// `types.rs`'s own machinery. A struct-typed reg/out's `= init` is
+    /// mandatory (parser-enforced, same as a scalar reg/out), so this
+    /// ALSO means there's no "declared bound with zero possible check
+    /// sites" gap analogous to v13/v17's own closed exhaustiveness
+    /// holes to worry about here: every struct-typed reg/out always has
+    /// at least this one guaranteed, checked site. (A struct type used
+    /// ONLY via `in`/mem/fifo, never via any reg/out, has a field bound
+    /// that's simply inert for those instances -- never checked, but
+    /// ALSO never trusted at any read, per `struct_field_bound`'s own
+    /// `DefKind` gate -- so that's not a soundness gap, just a bound
+    /// with no effect for that particular origin.)
+    fn check_struct_field_inits(&mut self) {
+        let mut stack: Vec<ItemId> = self.ast.roots.clone();
+        while let Some(id) = stack.pop() {
+            match self.ast.item(id) {
+                Item::Module { items, .. } => stack.extend(items.iter().copied()),
+                Item::Reg { init, .. } | Item::Output { init, .. } => {
+                    let Some(&def) = self.res.item_defs.get(&id) else {
+                        continue;
+                    };
+                    let Some(Ty::Struct {
+                        def: struct_def, ..
+                    }) = self.ty.state_tys.get(&def)
+                    else {
+                        continue;
+                    };
+                    let struct_def = *struct_def;
+                    let fields: Vec<String> = self
+                        .struct_field_bounds
+                        .keys()
+                        .filter(|(sd, _)| *sd == struct_def)
+                        .map(|(_, name)| name.clone())
+                        .collect();
+                    if fields.is_empty() {
+                        continue; // this struct type has no bounded field at all
+                    }
+                    // Caught by advisor review AFTER this feature had
+                    // already shipped: unlike a scalar reg/out (where
+                    // `parse_state_decl` requires an explicit `= init`
+                    // whenever THAT def's OWN `where` clause is present),
+                    // nothing forces an init here -- the bound lives on
+                    // the STRUCT FIELD, not on `p` itself, so `reg p :
+                    // Pair` with no init at all is ordinary, legal syntax
+                    // the parser has no way to reject at parse time (it
+                    // doesn't yet know whether `Pair` has any bounded
+                    // field). Without this check, `p`'s field would still
+                    // be unconditionally trusted at every read via the
+                    // `Reg`/`Output` arm of `struct_field_bound`, with
+                    // NOTHING ever verified against it -- concretely a
+                    // FALSE proof for a two-sided bound (`where 10 <= _ <
+                    // 20`), since a struct-typed reg with no init resets
+                    // to all-zero fields in FIRRTL, which violates any
+                    // bound whose floor is above 0. So a struct type with
+                    // any bounded field now REQUIRES every reg/out of
+                    // that type to declare an explicit init -- the same
+                    // "the induction needs a verified starting point"
+                    // requirement `where_clause_requires_an_explicit_
+                    // init` already enforces for a scalar bound, just
+                    // triggered by the STRUCT's own bounded fields
+                    // instead of the reg's own `where` clause.
+                    let Some(init) = init else {
+                        let span = self.ast.item_spans[id.0 as usize].clone();
+                        self.error(
+                            span,
+                            format!(
+                                "`{}`'s struct type has a bounded field, so it needs an \
+                                 explicit `= init` to verify it satisfies the declared bound \
+                                 (v0 restriction)",
+                                self.res.def(def).name
+                            ),
+                        );
+                        continue;
+                    };
+                    let init = *init;
+                    for field_name in fields {
+                        let bounded = self.struct_field_bounds[&(struct_def, field_name.clone())];
+                        let computed = self.struct_field_bound(
+                            init,
+                            &field_name,
+                            &HashMap::new(),
+                            &HashMap::new(),
+                            &HashMap::new(),
+                        );
+                        let span = self.ast.expr_spans[init.0 as usize].clone();
+                        let context = format!("init field `{field_name}`");
+                        self.check_against_bound(computed, bounded, span, &context);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// All rule/fn items, recursively through modules — the same
     /// exhaustive walk `types/collect.rs`'s `check_all` and
     /// `effects.rs`'s `collect_bodied_items` both already do; callees
@@ -846,8 +1159,17 @@ impl<'a> Checker<'a> {
         // otherwise skip this whole body walk, silently letting every
         // mem write through unchecked (the same "gated the descent on
         // the wrong condition" class of bug v14 found four times in a
-        // row).
-        if self.bounded.is_empty() && self.fn_ret_bound.is_empty() && self.mem_bounds.is_empty() {
+        // row). v18: widened again to FOUR-way for the identical reason,
+        // now that a program could have ONLY a bounded struct field and
+        // no other bounded reg/out/param/return/mem anywhere -- caught
+        // by advisor review of this feature's own plan before any code
+        // was written, the same bug class flagged (and discriminated
+        // with a dedicated driving example) at v17 above.
+        if self.bounded.is_empty()
+            && self.fn_ret_bound.is_empty()
+            && self.mem_bounds.is_empty()
+            && self.struct_field_bounds.is_empty()
+        {
             return; // nothing to check anywhere in the program
         }
         let body = match self.ast.item(id) {
@@ -861,6 +1183,15 @@ impl<'a> Checker<'a> {
             .map(|(d, b)| (*d, (b.lower, b.upper)))
             .collect();
         let mut locals: HashMap<DefId, Option<(u64, u64)>> = HashMap::new();
+        // v18: which expression each struct-typed LOCAL was bound to
+        // (its own `Stmt::Let` init) -- threaded and cloned/discarded
+        // per nested scope exactly like `locals`, NOT a flat `self`-
+        // field (caught by advisor review of this feature's own plan:
+        // a flat map would leak a branch-local binding's trust past the
+        // branch it was computed in, the same class of bug the
+        // existing "Branch/loop scoping" section above this struct
+        // already guards `state`/`locals` against).
+        let mut struct_origins: HashMap<DefId, ExprId> = HashMap::new();
         // v13: this item's own declared return postcondition, if any --
         // `None` for a `rule` (`item_defs` has no entry for one) or a
         // fn with no `where _ < N` (no `fn_ret_bound` entry).
@@ -869,7 +1200,7 @@ impl<'a> Checker<'a> {
             .and_then(|def| self.fn_ret_bound.get(&def))
             .copied();
         self.current_fn_def = item_def;
-        self.check_body(&body, &mut state, &mut locals);
+        self.check_body(&body, &mut state, &mut locals, &mut struct_origins);
     }
 
     fn check_body(
@@ -877,9 +1208,10 @@ impl<'a> Checker<'a> {
         body: &[StmtId],
         state: &mut HashMap<DefId, (u64, u64)>,
         locals: &mut HashMap<DefId, Option<(u64, u64)>>,
+        struct_origins: &mut HashMap<DefId, ExprId>,
     ) {
         for stmt in body {
-            self.check_stmt(*stmt, state, locals);
+            self.check_stmt(*stmt, state, locals, struct_origins);
         }
     }
 
@@ -888,6 +1220,7 @@ impl<'a> Checker<'a> {
         id: StmtId,
         state: &mut HashMap<DefId, (u64, u64)>,
         locals: &mut HashMap<DefId, Option<(u64, u64)>>,
+        struct_origins: &mut HashMap<DefId, ExprId>,
     ) {
         match self.ast.stmt(id).clone() {
             Stmt::Assign { lhs, rhs } => {
@@ -910,14 +1243,14 @@ impl<'a> Checker<'a> {
                 // the advisor's own follow-up probe past the four-site
                 // sweep above, confirmed with a driving scratch file
                 // before being fixed here.
-                self.check_calls_in(lhs, state, locals);
+                self.check_calls_in(lhs, state, locals, struct_origins);
                 let def = if let Expr::Ident(_) = self.ast.expr(lhs) {
                     self.res.expr_defs.get(&lhs).copied()
                 } else {
                     None
                 };
                 let bounded = def.and_then(|d| self.bounded.get(&d).copied());
-                let computed = self.expr_bound(rhs, state, locals);
+                let computed = self.expr_bound(rhs, state, locals, struct_origins);
                 if let (Some(def), Some(bounded)) = (def, bounded) {
                     self.found_writes.insert(def);
                     let span = self.ast.expr_spans[rhs.0 as usize].clone();
@@ -937,11 +1270,86 @@ impl<'a> Checker<'a> {
                     let span = self.ast.expr_spans[rhs.0 as usize].clone();
                     self.check_against_bound(computed, bounded, span, "write");
                 }
+                // v18: a struct-typed reg/out write (`p := Pair{...}`)
+                // checks EVERY bounded field of `p`'s own struct type
+                // against `rhs` -- reuses `struct_field_bound`, which
+                // already handles `rhs` being a plain `StructLit` (check
+                // the named field directly) or one with `..base` (recurse
+                // into `base`'s own same-named field); a `Call`-sourced
+                // struct write (the type-checker's OTHER permitted shape,
+                // `types/stmt.rs:450`) has no field-by-field mechanism
+                // here at all, so `struct_field_bound` falls through to
+                // `None` for it and this correctly, conservatively fails
+                // -- a real, documented v1 restriction, not a silent skip.
+                if let Some(def) = def
+                    && let Some(Ty::Struct {
+                        def: struct_def, ..
+                    }) = self.ty.state_tys.get(&def).cloned()
+                {
+                    let fields: Vec<String> = self
+                        .struct_field_bounds
+                        .keys()
+                        .filter(|(sd, _)| *sd == struct_def)
+                        .map(|(_, name)| name.clone())
+                        .collect();
+                    for field_name in fields {
+                        let bounded = self.struct_field_bounds[&(struct_def, field_name.clone())];
+                        let field_computed = self.struct_field_bound(
+                            rhs,
+                            &field_name,
+                            state,
+                            locals,
+                            struct_origins,
+                        );
+                        self.found_writes.insert(def);
+                        let span = self.ast.expr_spans[rhs.0 as usize].clone();
+                        let context = format!("write to field `{field_name}`");
+                        self.check_against_bound(field_computed, bounded, span, &context);
+                    }
+                }
+                // v18, caught by advisor review AFTER this feature had
+                // already shipped: a struct-typed LOCAL can be
+                // REASSIGNED via `:=` (unlike a reg/out, `types/stmt.rs`
+                // places no "must be a StructLit or Call" restriction on
+                // a `DefKind::Local` target), so `struct_origins`'s entry
+                // from this local's OWN `Stmt::Let` would otherwise keep
+                // pointing at its ORIGINAL binding forever -- `let p =
+                // Pair{data:15}; p := q; total := p.data` traced `p.data`
+                // back to the stale, already-superseded literal instead
+                // of `q` (an untrusted `in`-port value), letting an
+                // unproven value through as a false proof. Fixed by
+                // overwriting `struct_origins` with the NEW rhs on every
+                // reassignment, exactly like `Stmt::Let` already does for
+                // the initial binding -- `struct_field_bound`'s own
+                // recursive trace then correctly follows the CURRENT
+                // value, whether that's another checked literal (still
+                // composes) or an untrusted origin (correctly stops
+                // composing, the same mechanism an aliased `let` already
+                // relies on).
+                if let Some(def) = def
+                    && self.res.def(def).kind == crate::resolve::DefKind::Local
+                    && matches!(self.ty.expr_tys.get(&rhs), Some(Ty::Struct { .. }))
+                {
+                    struct_origins.insert(def, rhs);
+                }
             }
             Stmt::Let { name, init } => {
                 let def = def_of_name(self.res, &name);
-                let b = self.expr_bound(init, state, locals);
+                let b = self.expr_bound(init, state, locals, struct_origins);
                 locals.insert(def, b);
+                // v18: a struct-typed local's own SINGLE binding site is
+                // recorded so `struct_field_bound`'s `DefKind::Local` arm
+                // can trace `p.data` back to whatever `init` actually was
+                // -- sound because a struct-typed local can only ever be
+                // bound directly to a literal in this language (aliasing
+                // another struct-typed value, `let p2 = q`, is a separate
+                // v0 restriction enforced elsewhere); an untrusted origin
+                // (an `in`-port/mem/fifo-derived value) still correctly
+                // fails to compose once `struct_field_bound` recurses
+                // into it and hits its own `DefKind` gate.
+                if matches!(self.ty.expr_tys.get(&init), Some(Ty::Struct { .. })) {
+                    struct_origins.insert(def, init);
+                }
             }
             Stmt::If {
                 cond,
@@ -953,17 +1361,29 @@ impl<'a> Checker<'a> {
                 // state, before any narrowing -- the call happens as
                 // part of evaluating the condition, not inside either
                 // branch.
-                self.check_calls_in(cond, state, locals);
+                self.check_calls_in(cond, state, locals, struct_origins);
                 let mut then_state = self.narrow_for_condition(cond, state);
                 let mut then_locals = locals.clone();
-                self.check_body(&then_body, &mut then_state, &mut then_locals);
+                let mut then_origins = struct_origins.clone();
+                self.check_body(
+                    &then_body,
+                    &mut then_state,
+                    &mut then_locals,
+                    &mut then_origins,
+                );
                 if let Some(else_body) = else_body {
                     // v15: narrowed on the NEGATED condition, not the raw
                     // entry state -- see `narrow_for_else`'s own doc
                     // comment.
                     let mut else_state = self.narrow_for_else(cond, state);
                     let mut else_locals = locals.clone();
-                    self.check_body(&else_body, &mut else_state, &mut else_locals);
+                    let mut else_origins = struct_origins.clone();
+                    self.check_body(
+                        &else_body,
+                        &mut else_state,
+                        &mut else_locals,
+                        &mut else_origins,
+                    );
                 }
             }
             Stmt::IfLet {
@@ -975,14 +1395,26 @@ impl<'a> Checker<'a> {
                 // v14: `init` is exactly the position a fallible call
                 // (`if let x = Classify(a) { ... }`) or a fifo op sits
                 // in -- never checked before this pass.
-                self.check_calls_in(init, state, locals);
+                self.check_calls_in(init, state, locals, struct_origins);
                 let mut then_state = state.clone();
                 let mut then_locals = locals.clone();
-                self.check_body(&then_body, &mut then_state, &mut then_locals);
+                let mut then_origins = struct_origins.clone();
+                self.check_body(
+                    &then_body,
+                    &mut then_state,
+                    &mut then_locals,
+                    &mut then_origins,
+                );
                 if let Some(else_body) = else_body {
                     let mut else_state = state.clone();
                     let mut else_locals = locals.clone();
-                    self.check_body(&else_body, &mut else_state, &mut else_locals);
+                    let mut else_origins = struct_origins.clone();
+                    self.check_body(
+                        &else_body,
+                        &mut else_state,
+                        &mut else_locals,
+                        &mut else_origins,
+                    );
                 }
             }
             Stmt::While { cond, body } => {
@@ -1006,16 +1438,18 @@ impl<'a> Checker<'a> {
                 // to double-report through. Confirmed empirically too
                 // (a failing call in a `while` condition under
                 // `--firrtl` reports exactly one error, not two).
-                self.check_calls_in(cond, state, locals); // v14
+                self.check_calls_in(cond, state, locals, struct_origins); // v14
                 let mut loop_state = self.narrow_for_condition(cond, state);
                 let mut loop_locals = locals.clone();
-                self.check_body(&body, &mut loop_state, &mut loop_locals);
+                let mut loop_origins = struct_origins.clone();
+                self.check_body(&body, &mut loop_state, &mut loop_locals, &mut loop_origins);
             }
             Stmt::WhileLet { init, body, .. } => {
-                self.check_calls_in(init, state, locals); // v14
+                self.check_calls_in(init, state, locals, struct_origins); // v14
                 let mut loop_state = state.clone();
                 let mut loop_locals = locals.clone();
-                self.check_body(&body, &mut loop_state, &mut loop_locals);
+                let mut loop_origins = struct_origins.clone();
+                self.check_body(&body, &mut loop_state, &mut loop_locals, &mut loop_origins);
             }
             // A bare call statement (`Bump(x)`) is how a VOID fn/impl —
             // one with no return value, invoked purely for its `writes`
@@ -1027,7 +1461,7 @@ impl<'a> Checker<'a> {
             // against its callee's declared param bounds); the returned
             // range itself is meaningless here and discarded.
             Stmt::Expr(e) => {
-                self.expr_bound(e, state, locals);
+                self.expr_bound(e, state, locals, struct_origins);
             }
             // v13: only meaningful when the ENCLOSING fn declared a
             // postcondition (`current_ret_bound`, set once per item at
@@ -1046,7 +1480,7 @@ impl<'a> Checker<'a> {
                 // straight past `expr_bound`, silently missing `Bump`'s
                 // own argument violation. The postcondition CHECK
                 // itself still only fires when one is actually declared.
-                let computed = self.expr_bound(e, state, locals);
+                let computed = self.expr_bound(e, state, locals, struct_origins);
                 if let Some(bounded) = self.current_ret_bound {
                     let span = self.ast.expr_spans[e.0 as usize].clone();
                     self.check_against_bound(computed, bounded, span, "return value");
@@ -1349,6 +1783,7 @@ impl<'a> Checker<'a> {
         id: ExprId,
         state: &HashMap<DefId, (u64, u64)>,
         locals: &HashMap<DefId, Option<(u64, u64)>>,
+        struct_origins: &HashMap<DefId, ExprId>,
     ) -> Option<(u64, u64)> {
         if matches!(
             self.ast.expr(id),
@@ -1362,10 +1797,26 @@ impl<'a> Checker<'a> {
                 | Expr::Call { .. }
                 | Expr::Bracket { .. }
         ) {
-            return self.expr_bound(id, state, locals);
+            // v18: `Field` is deliberately NOT added here, even though
+            // `expr_bound` now has a real arm for it -- unlike `Bracket`
+            // (v16), that arm's own `struct_field_bound` helper does NOT
+            // recurse into an unrecognized `base` shape (a `Call`, ..),
+            // so stopping here on a bare `Field` would silently skip a
+            // call hidden under one used as, say, a mem index
+            // (`m[MakePair(50).data]` -- confirmed by running the
+            // existing `call_argument_hidden_under_a_field_access_in_a_
+            // mem_index_is_still_checked` test, which exists precisely
+            // to pin this). Leaving `Field` out of the stop-list means
+            // the generic `sub_exprs` recursion below still finds a
+            // `Call` nested under one; a bare `Field` used AS the whole
+            // checked position still composes correctly regardless,
+            // since `Stmt::Assign`/`Stmt::Return`/etc. all call `expr_
+            // bound` on their own top-level expression unconditionally,
+            // never through this stop-list at all.
+            return self.expr_bound(id, state, locals, struct_origins);
         }
         for child in crate::lower::sub_exprs(self.ast, id) {
-            self.check_calls_in(child, state, locals);
+            self.check_calls_in(child, state, locals, struct_origins);
         }
         None
     }
@@ -1385,6 +1836,7 @@ impl<'a> Checker<'a> {
         id: ExprId,
         state: &HashMap<DefId, (u64, u64)>,
         locals: &HashMap<DefId, Option<(u64, u64)>>,
+        struct_origins: &HashMap<DefId, ExprId>,
     ) -> Option<(u64, u64)> {
         match self.ast.expr(id) {
             Expr::Int(v) => Some((*v, v.checked_add(1)?)),
@@ -1414,8 +1866,8 @@ impl<'a> Checker<'a> {
                 // `rhs` (`unbounded + Bump(50)` never checked `Bump`'s
                 // own argument). Both calls now always happen; only the
                 // ARITHMETIC bails early if either came back `None`.
-                let a = self.expr_bound(*lhs, state, locals);
-                let b = self.expr_bound(*rhs, state, locals);
+                let a = self.expr_bound(*lhs, state, locals, struct_origins);
+                let b = self.expr_bound(*rhs, state, locals, struct_origins);
                 let (a_lo, a_hi) = a?;
                 let (b_lo, b_hi) = b?;
                 let lo = a_lo.checked_add(b_lo)?;
@@ -1438,8 +1890,8 @@ impl<'a> Checker<'a> {
                 // `checked_add` already gives on overflow — no separate
                 // error path needed. Both operands evaluated before
                 // either `?`-unwrap, same v14 reasoning as `Add` above.
-                let a = self.expr_bound(*lhs, state, locals);
-                let b = self.expr_bound(*rhs, state, locals);
+                let a = self.expr_bound(*lhs, state, locals, struct_origins);
+                let b = self.expr_bound(*rhs, state, locals, struct_origins);
                 let (a_lo, a_hi) = a?;
                 let (b_lo, b_hi) = b?;
                 let b_max = b_hi.checked_sub(1)?;
@@ -1463,8 +1915,8 @@ impl<'a> Checker<'a> {
                 // same idiom `Add`/`Sub` above already use. Both
                 // operands evaluated before either `?`-unwrap, same v14
                 // reasoning as `Add`/`Sub` above.
-                let a = self.expr_bound(*lhs, state, locals);
-                let b = self.expr_bound(*rhs, state, locals);
+                let a = self.expr_bound(*lhs, state, locals, struct_origins);
+                let b = self.expr_bound(*rhs, state, locals, struct_origins);
                 let (a_lo, a_hi) = a?;
                 let (b_lo, b_hi) = b?;
                 let a_max = a_hi.checked_sub(1)?;
@@ -1530,7 +1982,7 @@ impl<'a> Checker<'a> {
                             let param_def = def_of_name(self.res, &param.name);
                             self.bounded.get(&param_def).copied()
                         };
-                        let computed = self.expr_bound(*arg, state, locals);
+                        let computed = self.expr_bound(*arg, state, locals, struct_origins);
                         if let Some(bounded) = bounded {
                             let span = self.ast.expr_spans[arg.0 as usize].clone();
                             let context = format!("argument for parameter `{}`", param.name);
@@ -1576,7 +2028,7 @@ impl<'a> Checker<'a> {
             // the full structural argument), so a plain `insert` is
             // correct -- no merge-on-conflict is needed.
             Expr::Bracket { callee, args } => {
-                self.check_calls_in(*callee, state, locals);
+                self.check_calls_in(*callee, state, locals, struct_origins);
                 let mem_def = self
                     .res
                     .expr_defs
@@ -1584,7 +2036,7 @@ impl<'a> Checker<'a> {
                     .copied()
                     .filter(|d| self.res.def(*d).kind == crate::resolve::DefKind::Mem);
                 for arg in args {
-                    let computed = self.check_calls_in(*arg, state, locals);
+                    let computed = self.check_calls_in(*arg, state, locals, struct_origins);
                     if mem_def.is_some()
                         && let Some(range) = computed
                     {
@@ -1617,6 +2069,104 @@ impl<'a> Checker<'a> {
                 // returns.
                 None
             }
+            // v18: a struct field READ's own value, deliberately handed
+            // back here -- unlike a mem's `Bracket` arm above, this IS
+            // sound: see `struct_field_bounds`'s own doc comment and
+            // `struct_field_bound`'s own doc comment for the full
+            // argument (a struct-typed reg/out has a mandatory checked
+            // init plus every-write-is-a-checked-literal, exactly the
+            // induction that already makes a scalar reg/out's bound
+            // sound; a struct-typed local traces back to its own single
+            // literal binding). `base` itself is walked via `struct_
+            // field_bound`, a SEPARATE recursive function from this one
+            // (not `expr_bound` again) since it needs to inspect `base`'s
+            // own STRUCTURAL shape (a literal, an ident, ..), not a
+            // numeric range.
+            Expr::Field { base, name } => {
+                self.struct_field_bound(*base, name, state, locals, struct_origins)
+            }
+            _ => None,
+        }
+    }
+
+    /// A struct FIELD's own provable value bound (v18), given the
+    /// EXPRESSION representing the struct VALUE it comes from -- not a
+    /// `Field`-access `ExprId` (that's `expr_bound`'s own new arm, which
+    /// calls into this), since a `..base`-filled field has no literal
+    /// AST node of its own to call `expr_bound` on directly. Returns
+    /// `None` for any origin this pass doesn't affirmatively know is
+    /// checked -- the safe default, exactly like `expr_bound`'s own
+    /// catch-all.
+    ///
+    /// The `Expr::Ident` case's `DefKind` match is where this feature's
+    /// WHOLE soundness argument lives: `Reg`/`Output` are trusted
+    /// against the flat `struct_field_bounds` declared fact directly,
+    /// because EVERY write to a struct-typed reg/out (including its
+    /// mandatory `= init`) is independently checked elsewhere in this
+    /// file (`check_struct_field_inits`, `Stmt::Assign`'s own new
+    /// branch) -- the same "write-checked, read-trusted" argument v5's
+    /// own scalar reg/out bound already rests on, extended one layer.
+    /// `Local` is traced back to whatever expression it was bound to
+    /// (`struct_origins`, populated by `Stmt::Let`), recursing into
+    /// THAT expression instead of trusting the type alone -- needed
+    /// because, unlike a reg/out, a local's single binding site could be
+    /// an ALIAS of an untrusted value (`let p2 = q` where `q : Pair` is
+    /// an `in` port); tracing through means `p2.data` correctly falls
+    /// through to `None` once the recursion reaches `q`'s own `Expr::
+    /// Ident` and hits the catch-all below. EVERY OTHER `DefKind`
+    /// (`Input`, `Mem`, `Fifo`, `Io`, `Param`, ...) falls to that same
+    /// catch-all, unconditionally -- an `in`-port-typed struct's bits
+    /// arrive over an external wire, never through a checked `StructLit`
+    /// at all, exactly as untrusted as an unwritten mem address (the
+    /// hole v17 closed for mem reads, found again here through a
+    /// different door during this feature's own design review).
+    fn struct_field_bound(
+        &mut self,
+        expr: ExprId,
+        field_name: &str,
+        state: &HashMap<DefId, (u64, u64)>,
+        locals: &HashMap<DefId, Option<(u64, u64)>>,
+        struct_origins: &HashMap<DefId, ExprId>,
+    ) -> Option<(u64, u64)> {
+        match self.ast.expr(expr).clone() {
+            // A literal: check the named field directly, or -- if this
+            // literal used `..base` and omitted `field_name` -- recurse
+            // into `base`'s own same-named field, exactly mirroring how
+            // `compile_struct_field_read` (firrtl/expr.rs) itself
+            // resolves an omitted field, just for a provable bound
+            // instead of codegen.
+            Expr::StructLit { fields, base, .. } => match fields
+                .iter()
+                .find(|(n, _)| n == field_name)
+            {
+                Some((_, value)) => self.expr_bound(*value, state, locals, struct_origins),
+                None => self.struct_field_bound(base?, field_name, state, locals, struct_origins),
+            },
+            Expr::Ident(_) => {
+                let def = self.res.expr_defs.get(&expr).copied()?;
+                match self.res.def(def).kind {
+                    crate::resolve::DefKind::Reg | crate::resolve::DefKind::Output => {
+                        let struct_def = match self.ty.state_tys.get(&def)? {
+                            Ty::Struct { def, .. } => *def,
+                            _ => return None,
+                        };
+                        self.struct_field_bounds
+                            .get(&(struct_def, field_name.to_string()))
+                            .map(|b| (b.lower, b.upper))
+                    }
+                    crate::resolve::DefKind::Local => {
+                        let origin = struct_origins.get(&def).copied()?;
+                        self.struct_field_bound(origin, field_name, state, locals, struct_origins)
+                    }
+                    _ => None, // Input, Mem, Fifo, Io, Param, ... -- always untrusted here
+                }
+            }
+            // Deferred (v1 restriction, not yet supported): a nested
+            // struct-of-struct field chain (`outer.inner.x`) falls
+            // through here structurally -- `expr` would itself be an
+            // `Expr::Field`, which this match doesn't special-case, so
+            // it safely composes to `None` rather than attempting (and
+            // potentially getting wrong) a deeper chase.
             _ => None,
         }
     }
@@ -1770,6 +2320,23 @@ fn mem_elem_width(ty: &Types, def: DefId) -> Option<u64> {
             Ty::Bits(Width::Known(w)) => Some(*w),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// A struct field's own declared bit width (v18), if it's a plain
+/// `bits[N]` (concretely known) — the struct-field-bound sibling of
+/// `mem_elem_width` immediately above, reading through `Types.struct_
+/// fields` (the struct's own declared, ordered field list, keyed by the
+/// struct's `DefId`) instead of `state_tys`. A field whose type is
+/// anything else (a nested struct, an unresolved width) falls closed to
+/// `None`, same convention `mem_elem_width`/`ret_width`/`base_width` all
+/// already follow.
+fn struct_field_width(ty: &Types, struct_def: DefId, field_name: &str) -> Option<u64> {
+    let fields = ty.struct_fields.get(&struct_def)?;
+    let (_, field_ty) = fields.iter().find(|(name, _)| name == field_name)?;
+    match field_ty {
+        Ty::Bits(Width::Known(w)) => Some(*w),
         _ => None,
     }
 }

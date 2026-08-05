@@ -1739,6 +1739,345 @@ module M {
 }
 
 #[test]
+fn struct_field_write_within_bound_is_proven() {
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    rule write {
+        p := Pair{ valid: 1, data: 40 }
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn struct_field_write_exceeding_bound_is_rejected() {
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    rule write {
+        p := Pair{ valid: 1, data: 60 }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("computed value could reach 60"));
+}
+
+#[test]
+fn struct_field_read_value_composes_through_a_reg() {
+    // v18's own actual new capability, unlike v17's mem-element bound
+    // (which shipped WITHOUT read composition, see `mem_elem_read_
+    // value_is_deliberately_not_composed` above): a struct-typed reg's
+    // own field value DOES soundly compose at a read, since every
+    // possible value it could ever hold passed through a checked
+    // `StructLit` -- its mandatory `= init` or a later whole-value
+    // write, never an "unwritten address" the way a mem read can be.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    reg total : [8] where total < 50 = 0
+    rule write {
+        p := Pair{ valid: 1, data: 40 }
+    }
+    rule read {
+        total := p.data
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn struct_field_read_value_from_an_in_port_is_deliberately_not_composed() {
+    // The critical negative test, mirroring `mem_elem_read_value_is_
+    // deliberately_not_composed`'s own role for v17: a struct-typed
+    // `in` port's value never passes through a checked `StructLit` at
+    // all (it arrives over an external wire), exactly as untrusted as
+    // an unwritten mem address -- confirmed real and legal by `tests/
+    // firrtl.rs`'s own `struct_typed_input_port_flattens_and_reads_by_
+    // field`. Bug-reintroduction-verified during development by
+    // temporarily widening `struct_field_bound`'s `DefKind` match to
+    // also accept `Input`, which flips this test from 1 error to 0.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    in q : Pair
+    reg total : [8] where total < 50 = 0
+    rule read {
+        total := q.data
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write stays within the declared bound")
+    );
+}
+
+#[test]
+fn struct_field_read_composes_through_a_dotdot_base_spread() {
+    // A `..base`-filled field (the field omitted from an explicit
+    // `StructLit`, backfilled from `base`'s own same-named field) must
+    // still compose through `struct_field_bound`'s own recursive
+    // `base?` fallback, not silently fail to `None`.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    reg p : Pair = Pair{ valid: 0, data: 10 }
+    reg total : [8] where total < 50 = 0
+    rule write {
+        p := Pair{ valid: 1, ..p }
+    }
+    rule read {
+        total := p.data
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn struct_field_read_through_an_aliased_local_is_deliberately_not_composed() {
+    // The one case that requires `struct_field_bound`'s recursive
+    // `struct_origins` trace to work correctly, not just the direct
+    // cases: `let p2 = q` binds a struct-typed LOCAL to an ALIAS of an
+    // untrusted `in`-port value (not a fresh `StructLit`) -- `p2.data`
+    // must still fail to compose, by recursing through `p2`'s own
+    // recorded origin (`q`) and hitting the same `DefKind` gate a
+    // direct `q.data` read already does.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    in q : Pair
+    reg total : [8] where total < 50 = 0
+    rule read {
+        let p2 = q
+        total := p2.data
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write stays within the declared bound")
+    );
+}
+
+#[test]
+fn struct_field_write_from_a_call_is_rejected() {
+    // A documented v1 restriction, not a silent skip: a struct-typed
+    // write whose RHS is a `Call` (the type-checker's OTHER permitted
+    // shape alongside a plain `StructLit`, `types/stmt.rs:450`) has no
+    // field-by-field verification mechanism here at all, so it must
+    // conservatively fail rather than pass unchecked.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    MakePair() : Pair <combines> {
+        return Pair{ valid: 1, data: 10 }
+    }
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    rule write {
+        p := MakePair()
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write to field")
+    );
+}
+
+#[test]
+fn struct_field_write_exceeding_bound_is_rejected_with_no_other_bounded_def() {
+    // Discriminates `check_item`'s own FOUR-way early-return guard: this
+    // module has NO other bounded reg/out/param/return/mem anywhere,
+    // only the bounded struct field -- if the guard didn't include
+    // `struct_field_bounds`, `check_item` would bail out before ever
+    // walking this rule's body, and the out-of-range write below would
+    // be silently accepted instead of rejected. Caught by advisor
+    // review of this feature's own plan before any code was written.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    rule write {
+        p := Pair{ valid: 1, data: 60 }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("computed value could reach 60"));
+}
+
+#[test]
+fn struct_field_bad_init_is_rejected() {
+    // The base case: a struct-typed reg/out's own `= init` is checked
+    // against its bounded fields too, entirely within `bounds.rs`
+    // (`check_struct_field_inits`) rather than `types/stmt.rs` -- see
+    // that function's own doc comment for why this feature doesn't need
+    // `types.rs`'s `const_eval` the way a scalar bound's own base case
+    // does.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1]
+        data : [8] where _ < 50
+    }
+    reg p : Pair = Pair{ valid: 0, data: 60 }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify this init field"));
+}
+
+#[test]
+fn struct_field_missing_init_is_rejected() {
+    // A real soundness hole found by an advisor pass AFTER this feature
+    // had already shipped, not during its own design/implementation:
+    // unlike a scalar `where`-bounded reg/out (whose init requirement is
+    // enforced by `parse_state_decl`, triggered by that def's OWN
+    // `where` clause), NOTHING forced an init here -- the bound lives on
+    // the STRUCT FIELD, not on `p` itself, so `reg p : Pair` with no
+    // init at all was ordinary, legal syntax the parser has no way to
+    // reject (it doesn't know at parse time whether `Pair` has any
+    // bounded field). Without `check_struct_field_inits` rejecting a
+    // missing init, `p.data` would still be unconditionally trusted at
+    // every read -- concretely a FALSE proof for this two-sided bound,
+    // since a struct-typed reg with no init resets to all-zero fields in
+    // FIRRTL, which violates a floor of 10. Confirmed via direct
+    // reproduction before this test was written: this exact source
+    // compiled with ZERO errors prior to the fix.
+    let src = "\
+module M {
+    struct Pair {
+        data : [8] where 10 <= _ < 20
+    }
+    reg p : Pair
+    reg total : [8] where 10 <= total < 20 = 10
+    rule r {
+        total := p.data
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("needs an explicit `= init`"));
+}
+
+#[test]
+fn struct_field_read_through_a_reassigned_local_is_deliberately_not_composed() {
+    // A second real soundness hole found by the same advisor pass: a
+    // struct-typed LOCAL can be REASSIGNED via `:=` (unlike a reg/out,
+    // `types/stmt.rs` places no "must be a StructLit or Call" shape
+    // restriction on a `DefKind::Local` target), so `struct_origins`'s
+    // entry from this local's own `Stmt::Let` would otherwise keep
+    // pointing at its ORIGINAL binding forever: `p.data` traced back to
+    // the stale, already-superseded `Pair{data: 15}` literal instead of
+    // `q` (an untrusted `in`-port value) that `p` was actually
+    // reassigned to. Confirmed via direct reproduction before this test
+    // was written: this exact source compiled with ZERO errors prior to
+    // the fix (`Stmt::Assign` now overwrites `struct_origins` with the
+    // new rhs on every reassignment to a struct-typed local, exactly
+    // like `Stmt::Let` already does for the initial binding).
+    let src = "\
+module M {
+    struct Pair {
+        data : [8] where 10 <= _ < 20
+    }
+    in q : Pair
+    reg total : [8] where 10 <= total < 20 = 10
+    rule r {
+        let p = Pair{ data: 15 }
+        p := q
+        total := p.data
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("cannot verify this write stays within the declared bound")
+    );
+}
+
+#[test]
+fn struct_field_two_sided_bound_composes_through_a_reg() {
+    // Every OTHER struct-field test in this file uses a one-sided bound
+    // (`where _ < 50`), where a default-0 reset value happens to satisfy
+    // the bound regardless of whether the base case is actually
+    // checked -- the two-sided form (`where 10 <= _ < 20`) is the only
+    // shape that turns a missed base-case check into an OBSERVABLE false
+    // proof (flagged by advisor review as a real gap in this suite's own
+    // coverage, independent of the two bugs above). This pins the
+    // ordinary positive case with a two-sided bound specifically, so a
+    // future regression in the base-case check can't hide behind an
+    // always-satisfied floor of 0.
+    let src = "\
+module M {
+    struct Pair {
+        data : [8] where 10 <= _ < 20
+    }
+    reg p : Pair = Pair{ data: 15 }
+    reg total : [8] where 10 <= total < 20 = 10
+    rule write {
+        p := Pair{ data: 12 }
+    }
+    rule read {
+        total := p.data
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
 fn mem_elem_read_value_is_deliberately_not_composed() {
     // A soundness-restriction regression guard, not a capability test: an
     // earlier version of this feature handed the mem's declared bound
