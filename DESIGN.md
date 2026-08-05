@@ -3020,7 +3020,7 @@ v0 restrictions, all deliberate scope cuts:
   genuinely generic expression-tree walk, a separable follow-up — see
   v14 below, which closes it).
 - **Return-bound propagation (v13): a fn/impl's return TYPE can carry a
-  `where result < N` postcondition too, checked against every
+  `where _ < N` postcondition too, checked against every
   `Stmt::Return` in the fn's own body and trusted at every CALL site so
   a caller can compose with the call's own result** (`examples/
   return_bound_check.tr`). This is v12's own mirror in the OTHER
@@ -3029,12 +3029,13 @@ v0 restrictions, all deliberate scope cuts:
   declared postcondition, then lets that provable range flow OUT to the
   caller (`Expr::Call` returns `Some((lower, upper))` when the callee
   opted in, instead of unconditionally `None`) — e.g. `total := Bump(3)
-  + Bump(4)` composes cleanly when `Bump`'s declared `result < 20`
-  matches `total`'s own bound, impossible before this feature. `result`
-  is a textual placeholder for the return value, not a real scoped
-  binding (checked by matching the literal identifier `result`, not by
-  `DefId` — unlike a reg/out/param's self-reference, a return value is
-  never a named binding anywhere in scope to compare against). Kept as
+  + Bump(4)` composes cleanly when `Bump`'s declared `_ < 20`
+  matches `total`'s own bound, impossible before this feature. `_`
+  (`Expr::Wildcard`; the literal identifier `result` through v17, before
+  v18's retrofit) is a shape placeholder for the return value, not a
+  real scoped binding (checked by AST shape, not by `DefId` — unlike a
+  reg/out/param's self-reference, a return value is never a named
+  binding anywhere in scope to compare against). Kept as
   a SEPARATE map (`fn_ret_bound`, keyed by the fn's own `DefId`) rather
   than folded into the same map a reg/out/param populates, since a
   return value has no `DefId` of its own to key `self.bounded` by. Opt-
@@ -3218,19 +3219,24 @@ v0 restrictions, all deliberate scope cuts:
 - **`where` on mem elements, write-side only (v17)**. At v16's own
   decision point, Lumi was offered "where on struct fields / mem
   elements" as the alternative not picked; picked up directly here,
-  choosing mem elements over struct fields via AskUserQuestion (struct
-  fields are pure plumbing, the same shape as v8's `out` extension; mem
-  elements are a genuinely new capability). `mem m : [8][20] where elem
-  < K` declares a bound on every value ever WRITTEN to `m`, checked at
-  every write site via the identical per-site induction argument a
-  reg/out's own bound already uses.
+  choosing mem elements over struct fields via AskUserQuestion (mem
+  elements believed at the time to be the genuinely new capability,
+  struct fields the smaller, pure-plumbing one — v18's own investigation
+  later found this backwards: struct fields turned out to support
+  SOUND read composition too, something mem elements' lack of init/
+  reset ruled out below; see v18's own entry for the full story).
+  `mem m : [8][20] where _ < K` declares a bound on every value ever
+  WRITTEN to `m`, checked at every write site via the identical
+  per-site induction argument a reg/out's own bound already uses.
 
-  The self-reference placeholder is the literal identifier `elem`, not
-  the mem's own name — the same situation `result` (v13) is in: a mem
-  element has no scoped `DefId` of its own to compare against, unlike a
-  reg/out/param's bound (a real binding already in scope). Checked by
-  TEXT in `resolve.rs`'s new `check_mem_bound_shape`, mirroring
-  `check_ret_bound_shape` exactly. Kept in its own map
+  The self-reference placeholder is `_` (`Expr::Wildcard`; the literal
+  identifier `elem` through v17, before v18's retrofit), not
+  the mem's own name — the same situation the return-bound placeholder
+  (v13) is in: a mem element has no scoped `DefId` of its own to
+  compare against, unlike a reg/out/param's bound (a real binding
+  already in scope). Checked by SHAPE in `resolve.rs`'s new `check_mem_
+  bound_shape`, mirroring `check_ret_bound_shape` exactly. Kept in its
+  own map
   (`bounds.rs`'s `mem_bounds`), not folded into the same map a
   reg/out/param populates — a mem's bound is a flat, whole-array fact
   checked at every write site, never narrowed per-branch, the same
@@ -4866,7 +4872,7 @@ noted:
   DIFFERENT regs each be proven to occupy a disjoint sub-range. Exists to
   feed the mem-index disjointness proof above; see "Statically proven
   register bounds".
-- `mem m : elem_ty[depth] where elem < K` (v17): the same statically
+- `mem m : elem_ty[depth] where _ < K` (v17): the same statically
   PROVEN bound, but on every value ever WRITTEN to a mem, checked at
   every write site — deliberately NOT handed back at read sites (a
   read's own value still composes to `None`, unchanged; see "Statically

@@ -1,5 +1,5 @@
 module MemElemBoundedOnly {
-    mem m : [8][10] where elem < 50
+    mem m : [8][10] where _ < 50
 
     in i : [8]
 

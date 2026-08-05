@@ -881,7 +881,7 @@ fn return_value_within_the_declared_bound_is_proven() {
     // (`Stmt::Return`) that didn't exist before this feature.
     let src = "\
 module M {
-    Bump(i : [8] where i < 10) : [8] where result < 20 {
+    Bump(i : [8] where i < 10) : [8] where _ < 20 {
         return i + 5
     }
     rule step {
@@ -901,7 +901,7 @@ fn return_value_exceeding_the_declared_bound_is_rejected() {
     // existing per-item induction).
     let src = "\
 module M {
-    BadBump(i : [8] where i < 10) : [8] where result < 20 {
+    BadBump(i : [8] where i < 10) : [8] where _ < 20 {
         return i + 100
     }
 }
@@ -922,7 +922,7 @@ fn call_result_composes_into_a_bounded_write_via_declared_ret_bound() {
     let src = "\
 module M {
     reg total : [8] where total < 40 = 0
-    Bump(i : [8] where i < 10) : [8] where result < 20 {
+    Bump(i : [8] where i < 10) : [8] where _ < 20 {
         return i + 5
     }
     rule step {
@@ -950,7 +950,7 @@ fn return_bound_composition_uses_the_full_declared_width_not_narrower() {
     let src = "\
 module M {
     reg total : [8] where total < 40 = 0
-    Bump(i : [8] where i < 10) : [8] where result < 21 {
+    Bump(i : [8] where i < 10) : [8] where _ < 21 {
         return i + 5
     }
     rule step {
@@ -976,7 +976,7 @@ fn return_bound_with_no_return_statement_is_rejected() {
     let src = "\
 module M {
     reg total : [8] where total < 40 = 0
-    Bump(i : [8]) : [8] where result < 20 {
+    Bump(i : [8]) : [8] where _ < 20 {
     }
     rule step {
         total := Bump(3) + Bump(4)
@@ -1016,13 +1016,13 @@ module M {
 
 #[test]
 fn two_sided_return_bound_is_recognized() {
-    // The v6 two-sided surface form (`where L <= result < K`) works
+    // The v6 two-sided surface form (`where L <= _ < K`) works
     // identically on a return bound -- same parse path
     // (`parse_where_bound`), same collection path
     // (`collect_one_ret_bound`).
     let src = "\
 module M {
-    Bump(i : [8] where 5 <= i < 10) : [8] where 5 <= result < 15 {
+    Bump(i : [8] where 5 <= i < 10) : [8] where 5 <= _ < 15 {
         return i
     }
     rule step {
@@ -1186,7 +1186,7 @@ module M {
     Bump(i : [8] where i < 10) : [8] {
         return i
     }
-    Outer(x : [8]) : [8] where result < 40 {
+    Outer(x : [8]) : [8] where _ < 40 {
         return 0
     }
     rule step {
@@ -1231,7 +1231,7 @@ fn call_argument_in_a_return_with_no_declared_postcondition_is_still_checked() {
     // The `Stmt::Return` mirror of the test above: `current_ret_bound`
     // being `None` (no declared postcondition on the ENCLOSING fn) used
     // to gate the whole `expr_bound` call, so `return Bump(50)` inside
-    // a fn with no `where result < N` never checked `Bump`'s own
+    // a fn with no `where _ < N` never checked `Bump`'s own
     // argument either.
     let src = "\
 module M {
@@ -1562,7 +1562,7 @@ module M {
     Bump(i : [8] where i < 10) : [8] {
         return i
     }
-    Outer(x : [8]) : [8] where result < 40 {
+    Outer(x : [8]) : [8] where _ < 40 {
         return 0
     }
     reg total : [8] where total < 40 = 0
@@ -1707,7 +1707,7 @@ module M {
 fn mem_elem_write_within_bound_is_proven() {
     let src = "\
 module M {
-    mem m : [8][10] where elem < 50
+    mem m : [8][10] where _ < 50
     reg i : [8] where i < 10 = 0
     rule write {
         if i < 10 {
@@ -1724,7 +1724,7 @@ module M {
 fn mem_elem_write_exceeding_bound_is_rejected() {
     let src = "\
 module M {
-    mem m : [8][10] where elem < 50
+    mem m : [8][10] where _ < 50
     reg i : [8] where i < 10 = 0
     rule write {
         if i < 10 {
@@ -1753,7 +1753,7 @@ fn mem_elem_read_value_is_deliberately_not_composed() {
     // change can't silently reintroduce the hole.
     let src = "\
 module M {
-    mem m : [8][10] where elem < 50
+    mem m : [8][10] where _ < 50
     reg i : [8] where i < 10 = 0
     reg total : [8] where total < 50 = 0
     rule write {
@@ -1787,7 +1787,7 @@ fn mem_bound_never_written_is_rejected() {
     // second, unrelated "cannot verify this write" from `y`'s own body.
     let src = "\
 module M {
-    mem m : [8][10] where elem < 50
+    mem m : [8][10] where _ < 50
     out y : [8] = 0
     rule read {
         y := m[0]
@@ -1813,7 +1813,7 @@ fn mem_elem_write_exceeding_bound_is_rejected_with_no_other_bounded_def() {
     // accepted instead of rejected.
     let src = "\
 module M {
-    mem m : [8][10] where elem < 50
+    mem m : [8][10] where _ < 50
     in i : [8]
     rule write {
         m[i] := 60

@@ -1427,7 +1427,7 @@ fn mem_read_derived_value_does_not_feed_the_disjointness_proof() {
     // falls back to the ordinary derived stall.
     let src = "\
 module M {
-    mem m : [8][20] where 10 <= elem < 20
+    mem m : [8][20] where 10 <= _ < 20
     reg pc : [8] where pc < 10 = 0
     reg total : [8] = 0
     rule write {

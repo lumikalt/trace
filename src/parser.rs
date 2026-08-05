@@ -907,7 +907,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // v13: `where result < N` on the return type -- checked as a
+        // v13: `where _ < N` on the return type -- checked as a
         // postcondition against every `Stmt::Return` (bounds.rs), then
         // trusted at call sites. No restriction on presence, same as a
         // param's own `where` (unconditional, unlike `parse_state_

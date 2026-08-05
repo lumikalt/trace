@@ -895,13 +895,13 @@ module M {
 }
 
 #[test]
-fn result_placeholder_resolves_in_a_return_bound() {
-    // v13: `result` is a textual placeholder for the return value, not
-    // a real scoped binding -- resolved specially (check_ret_bound_
-    // shape), not via ordinary identifier lookup.
+fn wildcard_placeholder_resolves_in_a_return_bound() {
+    // v13, retrofitted in v18: `_` is a shape placeholder for the
+    // return value, not a real scoped binding -- resolved specially
+    // (check_ret_bound_shape), not via ordinary identifier lookup.
     let src = "\
 module M {
-    Bump(i : [8]) : [8] where result < 20 {
+    Bump(i : [8]) : [8] where _ < 20 {
         return i
     }
 }
@@ -923,19 +923,19 @@ module M {
     assert!(
         errors[0]
             .message
-            .contains("must reference the return value via the placeholder `result`")
+            .contains("must reference the return value via `_`")
     );
 }
 
 #[test]
-fn elem_placeholder_resolves_in_a_mem_bound() {
-    // v17's own sibling of `result_placeholder_resolves_in_a_return_
-    // bound` above -- `elem` is a textual placeholder for a mem's own
+fn wildcard_placeholder_resolves_in_a_mem_bound() {
+    // v17's own sibling of `wildcard_placeholder_resolves_in_a_return_
+    // bound` above -- `_` is a shape placeholder for a mem's own
     // element, not a real scoped binding (checked by `check_mem_bound_
     // shape`, not ordinary identifier lookup).
     let src = "\
 module M {
-    mem m : [8][10] where elem < 50
+    mem m : [8][10] where _ < 50
 }
 ";
     run_ok(src);
@@ -953,7 +953,7 @@ module M {
     assert!(
         errors[0]
             .message
-            .contains("must reference each element via the placeholder `elem`")
+            .contains("must reference each element via `_`")
     );
 }
 

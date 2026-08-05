@@ -2478,7 +2478,7 @@ manually in the meantime.
   positions, return-bound propagation, and whether the interval-set
   domain (v11's own open item) is worth building all remain undecided.
 - **RESOLVED (v13) — return-bound propagation: a fn/impl's return type
-  can carry a `where result < N` postcondition, checked against every
+  can carry a `where _ < N` postcondition, checked against every
   `Stmt::Return` in the fn's own body and trusted at every CALL site so
   a caller can compose with the call's own result**
   (`examples/return_bound_check.tr`). Lumi picked this over widening
@@ -2490,8 +2490,10 @@ manually in the meantime.
   provable range flow OUT to the caller (`Expr::Call` returns
   `Some((lower, upper))` instead of unconditionally `None` when the
   callee opted in) — e.g. `total := Bump(3) + Bump(4)` composes cleanly
-  when `Bump`'s declared `result < 20` matches `total`'s own bound,
-  impossible before this feature.
+  when `Bump`'s declared `_ < 20` matches `total`'s own bound,
+  impossible before this feature. (The self-reference placeholder was
+  the literal identifier `result` through v17, retrofitted to `_` in
+  v18 for consistency with mem-element and struct-field bounds.)
 
   No synthetic `DefId` needed for "the return value": unlike a reg/out/
   param's self-reference (compared by `DefId` equality against an
@@ -2956,21 +2958,25 @@ manually in the meantime.
   it** (`examples/mem_elem_bounded.tr`). At v16's own decision point,
   "where on struct fields / mem elements" was the alternative NOT
   picked; picked up directly here — Lumi asked to keep pushing on "the
-  type system," offered struct-field `where` (smaller, pure plumbing,
-  the same shape as v8's `out` extension — `Param`, shared by fn params
-  AND struct fields, already carries `bound`/`lower` in the AST) against
-  mem-element `where` (a genuinely new capability) via `AskUserQuestion`,
-  and picked mem elements.
+  type system," offered struct-field `where` (believed at the time to
+  be smaller, pure plumbing, the same shape as v8's `out` extension —
+  `Param`, shared by fn params AND struct fields, already carries
+  `bound`/`lower` in the AST) against mem-element `where` (believed the
+  genuinely new capability) via `AskUserQuestion`, and picked mem
+  elements. (v18's own investigation later found this backwards: struct
+  fields turned out to support sound READ composition too, which mem
+  elements' lack of init/reset ruled out below — see v18's own entry.)
 
-  Grammar: `mem m : [8][20] where elem < K` (optionally `where L <= elem
+  Grammar: `mem m : [8][20] where _ < K` (optionally `where L <= _
   < K`), reusing `parse_where_bound` completely unchanged — it already
   parses the `where <expr> [<= <expr>] < <expr>` shape structurally with
   no awareness of what the self-reference resolves to. The self-
-  reference is the literal placeholder `elem`, not the mem's own
-  declared name — mirrors v13's `result` for a fn's return bound
+  reference is `_` (`Expr::Wildcard`; the literal identifier `elem`
+  through v17, before v18's retrofit), not the mem's own
+  declared name — mirrors the fn return bound's own placeholder (v13)
   exactly, and for the same reason: a mem element has no scoped `DefId`
   of its own to compare against (unlike a reg/out/param's bound, a real
-  binding already in scope). Checked by TEXT in a new `resolve.rs`
+  binding already in scope). Checked by SHAPE in a new `resolve.rs`
   function, `check_mem_bound_shape`, mirroring `check_ret_bound_shape`
   verbatim in shape rather than generalizing it to take a placeholder
   string — matches this file's own stated convention (`bounds.rs`'s

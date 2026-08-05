@@ -1231,9 +1231,9 @@ fn where_clause_parses_on_a_fn_param() {
 
 #[test]
 fn where_clause_parses_on_a_fn_return_type() {
-    // v13: `where result < N` on a fn's return type -- checked against
+    // v13: `where _ < N` on a fn's return type -- checked against
     // every `Stmt::Return` in the body, then trusted at call sites.
-    let ast = parse_ok("module M {\n Bump(i : [8]) : [8] where result < 20 {\n return i\n }\n}\n");
+    let ast = parse_ok("module M {\n Bump(i : [8]) : [8] where _ < 20 {\n return i\n }\n}\n");
     let Item::Module { items, .. } = ast.item(ast.roots[0]) else {
         panic!()
     };
@@ -1241,7 +1241,7 @@ fn where_clause_parses_on_a_fn_return_type() {
         panic!("expected a fn");
     };
     let bound = ret_bound.expect("where clause should have parsed on the return type");
-    assert_eq!(ast.expr_sexpr(bound), "(< result 20)");
+    assert_eq!(ast.expr_sexpr(bound), "(< _ 20)");
 }
 
 #[test]

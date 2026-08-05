@@ -97,22 +97,23 @@
 //!   checked as of v13: a call inside an `if`/`while` condition —
 //!   closed by v14 below.
 //! - **Return-bound propagation (v13): a fn/impl's return type can
-//!   carry a `where result < N` postcondition too** — the mirror of
+//!   carry a `where _ < N` postcondition too** — the mirror of
 //!   v12 in the OTHER direction. Checked against every `Stmt::Return`
 //!   in the fn's own body (a NEW checked position — `current_ret_
 //!   bound`, set once per item at the top of `check_item`), then
 //!   trusted at every call site: `Expr::Call` returns `Some((lower,
 //!   upper))` from the callee's own `fn_ret_bound` entry instead of
 //!   unconditionally `None`, letting a caller compose with the call's
-//!   own result (`total := Bump(3) + Bump(4)`). `result` is a textual
-//!   placeholder, not a real scoped binding — a return value has no
-//!   `DefId` of its own (unlike a reg/out/param's self-reference,
-//!   checked by `DefId` equality against an existing declaration), so
-//!   `resolve.rs`'s `check_ret_bound_shape` checks it by matching the
-//!   literal identifier text instead, and this module keys its own
-//!   postcondition table (`fn_ret_bound`) by the FN's own `DefId`
-//!   rather than folding it into `self.bounded`. Opt-in, not blanket
-//!   inference: a fn with no declared postcondition still composes to
+//!   own result (`total := Bump(3) + Bump(4)`). `_` (`Expr::Wildcard`;
+//!   `result` through v17) is a shape placeholder, not a real scoped
+//!   binding — a return value has no `DefId` of its own (unlike a
+//!   reg/out/param's self-reference, checked by `DefId` equality
+//!   against an existing declaration), so `resolve.rs`'s `check_ret_
+//!   bound_shape` checks it by matching the AST shape instead, and this
+//!   module keys its own postcondition table (`fn_ret_bound`) by the
+//!   FN's own `DefId` rather than folding it into `self.bounded`.
+//!   Opt-in, not blanket inference: a fn with no declared postcondition
+//!   still composes to
 //!   `None`, exactly as before this feature. Trust at the call site is
 //!   NOT unconditional on the declaration alone: `check_return_site_
 //!   exhaustiveness` requires at least one actual `Stmt::Return` to
@@ -278,14 +279,15 @@
 //! - **`where` on mem elements, write-side only (v17)**: at v16's own
 //!   decision point, "where on struct fields / mem elements" was the
 //!   alternative not picked; picked up directly here. `mem m : [8][20]
-//!   where elem < K` declares a bound on every value ever WRITTEN to
+//!   where _ < K` declares a bound on every value ever WRITTEN to
 //!   `m`, checked at every write site via the identical per-site
 //!   induction argument a reg/out's own bound already uses. The self-
-//!   reference placeholder is the literal identifier `elem`, not the
-//!   mem's own name — the same situation `result` (v13) is in: a mem
-//!   element has no scoped `DefId` of its own to compare against, unlike
-//!   a reg/out/param's bound (a real binding already in scope). Checked
-//!   by TEXT in `resolve.rs`'s `check_mem_bound_shape`, mirroring
+//!   reference placeholder is `_` (`Expr::Wildcard`; `elem` through
+//!   v17, retrofitted for consistency once v18 introduced struct-field
+//!   bounds needing the same shape) — a mem element has no scoped
+//!   `DefId` of its own to compare against, unlike a reg/out/param's
+//!   bound (a real binding already in scope). Checked by SHAPE
+//!   in `resolve.rs`'s `check_mem_bound_shape`, mirroring
 //!   `check_ret_bound_shape` exactly. Kept in its OWN map
 //!   (`self.mem_bounds`), not folded into `self.bounded`: a mem's bound
 //!   is a flat, whole-array fact checked at every write site, never
@@ -543,7 +545,7 @@ struct Checker<'a> {
     /// more than once under a different `state` (see that arm's own
     /// doc comment for why).
     site_ranges: HashMap<ExprId, (u64, u64)>,
-    /// v17: every `mem` with a declared `where elem < K` bound, keyed by
+    /// v17: every `mem` with a declared `where _ < K` bound, keyed by
     /// its own `DefId` -- kept separate from `self.bounded` rather than
     /// folded in, since a mem's bound is a flat, whole-array fact
     /// checked at every write site (never narrowed per-branch the way
@@ -749,7 +751,7 @@ impl<'a> Checker<'a> {
             .insert(fn_def, self.ast.expr_spans[bound.0 as usize].clone());
     }
 
-    /// Every `mem` with a `where elem < K` bound (v17), collected the
+    /// Every `mem` with a `where _ < K` bound (v17), collected the
     /// same top-level-item-walk shape `collect_bounded_defs` uses for
     /// reg/out.
     fn collect_mem_bounds(&mut self) {
@@ -861,7 +863,7 @@ impl<'a> Checker<'a> {
         let mut locals: HashMap<DefId, Option<(u64, u64)>> = HashMap::new();
         // v13: this item's own declared return postcondition, if any --
         // `None` for a `rule` (`item_defs` has no entry for one) or a
-        // fn with no `where result < N` (no `fn_ret_bound` entry).
+        // fn with no `where _ < N` (no `fn_ret_bound` entry).
         let item_def = self.res.item_defs.get(&id).copied();
         self.current_ret_bound = item_def
             .and_then(|def| self.fn_ret_bound.get(&def))
@@ -1040,7 +1042,7 @@ impl<'a> Checker<'a> {
                 // at all (`current_ret_bound` is `None`) -- same
                 // gating-the-descent shape as the `Stmt::Assign`/
                 // `Expr::Call`-arg-loop gaps above: `return Bump(50)`
-                // inside a fn with no `where result < N` used to skip
+                // inside a fn with no `where _ < N` used to skip
                 // straight past `expr_bound`, silently missing `Bump`'s
                 // own argument violation. The postcondition CHECK
                 // itself still only fires when one is actually declared.
@@ -1674,7 +1676,7 @@ impl<'a> Checker<'a> {
     /// coupling to whether `check_stmt` ever actually reached a
     /// `Stmt::Return` to check. Caught by an advisor pass before
     /// committing, confirmed empirically (a fn with an empty body and a
-    /// declared `where result < 20` let a caller's composition through
+    /// declared `where _ < 20` let a caller's composition through
     /// with zero errors).
     fn check_return_site_exhaustiveness(&mut self) {
         for fn_def in self.fn_ret_bound.keys().copied().collect::<Vec<_>>() {
@@ -1701,7 +1703,7 @@ impl<'a> Checker<'a> {
     /// (see `expr_bound`'s `Expr::Bracket` arm's own doc comment) -- so
     /// this isn't closing a "trusted with nothing verified" soundness
     /// hole the way `check_return_site_exhaustiveness` does. It's a
-    /// smaller, still real problem: a declared `where elem < K` with
+    /// smaller, still real problem: a declared `where _ < K` with
     /// ZERO write sites anywhere in the program never gets its only
     /// actual obligation (the write-site check) exercised even once --
     /// dead, misleading metadata (a typo, or a sign the mem is only ever

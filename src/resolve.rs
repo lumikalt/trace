@@ -666,19 +666,20 @@ impl<'a> Resolver<'a> {
                 // never a real scoped binding (there's no `DefId` for
                 // "the return value" the way a param/reg/out already
                 // has one) -- only its constant side(s) are resolved
-                // normally; the placeholder `result` is checked by
-                // TEXT in `check_ret_bound_shape`, not passed through
-                // `resolve_expr` (which would otherwise error "cannot
-                // find `result`"). A bound with no declared `ret` type
-                // has nothing to check its own width against (bounds.rs
-                // needs `ret`'s own type expression) -- caught here so
-                // it's a real diagnostic, not an internal panic later.
+                // normally; the placeholder `_` is checked by SHAPE
+                // in `check_ret_bound_shape`, not passed through
+                // `resolve_expr` (which no-ops on `Expr::Wildcard`
+                // anyway, but the shape check runs regardless). A bound
+                // with no declared `ret` type has nothing to check its
+                // own width against (bounds.rs needs `ret`'s own type
+                // expression) -- caught here so it's a real diagnostic,
+                // not an internal panic later.
                 if let Some(ret_bound) = ret_bound {
                     if ret.is_none() {
                         self.error(
                             self.ast.expr_spans[ret_bound.0 as usize].clone(),
                             "a return bound needs a declared return type to check against (e.g. \
-                             `: [8] where result < 20`)"
+                             `: [8] where _ < 20`)"
                                 .to_string(),
                         );
                     }
@@ -1158,51 +1159,49 @@ impl<'a> Resolver<'a> {
     /// unlike `check_bound_self_reference`, there's no existing `DefId`
     /// to compare against (a return value is never a named binding
     /// anywhere in scope), so this checks the bound's self-reference
-    /// position by TEXT instead: it must be the literal placeholder
-    /// identifier `result` (already idiomatic in this codebase -- a
-    /// spawned fn's own handle exposes its return value via `.result`,
-    /// `lower/plan.rs`). Same fallthrough reasoning as `check_bound_
-    /// self_reference`: a malformed shape (LHS not even an `Ident`)
-    /// falls through to the same "doesn't match" error; `bounds.rs`
-    /// reports the precise shape complaint separately.
+    /// position by SHAPE instead: it must be the wildcard `_`
+    /// (`Expr::Wildcard` -- a reserved AST node, not a generic
+    /// identifier, see `ast.rs`/`lexer.rs`; v18 retrofit, was the
+    /// literal identifier `result` through v17). Same fallthrough
+    /// reasoning as `check_bound_self_reference`: a malformed shape
+    /// (LHS not even present) falls through to the same "doesn't match"
+    /// error; `bounds.rs` reports the precise shape complaint
+    /// separately.
     fn check_ret_bound_shape(&mut self, bound: ExprId) {
         let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        let is_result = matches!(self.ast.expr(lhs), Expr::Ident(name) if name == "result");
-        if !is_result {
+        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
+        if !is_placeholder {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
-                "a return bound must reference the return value via the placeholder `result` \
-                 (e.g. `where result < 20`)"
+                "a return bound must reference the return value via `_` (e.g. `where _ < 20`)"
                     .to_string(),
             );
         }
     }
 
     /// v17's own sibling of `check_ret_bound_shape` immediately above --
-    /// same reasoning, same shape, a different placeholder: a mem's
-    /// element has no scoped `DefId` either (unlike a reg/out/param's
-    /// own bound, checked by `check_bound_self_reference` against a
-    /// real binding), so the self-reference position is checked by TEXT
-    /// against the literal placeholder `elem`, kept as its own small
-    /// function rather than generalizing `check_ret_bound_shape` to take
-    /// a placeholder string -- this file's own convention (see `bounds.
-    /// rs`'s `collect_one_ret_bound` doc comment) is to only share a
-    /// helper across near-identical branches within one function, not
-    /// force a shared abstraction across two conceptually separate
-    /// checks like these.
+    /// same reasoning, same shape: a mem's element has no scoped `DefId`
+    /// either (unlike a reg/out/param's own bound, checked by `check_
+    /// bound_self_reference` against a real binding), so the self-
+    /// reference position is checked by SHAPE against `_`
+    /// (`Expr::Wildcard`; v18 retrofit, was the literal identifier
+    /// `elem` through v17), kept as its own small function rather than
+    /// generalizing `check_ret_bound_shape` -- this file's own
+    /// convention (see `bounds.rs`'s `collect_one_ret_bound` doc
+    /// comment) is to only share a helper across near-identical
+    /// branches within one function, not force a shared abstraction
+    /// across two conceptually separate checks like these.
     fn check_mem_bound_shape(&mut self, bound: ExprId) {
         let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        let is_elem = matches!(self.ast.expr(lhs), Expr::Ident(name) if name == "elem");
-        if !is_elem {
+        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
+        if !is_placeholder {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
-                "a mem bound must reference each element via the placeholder `elem` (e.g. \
-                 `where elem < 20`)"
-                    .to_string(),
+                "a mem bound must reference each element via `_` (e.g. `where _ < 20`)".to_string(),
             );
         }
     }

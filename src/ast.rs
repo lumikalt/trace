@@ -426,20 +426,25 @@ pub enum Item {
     Mem {
         name: Name,
         ty: ExprId,
-        /// `where elem < <const>` — an optional, statically PROVEN bound
-        /// (`bounds.rs`, v17) on every value ever stored in this mem,
+        /// `where _ < <const>` — an optional, statically PROVEN bound
+        /// (`bounds.rs`, v17) on every value ever WRITTEN to this mem,
         /// checked at every write site via the same per-site induction
-        /// argument a reg/out's own bound already uses, and handed back
-        /// at every READ site too (a mem read composes to `None`
-        /// otherwise). The self-reference placeholder is the literal
-        /// identifier `elem`, not this mem's own name -- a mem element
-        /// has no scoped `DefId` of its own to compare against, the same
-        /// situation `ret_bound`'s `result` placeholder is in, unlike a
-        /// reg/out/param's bound (which references a real binding
-        /// already in scope). Checked by TEXT in `resolve.rs`'s
+        /// argument a reg/out's own bound already uses. Deliberately
+        /// NOT handed back at read sites (a mem read still composes to
+        /// `None`, exactly as before v17): an earlier version of this
+        /// feature did compose at reads, but a mem has no `init`/reset,
+        /// so "every WRITTEN value satisfies the bound" doesn't imply
+        /// "every READ returns an in-range value" — see `bounds.rs`'s
+        /// module doc for the full soundness argument an advisor pass
+        /// caught before this shipped. The self-reference placeholder is
+        /// `_` (`Expr::Wildcard`), not this mem's own name -- a mem
+        /// element has no scoped `DefId` of its own to compare against,
+        /// the same situation `ret_bound`'s own placeholder is in,
+        /// unlike a reg/out/param's bound (which references a real
+        /// binding already in scope). Checked by SHAPE in `resolve.rs`'s
         /// `check_mem_bound_shape`, mirroring `check_ret_bound_shape`.
         bound: Option<ExprId>,
-        /// `where <const> <= elem < <const>` — the same bound's optional
+        /// `where <const> <= _ < <const>` — the same bound's optional
         /// LOWER end, mirroring `Item::Reg`'s own `lower` field exactly.
         lower: Option<ExprId>,
     },
@@ -500,14 +505,14 @@ pub enum Item {
         kind: FnKind,
         params: Vec<Param>,
         ret: Option<ExprId>,
-        /// `where result < N` / `where L <= result < N` (v13): a
-        /// postcondition on the fn's own return value, checked against
-        /// every `Stmt::Return` in this fn's body (bounds.rs) and
-        /// trusted at every call site so a caller can compose with the
-        /// call's own result — the mirror of `Param`'s `bound`/`lower`
-        /// (v12), which checks the opposite direction (an argument
-        /// against the callee's declared precondition). `result` is a
-        /// textual placeholder, not a real scoped binding: unlike a
+        /// `where _ < N` / `where L <= _ < N` (v13): a postcondition on
+        /// the fn's own return value, checked against every `Stmt::
+        /// Return` in this fn's body (bounds.rs) and trusted at every
+        /// call site so a caller can compose with the call's own
+        /// result — the mirror of `Param`'s `bound`/`lower` (v12), which
+        /// checks the opposite direction (an argument against the
+        /// callee's declared precondition). `_` (`Expr::Wildcard`) is a
+        /// shape placeholder, not a real scoped binding: unlike a
         /// reg/out/param's self-reference (an existing `DefId`), a
         /// return value is never a named binding anywhere in scope, so
         /// there's nothing to declare it against (resolve.rs).
