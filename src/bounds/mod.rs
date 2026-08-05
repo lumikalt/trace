@@ -3246,6 +3246,46 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The stage-1 shadow check's own flat re-keying of `struct_field_
+    /// bounds` (itself keyed by the struct TYPE's own `DefId`) into a
+    /// map keyed by each Reg/Output VARIABLE's own `DefId` instead --
+    /// exactly what `smt::translate_expr`'s new `Expr::Field` arm needs,
+    /// since that module has no type information of its own and
+    /// shouldn't need any (see `smt::StructFieldBoundsByDef`'s own doc
+    /// comment). Filters to `Reg`/`Output` ONLY, mirroring `struct_
+    /// field_bound`'s own `DefKind` match exactly: a `Local`'s field
+    /// isn't trusted flatly there (it may alias an untrusted value), so
+    /// it must be equally absent here, not just coincidentally excluded
+    /// by `state_tys` never containing a `Local` entry in the first
+    /// place -- an explicit filter, not a structural accident to rely
+    /// on. Computed once per `shadow_check_bounds` call, not per
+    /// branch/state: unlike a scalar's bound, a struct field's own
+    /// declared range never narrows per-guard (mirrors `struct_field_
+    /// bounds`'s own flat treatment, same as the real pass).
+    fn struct_field_bounds_by_def(&self) -> HashMap<(DefId, String), (u64, u64)> {
+        let mut map = HashMap::new();
+        for (&def, ty) in &self.ty.state_tys {
+            if !matches!(
+                self.res.def(def).kind,
+                crate::resolve::DefKind::Reg | crate::resolve::DefKind::Output
+            ) {
+                continue;
+            }
+            let Ty::Struct {
+                def: struct_def, ..
+            } = ty
+            else {
+                continue;
+            };
+            for ((sd, field), bounded) in &self.struct_field_bounds {
+                if sd == struct_def {
+                    map.insert((def, field.clone()), (bounded.lower, bounded.upper));
+                }
+            }
+        }
+        map
+    }
+
     /// Defense in depth, not trust-by-construction: every bounded def
     /// that `effects.rs` reports as written SOMEWHERE in the program
     /// must be a def this pass ALSO found a real `Stmt::Assign` for
@@ -3311,6 +3351,17 @@ impl<'a> Checker<'a> {
     /// doesn't attempt yet.
     fn shadow_check_bounds(&mut self) -> Vec<smt::Mismatch> {
         let mut mismatches = Vec::new();
+        let struct_field_bounds_by_def = self.struct_field_bounds_by_def();
+        // v13's own composition capability (`Bump(3) + Bump(4)`), re-keyed
+        // to plain `(u64, u64)` tuples for `smt::translate_expr`'s own
+        // `Expr::Call` arm -- no indirection needed here (unlike struct
+        // fields), since `fn_ret_bound` is already keyed by the callee's
+        // own `DefId`, exactly what a call site's `callee` resolves to.
+        let fn_ret_bounds_by_def: HashMap<DefId, (u64, u64)> = self
+            .fn_ret_bound
+            .iter()
+            .map(|(d, b)| (*d, (b.lower, b.upper)))
+            .collect();
         for id in self.collect_bodied_items() {
             let body = match self.ast.item(id) {
                 Item::Rule { body, .. } => body.clone(),
@@ -3339,7 +3390,16 @@ impl<'a> Checker<'a> {
                 .get(&id)
                 .and_then(|def| self.fn_ret_bound.get(def))
                 .copied();
-            self.shadow_walk_body(&body, &state, &[], &[], ret_bound, &mut mismatches);
+            self.shadow_walk_body(
+                &body,
+                &state,
+                &struct_field_bounds_by_def,
+                &fn_ret_bounds_by_def,
+                &[],
+                &[],
+                ret_bound,
+                &mut mismatches,
+            );
         }
         mismatches
     }
@@ -3439,43 +3499,131 @@ impl<'a> Checker<'a> {
         mismatches
     }
 
-    /// v12: every declared-bounded parameter of a DIRECTLY-called fn/
-    /// impl, checked against its own actual argument -- the call-site
-    /// half of param-bound propagation, mirroring `expr_bound`'s own
-    /// `Expr::Call` arm. v1 scope cut for this shadow check: only a
-    /// call that IS `id` itself (a bare call statement, or the WHOLE of
-    /// an assign's rhs/a return's value) is checked here -- a call
-    /// nested inside arithmetic, a condition, or another call's own
-    /// argument (`total := Bump(3) + Bump(4)`, `if Bump(5) < 3`, `Outer
-    /// (Bump(50))`) is a real, separate gap, not attempted, since
-    /// covering it exhaustively would mean reproducing `check_calls_
-    /// in`'s own full position sweep rather than this narrower slice.
+    /// v12: every declared-bounded parameter of a called fn/impl,
+    /// checked against its own actual argument -- the call-site half of
+    /// param-bound propagation, mirroring `expr_bound`'s own `Expr::
+    /// Call` arm. Recurses into a `Call`'s own args, a `Bracket`'s own
+    /// callee/args, and an `Add`/`Sub`/`Mul`'s own operands -- the same
+    /// three shapes `expr_bound`'s own `Call`/`Bracket` arms and
+    /// `check_calls_in`'s own stop-list recurse through to find a call
+    /// nested one layer down, confirmed as the ONLY shapes this shadow
+    /// check's own `Skipped`-site census found actually exercised
+    /// (`Outer(Bump(50))`, `m[Bump(50)]` read as a value, `Bump(3) +
+    /// Bump(4)`) -- not the fully general `check_calls_in` sweep (no
+    /// `sub_exprs` fallback for every OTHER wrapper shape), since
+    /// nothing in the current suite needs it and adding it would be
+    /// speculative completeness, not closing a measured gap. A call
+    /// inside a GUARD's own operand position (`if Bump(50) < 5`) is a
+    /// distinct, deliberately NOT-attempted gap (see `smt`'s own module
+    /// doc for why dropping an untranslatable guard's hypothesis to
+    /// reach it would be unsound) -- this function is never called on a
+    /// guard `ExprId` at all, only on a write's own rhs/return value/
+    /// bare call statement, so that gap can't accidentally get "fixed"
+    /// here as a side effect.
+    #[allow(clippy::too_many_arguments)]
     fn shadow_check_call_params(
         &mut self,
         state: &HashMap<DefId, (u64, u64)>,
+        struct_field_bounds_by_def: &HashMap<(DefId, String), (u64, u64)>,
+        fn_ret_bounds_by_def: &HashMap<DefId, (u64, u64)>,
         guards: &[ExprId],
         guards_negated: &[ExprId],
         id: ExprId,
         out: &mut Vec<smt::Mismatch>,
     ) {
-        let Expr::Call { callee, args } = self.ast.expr(id).clone() else {
-            return;
-        };
-        let Some(&fn_def) = self.res.expr_defs.get(&callee) else {
-            return;
-        };
-        let Some(params) = self.fn_params.get(&fn_def).cloned() else {
-            return;
-        };
-        for (param, &arg) in params.iter().zip(&args) {
-            if param.bound.is_none() {
-                continue;
+        if let Expr::Call { callee, args } = self.ast.expr(id).clone() {
+            if let Some(&fn_def) = self.res.expr_defs.get(&callee)
+                && let Some(params) = self.fn_params.get(&fn_def).cloned()
+            {
+                for (param, &arg) in params.iter().zip(&args) {
+                    if param.bound.is_none() {
+                        continue;
+                    }
+                    let def = def_of_name(self.res, &param.name);
+                    let Some(bound) = self.bounded.get(&def).copied() else {
+                        continue;
+                    };
+                    self.shadow_compare(
+                        state,
+                        struct_field_bounds_by_def,
+                        fn_ret_bounds_by_def,
+                        bound,
+                        guards,
+                        guards_negated,
+                        arg,
+                        out,
+                    );
+                }
             }
-            let def = def_of_name(self.res, &param.name);
-            let Some(bound) = self.bounded.get(&def).copied() else {
-                continue;
-            };
-            self.shadow_compare(state, bound, guards, guards_negated, arg, out);
+            // A nested call as ANOTHER call's own argument (`Outer(
+            // Bump(50))`) -- mirrors `expr_bound`'s own `Expr::Call` arm
+            // calling `expr_bound` on EVERY arg unconditionally, not
+            // just ones whose param has a declared bound (v14's own
+            // fix, see that arm's doc comment).
+            for &arg in &args {
+                self.shadow_check_call_params(
+                    state,
+                    struct_field_bounds_by_def,
+                    fn_ret_bounds_by_def,
+                    guards,
+                    guards_negated,
+                    arg,
+                    out,
+                );
+            }
+            return;
+        }
+        if let Expr::Bracket { callee, args } = self.ast.expr(id).clone() {
+            // A mem/fifo access's own callee/args -- mirrors `expr_
+            // bound`'s own `Expr::Bracket` arm, which recurses into
+            // both via `check_calls_in` (`m[Bump(50)]` used as a
+            // READ value, not a write target).
+            self.shadow_check_call_params(
+                state,
+                struct_field_bounds_by_def,
+                fn_ret_bounds_by_def,
+                guards,
+                guards_negated,
+                callee,
+                out,
+            );
+            for &arg in &args {
+                self.shadow_check_call_params(
+                    state,
+                    struct_field_bounds_by_def,
+                    fn_ret_bounds_by_def,
+                    guards,
+                    guards_negated,
+                    arg,
+                    out,
+                );
+            }
+            return;
+        }
+        if let Expr::Binary { op, lhs, rhs } = self.ast.expr(id).clone()
+            && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+        {
+            // `total := Bump(3) + Bump(4)` -- mirrors `expr_bound`'s own
+            // `Add`/`Sub`/`Mul` arms, each of which calls `expr_bound`
+            // on both operands unconditionally.
+            self.shadow_check_call_params(
+                state,
+                struct_field_bounds_by_def,
+                fn_ret_bounds_by_def,
+                guards,
+                guards_negated,
+                lhs,
+                out,
+            );
+            self.shadow_check_call_params(
+                state,
+                struct_field_bounds_by_def,
+                fn_ret_bounds_by_def,
+                guards,
+                guards_negated,
+                rhs,
+                out,
+            );
         }
     }
 
@@ -3494,16 +3642,29 @@ impl<'a> Checker<'a> {
     ///
     /// Calling `expr_bound` only AFTER confirming the SMT verdict isn't
     /// `Skipped` is load-bearing, not incidental: `check_bound_
-    /// obligation` only returns a non-`Skipped` verdict when
-    /// `translate_expr` accepted `rhs`, which means (by that function's
-    /// own structural induction) `rhs`'s whole subtree contains only
-    /// `Int`/`SizedInt`/bounded-`Ident`/`Add`/`Sub`/`Mul` nodes and no
-    /// `Expr::Call` at all -- so `expr_bound` cannot reach its own
-    /// call-argument-checking code here, and this can never double-push
-    /// an error `check_stmt`'s own real pass already recorded.
+    /// obligation` only returns a non-`Skipped` verdict when `translate_
+    /// expr` accepted `rhs`, which means (by that function's own
+    /// structural induction) `rhs`'s whole subtree contains only
+    /// `Int`/`SizedInt`/bounded-`Ident`/`Add`/`Sub`/`Mul`/a trusted
+    /// struct-field `Field`/an `fn_ret_bounds`-covered `Call` -- UNLIKE
+    /// the first four, `Field` and (especially) `Call` are NOT
+    /// side-effect-free to re-evaluate: `expr_bound`'s own `Call` arm
+    /// pushes a real "argument for parameter" error whenever an
+    /// argument violates its declared bound, as a deliberate SIDE
+    /// EFFECT of computing a range, not just a value computation (see
+    /// that arm's own doc comment). So `rhs` reaching here CAN now
+    /// contain a `Call`, and `expr_bound` below WOULD double-push
+    /// whatever error the real, live `check_stmt` pass already recorded
+    /// for the exact same site -- guarded against explicitly below
+    /// (snapshot `self.errors`'s length, discard anything this
+    /// reconstruction call itself pushed) rather than relying on it
+    /// being structurally impossible, since it no longer is.
+    #[allow(clippy::too_many_arguments)]
     fn shadow_compare(
         &mut self,
         bounds_by_def: &HashMap<DefId, (u64, u64)>,
+        struct_field_bounds_by_def: &HashMap<(DefId, String), (u64, u64)>,
+        fn_ret_bounds_by_def: &HashMap<DefId, (u64, u64)>,
         target: BoundedDef,
         guards: &[ExprId],
         guards_negated: &[ExprId],
@@ -3514,6 +3675,8 @@ impl<'a> Checker<'a> {
             self.ast,
             self.res,
             bounds_by_def,
+            struct_field_bounds_by_def,
+            fn_ret_bounds_by_def,
             target,
             guards,
             guards_negated,
@@ -3524,7 +3687,17 @@ impl<'a> Checker<'a> {
         }
         let locals = HashMap::new();
         let struct_origins = HashMap::new();
+        // See this fn's own doc comment: `rhs` can now contain a `Call`,
+        // whose own argument-bound violation `expr_bound` would push as
+        // a REAL error -- a duplicate of whatever the live `check_stmt`
+        // pass (or `shadow_check_call_params`, for this same site)
+        // already recorded. Truncate back to the pre-call length
+        // unconditionally: this reconstruction call exists purely to
+        // read back a COMPUTED RANGE for comparison, never to report
+        // anything itself.
+        let errors_before = self.errors.len();
         let computed = self.expr_bound(rhs, bounds_by_def, &locals, &struct_origins);
+        self.errors.truncate(errors_before);
         // Mirrors `check_against_bound`'s own three-way check exactly
         // (width overflow, upper violation, lower violation) -- NOT
         // just a bare `[lower, upper)` comparison, which would silently
@@ -3558,10 +3731,13 @@ impl<'a> Checker<'a> {
     /// two representations of one fact, not two independent sources of
     /// truth: both are derived from the exact same `cond` at the exact
     /// same `Stmt::If`, one line apart, below.
+    #[allow(clippy::too_many_arguments)]
     fn shadow_walk_body(
         &mut self,
         body: &[StmtId],
         state: &HashMap<DefId, (u64, u64)>,
+        struct_field_bounds_by_def: &HashMap<(DefId, String), (u64, u64)>,
+        fn_ret_bounds_by_def: &HashMap<DefId, (u64, u64)>,
         guards: &[ExprId],
         guards_negated: &[ExprId],
         ret_bound: Option<BoundedDef>,
@@ -3573,13 +3749,29 @@ impl<'a> Checker<'a> {
                 // purely for its `writes` effect) -- the ONLY position
                 // `Stmt::Expr` itself can hold a call directly.
                 Stmt::Expr(e) => {
-                    self.shadow_check_call_params(state, guards, guards_negated, e, out);
+                    self.shadow_check_call_params(
+                        state,
+                        struct_field_bounds_by_def,
+                        fn_ret_bounds_by_def,
+                        guards,
+                        guards_negated,
+                        e,
+                        out,
+                    );
                 }
                 Stmt::Assign { lhs, rhs } => {
                     // v12: `rhs` may itself be a bare call (`x :=
                     // Bump(y)`, `writes`-only or otherwise) regardless
                     // of whether `lhs` is itself bounded.
-                    self.shadow_check_call_params(state, guards, guards_negated, rhs, out);
+                    self.shadow_check_call_params(
+                        state,
+                        struct_field_bounds_by_def,
+                        fn_ret_bounds_by_def,
+                        guards,
+                        guards_negated,
+                        rhs,
+                        out,
+                    );
                     // Scalar reg/out/param: same shape as v5's own
                     // induction (`self.bounded`), self-reference in
                     // `rhs` resolves via `state` (which already
@@ -3588,7 +3780,16 @@ impl<'a> Checker<'a> {
                         && let Some(&def) = self.res.expr_defs.get(&lhs)
                         && let Some(bound) = self.bounded.get(&def).copied()
                     {
-                        self.shadow_compare(state, bound, guards, guards_negated, rhs, out);
+                        self.shadow_compare(
+                            state,
+                            struct_field_bounds_by_def,
+                            fn_ret_bounds_by_def,
+                            bound,
+                            guards,
+                            guards_negated,
+                            rhs,
+                            out,
+                        );
                     }
                     // v17: a mem write (`m[i] := rhs`) checks `rhs`
                     // against the mem's own flat declared elem bound --
@@ -3602,7 +3803,16 @@ impl<'a> Checker<'a> {
                         && self.res.def(mem_def).kind == crate::resolve::DefKind::Mem
                         && let Some(bound) = self.mem_bounds.get(&mem_def).copied()
                     {
-                        self.shadow_compare(state, bound, guards, guards_negated, rhs, out);
+                        self.shadow_compare(
+                            state,
+                            struct_field_bounds_by_def,
+                            fn_ret_bounds_by_def,
+                            bound,
+                            guards,
+                            guards_negated,
+                            rhs,
+                            out,
+                        );
                     }
                     // v18: a struct-typed write (`p := Pair{...}`)
                     // checks each bounded field's own value against its
@@ -3634,7 +3844,16 @@ impl<'a> Checker<'a> {
                                 continue; // `..base`-sourced -- see doc comment above
                             };
                             let bound = self.struct_field_bounds[&(struct_def, field_name.clone())];
-                            self.shadow_compare(state, bound, guards, guards_negated, *value, out);
+                            self.shadow_compare(
+                                state,
+                                struct_field_bounds_by_def,
+                                fn_ret_bounds_by_def,
+                                bound,
+                                guards,
+                                guards_negated,
+                                *value,
+                                out,
+                            );
                         }
                     }
                 }
@@ -3645,9 +3864,26 @@ impl<'a> Checker<'a> {
                 // bare call (v12's own obligation, checked the same way
                 // a bare call statement/assign-rhs is above).
                 Stmt::Return(Some(e)) => {
-                    self.shadow_check_call_params(state, guards, guards_negated, e, out);
+                    self.shadow_check_call_params(
+                        state,
+                        struct_field_bounds_by_def,
+                        fn_ret_bounds_by_def,
+                        guards,
+                        guards_negated,
+                        e,
+                        out,
+                    );
                     if let Some(bound) = ret_bound {
-                        self.shadow_compare(state, bound, guards, guards_negated, e, out);
+                        self.shadow_compare(
+                            state,
+                            struct_field_bounds_by_def,
+                            fn_ret_bounds_by_def,
+                            bound,
+                            guards,
+                            guards_negated,
+                            e,
+                            out,
+                        );
                     }
                 }
                 Stmt::If {
@@ -3661,6 +3897,8 @@ impl<'a> Checker<'a> {
                     self.shadow_walk_body(
                         &then_body,
                         &then_state,
+                        struct_field_bounds_by_def,
+                        fn_ret_bounds_by_def,
                         &then_guards,
                         guards_negated,
                         ret_bound,
@@ -3673,6 +3911,8 @@ impl<'a> Checker<'a> {
                         self.shadow_walk_body(
                             &else_body,
                             &else_state,
+                            struct_field_bounds_by_def,
+                            fn_ret_bounds_by_def,
                             guards,
                             &else_negated,
                             ret_bound,

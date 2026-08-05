@@ -9,13 +9,16 @@ own interval engine, for the generality: it can plausibly prove
 `examples/circular_buffer_disjoint.tr` as an ordinary refinement composition instead of
 the bespoke `invariant`/joint-guards mechanism that currently exists.
 
-Stage 1 (faithfulness) is IN PROGRESS — `bounds.rs` split into `src/bounds/{mod.rs,
-smt.rs}` (it was the clear size outlier) to make room for this. `pkgs.z3`/the `z3` crate
-are wired in (`tests/z3_smoke.rs` pins the linking); scalar reg/out/param bounds (v5+),
-mem-element bounds (write-side, v17), struct-field bounds (v18, named-field-only — the
-`..base` fallback is its own deferred slice), param bounds at a top-level call site (v12),
-return bounds (v13), AND the relational invariant (`circular_buffer_disjoint.tr`'s own
-case, v20) are all shadow-checked against the existing interval engine on every
+Stage 1 (faithfulness) is SUBSTANTIALLY COMPLETE — every measured `Skipped`-site gap
+closed except one deliberately-unattempted sub-case (below). `bounds.rs` split into
+`src/bounds/{mod.rs, smt.rs}` (it was the clear size outlier) to make room for this.
+`pkgs.z3`/the `z3` crate are wired in (`tests/z3_smoke.rs` pins the linking); scalar
+reg/out/param bounds (v5+, including nested calls and commuted `Ne` guards), mem-element
+bounds (write-side, v17), struct-field bounds (v18, both directions — write-side named-
+field composition AND read-side composition off a Reg/Output), param bounds at any
+recognized call position (v12), return bounds (v13), AND the relational invariant
+(`circular_buffer_disjoint.tr`'s own case, v20) are all shadow-checked against the existing
+interval engine on every
 `bounds::check` call, zero mismatches across the whole suite. The relational invariant is
 checked via a genuinely general `fire_R` transition encoding (`smt::check_relational_
 obligation`) rather than mirroring the hand-rolled mask-enumeration loop — this is the
@@ -29,17 +32,56 @@ branch's contradictory guard made the SMT query "prove" anything for free) caugh
 as the pre-implementation review warned it could be.
 
 A `Skipped`-site census (a temporary debug counter, run once across the whole suite then
-removed) turned "still needed" from a guess into a measured list: every `Skipped` site is
-either a deliberate scope cut already working as designed (the unreachable-hypothesis case;
-the relational invariant's `n <= 2` cap, which the `fire_R` encoding itself doesn't need but
-this shadow check still honors on purpose — NOT something to lift for stage 1, see
-DESIGN.md), or nothing-to-compare (the interval engine also returns no bound there), or one
-of three real, confirmed-exercised translation gaps: (1) a commuted guard comparison (`10 >
-i` vs `i < 10` — looks cheap to close), (2) a struct-field READ composed into an rhs
-expression (subsumes the `..base` case — one instance of "reaches into a struct field," not
-a separate mechanism), (3) a call nested inside arithmetic/another call's argument rather
-than a top-level position. None of these three were attempted this round. See DESIGN.md's
-own stage-1 entry for the full census breakdown and exact test names.
+removed) turned "still needed" from a guess into a measured list — corrected once already:
+the first pass logged the raw `expr_bound` result as evidence the interval engine "proved"
+a site, which is wrong (a computed range still has to clear the three-way in-bound check);
+re-run with the actual boolean before writing any code against the wrong list. The
+corrected census: every `Skipped` site is either a deliberate scope cut already working as
+designed (the unreachable-hypothesis case; the relational invariant's `n <= 2` cap, which
+the `fire_R` encoding itself doesn't need but this shadow check still honors on purpose —
+NOT something to lift for stage 1), or nothing-to-compare (the interval engine also has no
+verdict there — this bucket now also correctly includes `commuted_lt_is_not_recognized`,
+which the ORIGINAL census wrongly called a gap: that test pins the interval engine
+DELIBERATELY rejecting a commuted `Lt`/`Gt`/`Ge` guard too, per `narrow_for_condition`'s own
+doc comment — both engines agree, so recognizing that shape in the SMT check would make it
+strictly MORE capable than the engine it shadows, which is out of scope for stage 1), or one
+of three real, confirmed-exercised translation gaps: (1) a commuted **`Ne`** guard only
+(`5 <> i` vs `i <> 5` — `Ne` alone is genuinely order-independent in `narrow_for_condition`,
+unlike `Lt`/`Gt`/`Ge`), (2) a struct-field READ composed into an rhs expression (subsumes the
+`..base` case — one instance of "reaches into a struct field," not a separate mechanism),
+(3) a call nested inside arithmetic/another call's argument rather than a top-level
+position. A fourth, related but distinct gap was also found and filed separately, not folded
+into (3): a call inside a GUARD's own operand (`if Bump(50) < 5`) makes that whole guard
+untranslatable, conservatively skipping every write in that branch regardless of whether it
+actually depends on the call — dropping the guard's hypothesis instead of aborting was
+considered and rejected as unsound (it can silently defeat the vacuous-hypothesis check from
+bug 3, reintroducing that exact hazard through a side door). See DESIGN.md's own stage-1
+entry for the full census breakdown and exact test names.
+
+Gap (1) is now CLOSED — `translate_guard` recognizes commuted `Ne` (mirroring `ident_const_
+operands`'s own `Ne`-only fallback exactly), zero mismatches. Gap (2) is now CLOSED too —
+`translate_expr`'s new `Expr::Field` arm recognizes a struct field read off a bare Reg/Output
+`Ident` (via a new `Checker::struct_field_bounds_by_def` helper, re-keying `struct_field_
+bounds` by variable instead of struct type), which turned out to close all three named test
+sites at once: the `..base` complexity in one test's name is entirely on the WRITE side
+(already covered by the existing struct-field write obligation), not the READ this gap was
+actually about. Gap (3) is now CLOSED too, via TWO mechanisms — a distinction the first pass
+at this fix got wrong and stated incorrectly here, caught by re-running the same
+`Skipped`-site verification used for gaps (1)/(2) (skipped for this one initially, then
+re-applied): `shadow_check_call_params` recurses into a `Call`'s own args, a `Bracket`'s own
+callee/args, and an `Add`/`Sub`/`Mul`'s own operands (exactly the three shapes the census
+found actually exercised, not the fully general `check_calls_in` sweep) — this closes a
+nested call's own PARAM-argument check, but does nothing for composing a call's own RETURN
+value into the enclosing write's bound (`Bump(3) + Bump(4)`), which needed a separate new
+`translate_expr` `Expr::Call` arm (keyed by call-SITE `ExprId`, not callee `DefId`, so two
+calls to the same fn with different arguments aren't wrongly correlated). That second fix
+also surfaced a real double-push risk in `shadow_compare`'s own interval-engine
+reconstruction (now guarded by snapshotting/truncating `self.errors`), confirmed necessary
+via a synthetic repro, not just theorized. Only the guard-embedded-call sub-case remains,
+deliberately unattempted (dropping an untranslatable guard's hypothesis to reach it is
+unsound — see DESIGN.md). With that one deliberate exception, stage 1's shadow check now
+agrees with the interval engine on every obligation shape either engine can currently prove
+anything about.
 
 Z3's own linked version is now pinned too (`tests/z3_smoke.rs`'s `z3_linked_version_matches_
 the_devenv_pin`, mirroring the firtool/iverilog/verilator pins in `devenv.nix`'s `simulate`
@@ -47,7 +89,7 @@ script), and `--explain-schedule` is confirmed byte-identical across all 84 exam
 the pre-stage-1 baseline commit — stage 1's own stated success criterion, actually run.
 
 **Retiring the old interval-arithmetic engine is stage 4's work, not stage 1's** — even
-once the three gaps above close. `expr_bound` can't be deleted in stage 1 regardless of
+once the gaps above close. `expr_bound` can't be deleted in stage 1 regardless of
 shadow-check coverage, because `site_ranges` (stage 1's own explicit scope cut) is
 populated as a side effect of `expr_bound` itself and `schedule.rs`'s `real_range` still
 consults it; deletion rides along with `real_range`'s own retirement at stage 4. Stages

@@ -3798,7 +3798,8 @@ tool-version checks already do.
    stage where "nothing changed" IS the discriminating result, proving the
    encoding faithful before anything is built on top of it.
 
-   **In progress.** `z3` (dynamically linked against `pkgs.z3`, per "Build
+   **Substantially complete** (one deliberately-unattempted sub-case
+   remains, see below). `z3` (dynamically linked against `pkgs.z3`, per "Build
    integration" above) is wired in and confirmed working
    (`tests/z3_smoke.rs`). `src/bounds/smt.rs`'s `check_bound_obligation`
    re-derives a write's own base-case-plus-induction obligation via one Z3
@@ -3926,54 +3927,214 @@ tool-version checks already do.
    stage's own stated success criterion, actually run rather than assumed
    from "no scheduling code was touched."
 
-   **The `Skipped` census (measured, not guessed).** A temporary debug
-   counter (added, run once across the whole suite, then removed —
-   same discipline as the two earlier debug-trace checks above) recorded
-   every `Skipped` site's reason AND whether the interval engine's own
-   `expr_bound` independently proved a real bound there anyway. Result:
-   every `Skipped` site falls into one of three buckets, and only one is
-   a real gap.
+   **The `Skipped` census (measured, not guessed — and corrected once
+   already).** A temporary debug counter (added, run once across the
+   whole suite, then removed — same discipline as the two earlier
+   debug-trace checks above) recorded every `Skipped` site's reason AND
+   whether the interval engine's own `expr_bound` independently proved a
+   real bound there anyway. The FIRST version of this census logged the
+   raw `expr_bound` result tuple as its own evidence of "the interval
+   engine proved this" — wrong: a `Some((lo, hi))` result is just a
+   computed range, not a verdict, and still has to clear `check_against_
+   bound`'s own three-way comparison (width overflow, upper, lower)
+   before it means "in bound." Re-run with the ACTUAL boolean `shadow_
+   compare` itself computes (mirroring that three-way check exactly) —
+   caught before any code was written against the wrong list, not after.
+   The corrected census puts every `Skipped` site into one of three
+   buckets, and confirms real gaps are narrower than first measured.
    - **Not a gap, working as designed:** the unreachable-hypothesis case
      (bug 3 above) fired twice in the suite, and the relational `n > 2`
      cap fired once (`invariant_with_more_than_two_contributing_rules_
-     is_rejected`) — both deliberate, already-documented scope cuts.
-   - **Not a gap, nothing to compare:** roughly half the `rhs`-shape
-     `Skipped` sites had `expr_bound` ALSO return `None` (a genuinely
-     unbounded/unprovable expression) — no disagreement is possible
-     when neither engine has a verdict.
-   - **Real gaps — the interval engine proves something at these sites
-     that this encoding can't even attempt yet:** (1) a **commuted**
-     guard comparison (`10 > i` rather than `i < 10`) — `translate_guard`
-     only recognizes one operand order, so `commuted_lt_is_not_
-     recognized`, `else_branch_of_a_commuted_ne_also_narrows_to_the_
-     singleton`, `ne_commuted_lower_edge_subtraction_is_proven`, and
-     both call-argument-in-a-condition tests all skip past a real,
-     narrowly-scoped translation gap (this one looks cheap to close —
-     just a second match arm with the operands swapped — unlike the
-     other two); (2) a **struct-field READ composed into an rhs
-     expression** — `translate_expr` only recognizes `Int`/`SizedInt`/
-     a bounded `Ident`/`Add`/`Sub`/`Mul`, nothing that reaches into a
-     struct field at all, so `struct_field_read_composes_through_a_
-     dotdot_base_spread` (the `..base` case flagged as a scope cut
-     above), `struct_field_read_value_composes_through_a_reg`, and
-     `struct_field_two_sided_bound_composes_through_a_reg` all skip; (3)
-     a **call nested inside arithmetic or another call's own argument**
-     rather than at the top-level positions already covered —
+     is_rejected`) — both deliberate, already-documented scope cuts,
+     regardless of what the interval engine's own verdict happens to be
+     at an unreachable/capped site (not compared either way).
+   - **Not a gap, nothing to compare:** the majority of `rhs`-shape
+     `Skipped` sites have `interval_says_in_bound = false` too (either
+     `expr_bound` returns `None`, or it returns a range that fails the
+     three-way check) — no disagreement is possible when neither engine
+     claims success. **`commuted_lt_is_not_recognized` belongs here, not
+     in "real gaps"** — its own name is the tell: `narrow_for_condition`'s
+     own doc comment states plainly that a commuted `Lt`/`Gt`/`Ge`
+     (`8 < i` rather than `i > 8`) is a DELIBERATE non-feature ("a
+     separate feature nobody asked for"), and this exact test PINS the
+     interval engine REJECTING that shape too (`assert_eq!(errors.len(),
+     1)`) — both engines agree nothing is proven there, so `Skipped` is
+     the correct, harmless result, not a gap to close. Recognizing
+     commuted `Lt`/`Gt`/`Ge` in `translate_guard` would make this shadow
+     check strictly MORE capable than the engine it exists to shadow —
+     exactly the kind of drift stage 1 must not introduce; that
+     generalization is stage 3's business, if it's ever wanted at all.
+   - **Real gaps — `interval_says_in_bound = true`, confirmed via the
+     corrected boolean, at a genuinely `Skipped` site:** (1) a **commuted
+     `Ne`** guard (`5 <> i` rather than `i <> 5`) — unlike `Lt`/`Gt`/`Ge`,
+     `narrow_for_condition`'s own `ident_const_operands` fallback DOES
+     recognize this commuted form (equality is order-independent even as
+     a pass/fail predicate), so `else_branch_of_a_commuted_ne_also_
+     narrows_to_the_singleton` and `ne_commuted_lower_edge_subtraction_
+     is_proven` skip past a real proof; (2) a **struct-field READ
+     composed into an rhs expression** — `translate_expr` only recognizes
+     `Int`/`SizedInt`/a bounded `Ident`/`Add`/`Sub`/`Mul`, nothing that
+     reaches into a struct field at all, so `struct_field_read_composes_
+     through_a_dotdot_base_spread` (the `..base` case flagged as a scope
+     cut above), `struct_field_read_value_composes_through_a_reg`,
+     `struct_field_two_sided_bound_composes_through_a_reg`, and the
+     `p.data` write inside `struct_field_missing_init_is_rejected` (whose
+     own asserted error is about a MISSING INIT, an unrelated check —
+     the struct-field read this shadow check skips is a completely
+     separate, genuinely-provable site in that same source) all skip;
+     (3) a **call nested inside arithmetic or another call's own
+     argument** rather than at the top-level positions already covered —
      `call_argument_as_an_argument_to_another_call_is_still_checked`,
-     `call_argument_in_a_mem_read_as_a_call_argument_is_checked`, and
-     `call_result_composes_into_a_bounded_write_via_declared_ret_bound`
-     all skip for this reason (the gap already named above, now
-     confirmed to be real and exercised rather than hypothetical).
+     `call_argument_in_a_mem_read_as_a_call_argument_is_checked`, and the
+     `Bump(3) + Bump(4)` write inside `return_bound_with_no_return_
+     statement_is_rejected` (same shape as the struct-field case above:
+     the asserted error is about a missing `return`, unrelated to the
+     skipped site) all skip for this reason.
+   - **A fourth, related but DISTINCT gap, not folded into (3) above:** a
+     call embedded in a GUARD's own operand position (`if Bump(50) < 5`)
+     makes that guard untranslatable — `translate_guard` requires its
+     `lhs` to resolve to a bounded `Ident` via `res.expr_defs`, and a
+     `Call` never does — which conservatively `Skipped`s the ENTIRE
+     obligation for every write inside that guarded branch, even ones
+     that don't depend on the call at all. `call_argument_in_an_if_
+     condition_is_checked` and `call_argument_in_a_deeply_nested_
+     condition_is_checked` both skip their (trivially in-bound) `total :=
+     1`/`total := 2` writes for exactly this reason. Tempting fix
+     considered and REJECTED: silently drop an untranslatable guard's
+     hypothesis instead of aborting the whole query. That's unsound —
+     it can discard a hypothesis that was load-bearing for the vacuity
+     check (bug 3's exact hazard reappearing through a side door: an
+     `[cnt >= 0 (untranslatable), cnt < 5]` guard set in an unreachable
+     `else` would silently stop being caught as UNSAT), and more
+     generally `translate_guard` returning `None` and `narrow_for_
+     condition` failing to narrow are NOT guaranteed to be the same
+     fact — the two functions recognize different shapes (e.g.
+     `ident_const_operands` accepts const-foldable expressions,
+     `translate_guard` requires a literal `Expr::Int`), so "couldn't
+     translate" doesn't license assuming "the interval engine also
+     treated this as a no-op." Abort-on-untranslatable-guard stays the
+     conservative default. Filed as its own explicit sub-case, not
+     attempted.
 
-   Still to do for stage 1 to be COMPLETE (in ascending order of how
-   contained each looks): commuted guard comparisons, struct-field reads
-   composed into an rhs expression (which subsumes the `..base` case —
-   it's one instance of "reaches into a struct field," not a separate
-   mechanism), and a call nested deeper than the top-level positions
-   already covered — see the "What retires" list below for which
-   `bounds.rs` mechanism each maps to. None of these were attempted this
-   round; each is a real, scoped translation-coverage gap, not a design
-   question.
+   **Commuted `Ne` guards are now recognized** (`translate_guard` tries
+   `(lhs, rhs)` first, then — ONLY for `Ne` — `(rhs, lhs)`, mirroring
+   `narrow_for_condition`'s own `ident_const_operands` `Ne`-only
+   commuted fallback exactly; no operator flip needed since `entry.eq(&k)
+   .not()` is already order-independent). `else_branch_of_a_commuted_ne_
+   also_narrows_to_the_singleton` and `ne_commuted_lower_edge_
+   subtraction_is_proven` now shadow-check clean instead of `Skipped`.
+   `commuted_lt_is_not_recognized` deliberately stays `Skipped` — see the
+   census above for why that's correct, not a remaining gap. Zero
+   mismatches across the whole suite once wired in.
+
+   **Struct-field reads composed into an rhs expression are now
+   recognized too** (`translate_expr`'s new `Expr::Field` arm, plus
+   `Checker::struct_field_bounds_by_def`, a new helper re-keying
+   `struct_field_bounds` — itself keyed by the struct TYPE's own `DefId`
+   — by each Reg/Output VARIABLE's own `DefId` instead, resolving the
+   type indirection once so `smt.rs` never needs `ty.state_tys` itself).
+   Deliberately narrower than `struct_field_bound`'s own full recursive
+   provenance trace: only a bare `Ident` naming a Reg/Output is
+   recognized as `base` — no recursion into a `Local`'s own traced
+   origin, since that's for verifying a WRITE's own composed value
+   (already checked by the existing write-side obligation), and this is
+   a READ, where "base is a Reg/Output" is the whole fact needed (the
+   same "write-checked, read-trusted" argument the plain `Ident` arm
+   already rests on, one field narrower). This one change closes ALL
+   THREE named sites at once — `struct_field_read_composes_through_a_
+   dotdot_base_spread`, `struct_field_read_value_composes_through_a_
+   reg`, `struct_field_two_sided_bound_composes_through_a_reg` — because
+   all three `Skipped` sites turned out to be the identical READ shape
+   (`total := p.data`); the `..base` complexity in the first test's name
+   is entirely on the WRITE side, already covered by the existing
+   struct-field write obligation, not on the read this gap was about.
+   Zero mismatches across the whole suite, `--explain-schedule` still
+   byte-identical against the pre-stage-1 baseline.
+
+   **A call nested deeper than the top-level positions is now
+   shadow-checked too — via TWO separate mechanisms, not one, a
+   distinction the first pass through this fix got wrong.**
+   `shadow_check_call_params` recurses into exactly the three wrapper
+   shapes the `Skipped` census found actually exercised — a `Call`'s
+   own args (`Outer(Bump(50))`), a `Bracket`'s own callee/args
+   (`m[Bump(50)]` used as a read value), and an `Add`/`Sub`/`Mul`'s own
+   operands — mirroring exactly what `expr_bound`'s own `Call`/
+   `Bracket`/arithmetic arms already recurse into to reach a nested
+   call, NOT the fully general `check_calls_in` sweep (no `sub_exprs`
+   fallback for every other wrapper shape) — that would be speculative
+   completeness beyond what the census measured, not closing a
+   confirmed gap. This closes `call_argument_as_an_argument_to_another_
+   call_is_still_checked` and `call_argument_in_a_mem_read_as_a_call_
+   argument_is_checked` — but this recursion checks a nested call's OWN
+   ARGUMENT against its declared PARAM bound; it does nothing for the
+   OUTER write's own bound comparison, which is a completely different
+   question `translate_expr` alone answers.
+
+   **A first attempt at this fix incorrectly claimed the same
+   recursion also closed `Bump(3) + Bump(4)`'s own composition into a
+   write's bound — verified empirically to be false before it could be
+   left standing.** `translate_expr` had no `Expr::Call` arm at all, so
+   `total := Bump(3) + Bump(4)` still hit `Skipped` for the WRITE's own
+   comparison regardless of the param-check recursion above (confirmed
+   via the same `Skipped`-site re-verification discipline used for the
+   commuted-`Ne`/struct-field-read fixes, skipped for this one the
+   first time through — caught by re-running it, not by inspection).
+   Fixed properly with a NEW `Expr::Call` arm in `translate_expr`,
+   mirroring `expr_bound`'s own v13 propagation: a call composes to a
+   fresh symbolic value, constrained to the callee's declared return
+   postcondition (`fn_ret_bounds`, `Checker::fn_ret_bound` re-keyed to
+   plain tuples), the moment that postcondition exists — trusting
+   `check_return_site_exhaustiveness` to make that trust sound, exactly
+   as `expr_bound`'s own arm does. Keyed by the CALL SITE's own
+   `ExprId`, not the callee's `DefId`: `Bump(3)` and `Bump(4)` are two
+   DIFFERENT calls with different arguments, so nothing says they
+   return the same value, and `expr_bound`'s own Add/Sub/Mul arms call
+   `expr_bound` on each `Call` operand separately too — sharing one
+   symbolic variable per callee would silently correlate two
+   logically-independent results, not just be "more general."
+
+   **This surfaced a real double-push risk in `shadow_compare` itself,
+   also caught before it could ship silently.** `shadow_compare`'s own
+   "what does the interval engine say" reconstruction calls `expr_
+   bound(rhs, ...)` — and `expr_bound`'s `Call` arm pushes a REAL
+   "argument for parameter" error as a side effect of computing a
+   range, not just a value computation. Before this fix, `rhs` reaching
+   that reconstruction call could never contain a `Call` (`translate_
+   expr` didn't accept one, so `check_bound_obligation` would have
+   already returned `Skipped`) — a structural invariant the function's
+   own doc comment relied on. Now that `translate_expr` DOES accept
+   `Call`, that invariant no longer holds, and the reconstruction call
+   would double-push whatever error the real, live pass already
+   recorded for the same site. Fixed by snapshotting `self.errors`'
+   length before the reconstruction call and truncating back after,
+   unconditionally — confirmed necessary (not just theoretical) via a
+   synthetic repro (`Bump(50) + Bump(3)` where `Bump`'s own `i < 10`
+   param bound is violated): exactly one error reported, not two.
+
+   **Verified properly this time**, per the same discipline used for
+   param/return bounds and the relational invariant: `call_result_
+   composes_into_a_bounded_write_via_declared_ret_bound`'s own
+   `Skipped` line disappears (the write is now actually compared, and
+   `Proved`); `return_bound_composition_uses_the_full_declared_width_
+   not_narrower`'s own line disappears too, with the verdict `Disproved`
+   (its declared `< 21` postcondition composes to a true max of 40,
+   which is NOT `< 40` — the fencepost control, confirming the ret-bound
+   hypothesis isn't off by one); `unbounded_fn_call_result_is_still_
+   unprovable`'s line correctly REMAINS (no declared postcondition, no
+   `fn_ret_bounds` entry, still `Skipped` — the negative control). Zero
+   mismatches across the whole suite, `--explain-schedule` still
+   byte-identical.
+
+   **This closes every gap the `Skipped` census found EXCEPT the
+   guard-embedded-call sub-case**, which stays deliberately unattempted
+   (see above for why dropping an untranslatable guard's hypothesis to
+   reach it is unsound) — `shadow_check_call_params` is only ever
+   called on a write's own rhs/return value/bare call statement, never
+   on a guard `ExprId`, so this recursion can't accidentally paper over
+   that gap as a side effect. With that one deliberate exception, stage
+   1's shadow check now agrees with the interval engine on every
+   obligation shape either engine can currently prove anything about,
+   suite-wide.
 
    **z3's own version is pinned** (`tests/z3_smoke.rs`'s
    `z3_linked_version_matches_the_devenv_pin`, mirroring the firtool/

@@ -28,11 +28,13 @@
 //!   privileged "self" def to begin with).
 //! - An enclosing `if`/`else`'s own condition is a hypothesis when it's
 //!   a bare `<bounded def> <op> <const>` (`Lt`/`Gt`/`Ge`/`Ne`), the same
-//!   shape `narrow_for_condition`/`narrow_for_else` recognize -- v1
-//!   doesn't yet attempt `<>`'s own edge-only narrowing rule or `Ne`'s
-//!   commuted form, so a write that only type-checks BECAUSE one of
-//!   those finer rules fired correctly reports `Skipped` here rather
-//!   than a false disagreement.
+//!   shape `narrow_for_condition`/`narrow_for_else` recognize -- including
+//!   `Ne`'s own commuted form (`<const> <> <bounded def>`), which `narrow_
+//!   for_condition` also recognizes (see `translate_guard`'s own doc
+//!   comment for why `Ne` alone commutes, not `Lt`/`Gt`/`Ge`). v1 doesn't
+//!   yet attempt `<>`'s own edge-only narrowing rule, so a write that only
+//!   type-checks BECAUSE that finer rule fired correctly reports `Skipped`
+//!   here rather than a false disagreement.
 //! - A mem write's RHS checks against the mem's own flat declared elem
 //!   bound (v17) -- no different in kind from a scalar write, just a
 //!   different `target` `BoundedDef`.
@@ -133,6 +135,29 @@ const CALC_WIDTH: u32 = 64;
 /// `struct_field_bounds`'s own flat treatment).
 type BoundsByDef = HashMap<DefId, (u64, u64)>;
 
+/// A struct-typed Reg/Output's own field, keyed by (that VARIABLE's own
+/// `DefId`, field name) rather than `struct_field_bounds`'s own
+/// `(struct TYPE's DefId, field name)` -- the caller (`Checker::struct_
+/// field_bounds_by_def`) resolves the type indirection once, via `ty.
+/// state_tys`, so this module never needs type information at all.
+/// Deliberately built ONLY from Reg/Output defs, mirroring `struct_
+/// field_bound`'s own `DefKind` match exactly -- a `Local`'s field isn't
+/// trusted flatly (it may alias an untrusted value, see that function's
+/// own doc comment), so it's simply absent from this map rather than
+/// needing its own exclusion check here.
+type StructFieldBoundsByDef = HashMap<(DefId, String), (u64, u64)>;
+
+/// Every fn/impl `Item`'s own `DefId`, mapped to its declared return
+/// postcondition (v13, `Checker::fn_ret_bound`) -- consulted by `Expr::
+/// Call`'s own `translate_expr` arm exactly like `expr_bound`'s own
+/// `Expr::Call` arm consults `fn_ret_bound` directly: unconditionally,
+/// the moment an entry exists, with no re-verification here that the
+/// callee's OWN body actually upholds it -- `Checker::check_return_
+/// site_exhaustiveness` is what makes trusting this map sound (a
+/// declared-but-never-checked postcondition is caught and rejected
+/// there, independently of this shadow check).
+type FnRetBoundsByDef = HashMap<DefId, (u64, u64)>;
+
 /// Translate `id` into a `CALC_WIDTH`-bit bitvector term, ONLY when
 /// every sub-expression is one of v1's recognized shapes (a reference
 /// to some def PRESENT in `bounds_by_def`, an int/sized-int literal, or
@@ -152,11 +177,51 @@ type BoundsByDef = HashMap<DefId, (u64, u64)>;
 /// reg/out's own induction reads one), so the SAME mechanism that
 /// composes `i := i + 1` also composes `m[idx] := other_bounded_reg +
 /// 1` for free, with no separate code path.
+///
+/// `Expr::Field { base, .. }` (a struct field READ) recognizes ONLY a
+/// `base` that's a bare `Ident` naming a def PRESENT in `struct_field_
+/// bounds_by_def` -- i.e. a Reg/Output whose declared field bound the
+/// caller already resolved through the struct-TYPE indirection (see
+/// that map's own doc comment). No recursion into `base` itself is
+/// needed here (unlike `struct_field_bound`'s own `Expr::StructLit`/
+/// `Local`-tracing arms): those cases exist to verify a WRITE's own
+/// composed value, already checked by the existing struct-field-bound
+/// write-site obligation; this is a READ, so `base` being a Reg/Output
+/// is the whole fact needed -- the SAME "write-checked, read-trusted"
+/// argument the plain `Ident` arm above already rests on, one field
+/// narrower. A `base` that's anything OTHER than a bare bounded-Reg/
+/// Output `Ident` (a `Local` alias, a nested `outer.inner.x` chain, ..)
+/// isn't in `struct_field_bounds_by_def` at all, so this falls through
+/// to `None` -- the same v1 scope cut `struct_field_bound`'s own doc
+/// comment already documents for those shapes.
+///
+/// `Expr::Call` (v13's own composition capability) recognizes a call
+/// ONLY when its callee has an entry in `fn_ret_bounds` -- mirroring
+/// `expr_bound`'s own `Call` arm, which returns the callee's declared
+/// postcondition unconditionally once one exists, trusting `Checker::
+/// check_return_site_exhaustiveness` to have made that trust sound
+/// elsewhere. The fresh symbolic entry is keyed by the CALL SITE's own
+/// `ExprId`, NOT the callee's `DefId` -- `Bump(3)` and `Bump(4)` are two
+/// DIFFERENT calls to the same fn with different arguments, so nothing
+/// says they return the same value; keying by callee alone would force
+/// them to share one symbolic variable, silently correlating two
+/// logically-independent results. `expr_bound`'s own Add/Sub/Mul arms
+/// call `expr_bound` on each `Call` operand SEPARATELY too (never
+/// caching across occurrences), so per-call-site is the faithful
+/// mirror, not merely the more general choice. The `DefId` stored
+/// alongside each entry lets `check_bound_obligation` look its own
+/// declared bound back up when asserting hypotheses, without needing
+/// a second lookup pass over the AST.
+#[allow(clippy::too_many_arguments)]
 fn translate_expr(
     ast: &Ast,
     res: &Resolution,
     bounds_by_def: &BoundsByDef,
+    struct_field_bounds_by_def: &StructFieldBoundsByDef,
+    fn_ret_bounds: &FnRetBoundsByDef,
     entries: &mut HashMap<DefId, BV>,
+    field_entries: &mut HashMap<(DefId, String), BV>,
+    call_entries: &mut HashMap<ExprId, (BV, DefId)>,
     id: ExprId,
 ) -> Option<BV> {
     match ast.expr(id) {
@@ -175,14 +240,62 @@ fn translate_expr(
             )
         }
         Expr::Binary { op, lhs, rhs } if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => {
-            let a = translate_expr(ast, res, bounds_by_def, entries, *lhs)?;
-            let b = translate_expr(ast, res, bounds_by_def, entries, *rhs)?;
+            let a = translate_expr(
+                ast,
+                res,
+                bounds_by_def,
+                struct_field_bounds_by_def,
+                fn_ret_bounds,
+                entries,
+                field_entries,
+                call_entries,
+                *lhs,
+            )?;
+            let b = translate_expr(
+                ast,
+                res,
+                bounds_by_def,
+                struct_field_bounds_by_def,
+                fn_ret_bounds,
+                entries,
+                field_entries,
+                call_entries,
+                *rhs,
+            )?;
             Some(match op {
                 BinOp::Add => a.bvadd(&b),
                 BinOp::Sub => a.bvsub(&b),
                 BinOp::Mul => a.bvmul(&b),
                 _ => unreachable!("guarded by the match arm's own pattern"),
             })
+        }
+        Expr::Field { base, name } => {
+            let &d = res.expr_defs.get(base)?;
+            let key = (d, name.clone());
+            if !struct_field_bounds_by_def.contains_key(&key) {
+                return None;
+            }
+            Some(
+                field_entries
+                    .entry(key)
+                    .or_insert_with(|| BV::new_const(format!("field_{}_{}", d.0, name), CALC_WIDTH))
+                    .clone(),
+            )
+        }
+        Expr::Call { callee, .. } => {
+            let &fn_def = res.expr_defs.get(callee)?;
+            if !fn_ret_bounds.contains_key(&fn_def) {
+                return None;
+            }
+            Some(
+                call_entries
+                    .entry(id)
+                    .or_insert_with(|| {
+                        (BV::new_const(format!("call_{}", id.0), CALC_WIDTH), fn_def)
+                    })
+                    .0
+                    .clone(),
+            )
         }
         _ => None,
     }
@@ -191,8 +304,16 @@ fn translate_expr(
 /// Translate a guard condition into a hypothesis, ONLY when it's a bare
 /// `<def> <op> <const>` comparison against a def PRESENT in
 /// `bounds_by_def` -- the same operand order `narrow_for_condition`
-/// recognizes (v1 doesn't yet attempt `<>`'s own edge-only rule or
-/// `Ne`'s commuted form -- see module doc). `negate`: true for an
+/// recognizes, PLUS `Ne`'s own commuted form (`<const> <> <def>`),
+/// mirroring `narrow_for_condition`'s own `ident_const_operands`
+/// `Ne`-only fallback exactly (see that function's doc comment for why
+/// only `Ne` commutes: `Lt`/`Gt`/`Ge` stay single-order, a DELIBERATE
+/// non-feature the interval engine doesn't implement either --
+/// `commuted_lt_is_not_recognized` pins the interval engine rejecting
+/// that shape too, so recognizing it here would make this shadow check
+/// strictly MORE capable than the engine it exists to shadow, not
+/// faithfully reproduce it). v1 still doesn't attempt `<>`'s own
+/// edge-only narrowing rule -- see module doc. `negate`: true for an
 /// `else` branch, whose hypothesis is the condition's own negation.
 /// Shares `entries` with `translate_expr` so a guard naming the SAME
 /// def a write's RHS also reads (`if i < 8 { i := i + 1 }`) hypothesises
@@ -208,18 +329,26 @@ fn translate_guard(
     let Expr::Binary { op, lhs, rhs } = ast.expr(id) else {
         return None;
     };
-    let &d = res.expr_defs.get(lhs)?;
-    if !bounds_by_def.contains_key(&d) {
-        return None;
-    }
+    let def_const = |ident: ExprId, konst: ExprId| -> Option<(DefId, u64)> {
+        let &d = res.expr_defs.get(&ident)?;
+        if !bounds_by_def.contains_key(&d) {
+            return None;
+        }
+        let Expr::Int(k) = ast.expr(konst) else {
+            return None;
+        };
+        Some((d, *k))
+    };
+    let (d, k) = def_const(*lhs, *rhs).or_else(|| {
+        matches!(op, BinOp::Ne)
+            .then(|| def_const(*rhs, *lhs))
+            .flatten()
+    })?;
     let entry = entries
         .entry(d)
         .or_insert_with(|| BV::new_const(format!("entry_{}", d.0), CALC_WIDTH))
         .clone();
-    let Expr::Int(k) = ast.expr(*rhs) else {
-        return None;
-    };
-    let k = BV::from_u64(*k, CALC_WIDTH);
+    let k = BV::from_u64(k, CALC_WIDTH);
     let pos = match op {
         BinOp::Lt => entry.bvult(&k),
         BinOp::Gt => entry.bvugt(&k),
@@ -232,17 +361,20 @@ fn translate_guard(
 
 /// One write site's own obligation: does `rhs`, evaluated under every
 /// def in `bounds_by_def` (each hypothesised to hold its own declared/
-/// narrowed range) and every one of `guards`/`guards_negated` holding,
-/// always land in `[target.lower, target.upper)`, without reaching or
-/// exceeding `target`'s own declared width? Mirrors `expr_bound`'s own
-/// composition plus `check_against_bound`'s own three-way comparison
-/// (logical upper, logical lower, width overflow), as ONE Z3 query
-/// rather than interval arithmetic. `target` is whichever bound this
-/// SITE is checked against -- a scalar reg/out/param's own declared
-/// bound (in which case it's typically also a key of `bounds_by_def`,
-/// so a self-reference in `rhs` resolves), a mem's flat elem bound, or
-/// a struct field's own declared bound; this function doesn't care
-/// which, since the obligation shape is identical either way.
+/// narrowed range), every struct field in `struct_field_bounds_by_def`
+/// (same treatment, one layer down), every call in `fn_ret_bounds`
+/// (same treatment again, one call deep), and every one of `guards`/
+/// `guards_negated` holding, always land in `[target.lower, target.upper)`,
+/// without reaching or exceeding `target`'s own declared width? Mirrors
+/// `expr_bound`'s own composition plus `check_against_bound`'s own
+/// three-way comparison (logical upper, logical lower, width overflow),
+/// as ONE Z3 query rather than interval arithmetic. `target` is
+/// whichever bound this SITE is checked against -- a scalar reg/out/
+/// param's own declared bound (in which case it's typically also a key
+/// of `bounds_by_def`, so a self-reference in `rhs` resolves), a mem's
+/// flat elem bound, or a struct field's own declared bound; this
+/// function doesn't care which, since the obligation shape is identical
+/// either way.
 ///
 /// A `Skipped` verdict here is not itself a disagreement -- it means
 /// this v1 encoding couldn't translate the site at all (an unrecognized
@@ -251,16 +383,21 @@ fn translate_guard(
 /// a site via a rule this encoding doesn't implement yet (e.g. `<>`'s
 /// edge-only narrowing) -- that's real, out-of-scope-for-now
 /// under-approximation, not unsoundness in either direction.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn check_bound_obligation(
     ast: &Ast,
     res: &Resolution,
     bounds_by_def: &BoundsByDef,
+    struct_field_bounds_by_def: &StructFieldBoundsByDef,
+    fn_ret_bounds: &FnRetBoundsByDef,
     target: BoundedDef,
     guards: &[ExprId],
     guards_negated: &[ExprId],
     rhs: ExprId,
 ) -> SmtVerdict {
     let mut entries: HashMap<DefId, BV> = HashMap::new();
+    let mut field_entries: HashMap<(DefId, String), BV> = HashMap::new();
+    let mut call_entries: HashMap<ExprId, (BV, DefId)> = HashMap::new();
     let mut hyps = Vec::new();
     for &g in guards {
         match translate_guard(ast, res, bounds_by_def, &mut entries, g, false) {
@@ -274,13 +411,33 @@ pub(super) fn check_bound_obligation(
             None => return SmtVerdict::Skipped("a guard uses a shape v1 doesn't translate yet"),
         }
     }
-    let Some(new_value) = translate_expr(ast, res, bounds_by_def, &mut entries, rhs) else {
+    let Some(new_value) = translate_expr(
+        ast,
+        res,
+        bounds_by_def,
+        struct_field_bounds_by_def,
+        fn_ret_bounds,
+        &mut entries,
+        &mut field_entries,
+        &mut call_entries,
+        rhs,
+    ) else {
         return SmtVerdict::Skipped("rhs uses a shape v1 doesn't translate yet");
     };
 
     let solver = Solver::new();
     for (def, entry) in &entries {
         let (lower, upper) = bounds_by_def[def];
+        solver.assert(entry.bvuge(BV::from_u64(lower, CALC_WIDTH)));
+        solver.assert(entry.bvult(BV::from_u64(upper, CALC_WIDTH)));
+    }
+    for (key, entry) in &field_entries {
+        let (lower, upper) = struct_field_bounds_by_def[key];
+        solver.assert(entry.bvuge(BV::from_u64(lower, CALC_WIDTH)));
+        solver.assert(entry.bvult(BV::from_u64(upper, CALC_WIDTH)));
+    }
+    for (entry, fn_def) in call_entries.values() {
+        let (lower, upper) = fn_ret_bounds[fn_def];
         solver.assert(entry.bvuge(BV::from_u64(lower, CALC_WIDTH)));
         solver.assert(entry.bvult(BV::from_u64(upper, CALC_WIDTH)));
     }
