@@ -798,6 +798,14 @@ struct BoundedDef {
 /// readable, per clippy's own suggestion; no behavior of its own.
 type Comparison = (BinOp, Vec<(DefId, i64)>, u64);
 
+/// One `Stmt::Assign`'s own write obligation: the def to mark found, its
+/// declared bound, the computed value to check against it, and the
+/// context string for the error message -- see `check_stmt`'s own
+/// `Stmt::Assign` arm, which builds a `Vec` of these (one shared tail
+/// for what were three duplicated `found_writes`/`check_against_bound`
+/// call sites, not a new mechanism).
+type WriteObligation = (DefId, BoundedDef, Option<(u64, u64)>, String);
+
 #[derive(Clone)]
 struct RelationalBound {
     terms: Vec<(DefId, i64)>,
@@ -2367,26 +2375,33 @@ impl<'a> Checker<'a> {
                 } else {
                     None
                 };
-                let bounded = def.and_then(|d| self.bounded.get(&d).copied());
                 let computed = self.expr_bound(rhs, state, locals, struct_origins);
-                if let (Some(def), Some(bounded)) = (def, bounded) {
-                    self.found_writes.insert(def);
-                    let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                    self.check_against_bound(computed, *bounded, span, "write");
+                // This LHS's own write obligations, one entry per bounded
+                // def its write touches -- a bare-Ident write touches at
+                // most one (itself), a mem write touches one (the mem's
+                // elem bound), a struct-typed write touches one PER
+                // bounded field. Recognizing which obligations apply is
+                // still three separate shape tests (an assign's LHS really
+                // is one of three distinct AST shapes -- that's not
+                // duplication to remove); what collapses here is the
+                // `found_writes`/`check_against_bound` TAIL, previously
+                // written out three times with an identical body.
+                let mut obligations: Vec<WriteObligation> = Vec::new();
+                if let Some(def) = def
+                    && let Some(bounded) = self.bounded.get(&def).copied()
+                {
+                    obligations.push((def, *bounded, computed, "write".to_string()));
                 }
                 // v17: a mem write (`m[i] := rhs`) checks `rhs` against
-                // the mem's own declared elem bound, the same shape as
-                // the bare-Ident branch above but keyed by the callee's
-                // `DefId` instead -- reuses `computed`, already derived
-                // unconditionally above, no redundant `expr_bound` call.
+                // the mem's own declared elem bound -- reuses `computed`,
+                // already derived unconditionally above, no redundant
+                // `expr_bound` call.
                 if let Expr::Bracket { callee, .. } = self.ast.expr(lhs)
                     && let Some(mem_def) = self.res.expr_defs.get(callee).copied()
                     && self.res.def(mem_def).kind == crate::resolve::DefKind::Mem
                     && let Some(bounded) = self.mem_bounds.get(&mem_def).copied()
                 {
-                    self.found_writes.insert(mem_def);
-                    let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                    self.check_against_bound(computed, *bounded, span, "write");
+                    obligations.push((mem_def, *bounded, computed, "write".to_string()));
                 }
                 // v18: a struct-typed reg/out write (`p := Pair{...}`)
                 // checks EVERY bounded field of `p`'s own struct type
@@ -2419,11 +2434,18 @@ impl<'a> Checker<'a> {
                             locals,
                             struct_origins,
                         );
-                        self.found_writes.insert(def);
-                        let span = self.ast.expr_spans[rhs.0 as usize].clone();
-                        let context = format!("write to field `{field_name}`");
-                        self.check_against_bound(field_computed, bounded, span, &context);
+                        obligations.push((
+                            def,
+                            bounded,
+                            field_computed,
+                            format!("write to field `{field_name}`"),
+                        ));
                     }
+                }
+                let span = self.ast.expr_spans[rhs.0 as usize].clone();
+                for (found_def, bounded, obligation_computed, context) in obligations {
+                    self.found_writes.insert(found_def);
+                    self.check_against_bound(obligation_computed, bounded, span.clone(), &context);
                 }
                 // v18 originally patched a struct-typed LOCAL reassign
                 // (`p := q`) by overwriting `struct_origins` with the new
@@ -3816,6 +3838,15 @@ impl<'a> Checker<'a> {
                         rhs,
                         out,
                     );
+                    // This LHS's own write obligations, mirroring
+                    // `check_stmt`'s own real check exactly (see that
+                    // arm's doc comment) -- three shape tests recognizing
+                    // what applies, collapsed to one shared tail: each
+                    // obligation is a (declared bound, value expression
+                    // to compare it against) pair, drained by one
+                    // `shadow_compare` loop below instead of three
+                    // identical call sites.
+                    let mut obligations: Vec<(BoundedDef, ExprId)> = Vec::new();
                     // Scalar reg/out/param: same shape as v5's own
                     // induction (`self.bounded`), self-reference in
                     // `rhs` resolves via `state` (which already
@@ -3824,16 +3855,7 @@ impl<'a> Checker<'a> {
                         && let Some(&def) = self.res.expr_defs.get(&lhs)
                         && let Some(bound) = self.bounded.get(&def).copied()
                     {
-                        self.shadow_compare(
-                            state,
-                            struct_field_bounds_by_def,
-                            fn_ret_bounds_by_def,
-                            *bound,
-                            guards,
-                            guards_negated,
-                            rhs,
-                            out,
-                        );
+                        obligations.push((*bound, rhs));
                     }
                     // v17: a mem write (`m[i] := rhs`) checks `rhs`
                     // against the mem's own flat declared elem bound --
@@ -3847,16 +3869,7 @@ impl<'a> Checker<'a> {
                         && self.res.def(mem_def).kind == crate::resolve::DefKind::Mem
                         && let Some(bound) = self.mem_bounds.get(&mem_def).copied()
                     {
-                        self.shadow_compare(
-                            state,
-                            struct_field_bounds_by_def,
-                            fn_ret_bounds_by_def,
-                            *bound,
-                            guards,
-                            guards_negated,
-                            rhs,
-                            out,
-                        );
+                        obligations.push((*bound, rhs));
                     }
                     // v18: a struct-typed write (`p := Pair{...}`)
                     // checks each bounded field's own value against its
@@ -3889,17 +3902,20 @@ impl<'a> Checker<'a> {
                             };
                             let bound =
                                 *self.struct_field_bounds[&(struct_def, field_name.clone())];
-                            self.shadow_compare(
-                                state,
-                                struct_field_bounds_by_def,
-                                fn_ret_bounds_by_def,
-                                bound,
-                                guards,
-                                guards_negated,
-                                *value,
-                                out,
-                            );
+                            obligations.push((bound, *value));
                         }
+                    }
+                    for (bound, value) in obligations {
+                        self.shadow_compare(
+                            state,
+                            struct_field_bounds_by_def,
+                            fn_ret_bounds_by_def,
+                            bound,
+                            guards,
+                            guards_negated,
+                            value,
+                            out,
+                        );
                     }
                 }
                 // v13: only meaningful when the enclosing fn declared a

@@ -1831,6 +1831,43 @@ module M {
 }
 
 #[test]
+fn struct_field_write_with_two_bounded_fields_checks_both() {
+    // A regression pin for the `check_stmt`/shadow-check refactor that
+    // collapsed three duplicated `found_writes`/`check_against_bound`
+    // (resp. `shadow_compare`) call sites into one loop draining a
+    // `Vec` of obligations: with TWO bounded fields on one struct write,
+    // both obligations must still be checked, not just the first one
+    // the (HashMap-ordered) field loop happens to push. Order-
+    // independent on purpose -- `struct_field_bounds.keys()` iterates a
+    // `HashMap`, so which field is checked first isn't, and never was,
+    // a guaranteed order.
+    let src = "\
+module M {
+    struct Pair {
+        valid : [1] where _ < 1
+        data : [8] where _ < 50
+    }
+    reg p : Pair = Pair{ valid: 0, data: 0 }
+    rule write {
+        p := Pair{ valid: 1, data: 60 }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("field `valid`") && e.message.contains("could reach 1"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("field `data`") && e.message.contains("could reach 60"))
+    );
+}
+
+#[test]
 fn struct_field_read_value_composes_through_a_reg() {
     // v18's own actual new capability, unlike v17's mem-element bound
     // (which shipped WITHOUT read composition, see `mem_elem_read_

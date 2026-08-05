@@ -4262,6 +4262,59 @@ what that unification actually needs, not be decided upfront.
 `relational_bounds` stays a separate mechanism throughout (multi-def, no
 single owning type — DESIGN.md's own reasoning above still holds).
 
+**Stage 2, second sub-step done, and it corrects this section's own
+"unify the six maps" framing — that phrasing is wrong, not just
+unstarted.** A follow-up advisor pass, asked for the concrete
+`RefinementTarget` shape before writing ~40 call-site edits, found the
+map-merge plan above doesn't survive contact with what `check_stmt`
+actually needs: after merging, the "recognize this LHS's obligations"
+step still has three shape-branches (bare Ident / `Bracket`+Mem-kind /
+Ident+StructTy — these are three genuinely different AST shapes, not
+duplicated logic), and "compute the value to check" still needs a match
+on target kind, because `struct_field_bound` is a fundamentally
+different function from `expr_bound` (it projects one named field out
+of a struct literal; `expr_bound` doesn't). A `RefinementTarget` enum
+would have bought "one `HashMap`" and cost "a variant match in value
+computation, variant filtering in every iteration site
+(`check_write_site_exhaustiveness` chains `bounded.keys()` and
+`mem_bounds.keys()` today — that becomes a filter over the merged map),
+and an `unreachable!()` `FnReturn` arm in the write path" — the same
+net-negative flagged for the FIRST rejected plan, just reached from the
+other direction. Worse: `fn_ret_bound` isn't a write-obligation target
+at all — a return postcondition is checked at `Stmt::Return` against
+`current_ret_bound`, a different statement position entirely, so it has
+no business sharing a key space with things a `Stmt::Assign` checks.
+
+**The four maps stay separate, deliberately** — different key spaces
+(`DefId` / `(DefId, String)`), different narrowing behavior (`bounded`
+narrows per-branch via `state`; the other three are flat), and one of
+them (`fn_ret_bound`) isn't even the same kind of obligation. What
+actually collapses is the TAIL: `check_stmt`'s `Stmt::Assign` arm and
+the shadow-check's mirrored `Stmt::Assign` handling in `shadow_walk_
+body` each built a local `Vec` of obligations (an obligation = declared
+bound + value-to-check, plus for the real check the `DefId` to mark
+found and the context string) from the three shape-tests, unchanged,
+then drained it in ONE loop doing `found_writes.insert`/`check_against_
+bound` (resp. `shadow_compare`) — previously written out three times
+with an identical body. Confirmed byte-identical `--explain-schedule`
+across all 84 examples and zero regressions across the (now 839-test)
+suite; also added `struct_field_write_with_two_bounded_fields_checks_
+both` (`tests/bounds.rs`), since no existing test exercised a struct
+write with TWO bounded fields, and this refactor is exactly the kind of
+change an obligation-dropping bug could hide in behind a suite that
+still happens to pass (byte-identical `--explain-schedule` alone doesn't
+catch a dropped obligation when every existing example has at most one
+per write).
+
+Stage 2 is now considered done in the sense that matters: the
+duplication DESIGN.md's original "six maps" observation was actually
+pointing at (parallel per-map plumbing around an otherwise-identical
+check) is gone, without inventing a unification that doesn't pay for
+itself. What remains unmerged (the four maps, `relational_bounds`) stays
+unmerged because each has a real, distinct reason to. The provenance
+judgment (first sub-step, above) is the one part of the original
+six-maps framing that WAS worth building as a real type.
+
 ## Combinational loops
 
 Inside one `combines` scope, no forward reference is allowed, so a local cycle

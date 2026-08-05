@@ -98,21 +98,34 @@ predicate grammar, then — separately, since it proves strictly more and change
 hardware — collapse `schedule.rs`'s eight mem-disjointness arguments into one generic
 query, deleting the old engine alongside it) are ordered.
 
-**Stage 2 started, reordered on advisor review.** The original plan read "unify the six
-maps" literally (merge three maps behind an enum key, fold `bounded` in separately, add
-the proven/assumed provenance judgment last) — an advisor pass caught that this collapses
-nothing real (a bare enum key just renames `HashMap` lookups into enum-variant
-constructions) and that provenance constrains the value type, so doing it last risks
-redoing the merge. Reordered: provenance first, done — `Proven<T>` now lives in its own
-child submodule with a private field, so `Proven::checked` (called only by the four
-`collect_one_*` collectors right after their own const-fold/width verification) is the
-ONLY way to construct one; `self.bounded`/`mem_bounds`/`struct_field_bounds`/`fn_ret_bound`
-now store `Proven<BoundedDef>` instead of a bare struct anyone in the module could build ad
-hoc. Confirmed byte-identical `--explain-schedule` across all 84 examples and zero
-regressions across the full test suite. Next: fold `check_stmt`'s three parallel
-write-obligation branches (bare-Ident/mem-Bracket/struct-typed-Ident) into one loop, in the
-SAME commit as merging the four maps (not split by map) — see DESIGN.md's stage-2 entry
-for the full reasoning.
+**Stage 2 done, and "unify the six maps" turned out to be the wrong framing — corrected,
+not completed as originally stated.** First sub-step (provenance): `Proven<T>` now lives in
+its own child submodule with a private field, so `Proven::checked` (called only by the
+four `collect_one_*` collectors right after their own const-fold/width verification) is
+the ONLY way to construct one; `self.bounded`/`mem_bounds`/`struct_field_bounds`/
+`fn_ret_bound` now store `Proven<BoundedDef>` instead of a bare struct anyone in the module
+could build ad hoc. Second sub-step (the actual "six maps" duplication): a follow-up
+advisor pass, asked for the concrete `RefinementTarget` shape before ~40 call-site edits,
+found merging the four maps behind an enum key doesn't pay for itself — the "recognize
+this LHS's obligations" step still has three genuinely different AST-shape branches
+post-merge, "compute the value to check" still needs a match on target kind (`struct_
+field_bound` is a fundamentally different function from `expr_bound`, not the same logic
+duplicated), and `fn_ret_bound` isn't even a write-obligation target (a return
+postcondition is checked at `Stmt::Return`, a different statement position entirely) — so
+it has no business sharing a key space with things a `Stmt::Assign` checks. **The four maps
+stay separate, deliberately: different key spaces, different narrowing behavior, and one
+isn't the same kind of obligation.** What actually collapsed: the TAIL. `check_stmt`'s
+`Stmt::Assign` arm and the shadow-check's mirrored `Stmt::Assign` handling each built a
+`Vec` of obligations from the three (unchanged) shape-tests, then drained it in ONE loop
+doing `found_writes.insert`/`check_against_bound` (resp. `shadow_compare`) — previously
+written out three times with an identical body. Added `struct_field_write_with_two_
+bounded_fields_checks_both` (no existing test exercised two bounded fields on one struct
+write, and an obligation-dropping bug is exactly what this refactor could hide behind a
+suite where every other example has at most one obligation per write). Byte-identical
+`--explain-schedule` across all 84 examples, zero regressions (839 tests now). See
+DESIGN.md's stage-2 entry for the full reasoning — worth reading before re-attempting a map
+merge here, since the concrete reasons it doesn't pay off are specific, not just "seemed
+like more code."
 
 ## Emission (`src/firrtl/`)
 
