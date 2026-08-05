@@ -189,6 +189,27 @@ module M {
 }
 
 #[test]
+fn wildcard_self_reference_on_a_reg_bound_is_enforced_identically_to_the_name_form() {
+    // Stage 3's own `_`-placeholder unification: `resolve.rs`'s `check_
+    // bound_self_reference` now accepts `_` for a reg/out/param bound,
+    // not just the literal name -- `bounds.rs`'s own collector never
+    // reads the LHS once resolve.rs approves it, so this must reject
+    // the exact same over-limit write `unguarded_increment_is_rejected`
+    // (above) does, byte-for-byte, just spelled with `_` instead of `i`.
+    let src = "\
+module M {
+    reg i : [4] where _ < 9 = 0
+    rule bump {
+        i := i + 1
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify"));
+}
+
+#[test]
 fn insufficiently_narrowed_guard_is_rejected() {
     // `if i < 9` doesn't narrow enough: the composed bound (9 + 2 - 1 =
     // 10) still exceeds the declared `< 9`. A regression here would

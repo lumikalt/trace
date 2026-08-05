@@ -846,6 +846,23 @@ module M {
 }
 
 #[test]
+fn where_bound_referencing_wildcard_for_a_reg_resolves() {
+    // Stage 3's own `_`-placeholder unification: a reg/out/param bound
+    // used to require the literal variable name (unlike mem-element/
+    // return/struct-field bounds, which have required `_` since their
+    // own v18 retrofit) -- `_` is now accepted here too, alongside the
+    // name, since it denotes the exact same thing (the def's own value)
+    // and `bounds.rs`'s own collector never reads the LHS once this
+    // resolves anyway.
+    let src = "\
+module M {
+    reg i : [4] where _ < 10 = 0
+}
+";
+    run_ok(src);
+}
+
+#[test]
 fn where_bound_referencing_a_different_reg_is_an_error() {
     let src = "\
 module M {
@@ -868,6 +885,19 @@ fn where_bound_referencing_the_same_param_resolves() {
 module M {
     reg x : [8] = 0
     Bump(i : [8] where i < 10) {
+        x := i
+    }
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn where_bound_referencing_wildcard_for_a_param_resolves() {
+    let src = "\
+module M {
+    reg x : [8] = 0
+    Bump(i : [8] where _ < 10) {
         x := i
     }
 }
@@ -1003,6 +1033,16 @@ fn where_bound_referencing_the_same_output_resolves() {
     let src = "\
 module M {
     out i : [4] where i < 10 = 0
+}
+";
+    run_ok(src);
+}
+
+#[test]
+fn where_bound_referencing_wildcard_for_an_output_resolves() {
+    let src = "\
+module M {
+    out i : [4] where _ < 10 = 0
 }
 ";
     run_ok(src);

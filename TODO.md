@@ -148,11 +148,18 @@ identify the builtin from a free function) — no test/example needs it in a whe
 today. Regression test added, byte-identical `--explain-schedule` (nothing in the existing
 suite used a non-literal where-bound), zero regressions.
 
-Not yet done: `_`-placeholder unification (reg/out/param require the literal name and
-reject `_`; mem/return/struct-field require `_` and reject a name) and the actual
-predicate-grammar widening (the four collectors reduce a where-bound to a plain `(lower,
-upper, width)` triple and discard the expression — no "carry the predicate forward" path
-exists yet, which is what a cross-def bound needs). See DESIGN.md's stage-3 entry.
+`_`-placeholder unification is done: `resolve.rs`'s `check_bound_self_reference` (reg/out/
+param) now accepts `_` alongside the literal name (mem/return/struct-field have required
+`_` since their own v18 retrofit; reg/out/param never needed shape-based recognition since
+they have a real `DefId`, so were never retrofitted to also accept it). `bounds.rs`'s own
+collectors never read the bound's LHS once resolve.rs approves it, so this was a pure
+resolve.rs change. Six new tests, byte-identical `--explain-schedule`, zero regressions
+(867 tests now).
+
+Not yet done: the actual predicate-grammar widening (the four collectors reduce a
+where-bound to a plain `(lower, upper, width)` triple and discard the expression — no
+"carry the predicate forward" path exists yet, which is what a cross-def bound needs). See
+DESIGN.md's stage-3 entry.
 
 ## Emission (`src/firrtl/`)
 

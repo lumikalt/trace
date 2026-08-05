@@ -1168,14 +1168,30 @@ impl<'a> Resolver<'a> {
     /// def (returned straight from `declare`, v12 — no `item_defs`
     /// entry exists for a param) can call this identically to a
     /// reg/out's own `item_defs`-derived def.
+    ///
+    /// Stage 3's own `_`-placeholder unification: the wildcard `_` is
+    /// now accepted here too, alongside the literal name — mem-element/
+    /// return/struct-field bounds (`check_mem_bound_shape`/`check_ret_
+    /// bound_shape`/`check_struct_field_bound_shape` below) have
+    /// required `_` since their own v18 retrofit, since none of them has
+    /// a real `DefId` to compare against; reg/out/param DO have one, so
+    /// this was never retrofitted to match, leaving `_` rejected here
+    /// specifically until now. The literal-name form stays accepted
+    /// too, deliberately — every existing test/example uses it, and
+    /// `bounds.rs`'s own collector (`collect_one_bounded_def` etc.)
+    /// never reads `lhs` at all once this check passes, so there is no
+    /// downstream reason to prefer one form over the other.
     fn check_bound_self_reference(&mut self, self_def: DefId, bound: ExprId) {
         let Expr::Binary { lhs, .. } = self.ast.expr(bound).clone() else {
             return;
         };
-        if self.res.expr_defs.get(&lhs).copied() != Some(self_def) {
+        let is_placeholder = matches!(self.ast.expr(lhs), Expr::Wildcard);
+        let is_same_def = self.res.expr_defs.get(&lhs).copied() == Some(self_def);
+        if !is_placeholder && !is_same_def {
             self.error(
                 self.ast.expr_spans[lhs.0 as usize].clone(),
-                "a `where` bound must reference the same reg/out/param it's declared on"
+                "a `where` bound must reference the same reg/out/param it's declared on \
+                 (either by name, or via `_`)"
                     .to_string(),
             );
         }

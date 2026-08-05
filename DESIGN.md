@@ -4372,18 +4372,39 @@ form. Byte-identical `--explain-schedule` across all 84 examples (none
 use a non-literal where-bound today, so nothing was expected to change),
 zero regressions.
 
-Not yet done: the `_`-placeholder unification (today, `_` is required at
-mem-element/return/struct-field positions but REJECTED at reg/out/param
-positions, which instead require the literal variable name — `check_
-bound_self_reference`, `resolve.rs`, vs. the three `check_*_bound_shape`
-functions there) and the actual predicate-grammar/representation widening
-(the four collectors currently reduce a where-bound to `(lower, upper,
-width)` and DISCARD the original expression entirely — there is no
-"carry the predicate forward" path yet; making a bound reference another
-def needs that representation change, which in turn means `Bounds.
-ranges`/`site_ranges` has nothing to export for a cross-def bound, and
+**The `_`-placeholder unification is now done too — the cheap, additive
+part of stage 3.** `resolve.rs`'s `check_bound_self_reference` (reg/out/
+param) now accepts `_` as an alternative to the literal variable name, not
+just the name — mem-element/return/struct-field bounds have required `_`
+since their own v18 retrofit; reg/out/param never were retrofitted to
+match, since they (unlike the other three) have a real `DefId` to compare
+against and so never NEEDED shape-based recognition. The literal-name
+form stays accepted too, deliberately: every existing test/example uses
+it, and `bounds.rs`'s own `collect_one_bounded_def`/etc. never read the
+bound's own LHS at all once `resolve.rs` approves it (they destructure
+`Expr::Binary { rhs, .. }`, discarding `lhs` unconditionally) — so there
+was never a downstream reason to prefer one form, only resolve.rs's own
+DefId-equality check needed widening. Six new tests (three `resolve.rs`
+"wildcard resolves" tests mirroring the existing name-form ones for reg/
+param/output, one `bounds.rs` test confirming `_` is ENFORCED identically
+to the name form, not just accepted at resolve time) — the existing
+"different reg/references a name that isn't self" negative tests are
+untouched and still pass, since the updated error message still contains
+the substring they assert on. Byte-identical `--explain-schedule` across
+all 84 examples, zero regressions (867 tests now).
+
+Not yet done: the actual predicate-grammar/representation widening (the
+four collectors currently reduce a where-bound to `(lower, upper, width)`
+and DISCARD the original expression entirely — there is no "carry the
+predicate forward" path yet; making a bound reference another def needs
+that representation change, which in turn means `Bounds.ranges`/
+`site_ranges` has nothing to export for a cross-def bound, and
 `schedule.rs`'s `real_range` consumers need confirming they degrade
 gracefully on a missing entry before that's implemented, not assumed).
+This is the one piece of stage 3 that actually changes what's provable —
+needs its own advisor pass on the concrete representation before code,
+per this session's discipline (every prior sub-step in stages 2–3 was
+mis-scoped on the first pass and corrected by advisor review).
 
 ## Combinational loops
 
