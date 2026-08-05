@@ -4483,6 +4483,87 @@ end-state goal DESIGN.md's "Core representation" section describes, not
 this stage's). Stage 4 (`schedule.rs` collapse, retiring the old
 interval engine) remains ordered, not started.
 
+**A real, independent bug found and fixed between stages 3 and 4, via a
+live user report, not anticipated by any of the staged plan above.**
+This section's own "Comparisons: fallible by default" (above) has
+established since before this type-system arc began that a bare
+comparison statement (no `if`, no explicit `?`) implicitly gates its
+WHOLE enclosing rule — exactly like `(cond)?` — and `effects.rs` (`sig.
+fails`), `types/stmt.rs`, and `firrtl/writes.rs`'s `compile_guard`/
+`compile_guard_unwrap_cond` all correctly implement this, confirmed by a
+passing test (`tests/firrtl.rs`'s `a_bare_condition_implicitly_folds_
+into_the_rule_guard`). `bounds.rs`'s own per-statement walk never did:
+`check_stmt`'s `Stmt::Expr` arm called `expr_bound` on the bare
+expression purely for its nested-call side effect and discarded the
+result, never narrowing `state` for a write later in the same body —
+so a program using this well-established, already-shipped, already-
+tested language feature to guard against overflow (`out b : [5] where
+_ > 1 = 5; rule step { a?; b <> 0b11111; b := b + 1 }`) was incorrectly
+rejected, even though `firtool`-emitted hardware for the equivalent
+`if b <> 0b11111 { b := b + 1 }` form is provably identical and
+correctly accepted.
+
+Fixed by recognizing exactly the same shapes `is_guard_like`
+(`resolve.rs`, the single shared predicate `effects.rs`/`types.rs`/
+`firrtl/writes.rs` already route every guard-placement question
+through, rather than re-deriving it independently) recognizes: an
+explicit `Expr::Guard(inner)` narrows via `inner`; any other guard-like
+expression (a bare comparison; `narrow_for_condition` itself already
+no-ops gracefully on any shape it doesn't specifically recognize)
+narrows via the statement's own expression directly. Narrowed straight
+into `state` in place — no nested branch, since a false guard means the
+rule doesn't fire AT ALL this cycle, so there's no corresponding "else"
+world that also needs checking, unlike an ordinary `if`.
+
+**A deliberate v1 scope cut, not claimed as complete:** only narrows
+FORWARD in program order — a guard appearing textually AFTER a write it
+could also justify isn't retroactively applied, even though `compile_
+guard`'s own hardware semantics don't actually require program order at
+all (the rule's fire signal is one AND of every guard-like condition
+found anywhere in the body). Reproducing that fully would need a
+two-pass walk (collect every guard first, then check every write
+against their intersection); left for later, pinned by its own negative
+test (`bare_comparison_guard_does_not_narrow_a_write_before_it`,
+`tests/bounds.rs`).
+
+**A second, independently significant bug surfaced while fixing the
+first, and is worth recording as a finding about this whole arc's own
+verification methodology, not just about this one fix.** Fixing `check_
+stmt` alone left `shadow_walk_body` (the SMT shadow check's own
+independent reconstruction, stages 1–3) unnarrowed — and the program
+above compiled clean with ZERO panic even before `shadow_walk_body` was
+also fixed, which looked like agreement but wasn't: `shadow_compare`
+never reads `check_stmt`'s own LIVE state; it reconstructs its own
+copy of "what would the interval engine say" via `expr_bound` using
+`shadow_walk_body`'s OWN (separately threaded) `state`, then compares
+THAT against Z3's own verdict, itself derived from the SAME unnarrowed
+`state`/`guards` parameters. Since fixing `check_stmt` didn't touch
+`shadow_walk_body`, both the shadow reconstruction AND Z3 stayed
+unnarrowed together, kept agreeing with EACH OTHER, and the mismatch
+panic — built specifically to catch exactly this class of divergence —
+never fired, because it only ever compares the shadow check's own
+reconstruction against Z3, never against `check_stmt`'s real, live
+result. **The stage-1 "faithfulness" guarantee only holds as strongly as
+`shadow_walk_body`'s own reconstruction stays in lockstep with `check_
+stmt`'s real logic — the two are independently maintained, hand-mirrored
+code, not one shared code path, and a change to one silently desyncing
+from the other is a real, demonstrated risk class this arc's own
+architecture carries, not a hypothetical one.** Fixed by porting the
+identical narrowing to `shadow_walk_body`: its own `state`/`guards`/
+`guards_negated` parameters, previously threaded through the whole
+per-body loop unchanged (only `Stmt::If` ever forked new copies, for
+its own children), are now locally-owned and progressively updated by
+the SAME bare-guard case, mirroring `Stmt::If`'s existing narrow-and-
+extend pairing one line apart. Both fixes landed together, in the same
+commit, specifically so this exact silent-desync failure mode couldn't
+occur here.
+
+Regression tests: the bare form, the explicit `(cond)?` form (both must
+narrow identically), and the forward-only negative control — all in
+`tests/bounds.rs`. Byte-identical `--explain-schedule` across all 84
+examples (none currently use this pattern), zero regressions, zero
+shadow-check panics (881 tests now).
+
 ## Combinational loops
 
 Inside one `combines` scope, no forward reference is allowed, so a local cycle

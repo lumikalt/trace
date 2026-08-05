@@ -179,6 +179,27 @@ Deliberately still out of scope: `==`/`!=` operators, non-literal-but-constant l
 above). Stage 4 (`schedule.rs` collapse, retiring the old interval engine) is next, not
 started.
 
+**Real, independent bug found and fixed via a live user report (between stages 3 and 4): a
+bare comparison statement (no `if`, no `?`) didn't narrow bounds, even though DESIGN.md's
+own "Comparisons: fallible by default" section (predates this arc) already established it
+gates the whole rule, and `effects.rs`/`types.rs`/`firrtl/writes.rs` all already implement
+that correctly (confirmed by a passing firrtl.rs test). `bounds.rs`'s own `check_stmt` never
+did — a write after a bare guard was checked against the unnarrowed bound, rejecting valid
+programs. Fixed by recognizing the same shapes `is_guard_like` (the shared predicate every
+other pass already routes through) recognizes, narrowing `state` forward in place (no nested
+branch needed, since a false guard means the rule doesn't fire at all). A SECOND bug
+surfaced while fixing the first: `shadow_walk_body` (the SMT shadow check's own independent
+reconstruction) wasn't touched, and the affected program compiled with ZERO panic even
+before that second fix — the mismatch panic only ever compares the shadow check's own
+reconstruction against Z3, never against `check_stmt`'s real live result, so both staying
+equally stale masked the divergence entirely. This is a real, demonstrated risk in this
+arc's own hand-mirrored-code architecture (stage 1's shadow check and the real engine are
+independently maintained, not one shared path), not just a one-off bug — worth remembering
+for any future `check_stmt` change. Both fixed together, same commit. Three new regression
+tests (bare form, explicit `(cond)?` form, forward-only negative control). Byte-identical
+`--explain-schedule`, zero regressions, zero shadow-check panics (881 tests now). See
+DESIGN.md's own entry for the full detail.
+
 ## Emission (`src/firrtl/`)
 
 - Calling a user `fn`/`impl` from a rule inlines the callee at its call

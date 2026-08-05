@@ -674,7 +674,7 @@ use crate::ast::{
 };
 use crate::effects::Effects;
 use crate::lexer::Span;
-use crate::resolve::{DefId, Resolution};
+use crate::resolve::{DefId, Resolution, is_guard_like};
 use crate::types::{Ty, Types, Width};
 use std::collections::{HashMap, HashSet};
 
@@ -2589,8 +2589,59 @@ impl<'a> Checker<'a> {
             // effect (checking any `Call` reached anywhere in `e`
             // against its callee's declared param bounds); the returned
             // range itself is meaningless here and discarded.
+            //
+            // A GUARD-LIKE bare statement (an explicit `(cond)?`, or a
+            // bare comparison -- DESIGN.md's own "Comparisons: fallible
+            // by default") is a real, separate gap this arm used to miss
+            // entirely: per DESIGN.md, either shape is fallible and
+            // aborts the WHOLE enclosing rule's cycle if false, exactly
+            // like `effects.rs`'s `sig.fails` inference and `firrtl/
+            // writes.rs`'s `compile_guard` already treat it -- every
+            // OTHER pass in this compiler already narrows/gates on this;
+            // `bounds.rs`'s own per-statement walk never did, so a write
+            // AFTER such a guard was checked against the UNNARROWED
+            // declared bound, rejecting programs a bare `if cond { ... }`
+            // with the same write would have accepted (found via a real
+            // user report, not anticipated: `out b : [5] where _ > 1`,
+            // `b <> 0b11111` as its own bare statement, then `b := b +
+            // 1` -- rejected here despite the guard making the write
+            // provably safe). Narrowed directly into `state` (not a
+            // nested branch's own clone, since there's no "else" world
+            // to also check -- a false guard means the rule doesn't
+            // fire at all this cycle, so nothing in it needs checking
+            // against that world), so it persists forward for the rest
+            // of THIS body's sequential walk. `is_guard_like` (shared
+            // with effects.rs/types.rs/firrtl, not re-derived) decides
+            // WHICH bare statements even qualify -- a bare `Call`/fifo
+            // op/`spawn` is excluded (each has its own, different
+            // fallibility mechanism, untouched here); `narrow_for_
+            // condition` itself already no-ops gracefully on any
+            // qualifying shape it doesn't specifically recognize (e.g.
+            // a bare `bits[1]` flag), so gating on `is_guard_like` alone
+            // is what avoids a wasted clone on the common bare-call
+            // case, not a soundness requirement.
+            //
+            // v1 scope cut, not a soundness gap (under-proves, never
+            // over-proves): only narrows FORWARD in program order — a
+            // guard appearing textually AFTER a write it could also
+            // justify isn't retroactively applied. `firrtl/writes.rs`'s
+            // `compile_guard` doesn't actually require program order
+            // (the rule's own fire signal is one AND of every guard-like
+            // condition anywhere in the body, regardless of position),
+            // but reproducing that here would need a two-pass walk
+            // (collect every guard first, then check every write against
+            // their intersection) -- a real, deliberate widening left
+            // for later, not assumed to fall out of this fix for free.
             Stmt::Expr(e) => {
                 self.expr_bound(e, state, locals, struct_origins);
+                if is_guard_like(self.ast, self.res, e) {
+                    let cond = if let Expr::Guard(inner) = self.ast.expr(e) {
+                        *inner
+                    } else {
+                        e
+                    };
+                    *state = self.narrow_for_condition(cond, state);
+                }
             }
             // v13: only meaningful when the ENCLOSING fn declared a
             // postcondition (`current_ret_bound`, set once per item at
@@ -3797,32 +3848,67 @@ impl<'a> Checker<'a> {
         ret_bound: Option<BoundedDef>,
         out: &mut Vec<smt::Mismatch>,
     ) {
+        // Locally-owned, progressively updated by a bare guard-like
+        // statement below -- mirrors `check_stmt`'s own in-place `state`
+        // mutation for the SAME new case (see that arm's own doc
+        // comment for the full "bare comparison is fallible" reasoning)
+        // via owned rebinding instead of a `&mut` parameter, matching
+        // this walker's existing style (`Stmt::If` below already forks
+        // new owned copies for its own children). Without this, a bare
+        // guard here would silently desync this reconstruction from the
+        // REAL `check_stmt` walk it exists to shadow -- found exactly
+        // this way: fixing `check_stmt` alone left THIS walker's own
+        // `state`/`guards` unnarrowed, so its reconstruction and Z3's
+        // own verdict (which reads hypotheses from these SAME unnarrowed
+        // params) kept agreeing with EACH OTHER while both silently
+        // diverged from what `check_stmt` now actually proves -- no
+        // panic, since a mismatch only fires when these two disagree
+        // with each other, not against the real walk's live state.
+        let mut state = state.clone();
+        let mut guards = guards.to_vec();
+        let guards_negated = guards_negated.to_vec();
         for &stmt in body {
             match self.ast.stmt(stmt).clone() {
                 // v12: a bare call statement (a void fn/impl call, made
                 // purely for its `writes` effect) -- the ONLY position
                 // `Stmt::Expr` itself can hold a call directly.
+                //
+                // A guard-like bare statement (v22: mirrors `check_
+                // stmt`'s own new case exactly) additionally narrows
+                // `state` and extends `guards` for the REST of this
+                // same body -- both updated together, one line apart,
+                // the same pairing `Stmt::If` below already does for
+                // its own `then` branch.
                 Stmt::Expr(e) => {
                     self.shadow_check_call_params(
-                        state,
+                        &state,
                         struct_field_bounds_by_def,
                         fn_ret_bounds_by_def,
-                        guards,
-                        guards_negated,
+                        &guards,
+                        &guards_negated,
                         e,
                         out,
                     );
+                    if is_guard_like(self.ast, self.res, e) {
+                        let cond = if let Expr::Guard(inner) = self.ast.expr(e) {
+                            *inner
+                        } else {
+                            e
+                        };
+                        state = self.narrow_for_condition(cond, &state);
+                        guards.push(cond);
+                    }
                 }
                 Stmt::Assign { lhs, rhs } => {
                     // v12: `rhs` may itself be a bare call (`x :=
                     // Bump(y)`, `writes`-only or otherwise) regardless
                     // of whether `lhs` is itself bounded.
                     self.shadow_check_call_params(
-                        state,
+                        &state,
                         struct_field_bounds_by_def,
                         fn_ret_bounds_by_def,
-                        guards,
-                        guards_negated,
+                        &guards,
+                        &guards_negated,
                         rhs,
                         out,
                     );
@@ -3895,12 +3981,12 @@ impl<'a> Checker<'a> {
                     }
                     for (bound, value) in obligations {
                         self.shadow_compare(
-                            state,
+                            &state,
                             struct_field_bounds_by_def,
                             fn_ret_bounds_by_def,
                             bound,
-                            guards,
-                            guards_negated,
+                            &guards,
+                            &guards_negated,
                             value,
                             out,
                         );
@@ -3914,22 +4000,22 @@ impl<'a> Checker<'a> {
                 // a bare call statement/assign-rhs is above).
                 Stmt::Return(Some(e)) => {
                     self.shadow_check_call_params(
-                        state,
+                        &state,
                         struct_field_bounds_by_def,
                         fn_ret_bounds_by_def,
-                        guards,
-                        guards_negated,
+                        &guards,
+                        &guards_negated,
                         e,
                         out,
                     );
                     if let Some(bound) = ret_bound {
                         self.shadow_compare(
-                            state,
+                            &state,
                             struct_field_bounds_by_def,
                             fn_ret_bounds_by_def,
                             bound,
-                            guards,
-                            guards_negated,
+                            &guards,
+                            &guards_negated,
                             e,
                             out,
                         );
@@ -3940,8 +4026,8 @@ impl<'a> Checker<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let then_state = self.narrow_for_condition(cond, state);
-                    let mut then_guards = guards.to_vec();
+                    let then_state = self.narrow_for_condition(cond, &state);
+                    let mut then_guards = guards.clone();
                     then_guards.push(cond);
                     self.shadow_walk_body(
                         &then_body,
@@ -3949,20 +4035,20 @@ impl<'a> Checker<'a> {
                         struct_field_bounds_by_def,
                         fn_ret_bounds_by_def,
                         &then_guards,
-                        guards_negated,
+                        &guards_negated,
                         ret_bound,
                         out,
                     );
                     if let Some(else_body) = else_body {
-                        let else_state = self.narrow_for_else(cond, state);
-                        let mut else_negated = guards_negated.to_vec();
+                        let else_state = self.narrow_for_else(cond, &state);
+                        let mut else_negated = guards_negated.clone();
                         else_negated.push(cond);
                         self.shadow_walk_body(
                             &else_body,
                             &else_state,
                             struct_field_bounds_by_def,
                             fn_ret_bounds_by_def,
-                            guards,
+                            &guards,
                             &else_negated,
                             ret_bound,
                             out,

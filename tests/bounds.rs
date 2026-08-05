@@ -373,6 +373,89 @@ module M {
     assert!(errors[0].message.contains("cannot verify"));
 }
 
+// A real user report, not anticipated: DESIGN.md's own "Comparisons:
+// fallible by default" section says a bare comparison statement (no
+// `if`, no explicit `?`) implicitly gates the WHOLE enclosing rule --
+// exactly like `(cond)?` -- and every other pass in this compiler
+// (`effects.rs`'s `sig.fails`, `firrtl/writes.rs`'s `compile_guard`)
+// already implements this. `bounds.rs`'s own per-statement walk
+// (`check_stmt`'s `Stmt::Expr` arm) never did: a write AFTER a bare
+// guard was checked against the UNNARROWED declared bound, rejecting
+// programs firtool would happily accept. Fixing `check_stmt` alone
+// would have left `shadow_walk_body` (the SMT shadow check's own
+// independent reconstruction) stale -- it compares its OWN
+// reconstruction against Z3, not against `check_stmt`'s real live
+// state, so both silently agreeing (both still unnarrowed) would have
+// masked the real engine's divergence with no panic at all. Both are
+// fixed together here.
+
+#[test]
+fn bare_comparison_statement_narrows_subsequent_writes() {
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+    rule step {
+        a?
+        b <> 0b11111
+        b := b + 1
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn explicit_guard_sugar_narrows_subsequent_writes() {
+    // Same shape as `bare_comparison_statement_narrows_subsequent_
+    // writes`, spelled with the explicit `(cond)?` form instead of the
+    // bare comparison -- both must narrow identically (`check_stmt`'s
+    // new case handles `Expr::Guard(inner)` and a bare comparison via
+    // the same `is_guard_like` gate).
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+    rule step {
+        a?
+        (b <> 0b11111)?
+        b := b + 1
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn bare_comparison_guard_does_not_narrow_a_write_before_it() {
+    // A deliberate v1 scope cut, not a soundness gap: this fix only
+    // narrows FORWARD in program order. `firrtl/writes.rs`'s own
+    // `compile_guard` doesn't require program order at all (the rule's
+    // fire signal is one AND of every guard-like condition anywhere in
+    // the body, regardless of position) -- reproducing that here would
+    // need a two-pass walk, left for later. A write textually BEFORE
+    // the guard is still checked against the unnarrowed bound, so this
+    // program is still (conservatively, correctly) rejected.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+    rule step {
+        a?
+        b := b + 1
+        b <> 0b11111
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("could reach or exceed the declared width")
+    );
+}
+
 #[test]
 fn subtraction_by_a_provably_safe_amount_is_accepted() {
     // v7: `Sub` now composes -- `i - 0` is trivially in-bounds (the
