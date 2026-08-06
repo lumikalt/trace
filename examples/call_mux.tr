@@ -1,0 +1,10 @@
+module Top {
+    in sel : [1]
+    in a : [8]
+    in b : [8]
+    out result : [8] = 0
+
+    rule select {
+        result := mux(sel, a, b)
+    }
+}

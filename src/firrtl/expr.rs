@@ -714,6 +714,21 @@ impl<'a> Emitter<'a> {
                         }
                         Some(total)
                     }
+                    // Same rationale as `prio`/`pack` just above: a real,
+                    // computable result-width rule (`popcount_result_
+                    // width`, or the argument's own width unchanged for
+                    // the rest), so these resolve inside a generic body
+                    // too, not just at their own direct return.
+                    "popcount" => {
+                        let arg_w = self.resolve_bits_width(*args.first()?)?;
+                        Some(crate::types::popcount_result_width(arg_w))
+                    }
+                    "reverse" | "rotl" | "rotr" => self.resolve_bits_width(*args.first()?),
+                    "mux" => {
+                        let a = self.resolve_bits_width(*args.get(1)?)?;
+                        let b = self.resolve_bits_width(*args.get(2)?)?;
+                        Some(a.max(b))
+                    }
                     _ => match self.res.def(*def).kind {
                         DefKind::Fn | DefKind::Impl => self.resolve_nested_call_width(*def, args),
                         _ => None,

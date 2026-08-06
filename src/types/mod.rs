@@ -265,6 +265,17 @@ pub(crate) fn prio_result_width(arg_width: u64) -> u64 {
     clog2(arg_width).max(1)
 }
 
+/// `popcount`'s own result width, given its argument's — the single
+/// source of truth `type_builtin_call`'s `"popcount"` arm and firrtl's
+/// emission-time `resolve_bits_width` both call, same reasoning as
+/// `prio_result_width` above. A `w`-bit argument's set-bit count ranges
+/// `0..=w`, `w+1` distinct values, so `clog2(w + 1)` bits — NOT
+/// `clog2(w)`, which only covers `0..w` and would silently truncate the
+/// all-ones case.
+pub(crate) fn popcount_result_width(arg_width: u64) -> u64 {
+    clog2(arg_width + 1).max(1)
+}
+
 impl<'a> TypeChecker<'a> {
     pub(crate) fn error(&mut self, span: Span, message: String) {
         if self.emit {

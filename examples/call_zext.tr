@@ -1,0 +1,8 @@
+module Top {
+    in a : [8]
+    out result : [16] = 0
+
+    rule widen {
+        result := zext(a, 16)
+    }
+}

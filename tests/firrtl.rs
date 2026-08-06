@@ -3822,6 +3822,187 @@ module M {
 }
 
 #[test]
+fn zext_pads_with_zero() {
+    // The narrower-target-width error case (`zext`'s own type-check
+    // rejection, not an emission concern) is pinned in tests/types.rs
+    // alongside `wider_write_needs_trunc`.
+    let src = "\
+module M {
+    in a : [8]
+    out result : [16] = 0
+    rule r {
+        result := zext(a, 16)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, pad(a, 16)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn sext_casts_through_sint_to_replicate_the_sign_bit() {
+    let src = "\
+module M {
+    in a : [8]
+    out result : [16] = 0
+    rule r {
+        result := sext(a, 16)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, asUInt(pad(asSInt(a), 16))"));
+    run_firtool(&fir, &[]);
+}
+
+/// Pins the width-growth fix: FIRRTL's `add` gains a carry-out bit per
+/// operation (`max(w1, w2) + 1`), so an 8-bit argument's 8-deep `add`
+/// chain would land at `bits[12]`, not `bits[4]` — the exact width
+/// `popcount_result_width` computes and `types.rs` types this call as.
+/// The trailing `bits(..., 3, 0)` in the emitted string is what brings
+/// it back down; asserting on the FULL string (not just "compiles")
+/// catches a regression that drops that truncation. Dropping it
+/// wouldn't miscompile TODAY's shipped examples (a too-wide expression
+/// still connects to a narrower register correctly, and `compile_binop`
+/// re-truncates from `types.rs`'s own width for any further arithmetic
+/// around it) — but it would leave the emitted string's own width lying
+/// about what `types.rs` believes it is, which `run_firtool` alone has
+/// no way to catch, so it's still worth pinning here rather than
+/// discovering it the next time something reads this string's width
+/// directly instead of going through `compile_binop`.
+#[test]
+fn popcount_result_is_truncated_back_to_its_declared_width() {
+    let src = "\
+module M {
+    in a : [8]
+    out result : [4] = 0
+    rule r {
+        result := popcount(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_result, bits(add(add(add(add(add(add(add(add(UInt<4>(0), \
+         pad(bits(a, 0, 0), 4)), pad(bits(a, 1, 1), 4)), pad(bits(a, 2, 2), 4)), \
+         pad(bits(a, 3, 3), 4)), pad(bits(a, 4, 4), 4)), pad(bits(a, 5, 5), 4)), \
+         pad(bits(a, 6, 6), 4)), pad(bits(a, 7, 7), 4)), 3, 0)"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn reverse_flips_bit_order_via_a_cat_chain() {
+    let src = "\
+module M {
+    in a : [4]
+    out result : [4] = 0
+    rule r {
+        result := reverse(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_result, cat(cat(cat(bits(a, 0, 0), bits(a, 1, 1)), bits(a, 2, 2)), \
+         bits(a, 3, 3))"
+    ));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn rotl_and_rotr_are_mirrored_two_slice_cats() {
+    let src = "\
+module M {
+    in a : [8]
+    out result : [8] = 0
+    rule r {
+        result := rotl(a, 3)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, cat(bits(a, 4, 0), bits(a, 7, 5))"));
+    run_firtool(&fir, &[]);
+
+    let src_r = "\
+module M {
+    in a : [8]
+    out result : [8] = 0
+    rule r {
+        result := rotr(a, 3)
+    }
+}
+";
+    let fir_r = emit_from_source(src_r).expect("emission should succeed");
+    assert!(fir_r.contains("connect __out_result, cat(bits(a, 2, 0), bits(a, 7, 3))"));
+    run_firtool(&fir_r, &[]);
+}
+
+/// A non-constant rotate amount (here, another port) takes the
+/// double-width-`cat`-plus-`dshr` path instead of the static two-slice
+/// `cat` the constant-amount tests above pin — see `compile_rotate`'s own
+/// doc comment for the derivation. Pins the exact emitted shape (the
+/// `rem`-based modulo reduction and, for `rotl`, the `sub`-based
+/// `width - n` shift amount); real simulation across several runtime
+/// amounts, including ones at and past the value's own width, lives in
+/// `examples/call_rotl_dynamic.tr`/`call_rotr_dynamic.tr`.
+#[test]
+fn rotl_and_rotr_with_a_dynamic_amount_use_a_double_width_cat_and_dshr() {
+    let src = "\
+module M {
+    in a : [8]
+    in n : [4]
+    out result : [8] = 0
+    rule r {
+        result := rotl(a, n)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_result, tail(dshr(cat(a, a), sub(UInt<8>(8), rem(n, UInt<8>(8)))), 8)"
+    ));
+    run_firtool(&fir, &[]);
+
+    let src_r = "\
+module M {
+    in a : [8]
+    in n : [4]
+    out result : [8] = 0
+    rule r {
+        result := rotr(a, n)
+    }
+}
+";
+    let fir_r = emit_from_source(src_r).expect("emission should succeed");
+    assert!(fir_r.contains("connect __out_result, tail(dshr(cat(a, a), rem(n, UInt<8>(8))), 8)"));
+    run_firtool(&fir_r, &[]);
+}
+
+#[test]
+fn mux_lowers_directly_to_the_firrtl_mux_primop() {
+    let src = "\
+module M {
+    in sel : [1]
+    in a : [8]
+    in b : [8]
+    out result : [8] = 0
+    rule r {
+        result := mux(sel, a, b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, mux(sel, a, b)"));
+    run_firtool(&fir, &[]);
+}
+
+// `mux`'s selector-width rejection (`must be bits[1]`) is a type-check
+// error, not an emission one -- pinned in tests/types.rs instead.
+
+#[test]
 fn user_call_nested_inside_a_builtins_argument_composes() {
     // `prio` doesn't disqualify a callee from inlining, and (since
     // callee-calling-callee composition landed) neither does a user

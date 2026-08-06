@@ -902,12 +902,142 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ty::Bits(Width::Known(total))
             }
+            // `zext(value, width)`/`sext(value, width)`: widen `value` to
+            // exactly `width` bits, zero- or sign-filling the new high
+            // bits. Unlike `trunc`, there's no 1-argument inferred-width
+            // form — the whole point of spelling one of these out (over
+            // just letting the value flow into a wider write target,
+            // which already zero-extends implicitly) is to make a
+            // SIGN-extension explicit, so `width` is always required.
+            // `target < value`'s own width is a real error, not silently
+            // accepted as a no-op or routed through `trunc` — narrowing
+            // is a different operation with different data loss, and the
+            // fix is named right in the message.
+            "zext" | "sext" => {
+                if args.len() != 2 {
+                    self.error(self.expr_span(id), format!("`{name}` takes (value, width)"));
+                    return Ty::Unknown;
+                }
+                let target = self.const_eval(args[1], &HashMap::new());
+                match (arg_tys.first(), target) {
+                    (Some(Ty::Bits(Width::Known(vw))), Some(tw)) => {
+                        if tw < *vw {
+                            self.error(
+                                self.expr_span(id),
+                                format!(
+                                    "`{name}`'s target width ({tw}) is narrower than its \
+                                     value's own width ({vw}); use `trunc` to narrow instead"
+                                ),
+                            );
+                        }
+                        Ty::Bits(Width::Known(tw))
+                    }
+                    (_, Some(tw)) => Ty::Bits(Width::Known(tw)),
+                    _ => Ty::Bits(Width::Unknown),
+                }
+            }
             "prio" => match arg_tys.first() {
                 Some(Ty::Bits(Width::Known(w))) => {
                     Ty::Bits(Width::Known(super::prio_result_width(*w)))
                 }
                 _ => Ty::Bits(Width::Unknown),
             },
+            // `popcount(bits)`: the number of set bits, widened to fit
+            // the worst case (see `popcount_result_width`'s own doc
+            // comment on the `+1`).
+            "popcount" => {
+                if args.len() != 1 {
+                    self.error(
+                        self.expr_span(id),
+                        "`popcount` takes one argument".to_string(),
+                    );
+                    return Ty::Unknown;
+                }
+                match arg_tys.first() {
+                    Some(Ty::Bits(Width::Known(w))) => {
+                        Ty::Bits(Width::Known(super::popcount_result_width(*w)))
+                    }
+                    _ => Ty::Bits(Width::Unknown),
+                }
+            }
+            // `reverse(bits)`: same width as its argument, bit order
+            // flipped.
+            "reverse" => {
+                if args.len() != 1 {
+                    self.error(
+                        self.expr_span(id),
+                        "`reverse` takes one argument".to_string(),
+                    );
+                    return Ty::Unknown;
+                }
+                match arg_tys.first() {
+                    Some(Ty::Bits(Width::Known(w))) => Ty::Bits(Width::Known(*w)),
+                    _ => Ty::Bits(Width::Unknown),
+                }
+            }
+            // `rotl(value, n)`/`rotr(value, n)`: same width as `value` —
+            // rotating never changes bit count, unlike `zext`/`trunc`.
+            // `n` itself isn't checked here at all (same stance `trunc`'s
+            // 2-arg width takes): it only matters at FIRRTL emission,
+            // which requires it to be a compile-time constant (a static
+            // bit-slice boundary, not a dynamically indexed one) and
+            // reports that there, not here, the same division of labor
+            // `compile_trunc`'s doc comment already explains for its own
+            // one-arg width-inference gap.
+            "rotl" | "rotr" => {
+                if args.len() != 2 {
+                    self.error(
+                        self.expr_span(id),
+                        format!("`{name}` takes (value, amount)"),
+                    );
+                    return Ty::Unknown;
+                }
+                match arg_tys.first() {
+                    Some(Ty::Bits(Width::Known(w))) => Ty::Bits(Width::Known(*w)),
+                    _ => Ty::Bits(Width::Unknown),
+                }
+            }
+            // `mux(sel, a, b)`: an explicit 2-way combinational select —
+            // `sel` must be exactly `bits[1]` (no implicit "nonzero
+            // selects a" truthiness; `prio` takes the same strict stance
+            // on its own callers gating explicitly, see its own doc
+            // comment), `a`/`b` must both be `Bits`. Result width is the
+            // max of the two arms, mirroring `combine_bits_width`'s
+            // ordinary Chisel-style rule for every other binary op that
+            // isn't `Mul`/a shift — and matching FIRRTL's own `mux`
+            // primop, which pads the narrower arm to the wider one
+            // automatically, so no explicit padding is needed at
+            // emission either.
+            "mux" => {
+                if args.len() != 3 {
+                    self.error(self.expr_span(id), "`mux` takes (sel, a, b)".to_string());
+                    return Ty::Unknown;
+                }
+                if let Some(sel_ty) = arg_tys.first()
+                    && !matches!(sel_ty, Ty::Bits(Width::Known(1)) | Ty::Bits(Width::Unknown))
+                {
+                    self.error(
+                        self.expr_span(args[0]),
+                        format!(
+                            "`mux`'s selector must be `bits[1]`, not {sel_ty}; wrap a \
+                             comparison with `logic` to get one"
+                        ),
+                    );
+                }
+                match (arg_tys.get(1), arg_tys.get(2)) {
+                    (Some(Ty::Bits(Width::Known(a))), Some(Ty::Bits(Width::Known(b)))) => {
+                        Ty::Bits(Width::Known((*a).max(*b)))
+                    }
+                    (Some(Ty::Bits(_)), Some(Ty::Bits(_))) => Ty::Bits(Width::Unknown),
+                    _ => {
+                        self.error(
+                            self.expr_span(id),
+                            "`mux`'s two arms must both be `bits[..]`".to_string(),
+                        );
+                        Ty::Unknown
+                    }
+                }
+            }
             "sync" => Ty::Unit,
             // Guard-only (`race[...]` as its own statement) never reads
             // this type; value-producing (`value := race[...]`) does —

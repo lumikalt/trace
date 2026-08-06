@@ -1,17 +1,23 @@
-//! Inlining a call to a user `fn`/`impl` or the builtin `prio` — FIRRTL
-//! has no call concept, so `compile_call`/`compile_builtin_call` splice
-//! the callee in at its call site instead of emitting it as its own
-//! hardware. `validate_call` is the single choke point every inlining
-//! entry point (here, and writes.rs's write-hunt) goes through: effect
-//! coloring, the call-site module boundary, a call-CYCLE check
-//! (`find_call_cycle` — a callee may itself call another callee, just
-//! not one that transitively calls back to itself), and — reused from
-//! checks.rs, since it's already generic over any statement list, not
-//! rule-specific — `check_writing_call_positions_in` against THIS
-//! callee's own body, so a writing call inside it sits in a position
-//! `callee_reg_write`/`callee_port_write` (writes.rs) can actually find.
-//! `compile_callee_body` builds the callee's return value; `compile_prio`
-//! is the one synthesizable builtin, a fixed-priority `mux` chain.
+//! Inlining a call to a user `fn`/`impl` or one of the synthesizable
+//! builtins — FIRRTL has no call concept, so `compile_call`/
+//! `compile_builtin_call` splice the callee in at its call site instead
+//! of emitting it as its own hardware. `validate_call` is the single
+//! choke point every inlining entry point (here, and writes.rs's
+//! write-hunt) goes through: effect coloring, the call-site module
+//! boundary, a call-CYCLE check (`find_call_cycle` — a callee may itself
+//! call another callee, just not one that transitively calls back to
+//! itself), and — reused from checks.rs, since it's already generic over
+//! any statement list, not rule-specific — `check_writing_call_
+//! positions_in` against THIS callee's own body, so a writing call
+//! inside it sits in a position `callee_reg_write`/`callee_port_write`
+//! (writes.rs) can actually find. `compile_callee_body` builds the
+//! callee's return value; the rest of this file is each synthesizable
+//! builtin's own hand-written FIRRTL construction — `compile_prio` (a
+//! fixed-priority `mux` chain), `compile_trunc`/`compile_zext`/
+//! `compile_sext` (width changes), `compile_pack`/`compile_reverse`
+//! (`cat` chains), `compile_popcount` (an `add` chain), `compile_rotate`
+//! (a two-slice `cat`, `rotl`/`rotr` sharing one function), and
+//! `compile_mux` (a direct FIRRTL `mux`).
 
 use super::Emitter;
 use super::fifo::fifo_guard_cond;
@@ -447,13 +453,14 @@ impl<'a> Emitter<'a> {
     }
 
     /// A builtin has no body to splice (unlike a user `fn`/`impl`) — each
-    /// one needs its own hand-written FIRRTL construction. `prio` is the
-    /// only one synthesizable today; the rest (`bits`/`wire`/`list`/`any`
-    /// never reach here at all — `bits[N]` is a type-position construct,
-    /// `any` is spec/`chooses`-only, both handled entirely by types.rs/
-    /// effects.rs before emission — and `clog2`/`trunc`/`pack`/`len` are
-    /// real gaps but have no in-repo caller yet) fall through to an
-    /// explicit error.
+    /// one needs its own hand-written FIRRTL construction. `prio`/
+    /// `trunc`/`pack`/`zext`/`sext`/`popcount`/`reverse`/`rotl`/`rotr`/
+    /// `mux` are synthesizable today; `bits`/`wire`/`list`/`any` never
+    /// reach here at all (`bits[N]` is a type-position construct, `any`
+    /// is spec/`chooses`-only, both handled entirely by types.rs/
+    /// effects.rs before emission), and `clog2`/`len` remain
+    /// compile-time-only (real gaps, no in-repo caller needs them
+    /// synthesizable yet) — fall through to an explicit error.
     pub(crate) fn compile_builtin_call(
         &mut self,
         id: ExprId,
@@ -466,6 +473,13 @@ impl<'a> Emitter<'a> {
             "prio" => self.compile_prio(id, args, hint),
             "trunc" => self.compile_trunc(id, args, hint),
             "pack" => self.compile_pack(id, args),
+            "zext" => self.compile_zext(id, args),
+            "sext" => self.compile_sext(id, args),
+            "popcount" => self.compile_popcount(id, args, hint),
+            "reverse" => self.compile_reverse(id, args),
+            "rotl" => self.compile_rotate(id, args, true),
+            "rotr" => self.compile_rotate(id, args, false),
+            "mux" => self.compile_mux(id, args),
             "__race_value" => self.compile_race_value(id, args, hint),
             name => {
                 self.error(
@@ -473,8 +487,10 @@ impl<'a> Emitter<'a> {
                     format!(
                         "calling the builtin `{name}` is not yet supported in FIRRTL \
                          emission (v0 restriction: only `prio` — a fixed-priority \
-                         encoder — `trunc` — bit truncation — and `pack` — \
-                         concatenation — are synthesizable today)"
+                         encoder — `trunc` — bit truncation — `pack` — concatenation \
+                         — `zext`/`sext` — widening — `popcount` — set-bit count — \
+                         `reverse` — bit-order reversal — `rotl`/`rotr` — rotate — \
+                         and `mux` — 2-way select — are synthesizable today)"
                     ),
                 );
                 Err(())
@@ -621,6 +637,48 @@ impl<'a> Emitter<'a> {
         Ok(format!("bits({value_str}, {}, 0)", w.saturating_sub(1)))
     }
 
+    /// `zext(value, width)`: widen `value` to `width` bits, filling the
+    /// new high bits with zero. Every value in this language is already a
+    /// plain FIRRTL `UInt` (see `compile_shift`'s doc comment on
+    /// `AShr` — there's no separate signed type), and FIRRTL's own `pad`
+    /// primop zero-extends a `UInt` operand, so this is `pad` directly —
+    /// no cast needed, unlike `sext` below. `pad(e, n)` is a defined
+    /// no-op when `n <= width(e)`, so this also covers the trivial
+    /// `width == value`'s own width case without a special case here (a
+    /// genuinely narrower `width` is a `types.rs` error already, which
+    /// halts the pipeline before emission is reached).
+    fn compile_zext(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        if args.len() != 2 {
+            self.error(span, "`zext` takes (value, width)".to_string());
+            return Err(());
+        }
+        let w = self.width_of(id);
+        let value_str = self.compile_expr(args[0])?;
+        Ok(format!("pad({value_str}, {w})"))
+    }
+
+    /// `sext(value, width)`: widen `value` to `width` bits, filling the
+    /// new high bits by REPLICATING the current top bit — real sign
+    /// extension, unlike `zext`. `pad` on a `UInt` zero-extends (that's
+    /// `compile_zext`, above); to get its `SInt` sign-extending behavior
+    /// instead, `value` is cast to `SInt` first (`asSInt`), padded there,
+    /// then cast back to this language's normal `UInt` representation
+    /// (`asUInt`) — the identical `asUInt(pad(asSInt(...), w))` shape
+    /// `compile_shift`'s `AShr` case already uses and has confirmed
+    /// against real firtool + simulation, reused here rather than
+    /// re-deriving and re-verifying the same primop composition.
+    fn compile_sext(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        if args.len() != 2 {
+            self.error(span, "`sext` takes (value, width)".to_string());
+            return Err(());
+        }
+        let w = self.width_of(id);
+        let value_str = self.compile_expr(args[0])?;
+        Ok(format!("asUInt(pad(asSInt({value_str}), {w}))"))
+    }
+
     /// `prio(reqs)`: a fixed-priority encoder over `reqs`'s bits — the
     /// LOWEST set bit wins (bit 0 highest priority), matching the
     /// classic fixed-priority-arbiter convention. `reqs = 0` returns
@@ -650,6 +708,157 @@ impl<'a> Emitter<'a> {
             acc = format!("mux({bit}, UInt<{w}>({i}), {acc})");
         }
         Ok(acc)
+    }
+
+    /// `popcount(bits)`: the number of set bits, built as a plain `add`
+    /// chain over each individual bit — no dedicated FIRRTL primop for
+    /// this exists, unlike `prio`'s `mux` chain or `pack`'s `cat`. Each
+    /// bit is widened to the RESULT's own width (`w`, from `types.rs`'s
+    /// `popcount_result_width`) before summing — but FIRRTL's `add`
+    /// still GROWS by one bit per operation (`max(w1, w2) + 1`, the
+    /// carry-out bit), unlike `prio`'s `mux` chain, which never widens.
+    /// `w` bits is already exactly enough to hold the true sum (that's
+    /// `popcount_result_width`'s whole job), so the accumulated string's
+    /// own inflated FIRRTL-inferred width (up to `w + n` after `n`
+    /// additions) is discarded bits of zero, never a real value this
+    /// throws away — but leaving it inflated would still be wrong: a
+    /// caller nested further arithmetic around this call (`compile_
+    /// binop`) reasons about ITS width purely from `types.rs`'s `w`, so
+    /// splicing in a wider actual expression would silently combine at
+    /// the WRONG width there. `bits(acc, w-1, 0)` at the end brings the
+    /// string back down to exactly `w`, the same "truncate before
+    /// handing back" step `compile_unop`'s `Neg` case already takes for
+    /// the identical reason (`sub`'s own carry-out bit).
+    fn compile_popcount(
+        &mut self,
+        id: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let Some(&value) = args.first() else {
+            self.error(span, "`popcount` takes exactly one argument".to_string());
+            return Err(());
+        };
+        let n = self.concrete_width_of(value);
+        let value_str = self.compile_expr(value)?;
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let mut acc = format!("UInt<{w}>(0)");
+        for i in 0..n {
+            let bit = format!("pad(bits({value_str}, {i}, {i}), {w})");
+            acc = format!("add({acc}, {bit})");
+        }
+        Ok(format!("bits({acc}, {}, 0)", w.saturating_sub(1)))
+    }
+
+    /// `reverse(bits)`: bit order flipped, same width — a `cat` chain
+    /// identical in shape to `compile_pack`'s, except every "argument" is
+    /// one single-bit slice of the SAME value rather than distinct
+    /// expressions, walked from bit 0 (becomes the new high bit) up to
+    /// the top bit (becomes the new low bit).
+    fn compile_reverse(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let Some(&value) = args.first() else {
+            self.error(span, "`reverse` takes exactly one argument".to_string());
+            return Err(());
+        };
+        let n = self.concrete_width_of(value);
+        let value_str = self.compile_expr(value)?;
+        let mut acc = format!("bits({value_str}, 0, 0)");
+        for i in 1..n {
+            let bit = format!("bits({value_str}, {i}, {i})");
+            acc = format!("cat({acc}, {bit})");
+        }
+        Ok(acc)
+    }
+
+    /// `rotl(value, n)`/`rotr(value, n)`: rotate by `n` bits, same width
+    /// as `value`. `left`: true for `rotl`, false for `rotr` — one
+    /// function for both directions, which share everything except which
+    /// end of `value` moves first.
+    ///
+    /// A CONSTANT `n` (checked first, via `const_eval`) compiles to a
+    /// single static two-slice `cat` — cheaper hardware than the general
+    /// dynamic form below, and the shape every existing test pins. Rotate-
+    /// left by constant `n`: the new high `w - n` bits are the value's own
+    /// low `w - n` bits, and the new low `n` bits are the value's own high
+    /// `n` bits — `rotr` by `n` is the same split with the two pieces (and
+    /// their sizes) swapped, i.e. `rotl` by `w - n`. `n == 0` (after
+    /// reducing `n` modulo the value's own width, so an amount `>= width`
+    /// rotates the same as its remainder) is a special case: the `cat`
+    /// formula would otherwise need a zero-width `bits` slice, which
+    /// FIRRTL rejects.
+    ///
+    /// A DYNAMIC `n` (any other expression) uses the classic double-width
+    /// trick instead, since FIRRTL's `bits` needs static bounds: `dup =
+    /// cat(value, value)` is `2w` bits with `dup[j] == value[j mod w]` for
+    /// every `j` in `[0, 2w)` (both halves of the concatenation are the
+    /// SAME value) — so a `w`-bit window of `dup`, dynamically positioned,
+    /// already IS a rotation, with no per-bit-position case-work. `rotr`
+    /// by `n` is `dup`'s low `w` bits after shifting right by `n`
+    /// (`(dup >> n)[i] == dup[i + n] == value[(i + n) mod w]`, exactly
+    /// `rotr`'s definition); `rotl` by `n` is the same shift by `w - n`
+    /// instead (derived the identical way, `dup[i - n + w] ==
+    /// value[(i - n) mod w]`). `n` is reduced modulo `w` FIRST via `rem`
+    /// (FIRRTL's own `rem(a, b)` result width is `min(width(a),
+    /// width(b))`, sound here since a remainder is always `<= a` and
+    /// `< b`) so `w - n_mod` always lands in `[1, w]` — never negative,
+    /// never needing `n == 0`'s special case the constant path needs
+    /// (shifting `dup` right by exactly `w`, `rotl`'s `n_mod == 0` case,
+    /// correctly reads back `dup`'s own high half, `value` unchanged).
+    /// Verified against real firtool + simulation across several runtime
+    /// amounts, not just reasoned through (`examples/call_rotl_dynamic.tr`
+    /// / `call_rotr_dynamic.tr`).
+    fn compile_rotate(&mut self, id: ExprId, args: &[ExprId], left: bool) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let name = if left { "rotl" } else { "rotr" };
+        if args.len() != 2 {
+            self.error(span, format!("`{name}` takes (value, amount)"));
+            return Err(());
+        }
+        let w = self.concrete_width_of(args[0]);
+        let value_str = self.compile_expr(args[0])?;
+
+        if let Some(raw_n) = self.const_eval(args[1]) {
+            let n = raw_n % w;
+            if n == 0 {
+                return Ok(value_str);
+            }
+            let hi = if left { w - n } else { n };
+            return Ok(format!(
+                "cat(bits({value_str}, {}, 0), bits({value_str}, {}, {}))",
+                hi - 1,
+                w - 1,
+                hi
+            ));
+        }
+
+        let n_str = self.compile_expr(args[1])?;
+        let dup = format!("cat({value_str}, {value_str})");
+        let n_mod = format!("rem({n_str}, UInt<{w}>({w}))");
+        let shamt = if left {
+            format!("sub(UInt<{w}>({w}), {n_mod})")
+        } else {
+            n_mod
+        };
+        Ok(format!("tail(dshr({dup}, {shamt}), {w})"))
+    }
+
+    /// `mux(sel, a, b)`: `sel` selects `a` when 1, `b` when 0 — a direct,
+    /// one-to-one lowering to FIRRTL's own `mux` primop, which already
+    /// pads the narrower of `a`/`b` to the wider one itself (the same
+    /// rule `types.rs`'s own `"mux"` arm computes as this call's result
+    /// width), so no explicit padding is needed here.
+    fn compile_mux(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        if args.len() != 3 {
+            self.error(span, "`mux` takes (sel, a, b)".to_string());
+            return Err(());
+        }
+        let sel = self.compile_expr(args[0])?;
+        let a = self.compile_expr(args[1])?;
+        let b = self.compile_expr(args[2])?;
+        Ok(format!("mux({sel}, {a}, {b})"))
     }
 
     /// `__race_value(d1, r1, d2, r2, ...)`: lower.rs's own rewrite of a

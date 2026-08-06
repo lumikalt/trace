@@ -257,30 +257,42 @@ disjointness argument anywhere) passes end to end.
     (static call-graph check) — nested any deeper than those two write
     positions (an argument, a `let`, `Bump(a) + 1`) is a clean, explicit
     error.
-  - Of the builtins, only `prio`/`trunc`/`pack`/`logic` are
-    synthesizable as calls; `clog2`/`len` are compile-time-only
-    (`Ty::Int`), and `wire`/`list`/`any`/`sync`/`race` aren't applicable
-    to a plain combinational callee body at all (the old explicit
-    `bits[N]` spelling no longer has surface syntax at all — see the
-    `[N]` entry below).
+  - Of the builtins, `prio`/`trunc`/`pack`/`zext`/`sext`/`popcount`/
+    `reverse`/`rotl`/`rotr`/`mux`/`logic` are synthesizable as calls;
+    `clog2`/`len` are compile-time-only (`Ty::Int`), and `wire`/`list`/
+    `any`/`sync`/`race` aren't applicable to a plain combinational callee
+    body at all (the old explicit `bits[N]` spelling no longer has
+    surface syntax at all — see the `[N]` entry below). `rotl`/`rotr`'s
+    rotate amount can be either a compile-time constant (a single static
+    two-slice `cat`) or a dynamic expression (a double-width `cat` fed
+    through `dshr`, `n` reduced modulo `value`'s own width via `rem`).
   - A generic callee body's own width resolution (`Emitter::
     resolve_bits_width`, `src/firrtl/expr.rs`) chases a value through
     `self.locals` substitution, arithmetic/shift/bitwise combination
-    (`combine_bits_width`, shared with `type_binop`), the two
-    synthesizable builtins' own result-width rules (`prio`, `pack`), and
-    a nested call to ANOTHER user-defined generic function
-    (`resolve_nested_call_width`, re-running `type_call`'s own `env`-
-    building + return-type evaluation at emission time) — covering a
-    bare literal beside a generic-width value nested anywhere in the
-    body (guards, shifts, further arithmetic on a builtin's or a nested
-    call's own result), not just a direct return. Two params sharing one
-    implicit width name whose arguments resolve to genuinely conflicting
-    widths still fails cleanly ("no concrete width"), not a miscompile —
-    the one shape left where a call's own width truly isn't well-defined.
+    (`combine_bits_width`, shared with `type_binop`), the synthesizable
+    builtins' own result-width rules (`prio`, `pack`, `popcount`,
+    `reverse`, `rotl`/`rotr`, `mux` — NOT `trunc`/`zext`/`sext`, whose
+    result width is a separately-spelled argument rather than a function
+    of their value argument's width, so they rely on the `hint` mechanism
+    instead, same as `trunc`'s own 1-argument form), and a nested call to
+    ANOTHER user-defined generic function (`resolve_nested_call_width`,
+    re-running `type_call`'s own `env`-building + return-type evaluation
+    at emission time) — covering a bare literal beside a generic-width
+    value nested anywhere in the body (guards, shifts, further arithmetic
+    on a builtin's or a nested call's own result), not just a direct
+    return. Two params sharing one implicit width name whose arguments
+    resolve to genuinely conflicting widths still fails cleanly ("no
+    concrete width"), not a miscompile — the one shape left where a
+    call's own width truly isn't well-defined.
 
   See `examples/call.tr`, `examples/call_branch.tr`,
   `examples/call_writes.tr`, `examples/call_prio.tr`,
   `examples/call_trunc.tr`, `examples/call_pack.tr`,
+  `examples/call_zext.tr`, `examples/call_sext.tr`,
+  `examples/call_popcount.tr`, `examples/call_reverse.tr`,
+  `examples/call_rotl.tr`, `examples/call_rotr.tr`,
+  `examples/call_rotl_dynamic.tr`, `examples/call_rotr_dynamic.tr`,
+  `examples/call_mux.tr`,
   `examples/call_nested.tr`, `examples/call_nested_writes.tr`,
   `examples/call_guard.tr`, `examples/call_fifo.tr`.
 - `<elaborates>` recursion/unrolling (`src/elaborate.rs`) exists —

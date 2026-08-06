@@ -58,6 +58,55 @@ module M {
 }
 
 #[test]
+fn zext_and_sext_reject_a_target_width_narrower_than_the_value() {
+    for name in ["zext", "sext"] {
+        let src = format!(
+            "module M {{\n in a : [16]\n out result : [8] = 0\n rule r {{\n result := \
+             {name}(a, 8)\n }}\n}}\n"
+        );
+        let (_, _, errors) = run(&src);
+        assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+        assert!(errors[0].message.contains("use `trunc` to narrow instead"));
+    }
+
+    // A target width at least as wide as the value is accepted.
+    run_ok(
+        "module M {\n in a : [8]\n out result : [16] = 0\n rule r {\n result := zext(a, 16)\n }\n}\n",
+    );
+    run_ok(
+        "module M {\n in a : [8]\n out result : [16] = 0\n rule r {\n result := sext(a, 16)\n }\n}\n",
+    );
+}
+
+#[test]
+fn mux_rejects_a_selector_wider_than_one_bit() {
+    let src = "\
+module M {
+    in sel : [2]
+    in a : [8]
+    in b : [8]
+    out result : [8] = 0
+    rule r {
+        result := mux(sel, a, b)
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("must be `bits[1]`"))
+    );
+
+    // A bits[1] selector is accepted, and the result width is the max
+    // of the two arms.
+    run_ok(
+        "module M {\n in sel : [1]\n in a : [8]\n in b : [8]\n out result : [8] = 0\n rule r \
+         {\n result := mux(sel, a, b)\n }\n}\n",
+    );
+}
+
+#[test]
 fn mul_sums_widths() {
     let src = "\
 module M {

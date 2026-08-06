@@ -1,0 +1,9 @@
+module Top {
+    in a : [8]
+    in n : [4]
+    out result : [8] = 0
+
+    rule rot {
+        result := rotl(a, n)
+    }
+}

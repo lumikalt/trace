@@ -221,7 +221,10 @@ pub struct ResolveError {
 }
 
 /// Callable names with no user definition. `sync`/`race` parse as idents;
-/// `prio` is a priority encoder; the rest are the primitive vocabulary
+/// `prio` is a priority encoder; `zext`/`sext` widen (zero/sign extend);
+/// `popcount` counts set bits; `reverse` reverses bit order; `rotl`/
+/// `rotr` rotate by a compile-time-constant amount; `mux` is an explicit
+/// 2-way combinational select; the rest are the primitive vocabulary
 /// DESIGN.md examples assume. `__race_value` is compiler-internal —
 /// lower.rs's own rendering of a value-producing `race[...]`, never
 /// written by a user (see types.rs's `type_builtin_call`). `logic` is
@@ -236,6 +239,13 @@ const BUILTINS: &[&str] = &[
     "clog2",
     "pack",
     "trunc",
+    "zext",
+    "sext",
+    "popcount",
+    "reverse",
+    "rotl",
+    "rotr",
+    "mux",
     "len",
     "sync",
     "race",

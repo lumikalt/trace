@@ -2625,7 +2625,8 @@ guessing: two of that nested callee's own params sharing one implicit width
 name whose arguments resolve to genuinely conflicting concrete widths — a call
 whose own width truly isn't well-defined, not a gap in the resolver.
 
-Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
+Of the builtins, `prio`, `trunc`, `pack`, `zext`, `sext`, `popcount`,
+`reverse`, `rotl`/`rotr`, and `mux` are synthesizable as calls:
 
 - **`prio(reqs)`** is a fixed-priority encoder. The lowest set bit wins (bit 0 is
   highest priority); `reqs = 0` returns `0`, a defined but not meaningful value
@@ -2649,6 +2650,41 @@ Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
   first argument becomes the high bits, matching FIRRTL's `cat`, Chisel's `Cat`,
   and Verilog's `{a, b}` concatenation. The result width is the sum of the
   argument widths.
+- **`zext(value, width)`** / **`sext(value, width)`** widen `value` to exactly
+  `width` bits, filling the new high bits with zero or with a replicated sign
+  bit respectively. Unlike `trunc`, there's no 1-argument inferred-width form —
+  the whole point of spelling one of these out (over just letting a value flow
+  into a wider write target, which already zero-extends implicitly) is to make
+  a *sign* extension explicit, so `width` is always required. A `width`
+  narrower than `value`'s own width is a compile error naming `trunc` as the
+  fix, not silent truncation. Every value in this language is already a plain
+  FIRRTL `UInt` (see the `sequences`-lowering notes on `AShr`), so `zext` is a
+  direct `pad`; `sext` casts to `SInt`, pads (which sign-extends `SInt`), then
+  casts back.
+- **`popcount(bits)`** counts set bits, result width `clog2(width + 1)` (not
+  `clog2(width)` — a `w`-bit argument's count ranges `0..=w`, `w + 1` distinct
+  values). Built as an `add` chain over each individual bit; no dedicated
+  FIRRTL primop for this exists.
+- **`reverse(bits)`** reverses bit order, same width as its argument. Built as
+  a `cat` chain, the same shape as `pack`'s, over the argument's own bits.
+- **`rotl(value, n)`** / **`rotr(value, n)`** rotate left/right by `n` bits,
+  same width as `value`. A CONSTANT `n` compiles to a single `cat` of two
+  static `bits` slices. A DYNAMIC `n` (any other expression) uses the
+  classic double-width trick instead, since FIRRTL's `bits` needs static
+  bounds: `dup = cat(value, value)` is `2w` bits with `dup[j] ==
+  value[j mod w]` for every `j`, so a `w`-bit window of `dup`, dynamically
+  positioned via `dshr`, already IS a rotation — `rotr` by `n` is `dup`
+  shifted right by `n mod w` (via `rem`, whose FIRRTL width rule,
+  `min(w1, w2)`, is sound here since a remainder is always `<= a` and
+  `< b`); `rotl` by `n` is the same shift by `w - (n mod w)` instead.
+  Verified against real firtool + simulation across several runtime
+  amounts, including ones at and past `value`'s own width.
+- **`mux(sel, a, b)`** is an explicit 2-way combinational select — `sel` must
+  be exactly `bits[1]` (no implicit "nonzero selects a" truthiness; wrap a
+  comparison with `logic` to get one, the same explicit-gating stance `prio`
+  takes toward its own callers). Result width is the max of `a`'s and `b`'s
+  widths — FIRRTL's own `mux` primop already pads the narrower arm itself, so
+  this lowers directly to one `mux(sel, a, b)`, no manual padding needed.
 
 `logic <expr>` is different: a real prefix OPERATOR (`Expr::Logic`, ast.rs), not
 a call — no parens, no comma-separated arguments. Unlike every other prefix
@@ -6450,7 +6486,8 @@ noted:
   bare top-level guard and/or fifo op (folded into the caller's own rule
   guard, including the Enq+Deq pass-through case split across the call
   boundary — `examples/call_guard.tr`, `examples/call_fifo.tr`), the
-  synthesizable builtins `prio`/`trunc`/`pack` (`examples/call*.tr`).
+  synthesizable builtins `prio`/`trunc`/`pack`/`zext`/`sext`/`popcount`/
+  `reverse`/`rotl`/`rotr`/`mux` (`examples/call*.tr`).
 - `logic <expr>`: a fallible expression's success as a plain `[1]` value,
   discharged rather than propagated, with no side effect of its own
   (`examples/logic_probe.tr`).
