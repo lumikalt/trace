@@ -24,8 +24,8 @@ checked via a genuinely general `fire_R` transition encoding (`smt::check_relati
 obligation`) rather than mirroring the hand-rolled mask-enumeration loop — this is the
 FIRST half of DESIGN.md's own acid test passing (both of `circular_buffer_disjoint.tr`'s
 invariants independently proven by Z3); the second half (collapsing `schedule.rs`'s own
-`m[head] != m[tail]` proof into one generic query) is stage 4's separate work, not
-started. See DESIGN.md's own stage-1 entry for the three real bugs found extending
+`m[head] != m[tail]` proof into one generic query) was stage 4's separate work — see below,
+now done. See DESIGN.md's own stage-1 entry for the three real bugs found extending
 mem/struct-field/scalar coverage (all in the shadow check's own reconstruction, not in
 `bounds.rs`) — including a genuine vacuous-hypothesis hazard (an unreachable `else`
 branch's contradictory guard made the SMT query "prove" anything for free) caught exactly
@@ -92,11 +92,8 @@ the pre-stage-1 baseline commit — stage 1's own stated success criterion, actu
 once the gaps above close. `expr_bound` can't be deleted in stage 1 regardless of
 shadow-check coverage, because `site_ranges` (stage 1's own explicit scope cut) is
 populated as a side effect of `expr_bound` itself and `schedule.rs`'s `real_range` still
-consults it; deletion rides along with `real_range`'s own retirement at stage 4. Stages
-2–4 (unify the six `bounds.rs` maps into one representation, generalize the surface
-predicate grammar, then — separately, since it proves strictly more and changes generated
-hardware — collapse `schedule.rs`'s eight mem-disjointness arguments into one generic
-query, deleting the old engine alongside it) are ordered.
+consults it; deletion rides along with `real_range`'s own retirement at stage 4 — done, see
+below.
 
 **Stage 2 done, and "unify the six maps" turned out to be the wrong framing — corrected,
 not completed as originally stated.** First sub-step (provenance): `Proven<T>` now lives in
@@ -176,8 +173,7 @@ stage-3 entry for the full detail.
 
 Deliberately still out of scope: `==`/`!=` operators, non-literal-but-constant limits
 (elaboration params — no example needs this), and any bound referencing a mutable def (see
-above). Stage 4 (`schedule.rs` collapse, retiring the old interval engine) is next, not
-started.
+above).
 
 **Real, independent bug found and fixed via a live user report (between stages 3 and 4): a
 bare comparison statement (no `if`, no `?`) didn't narrow bounds, even though DESIGN.md's
@@ -199,6 +195,39 @@ for any future `check_stmt` change. Both fixed together, same commit. Three new 
 tests (bare form, explicit `(cond)?` form, forward-only negative control). Byte-identical
 `--explain-schedule`, zero regressions, zero shadow-check panics (881 tests now). See
 DESIGN.md's own entry for the full detail.
+
+**Stage 4 is DONE — the dependent-type-system arc's acid test now fully closes.**
+`schedule.rs`'s whole `IndexForm`/`forms_differ`/`real_range` chain (eight hand-built
+disjointness arguments) is deleted outright and replaced with one call per index pair to
+`bounds::provably_disjoint_mem_indices` (`src/bounds/mod.rs`, wrapping a new Z3 query in
+`src/bounds/smt.rs`), fed by a new `bounds::guarded_mem_accesses` walk pairing each mem-index
+site with the guards active there. Two real gaps found and fixed mid-implementation, not
+during the earlier design pass: (1) a genuine soundness question — the old `IndexForm` used
+WRAPPING arithmetic on purpose, while `smt.rs`'s existing `translate_expr` computes non-
+wrapping at 64 bits; reading `firrtl/expr.rs`'s actual emission confirmed real hardware
+truncates each arithmetic node to ITS OWN declared width, resolved (via advisor) by
+truncating the WHOLE index expression to the mem's real address width only once, at the
+end, gated by a new `leaves_wide_enough` check (sound only when every leaf def's own
+declared width is at least the address width); (2) the ported `circular_buffer_disjoint.tr`
+direct-call test failed after the rewrite because `translate_guard` (shared with `bounds.rs`'s
+own obligation checks, deliberately capped to stay a faithful shadow of `narrow_for_
+condition`) can't translate either of that example's own load-bearing guards (`push_count -
+pop_count < 8`, `push_count <> pop_count` — neither is a bare `ident op const`) — fixed with a
+new `translate_condition`, scoped to this query alone, that has no such faithfulness
+constraint to honor. Two existing tests pinning "stays unprovable" (a `Sub`-based index under
+a proven bound; a non-power-of-two depth) turned out to be limitations of the OLD engine, not
+real semantic boundaries — updated to the new, correct `Exemption::Disjoint` result, with the
+reasoning recorded inline rather than silently flipped. New demonstrating example
+(`examples/mem_disjoint_non_power_of_two.tr`) plus matching `tests/firrtl.rs`/`tests/
+schedule.rs` coverage. Byte-identical `--explain-schedule` across all 84 PRE-EXISTING examples
+against a pre-change baseline binary (the real behavioral change this stage's own success
+criterion expects doesn't happen to move any CURRENT example), zero regressions (883 tests
+now), clippy clean. See DESIGN.md's own stage-4 entry for the full detail.
+
+**The dependent/refinement type system rollout (stages 1–4) is now complete.** The acid test
+(`examples/circular_buffer_disjoint.tr`, both invariants proven AND `m[head] != m[tail]`
+proven disjoint, no `Item::Invariant`-specific induction and no bespoke `schedule.rs`
+disjointness argument anywhere) passes end to end.
 
 ## Emission (`src/firrtl/`)
 

@@ -404,6 +404,32 @@ fn mem_disjoint_affine_needs_no_conflict_free_annotation() {
 }
 
 #[test]
+fn mem_disjoint_non_power_of_two_needs_no_conflict_free_annotation() {
+    // Stage 4's own driving example (DESIGN.md's "`schedule.rs`: one
+    // generic disjointness query"): examples/mem_disjoint_non_power_of_
+    // two.tr is `mem_disjoint_affine.tr`'s SAME `m[i]`/`m[i+1]` shape,
+    // but depth 10 -- NOT a power of two, and `i` has no declared bound
+    // at all (unlike `mem_disjoint_bounded.tr`'s `where i < 9`). The old
+    // eight hand-built arguments (`schedule.rs`'s retired `IndexForm`/
+    // `forms_differ`) could ONLY prove this shape when the depth was an
+    // exact power of two, so this exact pair stayed unprovable before
+    // stage 4 -- purely a depth-factorization limitation, not a real
+    // ambiguity about whether `i`/`i+1` are different addresses. The new
+    // Z3 query (`bounds::provably_disjoint_mem_indices`) has no such
+    // requirement, and this proves disjoint with no annotation anywhere.
+    let fir = emit_from_source(&read_example("mem_disjoint_non_power_of_two.tr"))
+        .expect("emission should succeed");
+    assert!(fir.contains("connect m.w_m.addr, i"));
+    assert!(fir.contains("connect m.r0.addr, tail(add(i, UInt<4>(1)), 1)"));
+    assert!(fir.contains("node fires_write = UInt<1>(1)"));
+    assert!(fir.contains("node fires_read = UInt<1>(1)"));
+    assert!(!fir.contains("not(fires_write)"));
+    assert!(!fir.contains("not(fires_read)"));
+    assert!(!fir.contains("assert("));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
 fn mem_disjoint_bounded_needs_no_annotation_on_the_mem_pair() {
     // v5 of the four tests above -- the actual driving example
     // `bounds.rs` exists for: examples/mem_disjoint_bounded.tr's `m`

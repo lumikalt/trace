@@ -913,150 +913,181 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
     (bounds, checker.errors)
 }
 
-/// The `schedule.rs` consumer half of DESIGN.md's "Tier 3, not v0"
-/// circular-buffer case: whether `idx_a`/`idx_b` (two BARE-IDENT mem-
-/// index bases -- `schedule.rs`'s own `IndexForm` recognition already
-/// narrows to this shape before ever calling this) are PROVABLY
-/// DISTINCT whenever `rule_a`/`rule_b` (their own accessing rules) both
-/// fire the SAME cycle. This is the genuinely general argument every
-/// `forms_differ` case in `schedule.rs` (v1 through v7) can't make on
-/// its own: none of them need a shared base, a shared multiplier, or a
-/// per-register proven range the way this does -- this needs a
-/// RELATIONAL fact linking `idx_a`/`idx_b` to two OTHER defs this
-/// module can independently bound.
-///
-/// Recognizes exactly ONE shape (v1, deliberately narrow): a VERIFIED
-/// equality-to-zero fact (`link`, `bounds.relational`) naming `idx_a`/
-/// `idx_b` as a cancelling `+-1` pair (`ca == -cb`) plus EXACTLY one
-/// further cancelling pair (`other`); and a SECOND verified fact
-/// (`range_fact`) whose own terms equal `other` (or its negation),
-/// carrying a REAL absolute range (not just a congruence) for that
-/// same pair. `circular_buffer_disjoint.tr`'s own two invariants are
-/// exactly this: `link` = `head - tail - push_count + pop_count ≡ 0
-/// (mod 8)`, `other` = `{push_count: -1, pop_count: +1}`, `range_fact` =
-/// `push_count - pop_count < 9` (the SAME two defs, negated sign,
-/// modulus 16).
-///
-/// The derivation (`link`'s own equation, `cb = -ca`): `idx_a - idx_b ≡
-/// ca * (link.lower - other_expr) (mod link.modulus)`, so `idx_a ==
-/// idx_b` iff `other_expr ≡ link.lower (mod link.modulus)` -- notably
-/// INDEPENDENT of `ca`'s own sign, so `idx_a`/`idx_b`'s own coefficients
-/// never need to be untangled further. `range_fact`'s own guard-
-/// narrowed range (via `rule_a`'s and `rule_b`'s own leading guards,
-/// `narrow_combo_range` -- the SAME function `bounds.rs`'s own
-/// induction uses internally, re-run here rather than cached from it)
-/// gives a REAL range for `other_expr` (if `range_fact.terms ==
-/// other`) or for `-other_expr` (if `range_fact.terms == -other`, in
-/// which case the target flips to `(link.modulus - link.lower) %
-/// link.modulus` instead -- avoiding any interval negation, which the
-/// general case would otherwise need). Concludes `idx_a != idx_b` when
-/// that range excludes the target.
-///
-/// v1 restrictions (fails closed / `false`, never a silent gap): `link`
-/// must have exactly 4 terms (2 cancelling pairs, the FIFO pointer/
-/// counter shape -- no larger combination); `range_fact`'s own guard-
-/// narrowed range must already fit within `link.modulus` WITHOUT
-/// wraparound (`range_fits_modulus` -- a genuine cross-modulus
-/// reduction, needed whenever `range_fact`'s own native modulus differs
-/// from `link`'s, is not attempted); `idx_a`==`idx_b` (the SAME def) is
-/// never asked about -- callers already exclude that via `IndexForm`'s
-/// own base comparison.
-pub fn provably_disjoint_under_joint_guards(
+/// Stage 4 (DESIGN.md's "`schedule.rs`: one generic disjointness
+/// query, staged separately"): the single Z3 query that REPLACES
+/// `schedule.rs`'s whole eight-argument `forms_differ`/`IndexForm`
+/// chain, plus this module's own former `provably_disjoint_under_
+/// joint_guards` (the eighth, relational-only argument, now folded
+/// into the same general mechanism instead of staying a bespoke
+/// fallback). `idx_a`/`idx_b` are arbitrary index EXPRESSIONS (not
+/// pre-reduced to `IndexForm`'s own affine shape -- bitvector
+/// arithmetic natively subsumes the affine/banking/mirrored-parity
+/// reasoning `IndexForm` existed to hand-encode, per DESIGN.md's own
+/// argument), each paired with the guards active at its own access
+/// site (`guarded_mem_accesses` below, `schedule.rs`'s own job to
+/// look up per rule). `None` on anything this v1 doesn't translate
+/// (mirrors `check_bound_obligation`'s own `Skipped`, just collapsed
+/// to a plain bool here since `schedule.rs` only ever needs "may I
+/// treat these as disjoint," not a diagnostic) -- the safe, conservative
+/// direction: `schedule.rs` schedules a stall rather than risk a false
+/// disjointness claim.
+#[allow(clippy::too_many_arguments)]
+pub fn provably_disjoint_mem_indices(
     ast: &Ast,
     res: &Resolution,
+    ty: &Types,
     bounds: &Bounds,
-    idx_a: DefId,
-    idx_b: DefId,
-    rule_a: ItemId,
-    rule_b: ItemId,
+    addr_width: u64,
+    idx_a: ExprId,
+    guards_a: &[ExprId],
+    guards_a_negated: &[ExprId],
+    idx_b: ExprId,
+    guards_b: &[ExprId],
+    guards_b_negated: &[ExprId],
 ) -> bool {
-    let rule_guards = |rule: ItemId| -> Vec<ExprId> {
-        match ast.item(rule) {
-            Item::Rule { body, .. } => leading_guards(ast, body),
-            _ => Vec::new(),
-        }
-    };
-    let guards_a = rule_guards(rule_a);
-    let guards_b = rule_guards(rule_b);
-
-    for link in &bounds.relational {
-        if link.terms.len() != 4 || link.upper != link.lower + 1 {
-            continue; // v1: exactly the 4-term, equality-to-zero shape
-        }
-        let ca = link
-            .terms
-            .iter()
-            .find(|(d, _)| *d == idx_a)
-            .map(|(_, c)| *c);
-        let cb = link
-            .terms
-            .iter()
-            .find(|(d, _)| *d == idx_b)
-            .map(|(_, c)| *c);
-        let (Some(ca), Some(cb)) = (ca, cb) else {
-            continue;
-        };
-        if ca != -cb {
-            continue;
-        }
-        let other: Vec<(DefId, i64)> = link
-            .terms
-            .iter()
-            .filter(|(d, _)| *d != idx_a && *d != idx_b)
-            .copied()
-            .collect();
-        if other.len() != 2 {
-            continue;
-        }
-        let negated_other: Vec<(DefId, i64)> = other.iter().map(|(d, c)| (*d, -c)).collect();
-
-        for range_fact in &bounds.relational {
-            let sign = if same_terms(&range_fact.terms, &other) {
-                1i64
-            } else if same_terms(&range_fact.terms, &negated_other) {
-                -1i64
-            } else {
-                continue;
-            };
-            let mut range = (range_fact.lower, range_fact.upper);
-            for &guard in guards_a.iter().chain(guards_b.iter()) {
-                range = narrow_combo_range(ast, res, &range_fact.terms, guard, range);
-            }
-            let Some((lo, hi)) = range_fits_modulus(range, link.modulus) else {
-                continue;
-            };
-            if lo >= hi {
-                continue; // an empty/vacuous range proves nothing about `other_expr`'s value
-            }
-            let lower_mod = link.lower % link.modulus;
-            let target = if sign == 1 {
-                lower_mod
-            } else {
-                (link.modulus - lower_mod) % link.modulus
-            };
-            if !(lo..hi).contains(&target) {
-                return true;
-            }
-        }
-    }
-    false
+    smt::provably_disjoint(
+        ast,
+        res,
+        ty,
+        bounds,
+        addr_width,
+        idx_a,
+        guards_a,
+        guards_a_negated,
+        idx_b,
+        guards_b,
+        guards_b_negated,
+    )
 }
 
-/// Whether `range` (a real, non-wrapping `[lo, hi)` in its own NATIVE
-/// modulus) can be trusted UNCHANGED as a range modulo `to_modulus` --
-/// true only when it already fits (`hi <= to_modulus`), i.e. no value
-/// in it is large enough to need actual modular reduction. A range that
-/// exceeds `to_modulus` fails closed (`None`) rather than attempting a
-/// genuine cross-modulus wraparound reduction (`shift_preserves`'s own
-/// "reduce by SOME multiple `k`, require no straddle" logic could be
-/// adapted for it, but no motivating case needs the extra generality
-/// yet -- v1 restriction, not an oversight).
-fn range_fits_modulus(range: (u64, u64), to_modulus: u64) -> Option<(u64, u64)> {
-    let (lo, hi) = range;
-    if lo >= hi {
-        return Some(range); // vacuous either way
+/// For one rule's own body: every mem-index expression reached
+/// anywhere in it (read or write, at any nesting depth -- mirrors
+/// `effects.rs`'s own `infer_expr`/`infer_write` sweep, which is what
+/// originally discovered these same `ExprId`s into `EffectSig.mem_
+/// read_idx`/`mem_write_idx`), paired with the `(guards, guards_
+/// negated)` active at that exact site. Mirrors `shadow_walk_body`'s
+/// own if/else + bare-guard threading (see `check_stmt`'s `Stmt::Expr`
+/// arm for the "bare comparison is fallible" reasoning) -- a separate,
+/// free-function walk rather than a `Checker` method, since `schedule.
+/// rs` only ever has `Bounds`/`Ast`/`Resolution` after `bounds::check`
+/// returns, never a live `Checker`. Doesn't thread numeric `state` at
+/// all (unlike `shadow_walk_body`): this walk's only job is collecting
+/// which GUARD EXPRESSIONS are active, not computing a range from them
+/// -- `smt::provably_disjoint`'s own `translate_guard` call does that
+/// numeric interpretation later, so duplicating it here would be pure
+/// waste, not faithfulness. `While`/`IfLet`/`WhileLet` bodies are out
+/// of scope (matches `shadow_walk_body`'s own v1 restriction, and
+/// DESIGN.md's own "Scope: explicit in/out for v1" for the whole
+/// obligation-generation plan) -- an index reached only inside one of
+/// those has no entry here, so `provably_disjoint_mem_indices` sees
+/// empty guards for it: fails toward FEWER hypotheses, never toward a
+/// false disjointness claim.
+pub fn guarded_mem_accesses(
+    ast: &Ast,
+    res: &Resolution,
+    body: &[StmtId],
+) -> HashMap<ExprId, (Vec<ExprId>, Vec<ExprId>)> {
+    let mut out = HashMap::new();
+    walk_guarded_mem_accesses(ast, res, body, Vec::new(), Vec::new(), &mut out);
+    out
+}
+
+fn walk_guarded_mem_accesses(
+    ast: &Ast,
+    res: &Resolution,
+    body: &[StmtId],
+    mut guards: Vec<ExprId>,
+    guards_negated: Vec<ExprId>,
+    out: &mut HashMap<ExprId, (Vec<ExprId>, Vec<ExprId>)>,
+) {
+    for &stmt in body {
+        match ast.stmt(stmt) {
+            Stmt::Expr(e) => {
+                collect_mem_accesses(ast, res, *e, &guards, &guards_negated, out);
+                if is_guard_like(ast, res, *e) {
+                    let cond = if let Expr::Guard(inner) = ast.expr(*e) {
+                        *inner
+                    } else {
+                        *e
+                    };
+                    guards.push(cond);
+                }
+            }
+            Stmt::Assign { lhs, rhs } => {
+                collect_mem_accesses(ast, res, *lhs, &guards, &guards_negated, out);
+                collect_mem_accesses(ast, res, *rhs, &guards, &guards_negated, out);
+            }
+            Stmt::Return(Some(e)) => {
+                collect_mem_accesses(ast, res, *e, &guards, &guards_negated, out);
+            }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_mem_accesses(ast, res, *cond, &guards, &guards_negated, out);
+                let mut then_guards = guards.clone();
+                then_guards.push(*cond);
+                walk_guarded_mem_accesses(
+                    ast,
+                    res,
+                    then_body,
+                    then_guards,
+                    guards_negated.clone(),
+                    out,
+                );
+                if let Some(else_body) = else_body {
+                    let mut else_negated = guards_negated.clone();
+                    else_negated.push(*cond);
+                    walk_guarded_mem_accesses(
+                        ast,
+                        res,
+                        else_body,
+                        guards.clone(),
+                        else_negated,
+                        out,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
-    if hi <= to_modulus { Some(range) } else { None }
+}
+
+/// Sweeps `id`'s own subtree (`lower::sub_exprs`, the same generic
+/// child-walker `check_calls_in` uses) for every `Bracket` dispatched
+/// to a `Mem` def, recording its own index expression's `ExprId`
+/// against the guards active at THIS statement. Deliberately more
+/// inclusive than `smt::translate_expr`'s own narrower recognized
+/// shapes (which only recurse through `Add`/`Sub`/`Mul`/`Field`/
+/// `Call`) -- wandering into a shape `translate_expr` would never
+/// reach is harmless (an unused map entry), while missing one it WOULD
+/// reach is not (a spurious `None` from `provably_disjoint_mem_
+/// indices`, an extra conservative stall, never unsoundness -- but
+/// still a real, avoidable capability loss). Two sites that happen to
+/// share the exact same index `ExprId` (impossible in practice --
+/// every syntactic occurrence gets its own node -- but not structurally
+/// prevented) would have the LATER one's guards win; not a concern
+/// here, since `effects.rs`'s own `mem_read_idx`/`mem_write_idx` already
+/// give the caller one `ExprId` per real occurrence.
+fn collect_mem_accesses(
+    ast: &Ast,
+    res: &Resolution,
+    id: ExprId,
+    guards: &[ExprId],
+    guards_negated: &[ExprId],
+    out: &mut HashMap<ExprId, (Vec<ExprId>, Vec<ExprId>)>,
+) {
+    if let Expr::Bracket { callee, args } = ast.expr(id)
+        && let Some(&mem_def) = res.expr_defs.get(callee)
+        && res.def(mem_def).kind == crate::resolve::DefKind::Mem
+        && let Some(&index) = args.first()
+    {
+        out.insert(index, (guards.to_vec(), guards_negated.to_vec()));
+    }
+    for child in crate::lower::sub_exprs(ast, id) {
+        collect_mem_accesses(ast, res, child, guards, guards_negated, out);
+    }
 }
 
 struct Checker<'a> {

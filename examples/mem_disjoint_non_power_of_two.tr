@@ -1,0 +1,47 @@
+-- A THIRD variant of examples/mem_disjoint_affine.tr's `m[i]`/`m[i+1]`
+-- pair, driving stage 4 of DESIGN.md's dependent-type-system rollout
+-- (`schedule.rs`: one generic disjointness query"): same shape, but
+-- `m`'s depth is 10 -- NOT a power of two. The OLD eight hand-built
+-- disjointness arguments (`schedule.rs`'s retired `IndexForm`/`forms_
+-- differ`) required the mem's depth to be an EXACT power of two before
+-- the same-base-affine argument would even fire, so this exact pattern
+-- was UNPROVABLE before stage 4, purely because of the depth's own
+-- factorization -- not because `i`/`i+1` were any less obviously
+-- different addresses.
+--
+-- The new Z3 query (`bounds::provably_disjoint_mem_indices`) has no such
+-- requirement: `i` and `i+1`, truncated to the mem's own real address
+-- width (`clog2(10) = 4` bits), are provably different bit patterns for
+-- EVERY value `i` can take -- including the wraparound case, `i = 15`'s
+-- own `i+1 = 0` (mod 16) -- regardless of whether that address happens
+-- to name a real cell (`0..10`) or the undefined padding region
+-- (`10..16`, `v0` has no bounds check against it, left entirely to
+-- `firtool`). The disjointness claim is purely about the two computed
+-- ADDRESS PORT values never coinciding, which is exactly what matters
+-- for a same-cycle read/write hazard -- not about whether either access
+-- is itself in range.
+--
+-- Confirmed empirically: `--explain-schedule` reports no stall between
+-- `write` and `read` at all, with no `conflict_free` annotation needed --
+-- see `mem_disjoint_v2_non_power_of_two_depth_is_now_provable_via_the_
+-- stage_4_z3_query`, tests/schedule.rs, for the same fact pinned as a
+-- unit test.
+module MemDisjointNonPowerOfTwo {
+    mem m : [8][10]
+
+    in i : [4]
+    in x : [8]
+    out y : [8] = 0
+
+    rule write {
+        m[i] := x
+    }
+
+    rule read {
+        y := m[i+1]
+    }
+
+    schedule {
+        urgency write > read
+    }
+}

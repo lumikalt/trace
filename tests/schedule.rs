@@ -1132,15 +1132,23 @@ module M {
 }
 
 #[test]
-fn mem_disjoint_v5_proven_bound_does_not_rescue_a_subtraction() {
-    // `m[i-1]` under a proven `i < 10`: `real_range` recognizes
-    // only `Ident`/literal/`Add` (mirroring `bounds.rs`'s own
-    // `expr_bound`) -- `Sub` is deliberately excluded, since `IndexForm`
-    // stores `i-1`'s offset as a WRAPPED `u64::MAX`, which would be
-    // wrong to treat as a real, non-negative integer (`i=0` genuinely
-    // underflows). Depth is deliberately non-power-of-two here too, so
-    // if this regressed to "provable," it could only be via the
-    // proven-bound argument, not one of the other two.
+fn mem_disjoint_v5_a_subtraction_is_now_provable_via_the_stage_4_z3_query() {
+    // `m[i-1]` vs `m[i]`, `i : [4] where i < 10`: PROVABLY disjoint under
+    // stage 4's Z3 query, unlike the old `IndexForm`/`real_range`-based
+    // proof this replaced (which deliberately excluded `Sub` -- see this
+    // arc's own git history -- since `IndexForm`'s own WRAPPING
+    // arithmetic and `real_range`'s INDEPENDENT non-wrapping walk were
+    // two separate representations that could disagree, and treating a
+    // wrapped `u64::MAX` offset as a real non-negative integer would
+    // have been unsound). The Z3 query has no such mismatch: it
+    // translates `i-1` ONCE, at `CALC_WIDTH` (64-bit, non-wrapping), then
+    // truncates to the mem's own `addr_width` (4, `clog2(10)`) at the
+    // very end -- sound here because `i`'s own declared width (4) is
+    // `>= addr_width` (`leaves_wide_enough`, `bounds/smt.rs`'s own doc
+    // comment). For every `i` in `[0,10)`, `(i-1) mod 16 != i mod 16`
+    // (`i=0`'s own wraparound to 15 included) -- a genuine fact about the
+    // two computed ADDRESS bit patterns, independent of whether the mem's
+    // depth happens to be a power of two.
     let src = "\
 module M {
     mem m : [8][10]
@@ -1159,7 +1167,49 @@ module M {
     assert!(errors.is_empty());
     let group = &sched.groups[0];
     assert_eq!(group.conflicts.len(), 1);
-    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
+}
+
+#[test]
+fn mem_disjoint_v5_a_subtraction_is_still_sound_when_the_leaf_is_wider_than_addr_width() {
+    // The v5 test above has `i`'s own declared width EQUAL to `addr_
+    // width` (4 and 4) -- both landing on the same number is not enough
+    // to confirm `leaves_wide_enough`'s own gate (`bounds/smt.rs`'s doc
+    // comment: sound only when a leaf's width is `>= addr_width`, not
+    // `== addr_width`) is checking the right inequality, since equality
+    // alone can't distinguish ">=" from "==". Here `i : [8]` (leaf width
+    // 8) against the SAME depth-10 mem (`addr_width` still 4, strictly
+    // LESS than 8) -- `i` is deliberately left UNBOUNDED (no `where`) so
+    // real hardware's own `i-1` truncates at `i`'s FULL 8-bit width
+    // (`tail(sub(i,1),1)`, matching `type_binop`'s `max(x,y)` rule) before
+    // the mem port's own connect narrows further to 4 bits. At `i=0`:
+    // real hardware computes `i-1` as `255` (8-bit wraparound), then the
+    // mem address take its low 4 bits, `15`. The Z3 model computes `i-1`
+    // at `CALC_WIDTH` (64-bit) and truncates ONCE, at the very end, to 4
+    // bits -- `(0-1) mod 2^64`, low 4 bits, ALSO `15`, since 64 >= 8 >= 4
+    // (the congruence `bounds/smt.rs`'s own doc comment states holds for
+    // any width `>=` the final one). Confirms the gate holds on the
+    // STRICT inequality, not merely the equal-widths case the v5 test
+    // alone exercises.
+    let src = "\
+module M {
+    mem m : [8][10]
+    in i : [8]
+    in x : [8]
+    out y : [8] = 0
+    rule wr {
+        m[i-1] := x
+    }
+    rule rd {
+        y := m[i]
+    }
+}
+";
+    let (_, _, sched, errors) = run(src);
+    assert!(errors.is_empty());
+    let group = &sched.groups[0];
+    assert_eq!(group.conflicts.len(), 1);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
 }
 
 #[test]
@@ -1443,13 +1493,20 @@ module M {
 }
 
 #[test]
-fn mem_disjoint_v2_non_power_of_two_depth_stays_unprovable() {
+fn mem_disjoint_v2_non_power_of_two_depth_is_now_provable_via_the_stage_4_z3_query() {
     // Same shape as the proven case above, but depth 10 (not a power of
     // two): `clog2(10) == 4`, so addresses 10..16 are representable but
-    // not real cells, and v0 has no bounds check against that at all --
-    // an out-of-range address's behavior is undefined, left to firtool.
-    // The affine proof must not depend on that undefined behavior, so it
-    // simply never fires here.
+    // not real cells, an out-of-range address's behavior undefined, left
+    // to firtool. The OLD `forms_differ`/`IndexForm` affine argument
+    // (this arc's own git history) required the depth to be an EXACT
+    // power of two before it would even attempt the same-base argument,
+    // so this stayed unprovable under it. Stage 4's Z3 query has no such
+    // requirement: `i` and `i+1` are provably different ADDRESS bit
+    // patterns (`i mod 16 != (i+1) mod 16` for every `i`, including the
+    // `i=15` wraparound to `0`) regardless of what the mem's real depth
+    // is -- the proof is purely about the two computed addresses never
+    // coinciding, not about whether either address happens to be a real
+    // cell or padding.
     let src = "\
 module M {
     mem m : [8][10]
@@ -1468,7 +1525,7 @@ module M {
     assert!(errors.is_empty());
     let group = &sched.groups[0];
     assert_eq!(group.conflicts.len(), 1);
-    assert_eq!(group.conflicts[0].exemption, Exemption::None);
+    assert_eq!(group.conflicts[0].exemption, Exemption::Disjoint);
 }
 
 #[test]

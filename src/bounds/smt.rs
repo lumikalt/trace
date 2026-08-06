@@ -77,7 +77,7 @@ use crate::ast::{Ast, BinOp, Expr, ExprId};
 use crate::lexer::Span;
 use crate::resolve::{DefId, Resolution};
 
-use super::{BoundedDef, RelationalBound};
+use super::{BoundedDef, RelationalBound, RelationalFact};
 
 /// One write site's own independently-computed verdict, compared
 /// against the interval-arithmetic engine's existing verdict for the
@@ -359,6 +359,74 @@ fn translate_guard(
     Some(if negate { pos.not() } else { pos })
 }
 
+/// `provably_disjoint`'s OWN guard translation -- deliberately NOT
+/// `translate_guard` above, whose recognized shapes are pinned to
+/// `narrow_for_condition`'s own (a bare `<def> <op> <const>`) so it stays
+/// a faithful SHADOW of that engine for `check_bound_obligation`/`check_
+/// relational_obligation`'s sake; widening it would break that
+/// faithfulness for callers that need it. `provably_disjoint` has no
+/// such constraint -- it's a general Z3 query, not a shadow of anything
+/// -- so this translates EITHER side as an arbitrary expression via the
+/// same `translate_expr` a write's own RHS uses (`push_count - pop_count
+/// < 8`, `push_count <> pop_count`: neither a bare `ident op const`, both
+/// provable disjointness hypotheses `examples/circular_buffer_disjoint
+/// .tr` genuinely needs). `None` on anything either side's own
+/// `translate_expr` can't handle, or a comparison op this doesn't
+/// recognize -- `provably_disjoint`'s own caller already treats an
+/// untranslatable guard as one to SKIP, not fail closed on (dropping a
+/// hypothesis only widens the checked state space, the sound direction
+/// for a disjointness proof).
+#[allow(clippy::too_many_arguments)]
+fn translate_condition(
+    ast: &Ast,
+    res: &Resolution,
+    bounds_by_def: &BoundsByDef,
+    struct_field_bounds_by_def: &StructFieldBoundsByDef,
+    fn_ret_bounds: &FnRetBoundsByDef,
+    entries: &mut HashMap<DefId, BV>,
+    field_entries: &mut HashMap<(DefId, String), BV>,
+    call_entries: &mut HashMap<ExprId, (BV, DefId)>,
+    id: ExprId,
+    negate: bool,
+) -> Option<Z3Bool> {
+    let Expr::Binary { op, lhs, rhs } = ast.expr(id) else {
+        return None;
+    };
+    let (op, lhs, rhs) = (*op, *lhs, *rhs);
+    let l = translate_expr(
+        ast,
+        res,
+        bounds_by_def,
+        struct_field_bounds_by_def,
+        fn_ret_bounds,
+        entries,
+        field_entries,
+        call_entries,
+        lhs,
+    )?;
+    let r = translate_expr(
+        ast,
+        res,
+        bounds_by_def,
+        struct_field_bounds_by_def,
+        fn_ret_bounds,
+        entries,
+        field_entries,
+        call_entries,
+        rhs,
+    )?;
+    let pos = match op {
+        BinOp::Lt => l.bvult(&r),
+        BinOp::Gt => l.bvugt(&r),
+        BinOp::Le => l.bvule(&r),
+        BinOp::Ge => l.bvuge(&r),
+        BinOp::Eq => l.eq(&r),
+        BinOp::Ne => l.eq(&r).not(),
+        _ => return None,
+    };
+    Some(if negate { pos.not() } else { pos })
+}
+
 /// One write site's own obligation: does `rhs`, evaluated under every
 /// def in `bounds_by_def` (each hypothesised to hold its own declared/
 /// narrowed range), every struct field in `struct_field_bounds_by_def`
@@ -614,4 +682,290 @@ pub(super) fn check_relational_obligation(
         }
         SatResult::Unknown => SmtVerdict::Skipped("solver returned unknown"),
     }
+}
+
+/// Stage 4's own disjointness query (`bounds::provably_disjoint_mem_
+/// indices`'s own doc comment has the full design rationale -- this is
+/// just the Z3 mechanics). Given two mem-index expressions and each
+/// one's own accumulated guards, is `idx_a == idx_b` satisfiable when
+/// both rules' guards hold simultaneously? `false` (not provably
+/// disjoint -- `schedule.rs` schedules a stall) on anything this can't
+/// translate, an inconsistent (vacuous) hypothesis set, or a genuine
+/// SAT counterexample; `true` (disjoint) ONLY on a definitive UNSAT.
+///
+/// Every def either index or either rule's own guards reference gets a
+/// symbolic entry, constrained by its own declared bound (`bounds.
+/// ranges`) when one exists, or -- deliberately inverted from `check_
+/// bound_obligation`'s own fail-CLOSED default, which is correct for a
+/// bound OBLIGATION (nothing to hypothesise about an unbounded def) and
+/// wrong here -- `[0, 2^width)` from its declared storage width when it
+/// has none: an ordinary unconstrained loop-counter index still has a
+/// real, finite range, and treating it as untranslatable would make
+/// this query unable to prove the overwhelmingly common case. Built via
+/// a plain, MORE-inclusive-than-necessary def collection (`collect_
+/// referenced_defs`, a generic `sub_exprs` sweep) rather than threading
+/// this fallback through `translate_expr`/`translate_guard` themselves
+/// -- those two stay untouched, used identically to every existing
+/// caller, avoiding the exact "two independently-maintained shapes
+/// drift apart" risk this arc has already found and fixed once
+/// (`const_fold`/`const_eval`, and again in `shadow_walk_body`).
+///
+/// `addr_width` is the mem's OWN address width (`clog2(depth).max(1)`,
+/// `schedule.rs`'s job to compute -- matches `firrtl/module.rs`'s own
+/// `addr_w` exactly, the width the real `mem.addr` port is declared at).
+/// The final comparison truncates both sides to this width (`extract`)
+/// rather than comparing full `CALC_WIDTH` values: two index
+/// expressions that differ as unbounded integers can still land on the
+/// SAME hardware address once real wraparound at `addr_width` bits is
+/// accounted for (`m[i]` vs `m[i + depth]`), so an untruncated compare
+/// would be unsound in the disjoint direction. Truncating a `CALC_WIDTH`
+/// (64-bit) computation down to `addr_width` bits at the very end is
+/// only equivalent to the REAL hardware's own per-node truncation
+/// (`firrtl/expr.rs`'s `tail(add(...), 1)` etc., each sized to the
+/// type-checker's own width for THAT node, which can be narrower than
+/// `addr_width`) when every leaf def the two index expressions reference
+/// already has its own declared width `>= addr_width` -- `Add`/`Sub`
+/// take the max of their operands' widths and `Mul` sums them, so no
+/// node's own width can ever fall below its narrowest leaf, and modular
+/// reduction commutes through `+`/`-`/`*` for any width `>=` the final
+/// one. A leaf narrower than `addr_width` means the real hardware
+/// discards bits this 64-bit-then-truncate model would have kept (e.g.
+/// two 8-bit regs summing into a 10-bit-addressed mem: hardware wraps
+/// the sum at 8 bits before zero-extending, not at 10), so that case
+/// fails closed (`not disjoint`) via `leaves_wide_enough` below rather
+/// than risk a false disjointness claim.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn provably_disjoint(
+    ast: &Ast,
+    res: &Resolution,
+    ty: &crate::types::Types,
+    bounds: &super::Bounds,
+    addr_width: u64,
+    idx_a: ExprId,
+    guards_a: &[ExprId],
+    guards_a_negated: &[ExprId],
+    idx_b: ExprId,
+    guards_b: &[ExprId],
+    guards_b_negated: &[ExprId],
+) -> bool {
+    if !leaves_wide_enough(ast, res, ty, idx_a, addr_width)
+        || !leaves_wide_enough(ast, res, ty, idx_b, addr_width)
+    {
+        return false;
+    }
+    let mut relevant = std::collections::HashSet::new();
+    collect_referenced_defs(ast, res, idx_a, &mut relevant);
+    collect_referenced_defs(ast, res, idx_b, &mut relevant);
+    for &g in guards_a
+        .iter()
+        .chain(guards_a_negated)
+        .chain(guards_b)
+        .chain(guards_b_negated)
+    {
+        collect_referenced_defs(ast, res, g, &mut relevant);
+    }
+    for fact in &bounds.relational {
+        relevant.extend(fact.terms.iter().map(|(d, _)| *d));
+    }
+    let mut bounds_by_def: BoundsByDef = HashMap::new();
+    for def in relevant {
+        if let Some(&range) = bounds.ranges.get(&def) {
+            bounds_by_def.insert(def, range);
+        } else if let Some(width) = super::base_width(ty, def)
+            && let Some(ceiling) = 1u64.checked_shl(width as u32)
+        {
+            bounds_by_def.insert(def, (0, ceiling));
+        }
+        // Neither a declared bound nor a known width: omitted:
+        // `translate_expr`/`translate_guard` fail closed (`None`) the
+        // moment they'd need this def, same as today.
+    }
+
+    let mut entries: HashMap<DefId, BV> = HashMap::new();
+    let mut field_entries: HashMap<(DefId, String), BV> = HashMap::new();
+    let mut call_entries: HashMap<ExprId, (BV, DefId)> = HashMap::new();
+    let no_fields = StructFieldBoundsByDef::new();
+    let no_calls = FnRetBoundsByDef::new();
+
+    // An untranslatable guard (`translate_condition`'s own recognized
+    // shapes are still not everything -- e.g. a call or a bracket index
+    // inside a condition) is SKIPPED, not failed closed: dropping a
+    // hypothesis only WIDENS the set of assignments the solver has to
+    // rule out, which can only make proving disjointness harder, never
+    // wrongly easier -- UNSAT over a superset of the real reachable
+    // states implies UNSAT over the real (guard-narrowed) subset too. A
+    // guard irrelevant to this particular pair (an enable condition
+    // neither index depends on, as in `examples/circular_buffer_
+    // disjoint.tr`'s `push_en`/`pop_en`) must not sink an otherwise-
+    // provable pair.
+    let mut hyps = Vec::new();
+    for &g in guards_a.iter().chain(guards_b) {
+        if let Some(h) = translate_condition(
+            ast,
+            res,
+            &bounds_by_def,
+            &no_fields,
+            &no_calls,
+            &mut entries,
+            &mut field_entries,
+            &mut call_entries,
+            g,
+            false,
+        ) {
+            hyps.push(h);
+        }
+    }
+    for &g in guards_a_negated.iter().chain(guards_b_negated) {
+        if let Some(h) = translate_condition(
+            ast,
+            res,
+            &bounds_by_def,
+            &no_fields,
+            &no_calls,
+            &mut entries,
+            &mut field_entries,
+            &mut call_entries,
+            g,
+            true,
+        ) {
+            hyps.push(h);
+        }
+    }
+    let Some(a) = translate_expr(
+        ast,
+        res,
+        &bounds_by_def,
+        &no_fields,
+        &no_calls,
+        &mut entries,
+        &mut field_entries,
+        &mut call_entries,
+        idx_a,
+    ) else {
+        return false;
+    };
+    let Some(b) = translate_expr(
+        ast,
+        res,
+        &bounds_by_def,
+        &no_fields,
+        &no_calls,
+        &mut entries,
+        &mut field_entries,
+        &mut call_entries,
+        idx_b,
+    ) else {
+        return false;
+    };
+
+    let solver = Solver::new();
+    for fact in &bounds.relational {
+        if !assert_relational_fact(&solver, &mut entries, fact) {
+            return false; // a term with neither a declared bound nor a known width -- can't hypothesise, fail closed
+        }
+    }
+    for (def, entry) in &entries {
+        let Some(&(lower, upper)) = bounds_by_def.get(def) else {
+            return false; // referenced only via a relational fact term outside `relevant`'s own reach -- shouldn't happen, fail closed rather than panic
+        };
+        solver.assert(entry.bvuge(BV::from_u64(lower, CALC_WIDTH)));
+        solver.assert(entry.bvult(BV::from_u64(upper, CALC_WIDTH)));
+    }
+    for h in &hyps {
+        solver.assert(h.clone());
+    }
+    // Same vacuous-hypothesis guard as `check_bound_obligation`/`check_
+    // relational_obligation` -- an inconsistent hypothesis set must not
+    // be exploited to vacuously "prove" anything. Here that would mean
+    // vacuously proving DISJOINTNESS, which `schedule.rs` would then
+    // trust to eliminate a real stall -- the polarity is inverted from
+    // an obligation check (there, vacuous -> `Skipped`, still safe; here
+    // vacuous must also resolve to the CONSERVATIVE answer, "not
+    // disjoint," not the permissive one).
+    if solver.check() == SatResult::Unsat {
+        return false;
+    }
+    let addr_bits = addr_width.max(1) as u32;
+    let a_addr = a.extract(addr_bits - 1, 0);
+    let b_addr = b.extract(addr_bits - 1, 0);
+    solver.assert(a_addr.eq(&b_addr));
+    matches!(solver.check(), SatResult::Unsat)
+}
+
+/// Every `Expr::Ident` leaf reachable in `id`'s subtree has a declared
+/// width `>= min_width` -- see `provably_disjoint`'s own doc comment for
+/// why this gates the truncate-once-at-the-end model's soundness. A
+/// leaf with no recognized width at all (not a plain `Bits`-typed def)
+/// fails this too: `false`, not "assume wide enough."
+fn leaves_wide_enough(
+    ast: &Ast,
+    res: &Resolution,
+    ty: &crate::types::Types,
+    id: ExprId,
+    min_width: u64,
+) -> bool {
+    if let Expr::Ident(_) = ast.expr(id)
+        && let Some(&d) = res.expr_defs.get(&id)
+    {
+        let Some(w) = super::base_width(ty, d) else {
+            return false;
+        };
+        if w < min_width {
+            return false;
+        }
+    }
+    crate::lower::sub_exprs(ast, id)
+        .into_iter()
+        .all(|child| leaves_wide_enough(ast, res, ty, child, min_width))
+}
+
+/// A generic, MORE-inclusive-than-strictly-necessary sweep (`lower::
+/// sub_exprs`) collecting every `Expr::Ident`'s own resolved `DefId`
+/// reachable anywhere in `id`'s subtree -- see `provably_disjoint`'s own
+/// doc comment for why over-collecting (versus `translate_expr`'s own
+/// narrower recognized shapes) is the safe direction.
+fn collect_referenced_defs(
+    ast: &Ast,
+    res: &Resolution,
+    id: ExprId,
+    out: &mut std::collections::HashSet<DefId>,
+) {
+    if let Expr::Ident(_) = ast.expr(id)
+        && let Some(&d) = res.expr_defs.get(&id)
+    {
+        out.insert(d);
+    }
+    for child in crate::lower::sub_exprs(ast, id) {
+        collect_referenced_defs(ast, res, child, out);
+    }
+}
+
+/// Asserts one already-PROVEN `RelationalFact` as a hypothesis about
+/// the CURRENT symbolic values in `entries` (creating a fresh entry for
+/// any term not already referenced by an index/guard) -- unlike `check_
+/// relational_obligation`, which proves a fact's own inductive step,
+/// this only ever ASSUMES an already-established one, exactly the way
+/// a declared `where` bound is assumed once proven (see this module's
+/// own top-of-file doc comment on the provenance judgment). `false` if
+/// any term has neither a declared bound nor a known width to fall back
+/// to (fails closed, same direction as everywhere else in this query).
+fn assert_relational_fact(
+    solver: &Solver,
+    entries: &mut HashMap<DefId, BV>,
+    fact: &RelationalFact,
+) -> bool {
+    let mut sum = BV::from_u64(0, CALC_WIDTH);
+    for &(def, coeff) in &fact.terms {
+        let entry = entries
+            .entry(def)
+            .or_insert_with(|| BV::new_const(format!("entry_{}", def.0), CALC_WIDTH))
+            .clone();
+        let coeff_bv = BV::from_u64(coeff as u64, CALC_WIDTH);
+        sum = sum.bvadd(entry.bvmul(&coeff_bv));
+    }
+    let modulus = BV::from_u64(fact.modulus, CALC_WIDTH);
+    let reduced = sum.bvurem(&modulus);
+    solver.assert(reduced.bvuge(BV::from_u64(fact.lower, CALC_WIDTH)));
+    solver.assert(reduced.bvult(BV::from_u64(fact.upper, CALC_WIDTH)));
+    true
 }

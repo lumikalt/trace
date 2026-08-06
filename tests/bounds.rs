@@ -2,6 +2,7 @@ use trace::ast::{Ast, Item, ItemId};
 use trace::bounds::{self, Bounds, BoundsError};
 use trace::effects::Effects;
 use trace::resolve::{DefId, Resolution};
+use trace::types::Types;
 use trace::{effects, lexer, parser, resolve, types};
 
 fn run(src: &str) -> Vec<BoundsError> {
@@ -47,10 +48,10 @@ fn run_with_bounds(src: &str) -> (Effects, Bounds, Vec<BoundsError>) {
     (fx, bounds, errors)
 }
 
-/// Full pipeline including `Ast`/`Resolution` -- `provably_disjoint_
-/// under_joint_guards` needs both (rule bodies for guards, a `DefId`
-/// for each mem-index base) alongside `Bounds` itself.
-fn run_full(src: &str) -> (Ast, Resolution, Bounds, Vec<BoundsError>) {
+/// Full pipeline including `Ast`/`Resolution`/`Types` -- `provably_
+/// disjoint_mem_indices` needs all three (rule bodies for guards, `Types`
+/// for its own leaf-width soundness check) alongside `Bounds` itself.
+fn run_full(src: &str) -> (Ast, Resolution, Types, Bounds, Vec<BoundsError>) {
     let (tokens, lex_errors) = lexer::lex(src);
     assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
     let (ast, parse_errors) = parser::parse(src, &tokens);
@@ -65,7 +66,52 @@ fn run_full(src: &str) -> (Ast, Resolution, Bounds, Vec<BoundsError>) {
     let (ty, type_errors) = types::check(&ast, &res, &fx);
     assert!(type_errors.is_empty(), "type errors: {type_errors:?}");
     let (bounds, errors) = bounds::check(&ast, &res, &fx, &ty);
-    (ast, res, bounds, errors)
+    (ast, res, ty, bounds, errors)
+}
+
+/// The sole mem-index `ExprId` reached in `rule`'s own body, paired with
+/// the guards active at that exact site -- `bounds::guarded_mem_
+/// accesses`'s own per-rule walk, restricted to one rule instead of
+/// `the_only_mem_index`'s whole-program aggregation (needed here since a
+/// test's two rules each have their own single mem access, and the two
+/// must not be conflated).
+fn the_only_mem_index_in_rule(
+    ast: &Ast,
+    res: &Resolution,
+    rule: ItemId,
+) -> (
+    trace::ast::ExprId,
+    Vec<trace::ast::ExprId>,
+    Vec<trace::ast::ExprId>,
+) {
+    let Item::Rule { body, .. } = ast.item(rule) else {
+        panic!("expected a rule");
+    };
+    let accesses = bounds::guarded_mem_accesses(ast, res, body);
+    assert_eq!(
+        accesses.len(),
+        1,
+        "expected exactly one mem index site in rule"
+    );
+    let (idx, (guards, guards_negated)) = accesses.into_iter().next().unwrap();
+    (idx, guards, guards_negated)
+}
+
+/// Any `Expr::Ident` in the whole program resolving to `def` -- used to
+/// feed `provably_disjoint_mem_indices` a bare register reference
+/// directly (not a real mem-index site) when a test wants to check the
+/// relational-fact argument alone, independent of any actual `m[...]`
+/// access.
+fn any_ident_for(ast: &Ast, res: &Resolution, def: DefId) -> trace::ast::ExprId {
+    for i in 0..ast.exprs.len() {
+        let id = trace::ast::ExprId(i as u32);
+        if matches!(ast.expr(id), trace::ast::Expr::Ident(_))
+            && res.expr_defs.get(&id) == Some(&def)
+        {
+            return id;
+        }
+    }
+    panic!("no Ident expression resolves to {def:?}");
 }
 
 /// The one `DefId` whose own name matches `name` exactly -- panics on
@@ -2988,14 +3034,13 @@ module M {
     );
 }
 
-// --- `provably_disjoint_under_joint_guards` (the `schedule.rs`
-// consumer half of DESIGN.md's "Tier 3, not v0" circular-buffer case)
-// ---
+// --- `provably_disjoint_mem_indices` (the `schedule.rs` consumer half
+// of DESIGN.md's "Tier 3, not v0" circular-buffer case) ---
 //
-// Tested directly here, independent of `schedule.rs`'s own IndexForm
-// plumbing, since the function only needs `Bounds`/`Ast`/`Resolution`
-// and two `DefId`s/two rule `ItemId`s -- exactly what these helpers
-// build.
+// Tested directly here, independent of `schedule.rs`'s own plumbing,
+// since the function only needs `Ast`/`Resolution`/`Types`/`Bounds`, an
+// address width, and each side's own index `ExprId` plus its guards --
+// exactly what these helpers build.
 
 #[test]
 fn circular_buffer_head_and_tail_are_provably_disjoint_under_joint_guards() {
@@ -3036,18 +3081,39 @@ module CircularBufferDisjoint {
     }
 }
 ";
-    let (ast, res, bounds, errors) = run_full(src);
+    let (ast, res, ty, bounds, errors) = run_full(src);
     assert!(errors.is_empty(), "{errors:?}");
-    let head = def_named(&res, "head");
-    let tail = def_named(&res, "tail");
     let push = rule_named(&ast, "push");
     let pop = rule_named(&ast, "pop");
-    assert!(bounds::provably_disjoint_under_joint_guards(
-        &ast, &res, &bounds, head, tail, push, pop
+    let (head_idx, head_guards, head_guards_neg) = the_only_mem_index_in_rule(&ast, &res, push);
+    let (tail_idx, tail_guards, tail_guards_neg) = the_only_mem_index_in_rule(&ast, &res, pop);
+    const ADDR_WIDTH: u64 = 3; // mem m : [8][8] -- clog2(8)
+    assert!(bounds::provably_disjoint_mem_indices(
+        &ast,
+        &res,
+        &ty,
+        &bounds,
+        ADDR_WIDTH,
+        head_idx,
+        &head_guards,
+        &head_guards_neg,
+        tail_idx,
+        &tail_guards,
+        &tail_guards_neg,
     ));
     // Order-independence: the caller may pass the pair either way.
-    assert!(bounds::provably_disjoint_under_joint_guards(
-        &ast, &res, &bounds, tail, head, pop, push
+    assert!(bounds::provably_disjoint_mem_indices(
+        &ast,
+        &res,
+        &ty,
+        &bounds,
+        ADDR_WIDTH,
+        tail_idx,
+        &tail_guards,
+        &tail_guards_neg,
+        head_idx,
+        &head_guards,
+        &head_guards_neg,
     ));
 }
 
@@ -3095,14 +3161,23 @@ module CircularBufferDisjoint {
     }
 }
 ";
-    let (ast, res, bounds, errors) = run_full(src);
+    let (ast, res, ty, bounds, errors) = run_full(src);
     assert!(errors.is_empty(), "{errors:?}");
-    let push_count = def_named(&res, "push_count");
-    let pop_count = def_named(&res, "pop_count");
-    let push = rule_named(&ast, "push");
-    let pop = rule_named(&ast, "pop");
-    assert!(!bounds::provably_disjoint_under_joint_guards(
-        &ast, &res, &bounds, push_count, pop_count, push, pop
+    let push_count = any_ident_for(&ast, &res, def_named(&res, "push_count"));
+    let pop_count = any_ident_for(&ast, &res, def_named(&res, "pop_count"));
+    const ADDR_WIDTH: u64 = 3; // mem m : [8][8] -- clog2(8)
+    assert!(!bounds::provably_disjoint_mem_indices(
+        &ast,
+        &res,
+        &ty,
+        &bounds,
+        ADDR_WIDTH,
+        push_count,
+        &[],
+        &[],
+        pop_count,
+        &[],
+        &[],
     ));
 }
 
@@ -3164,11 +3239,22 @@ module CircularBufferDisjoint {
     assert!(type_errors.is_empty());
     let (bounds, errors) = bounds::check(&ast, &res, &fx, &ty);
     assert_eq!(errors.len(), 1); // the occupancy invariant fails to verify
-    let head = def_named(&res, "head");
-    let tail = def_named(&res, "tail");
     let push = rule_named(&ast, "push");
     let pop = rule_named(&ast, "pop");
-    assert!(!bounds::provably_disjoint_under_joint_guards(
-        &ast, &res, &bounds, head, tail, push, pop
+    let (head_idx, head_guards, head_guards_neg) = the_only_mem_index_in_rule(&ast, &res, push);
+    let (tail_idx, tail_guards, tail_guards_neg) = the_only_mem_index_in_rule(&ast, &res, pop);
+    const ADDR_WIDTH: u64 = 3; // mem m : [8][8] -- clog2(8)
+    assert!(!bounds::provably_disjoint_mem_indices(
+        &ast,
+        &res,
+        &ty,
+        &bounds,
+        ADDR_WIDTH,
+        head_idx,
+        &head_guards,
+        &head_guards_neg,
+        tail_idx,
+        &tail_guards,
+        &tail_guards_neg,
     ));
 }

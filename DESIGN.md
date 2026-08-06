@@ -4168,6 +4168,14 @@ tool-version checks already do.
    diff by hand before accepting it, since it's the one stage whose
    success criterion is a real behavioral change.
 
+   **Done.** See the dated write-up above ("Stage 4 (`schedule.rs`
+   collapse) is done") for the full account, including a soundness gap
+   (wrapping vs. non-wrapping arithmetic) and a guard-translation gap
+   found and fixed mid-implementation, and two existing tests whose own
+   "stays unprovable" pin turned out to be a limitation of the OLD
+   engine, not a real semantic boundary — updated to the new, correct,
+   more precise result rather than left stale.
+
 Each stage bug-reintroduction-verified and `--firrtl`-sanity-checked (both
 this compiler's own emitter and real `firtool`) independently, per this
 arc's standing discipline.
@@ -4191,7 +4199,15 @@ arc's standing discipline.
   confirming this, per the provenance section's own caution above.
 - Per-site export to `schedule.rs` (v16, `site_ranges`/`real_range`'s
   fallback) stays as-is through stage 3, then retires at stage 4 once the
-  one generic disjointness query replaces its only consumer.
+  one generic disjointness query replaces its only consumer. **Done**:
+  `real_range` itself (and `IndexForm`/`index_form`/`forms_differ`/
+  `offsets_differ`/`pow2_addr_width`) is deleted from `schedule.rs`.
+  `Bounds.site_ranges` stays populated (`bounds.rs`'s own forward walk
+  still exports it, still consulted elsewhere), but the new query
+  doesn't consult it — only the def's flat declared range
+  (`bounds.ranges`) or, failing that, its declared storage width, since
+  Z3 reasons over the guards active at each site directly rather than a
+  pre-narrowed interval computed ahead of time.
 
 ### The acid test
 
@@ -4204,17 +4220,26 @@ uses, and the disjointness proof is one call to the one generic query in
 code path for this example, it hasn't closed the gap this plan exists to
 close.
 
-**First half done (stage 1, "Staged rollout" above): both invariants are
-independently proven by `smt::check_relational_obligation`'s general
-`fire_R` encoding**, a shadow check running alongside — not yet
-replacing — `check_relational_bound_induction`'s own bespoke induction.
-The `Item::Invariant`-specific machinery still exists in `bounds.rs`
-today (stage 1 doesn't delete anything yet, per its own "run alongside"
-discipline); this is evidence the REPLACEMENT is sound before stage 2
-attempts unifying the representation, not the replacement itself. Second
-half — `m[head] != m[tail]` via the one generic disjointness query,
-`schedule.rs`'s own bespoke `provably_disjoint_under_joint_guards`
-retired — is stage 4's work, not started.
+**Both halves now done.** First half (stage 1, "Staged rollout" above):
+both invariants are independently proven by `smt::check_relational_
+obligation`'s general `fire_R` encoding**, a shadow check running
+alongside — not yet replacing — `check_relational_bound_induction`'s own
+bespoke induction. The `Item::Invariant`-specific machinery still exists
+in `bounds.rs` today (stage 1 doesn't delete anything yet, per its own
+"run alongside" discipline); this is evidence the REPLACEMENT is sound
+before stage 2 attempts unifying the representation, not the replacement
+itself. Second half — `m[head] != m[tail]`, proven by
+`bounds::provably_disjoint_mem_indices` (`schedule.rs`'s own bespoke
+`provably_disjoint_under_joint_guards` and the whole `IndexForm`/`forms_
+differ` chain retired outright, not kept as a fallback) — is stage 4's
+work, done (see the dated write-up above). `circular_buffer_disjoint
+.tr`'s own `push`/`pop` conflict has `m` dropped from its reported `on`
+set (the pair's overall stall persists regardless, driven by the
+ordinary scalar hazard on `push_count`/`pop_count` — see `tests/schedule
+.rs`'s `circular_buffer_mem_drops_from_the_conflict_set_but_stall_
+persists`, unchanged by this stage), confirmed via `tests/bounds.rs`'s
+direct-call tests too (ported to the new `provably_disjoint_mem_indices`
+API from the retired function's own).
 
 **Stage 2, first sub-step done: the provenance judgment is now a real
 type, not a naming convention.** An advisor review of the original
@@ -4563,6 +4588,142 @@ narrow identically), and the forward-only negative control — all in
 `tests/bounds.rs`. Byte-identical `--explain-schedule` across all 84
 examples (none currently use this pattern), zero regressions, zero
 shadow-check panics (881 tests now).
+
+**Stage 4 (`schedule.rs` collapse) is done — the acid test's second half
+now closes too.** `schedule.rs`'s whole `IndexForm`/`forms_differ`/
+`index_form`/`real_range`/`pow2_addr_width` machinery (v1 through v7,
+plus this module's own `mem_accesses_disjoint` fallback to `bounds.rs`'s
+`provably_disjoint_under_joint_guards`) is deleted outright — a full
+replacement, not a fallback path kept alongside the new query, per this
+plan's own "Staged rollout" note that stage 4's success criterion is a
+real behavioral change, reviewed by hand rather than pinned as byte-
+identical. `one_mem_disjoint` now calls exactly one new function per
+index pair: `bounds::provably_disjoint_mem_indices` (`src/bounds/mod.rs`,
+thin wrapper over `smt::provably_disjoint`, `src/bounds/smt.rs`), fed by
+a new free-function walk, `bounds::guarded_mem_accesses`, that pairs
+every mem-index `ExprId` reached in a rule's own body with the guards
+active at that exact site (mirrors `shadow_walk_body`'s own if/else +
+bare-guard threading, including this arc's own "bare comparisons are
+fallible" fix above — a `while`/`if let`/`while let` body is out of v1's
+scope, same restriction `shadow_walk_body` already has, so an index only
+reached inside one just sees empty guards: fewer hypotheses, never a
+false disjointness claim).
+
+**A genuine, safety-critical soundness question surfaced mid-
+implementation, not caught during the design pass, and had to be
+resolved before any of this could be wired up.** `schedule.rs`'s OLD
+`IndexForm` used explicitly WRAPPING (`wrapping_add`/`wrapping_sub`/
+`wrapping_mul`, mod 2^64) arithmetic on purpose; `smt.rs`'s existing
+`translate_expr` computes at `CALC_WIDTH = 64` NON-wrapping, matching the
+interval engine's own `u64` semantics. Reading `firrtl/expr.rs`'s actual
+`Add`/`Sub`/`Mul` compilation (`tail(add(l, r), 1)` etc.) confirmed the
+real hardware TRUNCATES every arithmetic node to the type-checker's own
+declared width for THAT node (`type_binop`'s `max(x, y)` for `Add`/`Sub`,
+`x + y` for `Mul`) — a genuine per-node modular reduction, not just a
+final connect-time cast. An advisor consultation resolved this
+correctly: compute the WHOLE index expression once at `CALC_WIDTH`
+(non-wrapping — bitvector `+`/`-`/`*` are congruent mod 2^k for every
+k <= the computation width, a property of two's-complement arithmetic),
+then truncate to the mem's own REAL address width (`addr_width =
+clog2(depth).max(1)`, matching `firrtl/module.rs`'s own `addr_w` exactly)
+ONLY at the very end, comparing `a.extract(addr_width-1, 0)` against
+`b.extract(addr_width-1, 0)` rather than the untruncated `CALC_WIDTH`
+values. This is sound ONLY when every LEAF def either index expression
+references has its OWN declared width `>= addr_width` — `Add`/`Sub` take
+the max of their operands' widths and `Mul` sums them, so no node's own
+width can ever fall below its narrowest leaf, meaning a leaf narrower
+than `addr_width` is the one case where real hardware's own per-node
+truncation would discard bits this single-truncation-at-the-end model
+keeps (two 8-bit regs summing into a 10-bit-addressed mem: hardware
+wraps the sum at 8 bits before zero-extending, not at 10). Guarded by a
+new `leaves_wide_enough` check (`bounds/smt.rs`) that fails the whole
+query closed (not disjoint) rather than risk this specific unsoundness —
+a real, if narrow, scope cut, not an oversight.
+
+**A second gap surfaced empirically, via `tests/bounds.rs`'s own
+`circular_buffer_head_and_tail_are_provably_disjoint_under_joint_guards`
+(ported from the now-deleted `provably_disjoint_under_joint_guards`'s own
+direct-call test) failing after the rewrite.** The retired function never
+routed guards through `translate_guard` at all — it used its own bespoke
+`narrow_combo_range`, which silently skips a guard shape it doesn't
+recognize rather than failing the whole proof closed. `translate_guard`
+(the SAME translation `check_bound_obligation`/`check_relational_
+obligation` use) recognizes only a bare `<def> <op> <const>` shape,
+DELIBERATELY capped to stay a faithful shadow of `narrow_for_condition`'s
+own equally narrow recognition — widening it would break that
+faithfulness for ITS callers. Neither of `circular_buffer_disjoint.tr`'s
+own load-bearing guards fit that shape (`push_count - pop_count < 8`: a
+binary expression on the left, not a bare ident; `push_count <>
+pop_count`: ident vs ident, no constant at all) — so BOTH silently failed
+to translate, leaving the query with zero hypotheses and a real
+counterexample (`push_count = pop_count = 5, head = tail = 3` satisfies
+both relational facts with no guard ruling it out). Fixed with a new
+function scoped to `provably_disjoint` alone, `translate_condition`: NOT
+a `translate_guard` widening (which would violate that function's own
+faithfulness constraint), but a genuinely more general condition
+translator built on the SAME `translate_expr` a write's own RHS already
+uses for EITHER side of the comparison, plus `Eq`/`Le` (`translate_
+guard` has neither, since `narrow_for_condition` doesn't need them).
+Sound because `provably_disjoint` has no "stay a faithful shadow of X"
+constraint to begin with — it's a general Z3 query, not a shadow of
+anything. An untranslatable guard is SKIPPED (not failed closed): a
+dropped hypothesis only WIDENS the state space the solver has to rule
+out, which can only make proving disjointness harder, never wrongly
+easier — an enable condition neither index depends on
+(`push_en`/`pop_en`) must not sink an otherwise-provable pair.
+
+**Empirically found, not assumed going in: the new query proves strictly
+more than DESIGN.md's own earlier stage-4 design pass anticipated.** Two
+existing `tests/schedule.rs` cases pinning "stays unprovable" (`m[i-1]`
+vs `m[i]` under a proven `i < 10`; `m[i]` vs `m[i+1]` under a NON-power-
+of-two depth, both previously blocked by the old `IndexForm`/`real_
+range` split's own deliberate `Sub`-exclusion and power-of-two
+requirement respectively) now correctly report `Exemption::Disjoint`
+instead — confirmed sound by hand (not just accepted because the solver
+said so): both are genuine facts about the two computed ADDRESS bit
+patterns never coinciding, independent of whether either address lands
+in the mem's real (possibly non-power-of-two) depth or the undefined
+padding region `firtool` alone governs — exactly the property `schedule
+.rs`'s own disjointness proof needs (no same-cycle same-PORT-address
+hazard), nothing more. This "different address bits imply no hazard"
+step itself relies on one fact about the emitted hardware, not just
+about the proof: the FIRRTL `mem` primitive's read/write ports each
+expose exactly ONE `addr` input as their only aliasing channel (`module
+.rs`'s own mem-port emission) — there is no second path by which two
+accesses with different address bit patterns could still touch the same
+storage cell. Both tests updated to pin the new, correct result, with
+the reasoning recorded inline. Also re-confirmed by hand (not just via
+the byte-identical sweep below, which only shows the CURRENT 84 examples
+don't move): `examples/mem_disjoint_banked.tr`'s banking argument (`2*i`
+vs `2*j+1`, base identity irrelevant) still proves disjoint under the
+new query — its own even/odd parity argument over TWO unbounded,
+unrelated bases has no obvious analog in the old syntactic arguments'
+own case-by-case structure, so it was the one existing example most at
+risk of a silent capability regression hiding behind an otherwise-
+unchanged diff; `tests/firrtl.rs`'s `mem_disjoint_banked_needs_no_
+conflict_free_annotation` (pre-existing) still passes. A new
+regression test, `mem_disjoint_v5_a_subtraction_is_still_sound_when_the_
+leaf_is_wider_than_addr_width` (`tests/schedule.rs`), also confirms
+`leaves_wide_enough`'s own gate on the STRICT inequality (leaf width 8,
+`addr_width` 4) — the two other subtraction/non-power-of-two tests both
+happen to have leaf width EQUAL to `addr_width`, which alone can't
+distinguish ">=" from "==" in that gate's own condition. A new
+demonstrating example,
+`examples/mem_disjoint_non_power_of_two.tr` (`mem_disjoint_affine.tr`'s
+same `m[i]`/`m[i+1]` shape, depth 10 instead of 16, no declared bound on
+`i` at all), with matching `tests/firrtl.rs`/`tests/schedule.rs`
+coverage, makes this new capability concrete rather than only visible in
+a diff.
+
+**Verification:** byte-identical `--explain-schedule` across all 84
+PRE-EXISTING examples against a pre-change baseline binary (none of them
+happen to exercise the newly-provable region — the behavioral change is
+real, per this stage's own success criterion, but doesn't move any
+CURRENT example's derived schedule), zero test regressions (883 tests
+now, up from 881), clippy clean. `schedule.rs`'s own module-level doc
+comment (the v1-through-v8 case-by-case rationale for the retired
+arguments) is replaced with a short pointer to this section rather than
+kept as dead prose describing deleted code.
 
 ## Combinational loops
 
