@@ -1,0 +1,55 @@
+-- The `<sequences>`-loop (runtime-length) closure consumer: the third
+-- and last of the three consumers "Closures and partial application"
+-- was designed against (DESIGN.md). No new combinator syntax needed --
+-- `while let x = f.Deq[] { total := combine(total, x) }` folds a
+-- two-argument closure over however many items happen to be queued,
+-- reusing `while let`'s own newly-extended fifo-Deq binding (mirrors
+-- `if let`'s, see "`if let`: a fifo op's own presence") and the
+-- already-shipped let-bound-closure mechanism (`closures.rs`) together
+-- -- neither needed to change for the other to work.
+--
+-- `start` gates the drain's own restart (`(start = 1)?` at the top of
+-- `drain`'s `<sequences>` body) purely so a testbench can queue more
+-- than one item before the fold begins; it isn't otherwise part of the
+-- feature. `producer`/`drain` touching the same fifo from different
+-- rules compose safely for free -- the scheduler's own priority mux
+-- already excludes `drain`'s dequeue on any cycle `producer` also
+-- fires (see `fires_drain_s1`'s own `not(fires_producer)` term in the
+-- emitted FIRRTL), so a push mid-drain simply postpones that cycle's
+-- dequeue by one cycle rather than racing it.
+--
+-- See sim/fifo_fold_closure_tb.v, which queues two items before
+-- triggering the drain and confirms `result` is their SUM (30, not
+-- either value alone), proving the loop actually iterated more than
+-- once, not just that the wiring compiles.
+Add(a : [8], b : [8]) : [8] <combines> {
+    return a + b
+}
+
+module FifoFoldClosure {
+    fifo f : {3}[8]
+
+    in push : [1]
+    in push_val : [8]
+    in start : [1]
+    reg total : [8] = 0
+    out result : [8] = 0
+    out done : [1] = 0
+
+    rule producer {
+        (push = 1)?
+        f.Enq[push_val]
+    }
+
+    rule drain <sequences> {
+        (start = 1)?
+        let combine = Add(_, _)
+        total := 0
+        done := 0
+        while let x = f.Deq[] {
+            total := combine(total, x)
+        }
+        result := total
+        done := 1
+    }
+}

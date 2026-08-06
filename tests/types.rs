@@ -2323,20 +2323,16 @@ fn while_let_binds_the_unwrapped_option_type() {
     assert_eq!(errors.len(), 1);
 }
 
-/// `while let`'s right-hand side must be an Option's own `?`-unwrap, same
-/// v0 restriction as `if let`'s equivalent test above -- pins the
-/// "while let"-worded error message `Stmt::WhileLet`'s arm produces.
+/// `while let`'s right-hand side must be an Option's own `?`-unwrap OR a
+/// fifo `Deq[]` (see the acceptance test just below) -- any other
+/// fallible shape still hits the same v0-restricted message `if let`'s
+/// equivalent test above hits, pinning the "while let"-worded error
+/// `Stmt::WhileLet`'s arm produces.
 #[test]
 fn while_let_rhs_must_be_an_option_unwrap_not_another_fallible_shape() {
     // Missing `?` entirely.
     let (_, _, errors) = run("module M {\n reg opt : ?[8] = false\n reg v : [8] = 0\n \
          rule r {\n while let x = opt {\n v := x\n }\n }\n}\n");
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("Option's own unwrap"));
-
-    // A fifo op -- not itself `Expr::Guard`, so it hits the same message.
-    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [8] = 0\n \
-         rule r {\n while let x = f.Deq[] {\n v := x\n }\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("Option's own unwrap"));
 
@@ -2346,6 +2342,23 @@ fn while_let_rhs_must_be_an_option_unwrap_not_another_fallible_shape() {
          rule r {\n while let x = (a > b)? {\n v := x\n }\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("Option's own unwrap"));
+}
+
+/// `while let x = fifo.Deq[] { ... }` -- bare, never `?`-wrapped, same
+/// as `if let`'s equivalent fifo-Deq test above: mirrors `IfLet`'s own
+/// `is_fifo_deq` branch, binding `x` to the fifo's own element type.
+/// The runtime-length drain-loop consumer (DESIGN.md's "Closures and
+/// partial application", `examples/fifo_fold_closure.tr`) depends on
+/// this accepting, not just `if let`'s single-shot form.
+#[test]
+fn while_let_binds_a_fifo_deqs_own_element_type() {
+    run_ok(
+        "module M {\n fifo f : [8]\n reg v : [8] = 0\n \
+         rule r {\n while let x = f.Deq[] {\n v := x\n }\n }\n}\n",
+    );
+    let (_, _, errors) = run("module M {\n fifo f : [8]\n reg v : [4] = 0\n \
+         rule r {\n while let x = f.Deq[] {\n v := x\n }\n }\n}\n");
+    assert_eq!(errors.len(), 1);
 }
 
 #[test]

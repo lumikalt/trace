@@ -1809,6 +1809,13 @@ design:**
 - **`while let`, and a `while`'s own condition, stay untouched** —
   Verse's own construct is `if`-shaped only (TODO.md), and nothing here
   argues for extending the loop forms too.
+  **Correction (2026-08-07): `while let` DID need extending after all** —
+  not for this feature directly, but as the prerequisite for "Closures
+  and partial application"'s third consumer (the `<sequences>`-loop/
+  runtime-length fold over a fifo's unknown occupancy). See "`while
+  let`: a fifo op's own presence" below; the Option/failing-call forms
+  of `while`/`while let` this bullet was actually about remain
+  untouched by that later change.
 
 **Implementation, reusing existing mechanisms almost entirely, no new
 `Stmt` variant or position-check surface:**
@@ -1989,6 +1996,113 @@ machinery almost entirely:**
 - The 8 `if_let_binds` sites' 3-way match (writes.rs/calls.rs, from the
   fifo feature above) gained one more arm: `_ if ... || matches!(Expr::
   Call { .. }) => init`.
+
+### `while let`: a fifo op's own presence
+
+`while let x = f.Deq[] { body }` — the prerequisite the `<sequences>`-
+loop (runtime-length) closure consumer needed (DESIGN.md's "Closures
+and partial application", TODO.md). Bare, never `?`-wrapped, same
+reasoning as `if let`'s own fifo-Deq case above: `Deq[]` is fallible by
+default.
+
+```trace
+Add(a : [8], b : [8]) : [8] <combines> {
+    return a + b
+}
+
+module FifoFoldClosure {
+    fifo f : {3}[8]
+
+    in push : [1]
+    in push_val : [8]
+    in start : [1]
+    reg total : [8] = 0
+    out result : [8] = 0
+    out done : [1] = 0
+
+    rule producer {
+        (push = 1)?
+        f.Enq[push_val]
+    }
+
+    rule drain <sequences> {
+        (start = 1)?
+        let combine = Add(_, _)
+        total := 0
+        done := 0
+        while let x = f.Deq[] {
+            total := combine(total, x)
+        }
+        result := total
+        done := 1
+    }
+}
+```
+
+`while let`'s loop lowering (lower.rs's `while_loop_header`) already
+renders `while let NAME = INIT { body }` as literal `if let NAME = INIT
+{ body; cont := SELF } else { cont := NEXT }` source text, re-fed
+through the WHOLE pipeline — reusing `if let`'s own syntax verbatim, the
+same move plain `while` already makes. That means the actual per-
+iteration mux/dequeue-gating machinery needed ZERO new code: once the
+rendered text is an ordinary `if let x = f.Deq[]`, the "`if let`: a fifo
+op's own presence" feature above (plus the depth > 1 emission fix its
+own "Correction" callout describes) handles it completely. The only gap
+was upstream of lowering: the FIRST `check()` pass (types.rs/effects.rs,
+run on the ORIGINAL, not-yet-lowered source) rejected `while let x =
+f.Deq[]` outright before it ever got the chance to render.
+
+**Implementation — two small arms mirroring `IfLet`'s own, `checks.rs`
+needing no changes at all:**
+- `types.rs`'s `Stmt::WhileLet` arm gained the identical `else if self.
+  is_fifo_deq(init)` branch `IfLet`'s arm already has, reusing `type_
+  expr`'s existing dispatch as-is.
+- `effects.rs`'s `Stmt::WhileLet` arm gained the identical fifo-Deq
+  branch `IfLet`'s arm already has: reads+writes the fifo, deliberately
+  does NOT set `sig.fails` (this presence check never gates the
+  enclosing rule the way an ordinary top-level `Deq[]` does).
+- `checks.rs`'s `fifo_ops_outside_allowed_positions` already listed
+  `Stmt::WhileLet { init, .. } if is_fifo_op(init) => Some(init)` as an
+  allowed position — dead code until this feature made it reachable,
+  confirmed by direct probe rather than assumed (verified `while let x =
+  f.Deq[]` actually compiled end to end through `--lower`/`--firrtl`
+  before writing any of the write-up above).
+
+Verified through real firtool + Icarus simulation, and specifically
+proving MULTIPLE loop iterations fold correctly, not just that the
+wiring compiles: `examples/fifo_fold_closure.tr` + `sim/fifo_fold_
+closure_tb.v` (`tests/sim.rs`'s `fifo_fold_closure_folds_a_two_argument_
+closure_over_a_real_drain`) queue two items (10, 20) before triggering
+`drain`, and assert `result` is their SUM (30) — a single-iteration bug,
+or the depth > 1 guard-gating bug this feature depended on being fixed
+first, would each produce a single value instead. A second, single-item
+drain afterward confirms the accumulator (`total`) genuinely resets each
+restart rather than accumulating across drains.
+
+`producer` (an ordinary rule) and `drain` (the `<sequences>` rule doing
+the looping) touch the same fifo from two DIFFERENT rules — this
+composes safely for free, not by any new mechanism: the scheduler's own
+priority-mux already excludes `drain`'s dequeue on any cycle `producer`
+also fires (`fires_drain_s1`'s own `not(fires_producer)` term in the
+emitted FIRRTL), so a push arriving mid-drain simply postpones that
+cycle's dequeue by one cycle rather than racing it — confirmed by
+reading the emitted FIRRTL directly, not assumed from the scheduler's
+general description.
+
+**v0 scope, same restrictions as `while`/`if let`'s fifo case:**
+- `Deq` only, not `Enq` — same reasoning as `if let`'s fifo case.
+- The "drain and forward to another fifo" bridge shape (`while let x =
+  in.Deq[] { out.Enq[x] }`) is explicitly OUT of scope, not just
+  untested: `checks.rs`'s pre-existing "nested fifo op in loop body"
+  restriction still rejects a SECOND fifo op inside the loop body, and
+  `Enq` has no `select`-gating mechanism at all to extend even if it
+  didn't. Accumulating into a `reg`/`out` (this section's own example)
+  is unaffected — the loop body's only fifo touch is the `while let`'s
+  own `init`.
+- A failing call as `while let`'s init is untouched by this — `if let`'s
+  equivalent extension (above) needed real new plumbing (`fx: &Effects`
+  threaded into `TypeChecker`) that this fifo-only change didn't reuse
+  or extend.
 
 ### `if`: a fifo op's own bare condition
 
@@ -2868,9 +2982,9 @@ but the AST node it used to name is still synthesized internally by every
 
 ## Closures and partial application (planned)
 
-**Two of three consumers shipped (2026-08-06), both proven through real
-firtool + Icarus simulation** — see Part 3's own "Implementation status"
-entries:
+**All three originally-designed consumers shipped (2026-08-06/07), all
+proven through real firtool + Icarus simulation** — see Part 3's own
+"Implementation status" entries:
 - `map` over an elaboration-time `list` (`examples/map_double.tr`) —
   `_` resolved via `elaborate.rs`'s own interpreter-level `placeholder`.
 - A `let`-bound closure, callable later, possibly more than once
@@ -2881,12 +2995,24 @@ entries:
   (see "Effect inference" below, corrected once this was actually built)
   — the surface syntax is one thing, but there is no single shared
   runtime for it underneath.
+- The `<sequences>`-loop (runtime-length) consumer — folding a `let`-
+  bound closure over a fifo's unknown occupancy
+  (`examples/fifo_fold_closure.tr`). A FOURTH distinct mechanism only in
+  the sense that it needed no new mechanism at all: `while let x =
+  f.Deq[] { total := combine(total, x) }` composes the `let`-bound-
+  closure mechanism above with a separately-extended `while let` (see
+  "`while let`: a fifo op's own presence"), which turned out to depend
+  on fixing a real, pre-existing depth > 1 fifo emission bug first (see
+  "FIFO synthesis emission"'s own follow-up paragraph) — not a fourth
+  closure-resolution mechanism, just the first two features composing
+  once their own, unrelated prerequisite gap was closed.
 
-Still unbuilt: the `<sequences>`-loop (runtime-length) consumer, and the
-rest of the combinator library beyond `map` itself. The mechanism/effect-
-inference discussion below covers the FULL original design, not just the
-shipped slices — read each claim against Part 3's own status list before
-trusting it describes shipped behavior.
+The rest of the combinator library beyond `map` (`zip` etc., under a
+name of its own) is still unbuilt — turned out not to be needed for the
+`<sequences>`-loop case specifically, see the bullet just above. The
+mechanism/effect-inference discussion below covers the FULL original
+design, not just the shipped slices — read each claim against Part 3's
+own status list before trusting it describes shipped behavior.
 
 Grew out of wanting Chisel-style elaboration-time hardware generation
 (`xs.map(...)`-shaped combinators building N pieces of hardware from a
@@ -3080,12 +3206,18 @@ restriction itself is a separate, unscoped effort, not assumed solved here.
 
 ### Not designed here
 
-- The `<sequences>`-loop (runtime-length) consumer itself, e.g. a `fold`/
-  `drain` over a fifo's unknown occupancy — the "Open interaction" above
-  (the `while`-loop accumulator restriction) is unresolved, and no
-  concrete surface syntax for this consumer has been designed at all.
-- The rest of the combinator library beyond `map` (`fold`/`zip`/`drain`
-  names, arities, exact signatures).
+- **Shipped (2026-08-07), moved out of this list:** the `<sequences>`-
+  loop (runtime-length) consumer, e.g. folding over a fifo's unknown
+  occupancy — see "`while let`: a fifo op's own presence" and
+  `examples/fifo_fold_closure.tr`. No new surface syntax was needed;
+  `while let x = f.Deq[] { total := combine(total, x) }` targets a
+  `reg`/`out` accumulator directly, sidestepping the "Open interaction"
+  `while`-loop accumulator restriction above (a captured `let`-local
+  surviving the loop boundary) rather than lifting it — that restriction
+  remains unresolved and unrelated to this feature.
+- The rest of the combinator library beyond `map` (`zip` etc., names/
+  arities/signatures) — turned out not to be needed for the
+  `<sequences>`-loop case above; still undesigned for anything else.
 - Threading a closure argument through an intermediate USER-defined `fn`
   parameter (a trace-authored higher-order function, not a builtin) —
   plausibly the same param chase-through "Calling a function: inlining"
@@ -7530,9 +7662,7 @@ adder_tree.tr`, DESIGN.md's own `AdderTree`).
   always supplies exactly one element per call). The result is an
   ordinary `ElabValue::List`, composing into any existing list consumer
   (`AdderTree`) with no changes there at all (`examples/map_double.tr`,
-  `AdderTree(xs.map(Double(_)))`). The `<sequences>`-loop (runtime-
-  length) consumer is still unbuilt — see that section's own TODO.md
-  entry.
+  `AdderTree(xs.map(Double(_)))`).
 - A `let`-bound closure, callable later — possibly more than once — a
   SEPARATE new pipeline stage (`closures.rs`, chained via `pipeline.rs`
   ahead of every other stage), not the same mechanism `map` uses: it
@@ -7558,6 +7688,18 @@ adder_tree.tr`, DESIGN.md's own `AdderTree`).
   path for closures at all. Threading a closure argument through an
   intermediate USER-defined `fn` parameter is still unbuilt — see
   TODO.md.
+- The `<sequences>`-loop (runtime-length) consumer: folding a `let`-
+  bound closure over a fifo's unknown occupancy (`examples/
+  fifo_fold_closure.tr`, `while let x = f.Deq[] { total :=
+  combine(total, x) }`, `combine = Add(_, _)`). No new closure-resolution
+  mechanism — composes the `let`-bound-closure mechanism above with
+  `while let` newly extended to accept a fifo `Deq[]` as its own binding
+  (see "`while let`: a fifo op's own presence"), which in turn depended
+  on fixing a real, pre-existing depth > 1 fifo emission bug first (see
+  "FIFO synthesis emission"). Proven against real firtool + Icarus
+  simulation folding TWO items into one sum (30, not either value alone
+  — the load-bearing assertion, since a single-iteration bug would also
+  compile and simulate without crashing).
 - General `struct` types: declaration, exhaustive-field-checked
   construction, whole-value read/write, arbitrary nesting (a struct field
   may itself be a struct, cycle-rejected), flattened to N plain

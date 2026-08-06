@@ -212,12 +212,23 @@ impl<'a> TypeChecker<'a> {
                         self.error(
                             self.expr_span(init),
                             "`while let`'s right-hand side must be an Option's own unwrap \
-                             (`opt?`, `opt : ?T`) (v0 restriction: a fifo op, failing \
-                             call, or comparison isn't supported here yet)"
+                             (`opt?`, `opt : ?T`) (v0 restriction: a failing call or \
+                             comparison isn't supported here yet)"
                                 .to_string(),
                         );
                         Ty::Unknown
                     }
+                } else if self.is_fifo_deq(init) {
+                    // `while let x = fifo.Deq[] { ... }` -- bare, never
+                    // Guard-wrapped, same as `IfLet`'s own arm above: a
+                    // `Deq[]` is fallible by default, no `?` needed. Each
+                    // loop iteration renders as literal `if let` source
+                    // text (lower.rs's `while_loop_header`), so the
+                    // rendered form re-hits `IfLet`'s own (already-shipped)
+                    // fifo-Deq branch directly -- this arm only needs to
+                    // survive typing ONCE, the same reasoning `While`'s own
+                    // bare-fifo-Deq exemption above already documents.
+                    self.type_expr(init, locals)
                 } else {
                     self.type_expr(init, locals);
                     self.error(

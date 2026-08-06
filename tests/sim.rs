@@ -2537,6 +2537,40 @@ fn if_bare_fifo_deq_condition_drives_a_real_dequeue_exactly_when_present() {
     );
 }
 
+/// The `<sequences>`-loop (runtime-length) closure consumer -- the
+/// third and last of the three consumers "Closures and partial
+/// application" was designed against (DESIGN.md, TODO.md). No new
+/// combinator syntax: `while let x = f.Deq[] { total := combine(total,
+/// x) }` folds a let-bound two-argument closure over however many
+/// items are queued, composing `while let`'s newly-extended fifo-Deq
+/// binding with the already-shipped let-bound-closure mechanism.
+/// `examples/fifo_fold_closure.tr` + `sim/fifo_fold_closure_tb.v` queue
+/// two items before triggering the drain and assert `result` is their
+/// SUM (30) -- proving the loop actually iterated more than once, not
+/// just that the wiring compiles -- then run a second, single-item
+/// drain proving the accumulator resets each restart.
+#[test]
+fn fifo_fold_closure_folds_a_two_argument_closure_over_a_real_drain() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/fifo_fold_closure.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/fifo_fold_closure_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// The Verilator-backed twin of
 /// `if_bare_fifo_deq_condition_drives_a_real_dequeue_exactly_when_present`.
 #[test]

@@ -461,9 +461,19 @@ impl<'a> Checker<'a> {
                 // identical reason: `init` is `Expr::Guard(inner)`
                 // (types.rs's own arm requires this), and the presence
                 // check never gates the enclosing item the way a bare
-                // top-level `opt?` does.
+                // top-level `opt?` does. The fifo-Deq branch mirrors
+                // `IfLet`'s own identically too -- does NOT set `sig.
+                // fails`, same reasoning.
                 if let Expr::Guard(inner) = self.ast.expr(*init) {
                     self.infer_expr(*inner, sig);
+                } else if let Expr::Bracket { callee, args } = self.ast.expr(*init)
+                    && let Some(fifo) = self.fifo_op_target(*callee)
+                {
+                    sig.reads.insert(fifo);
+                    sig.writes.insert(fifo);
+                    for arg in args {
+                        self.infer_expr(*arg, sig);
+                    }
                 } else {
                     self.infer_expr(*init, sig);
                 }

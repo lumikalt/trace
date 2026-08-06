@@ -516,8 +516,8 @@ polymorphism needed. Lumi explicitly ruled out both cases that would have
 forced real effect polymorphism — a separately-compiled module system, and
 a combinator library big enough to need per-definition error locality.
 
-**Two of three consumers SHIPPED (2026-08-06), both proven through real
-firtool + Icarus simulation:**
+**All three originally-designed consumers SHIPPED (2026-08-06/07), all
+proven through real firtool + Icarus simulation:**
 
 1. **`map` over an elaboration-time `list`**
    (`examples/map_double.tr`, `map_double_runs_through_real_ports`). A
@@ -564,38 +564,45 @@ firtool + Icarus simulation:**
    diverge (this was `devenv.nix`'s `simulate` script's own exposure:
    three separate `cargo run` invocations, now collapsed to one
    `--firrtl` call that chains internally).
+3. **The `<sequences>`-loop (runtime-length) consumer** — folding a
+   `let`-bound closure over a fifo's unknown occupancy, accumulating
+   into a `reg`/`out` (`while let x = f.Deq[] { total := combine(total,
+   x) }`, `combine = Add(_, _)`, `examples/fifo_fold_closure.tr`,
+   `fifo_fold_closure_folds_a_two_argument_closure_over_a_real_drain`).
+   No new combinator syntax, and no fourth closure-resolution mechanism
+   — this is items 1/2's own mechanisms composing once `while let` was
+   separately extended to accept a fifo `Deq[]` as its own binding (see
+   DESIGN.md's "`while let`: a fifo op's own presence"), mirroring `if
+   let`'s already-shipped fifo-Deq branch almost exactly (`types.rs`/
+   `effects.rs` two small arms each; `checks.rs` needed zero changes,
+   already had the groundwork).
+   **Real prerequisite bug found and fixed first (2026-08-07):** wiring
+   `while let`'s fifo case would have hit a genuine, pre-existing
+   correctness bug head-on — depth > 1 fifos ignored a conditional
+   `Deq`'s own guard entirely in `emit_fifo_depth_n` (module.rs),
+   corrupting `count` on every idle cycle (decrementing an already-empty
+   fifo, wrapping to a bogus nonzero value) — and a drain loop is only
+   meaningful on depth > 1 (a depth-1 fifo holds at most one item,
+   nothing to loop over). No check rejected the combination either, so
+   this was a LIVE miscompile the moment `if let`'s fifo case shipped,
+   not a hypothetical one. Reproduced as a failing real firtool+Icarus
+   simulation before writing the fix (`examples/fifo_depth_if_let.tr`,
+   `fifo_depth_if_let_gates_head_and_count_on_the_guard`), fixed as its
+   own separate unit/commit ahead of and independent of `while let`
+   itself — see DESIGN.md's "FIFO synthesis emission" and the
+   "Correction (2026-08-07)" callout in "if let: a fifo op's own
+   presence".
+   The "drain and forward to another fifo" bridge shape (`while let x =
+   in.Deq[] { out.Enq[x] }`) stays out of scope, not just untested —
+   `checks.rs`'s pre-existing "nested fifo op in loop body" restriction
+   still rejects a second fifo op in the loop body, and `Enq` has no
+   `select`-gating mechanism at all to extend even if it didn't;
+   accumulate-into-a-reg (this item's own shape) is unaffected.
 
-Still not started. Known open items, not yet designed:
-- The `<sequences>`-loop (runtime-length) consumer — e.g. draining a
-  fifo of unknown occupancy, accumulating into a `reg`/`out` with a
-  closure (`while let x = f.Deq[] { total := f(total, x) }`). No new
-  combinator syntax needed — once `while let` itself accepts a fifo
-  `Deq[]` as its binding, the already-shipped closure mechanism (item 2
-  above) handles the rest for free; a named `fold`/`drain` on top would
-  be new surface syntax nobody's asked for (dropped from this entry's
-  earlier draft per advisor review).
-  **Prerequisite fixed (2026-08-07):** `while let x = f.Deq[]` itself
-  isn't wired yet (`types/stmt.rs`'s `WhileLet` arm only accepts an
-  Option unwrap) — mechanically small, mirrors `IfLet`'s own already-
-  shipped fifo-Deq branch (`checks.rs` already has the groundwork:
-  `fifo_ops_outside_allowed_positions`'s `WhileLet` arm). But wiring it
-  would have hit a real, separate correctness bug head-on: depth > 1
-  fifos ignored a conditional `Deq`'s own guard entirely in `emit_fifo_
-  depth_n` (module.rs), corrupting `count` on an idle cycle — and a
-  drain loop is only meaningful on depth > 1 (a depth-1 fifo holds at
-  most one item, nothing to loop over). Fixed as its own unit, ahead of
-  and independent of `while let` itself — see DESIGN.md's "FIFO
-  synthesis emission" and the "Correction (2026-08-07)" callout in "if
-  let: a fifo op's own presence"; `examples/fifo_depth_if_let.tr` +
-  `fifo_depth_if_let_gates_head_and_count_on_the_guard` proves it against
-  real firtool + Icarus. `while let`'s own extension is still unbuilt.
-  The "drain and forward" bridge shape (`while let x = in.Deq[] {
-  out.Enq[x] }`) stays separately blocked — `checks.rs`'s "nested fifo
-  op in loop body" restriction, plus `Enq` having no `select`-gating
-  mechanism at all; out of scope for the accumulate-into-a-reg case.
+Known open items, not yet designed:
 - The rest of the combinator library (`zip` etc.) is not designed —
   only `map` is built, and `fold`/`drain`-shaped iteration turns out not
-  to need a name of its own (see above).
+  to need a name of its own (see item 3 above).
 - Threading a closure argument through an intermediate USER-defined `fn`
   parameter (not just a builtin) plausibly extends the existing struct/
   Option param chase-through ("Calling a function: inlining"), but this
