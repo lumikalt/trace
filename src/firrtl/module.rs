@@ -1257,17 +1257,18 @@ impl<'a> Emitter<'a> {
                         "      connect {count}, tail(add({count}, UInt<{count_w}>(1)), 1)"
                     );
                 }
-                // Combined Enq+Deq (deq unconditional, or conditional
-                // with its guard actually holding): `count` is unchanged
-                // (the Enq's +1 above is skipped and the Deq's -1 below
-                // is skipped too — they'd net to zero anyway, but
-                // composing them by branching off the SAME pre-update
-                // `count` twice is exactly the bug the hand-verified
-                // circuit caught; omitting both connects sidesteps it
-                // entirely and holds the register's current value). If
-                // the deq is conditional and its guard does NOT hold,
-                // the match below still emits its own `count` increment
-                // — this is really just a plain Enq that cycle.
+                // Combined Enq+Deq: `count` is unchanged (the Enq's +1
+                // above is skipped and the Deq's -1 below is skipped
+                // too — they'd net to zero anyway, but composing them
+                // by branching off the SAME pre-update `count` twice is
+                // exactly the bug the hand-verified circuit caught;
+                // omitting both connects sidesteps it entirely and
+                // holds the register's current value). Always an
+                // unconditional deq here (`deq_op.select: None` below)
+                // — `check_fifo_op_counts` forbids pairing an Enq with a
+                // `Cond`-selected Deq in the same rule at all (see that
+                // match's own doc comment), so a combined Enq+Deq is
+                // never conditional.
                 for i in 0..depth {
                     let slot = fifo_slot_name(fifo_name, i);
                     let _ = writeln!(
@@ -1294,29 +1295,32 @@ impl<'a> Emitter<'a> {
                     // `count` need gating: if the guard holds, this is a
                     // real dequeue (head advances; `count` only drops when
                     // there's no matching Enq, else it nets to unchanged,
-                    // same as the unconditional case below); if it
-                    // doesn't, no dequeue happened at all, so a co-located
-                    // Enq is really just a plain enqueue and needs its own
-                    // `count` increment (skipped up above precisely
-                    // because `saw_deq` looked structural, not gated).
+                    // same as the unconditional case below). A co-located
+                    // Enq (`enq.is_some()`) can never actually reach this
+                    // arm: `check_fifo_op_counts`'s conditional/
+                    // unconditional-mix rejection ("a conditionally-
+                    // touched fifo may only be touched through that one
+                    // conditional position") already forbids an Enq
+                    // anywhere else in the same rule as a `Cond`-selected
+                    // Deq, confirmed by direct probe (both the nested-
+                    // inside-the-branch-body and sibling-statement
+                    // arrangements hit it, `checks.rs`'s "fifo operation
+                    // nested in if/while" restriction independently
+                    // rejects the former too) rather than assumed —
+                    // `touching_n`'s own `enq` here is therefore always
+                    // `None` whenever `select` is `Cond`.
                     Some(FifoSelect::Cond(sel)) => {
+                        assert!(
+                            enq.is_none(),
+                            "check_fifo_op_counts rejects an Enq alongside a Cond-selected Deq \
+                             in the same rule before this ever runs"
+                        );
                         let _ = writeln!(out, "      when {sel} :");
                         let _ = writeln!(out, "        connect {head}, {head_p1}");
-                        if enq.is_none() {
-                            let _ = writeln!(
-                                out,
-                                "        connect {count}, tail(sub({count}, \
-                                 UInt<{count_w}>(1)), 1)"
-                            );
-                        }
-                        if enq.is_some() {
-                            let _ = writeln!(out, "      else :");
-                            let _ = writeln!(
-                                out,
-                                "        connect {count}, tail(add({count}, \
-                                 UInt<{count_w}>(1)), 1)"
-                            );
-                        }
+                        let _ = writeln!(
+                            out,
+                            "        connect {count}, tail(sub({count}, UInt<{count_w}>(1)), 1)"
+                        );
                     }
                     Some(FifoSelect::Branch(..)) => unreachable!(
                         "check_branch_fifo_op_depth rejects a Branch-selected fifo op on any \

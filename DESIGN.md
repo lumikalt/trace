@@ -6726,20 +6726,23 @@ one — reproduced first (`examples/fifo_depth_if_let.tr` +
 before writing the fix, per this project's own discipline. Fixed by
 threading the same `Cond`/`None` branch the depth-1 path already has
 through `emit_fifo_depth_n`: a `Cond`-selected `Deq`'s `head`/`count`
-update now sits inside its own `when {guard} :`, with the co-located
-Enq (if any) getting its OWN `count` increment in the `else` branch —
-since a guard-false cycle means no dequeue actually happened, so a
-paired Enq is really just a plain enqueue that cycle, not a pass-
-through. The Enq's own slot write is unaffected either way: it already
-used `head + count`'s pre-edge value, which is the correct tail slot
-whether or not the paired dequeue's guard holds. `FifoSelect::Branch`
-(an ordinary `if`/`else` branch, not `if let`'s own condition) stays
-rejected on depth > 1 by the pre-existing `check_branch_fifo_op_depth` —
-unaffected, and unreachable inside `emit_fifo_depth_n`'s own `Cond`/
-`None` match by construction. Verified against real firtool + Icarus
-simulation, including several idle cycles both before the first push
-and after the pushed item drains — the load-bearing assertions, since a
-single push-then-pop round trip alone wouldn't have caught the bug.
+update now sits inside its own `when {guard} :`. No paired-Enq case to
+handle inside that gate at all — `check_fifo_op_counts`'s pre-existing
+conditional/unconditional-mix rejection ("a conditionally-touched fifo
+may only be touched through that one conditional position") already
+forbids an Enq anywhere else in the same rule as a `Cond`-selected Deq,
+confirmed by direct probe (both nesting an Enq inside the `if let`'s own
+branch body, and placing it as a sibling statement, hit existing v0
+restrictions) rather than assumed — an `assert!` pins this invariant at
+the `Cond` arm itself rather than silently trusting it. `FifoSelect::
+Branch` (an ordinary `if`/`else` branch, not `if let`'s own condition)
+stays rejected on depth > 1 by the pre-existing `check_branch_fifo_op_
+depth` — unaffected, and unreachable inside `emit_fifo_depth_n`'s own
+`Cond`/`None` match by construction, same as the paired-Enq case above.
+Verified against real firtool + Icarus simulation, including several
+idle cycles both before the first push and after the pushed item drains
+— the load-bearing assertions, since a single push-then-pop round trip
+alone wouldn't have caught the bug.
 
 ## Port-based memory access
 
