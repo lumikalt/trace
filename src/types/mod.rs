@@ -18,7 +18,7 @@
 //! operand's width (it must fit). Writing a wider value into a narrower
 //! register is an error that names `trunc` — no silent truncation.
 
-use crate::ast::{Ast, ExprId, ItemId};
+use crate::ast::{Ast, BinOp, ExprId, ItemId};
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
 use std::collections::HashMap;
@@ -29,6 +29,36 @@ pub enum Width {
     /// Depends on an unsolved implicit parameter; checked at concrete
     /// call sites, not here.
     Unknown,
+}
+
+/// The `Width` a `Bits op Bits` expression combines to — `Mul` sums the
+/// two, `Shl`/`Shr`/`AShr` keep the LEFT operand's own width (a shift
+/// amount never widens/narrows the shifted value's own type), everything
+/// else (`Add`/`Sub`/`Div`/`Rem`/`BitAnd`/`BitOr`/`BitXor`) takes the max
+/// — Chisel-style modular arithmetic, this module's own doc comment.
+/// `type_binop` (`types/expr.rs`) is this rule's PRIMARY use, but it's a
+/// free function specifically so `firrtl`'s own emission-time width
+/// resolver (`Emitter::resolve_bits_width`, for a generic callee body's
+/// own expressions, whose static `expr_tys` entry is deliberately
+/// `Unknown` per this module's own doc comment) can call the SAME rule
+/// instead of an independently-maintained second copy — the exact
+/// "const_fold`/`const_eval` drift" class of bug this codebase has
+/// already found and fixed more than once. A comparison's own result
+/// (`Ty::Bits(w)` is never this function's concern) never reaches here —
+/// `type_binop` returns `l`'s own type for those, before this rule would
+/// apply at all.
+pub(crate) fn combine_bits_width(op: BinOp, a: Width, b: Width) -> Width {
+    match op {
+        BinOp::Mul => match (a, b) {
+            (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
+            _ => Width::Unknown,
+        },
+        BinOp::Shl | BinOp::Shr | BinOp::AShr => a,
+        _ => match (a, b) {
+            (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y)),
+            _ => Width::Unknown,
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +189,14 @@ mod eval;
 mod expr;
 mod stmt;
 
+// Emission-time width resolution (`firrtl::Emitter::resolve_bits_width`)
+// needs these two directly -- a nested generic call's own result width is
+// found by re-running the identical `env`-building + width-expression-
+// evaluation `type_call` does at type-check time, just with concretely-
+// resolved argument widths instead of statically-known ones. Re-exported
+// here (`eval` itself stays a private submodule) rather than duplicated.
+pub(crate) use eval::{bits_width_expr, const_eval_expr, implicit_width_param};
+
 pub fn check(ast: &Ast, res: &Resolution, fx: &crate::effects::Effects) -> (Types, Vec<TypeError>) {
     let mut checker = TypeChecker {
         ast,
@@ -215,6 +253,16 @@ fn clog2(v: u64) -> u64 {
     } else {
         64 - (v - 1).leading_zeros() as u64
     }
+}
+
+/// `prio`'s own result width, given its argument's -- the single source
+/// of truth `type_builtin_call`'s own `"prio"` arm and `firrtl`'s
+/// emission-time `Emitter::resolve_bits_width` (a generic callee body's
+/// `let g = prio(reqs); ...`, where `reqs`'s own width is only known
+/// once substituted at a concrete call site) both call, rather than each
+/// keeping its own copy of the `clog2(w).max(1)` rule.
+pub(crate) fn prio_result_width(arg_width: u64) -> u64 {
+    clog2(arg_width).max(1)
 }
 
 impl<'a> TypeChecker<'a> {

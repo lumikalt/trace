@@ -7,9 +7,95 @@
 //! params a call site has already solved (see `type_call`, expr.rs).
 
 use super::{Ty, TypeChecker, Width, clog2};
-use crate::ast::{BinOp, Expr, ExprId};
-use crate::resolve::{DefId, DefKind};
+use crate::ast::{Ast, BinOp, Expr, ExprId};
+use crate::resolve::{DefId, DefKind, Resolution};
 use std::collections::HashMap;
+
+fn is_builtin_ref(res: &Resolution, id: ExprId, name: &str) -> bool {
+    res.expr_defs.get(&id).is_some_and(|d| {
+        let def = res.def(*d);
+        def.kind == DefKind::Builtin && def.name == name
+    })
+}
+
+/// `bits[<width-expr>]` -> the width expression itself (`<width-expr>`),
+/// whatever shape it takes -- a bare implicit param (`bits[N]`) or a
+/// compound formula (`bits[n + m + 1]`, a generic function's own return
+/// type). `implicit_width_param`, below, is the narrower case (the width
+/// expr must ALSO be a bare implicit-param ident, the only shape a
+/// PARAMETER type is allowed) built on top of this same shape check, so
+/// there's one place that knows what a `bits[...]` type looks like, not
+/// two.
+pub(crate) fn bits_width_expr(ast: &Ast, res: &Resolution, ty: ExprId) -> Option<ExprId> {
+    let Expr::Bracket { callee, args } = ast.expr(ty) else {
+        return None;
+    };
+    if !is_builtin_ref(res, *callee, "bits") {
+        return None;
+    }
+    args.first().copied()
+}
+
+/// Constant-evaluate an elaboration expression, if possible. A free
+/// function (not a `TypeChecker` method) specifically so `firrtl`'s own
+/// emission-time width resolver (`Emitter::resolve_bits_width`,
+/// `src/firrtl/expr.rs` -- resolving a NESTED generic function call's own
+/// result width, by evaluating ITS return type expression against an
+/// `env` built from the caller's already-resolved argument widths) can
+/// call the SAME evaluator `TypeChecker::const_eval` (below, now a thin
+/// wrapper) uses, instead of an independently-maintained second copy --
+/// the same "const_fold/const_eval drift" class of bug this codebase has
+/// already found and fixed more than once.
+pub(crate) fn const_eval_expr(
+    ast: &Ast,
+    res: &Resolution,
+    id: ExprId,
+    env: &HashMap<DefId, u64>,
+) -> Option<u64> {
+    match ast.expr(id) {
+        Expr::Int(v) => Some(*v),
+        Expr::SizedInt { value, .. } => Some(*value),
+        Expr::Ident(_) => {
+            let def = res.expr_defs.get(&id)?;
+            env.get(def).copied()
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let l = const_eval_expr(ast, res, *lhs, env)?;
+            let r = const_eval_expr(ast, res, *rhs, env)?;
+            match op {
+                BinOp::Add => l.checked_add(r),
+                BinOp::Sub => l.checked_sub(r),
+                BinOp::Mul => l.checked_mul(r),
+                BinOp::Div => l.checked_div(r),
+                BinOp::Rem => l.checked_rem(r),
+                BinOp::Shl => l.checked_shl(r as u32),
+                BinOp::Shr => l.checked_shr(r as u32),
+                _ => None,
+            }
+        }
+        Expr::Call { callee, args } => {
+            if is_builtin_ref(res, *callee, "clog2") && args.len() == 1 {
+                Some(clog2(const_eval_expr(ast, res, args[0], env)?))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `bits[N]` where `N` is an implicit param -> that param's def. Free
+/// function for the same reason `bits_width_expr`/`const_eval_expr`,
+/// above, are: `firrtl::Emitter::resolve_bits_width` needs this exact
+/// check (a nested generic call's own PARAMETER types, to build the
+/// `env` its return type evaluates against) and shouldn't carry a second
+/// copy of "what counts as an implicit width param" to drift out of sync
+/// with `type_call`'s own use of it (types/expr.rs).
+pub(crate) fn implicit_width_param(ast: &Ast, res: &Resolution, ty: ExprId) -> Option<DefId> {
+    let width_expr = bits_width_expr(ast, res, ty)?;
+    let def = res.expr_defs.get(&width_expr)?;
+    (res.def(*def).kind == DefKind::ImplicitParam).then_some(*def)
+}
 
 impl<'a> TypeChecker<'a> {
     /// A fifo's type is either a bare element type (`bits[8]`, depth 1)
@@ -143,54 +229,15 @@ impl<'a> TypeChecker<'a> {
 
     /// Constant-evaluate an elaboration expression, if possible.
     pub(crate) fn const_eval(&self, id: ExprId, env: &HashMap<DefId, u64>) -> Option<u64> {
-        match self.ast.expr(id) {
-            Expr::Int(v) => Some(*v),
-            Expr::SizedInt { value, .. } => Some(*value),
-            Expr::Ident(_) => {
-                let def = self.res.expr_defs.get(&id)?;
-                env.get(def).copied()
-            }
-            Expr::Binary { op, lhs, rhs } => {
-                let l = self.const_eval(*lhs, env)?;
-                let r = self.const_eval(*rhs, env)?;
-                match op {
-                    BinOp::Add => l.checked_add(r),
-                    BinOp::Sub => l.checked_sub(r),
-                    BinOp::Mul => l.checked_mul(r),
-                    BinOp::Div => l.checked_div(r),
-                    BinOp::Rem => l.checked_rem(r),
-                    BinOp::Shl => l.checked_shl(r as u32),
-                    BinOp::Shr => l.checked_shr(r as u32),
-                    _ => None,
-                }
-            }
-            Expr::Call { callee, args } => {
-                if self.is_builtin(*callee, "clog2") && args.len() == 1 {
-                    Some(clog2(self.const_eval(args[0], env)?))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
+        const_eval_expr(self.ast, self.res, id, env)
     }
 
     fn is_builtin(&self, id: ExprId, name: &str) -> bool {
-        self.res.expr_defs.get(&id).is_some_and(|d| {
-            let def = self.res.def(*d);
-            def.kind == DefKind::Builtin && def.name == name
-        })
+        is_builtin_ref(self.res, id, name)
     }
 
     /// `bits[N]` where `N` is an implicit param -> that param's def.
     pub(crate) fn implicit_width_param(&self, ty: ExprId) -> Option<DefId> {
-        let Expr::Bracket { callee, args } = self.ast.expr(ty) else {
-            return None;
-        };
-        if !self.is_builtin(*callee, "bits") {
-            return None;
-        }
-        let def = self.res.expr_defs.get(args.first()?)?;
-        (self.res.def(*def).kind == DefKind::ImplicitParam).then_some(*def)
+        implicit_width_param(self.ast, self.res, ty)
     }
 }

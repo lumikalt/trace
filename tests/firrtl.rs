@@ -2149,18 +2149,166 @@ module M {
 }
 
 #[test]
-fn a_generic_nested_call_through_a_binop_is_a_clean_error_not_a_miscompile() {
-    // Boundary this feature newly makes reachable, not something it
-    // needs to solve: `compile_binop` computes ITS OWN width hint via
-    // `known_width(id)` (`types.expr_tys` for the binop's own id),
-    // ignoring whatever hint its caller threaded down — fine for a
-    // CONCRETE callee body, but `Outer`'s body here is generic
-    // (`[N]`), type-checked once with `N` never resolved, so
-    // `known_width` returns nothing and the nested `Inner(x)` call
-    // falls back to `width_of`, which also finds nothing. Pinned as a
-    // clean error (not a hang, not a wrong width silently emitted) —
-    // the same latent gap already documented for `prio`'s own argument
-    // width (`concrete_width_of`), not something this feature fixes.
+fn a_bare_literal_beside_a_generic_width_value_inside_a_callee_body_now_resolves() {
+    // The real gap this test group's OWN neighboring tests (`a_generic_
+    // nested_call_through_a_binop_is_a_clean_error_not_a_miscompile`,
+    // just below) documented as a permanent boundary turned out to be
+    // much narrower than it looked: a bare Ident reference to a generic
+    // param (or a `let`-bound alias, however many hops deep) was ALWAYS
+    // resolvable via `self.locals` substitution -- `known_width`'s own
+    // static `types.expr_tys` lookup (no substitution awareness at all)
+    // was only ever consulted for HINTING A LITERAL, so the true
+    // boundary was "a bare literal beside a generic-width value," not
+    // "any computation beyond a direct return." `Emitter::resolve_bits_
+    // width` (`src/firrtl/expr.rs`) closes exactly that: it walks the
+    // SAME substitution chain `compile_expr_hinted`'s own `Ident` arm
+    // uses, combining resolved operand widths via `combine_bits_width`
+    // (`src/types/mod.rs`) -- the SAME rule `type_binop` itself uses,
+    // not a second, independently-maintained copy. `Add`'s own `n + m +
+    // 1` return type instantiates concretely per call site (`[9]` for
+    // two `[4]`s), and the LITERAL `0` here -- nested one layer inside
+    // the SAME return statement, previously enough to fail with "no
+    // concrete width" -- now resolves too.
+    let src = "\
+Add(x : [n], y : [m]) : [n + m + 1] <combines> {
+    return (x + y) + 0
+}
+module M {
+    in a : [4]
+    out r : [9] = 0
+    rule go {
+        r := Add(a, a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_r, tail(add(tail(add(a, a), 1), UInt<4>(0)), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_comparison_between_two_generic_width_params_inside_a_callee_body_now_resolves() {
+    // Same underlying fix as the test above, exercised on a GUARD
+    // rather than an arithmetic expression: `x < y`'s own literal-free
+    // comparison never needed `resolve_bits_width` at all (neither side
+    // is a bare literal), so it already worked before this fix --
+    // included here as the companion negative-control shape to the
+    // NEXT test, which puts a literal in the same position and DOES
+    // need the fix.
+    let src = "\
+Max(x : [n], y : [m]) : [n + m] <combines> {
+    if x < y {
+        return y
+    } else {
+        return x
+    }
+}
+module M {
+    in a : [4]
+    out r : [8] = 0
+    rule go {
+        r := Max(a, a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("mux(lt(a, a), a, a)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_literal_guard_on_a_bare_generic_param_now_resolves() {
+    // The comparison's own literal operand (`x < 1`) is exactly the
+    // shape that used to fail: `x`'s own static type inside the generic
+    // body is `Unknown` (`n` never resolved there), and hinting the
+    // literal `1` used to require reading that static type directly,
+    // with no substitution fallback.
+    let src = "\
+Clamp(x : [n]) : [n] <combines> {
+    if x < 1 {
+        return x
+    } else {
+        return x
+    }
+}
+module M {
+    in a : [4]
+    out r : [4] = 0
+    rule go {
+        r := Clamp(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("lt(a, UInt<4>(1))"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_shift_on_a_bare_generic_param_now_resolves() {
+    // `compile_shift` calls `width_of(lhs)` directly (not through
+    // `compile_binop`'s own literal-hint logic at all) -- a separate
+    // call site `resolve_bits_width` also had to cover, not just
+    // `compile_binop`'s.
+    let src = "\
+Dbl(x : [n]) : [n] <combines> {
+    return x << 1
+}
+module M {
+    in a : [4]
+    out r : [4] = 0
+    rule go {
+        r := Dbl(a)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("tail(shl(a, 1), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_builtin_calls_own_result_chained_through_further_arithmetic_now_resolves() {
+    // `prio`'s own result width (`clog2(N).max(1)`) previously resolved
+    // only when RETURNED DIRECTLY (chased as a plain alias through
+    // `self.locals`, same as a bare param) -- feeding it into further
+    // arithmetic first (`g + 0`) produced a genuinely different
+    // `ExprId` (the `Add` node itself) with no substitution entry at
+    // all, only fixable by teaching `resolve_bits_width` `prio`'s own
+    // result-width RULE (`prio_result_width`, `src/types/mod.rs` --
+    // the SAME function `type_builtin_call`'s own `"prio"` arm calls),
+    // not just chasing an alias.
+    let src = "\
+RRPlus(reqs : [N]) : [clog2(N)] <combines> {
+    let g = prio(reqs)
+    let g2 = g + 0
+    return g2
+}
+module M {
+    in reqs : [4]
+    out grant : [2] = 0
+    rule go {
+        grant := RRPlus(reqs)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_generic_nested_call_through_a_binop_now_resolves() {
+    // Was pinned as a clean error: `resolve_bits_width`'s `Expr::Call`
+    // arm used to know only the two synthesizable builtins (`prio`/
+    // `pack`) by name, so a nested call to ANOTHER user-defined generic
+    // function fell through to `None`. `resolve_nested_call_width`
+    // closes this the same way `type_call` (types/expr.rs) itself
+    // instantiates a call at type-check time: build an `env` mapping
+    // `Inner`'s own implicit width param to THIS call's own argument
+    // width (resolved recursively, through `resolve_bits_width` again),
+    // then evaluate `Inner`'s declared return type against that `env`
+    // (`const_eval_expr` — the SAME evaluator `type_call`'s `eval_ty`
+    // uses, not a second copy).
     let src = "\
 Inner(x : [N]) : [N] <combines> {
     return x
@@ -2172,6 +2320,76 @@ module M {
     reg r : [8] = 0
     rule compute {
         r := Outer(r)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect r, tail(add(r, UInt<8>(1)), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_generic_nested_call_with_a_width_changing_return_type_resolves_through_further_arithmetic() {
+    // A stronger case than the identity `Inner` above: `Add`'s own
+    // return width (`n + m + 1`) genuinely differs from either
+    // argument's, and `Wrap`'s own body chains `Add`'s nested result
+    // through YET more arithmetic (`+ 0`) before returning it —
+    // exercising both `resolve_nested_call_width`'s `env`-building
+    // (two DIFFERENT implicit params, `n` and `m`, resolved off two
+    // DIFFERENT call-site arguments) and its result feeding back into
+    // the ordinary `Expr::Binary` recursion case just above it.
+    let src = "\
+Add(x : [n], y : [m]) : [n + m + 1] <combines> {
+    return x + y
+}
+Wrap(x : [n], y : [m]) : [n + m + 1] <combines> {
+    return Add(x, y) + 0
+}
+module M {
+    in a : [4]
+    in b : [4]
+    out r : [9] = 0
+    rule go {
+        r := Wrap(a, b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_r, tail(add(tail(add(a, b), 1), UInt<9>(0)), 1)"));
+    run_firtool(&fir, &[]);
+}
+
+#[test]
+fn a_nested_generic_calls_shared_implicit_width_param_conflict_is_a_clean_error_not_a_guess() {
+    // `Foo`'s two params share one implicit name (`x : [n], y : [n]`),
+    // so its own declared invariant is "both arguments are the SAME
+    // width." Called from inside ANOTHER generic body (`Bar`), that
+    // invariant is never actually checked anywhere: not statically
+    // (`c`/`d` are `Bar`'s own still-generic `p`/`q` at `Foo`'s own
+    // type-check time, so `check_assignable` never sees concrete
+    // widths), and not by the real inlining machinery (`compile_call`
+    // substitutes each param independently). `Bar(c, d)`, called
+    // concretely with `c : [4]`/`d : [8]`, reaches emission with a REAL
+    // width conflict at `Foo(a, b)`'s own nested call site --
+    // `resolve_nested_call_width`'s `env`-building must bail to `None`
+    // here (matching `type_call`'s own conflict check) rather than let
+    // `HashMap::insert`'s last-write-wins silently pick one of the two
+    // widths, which would size the `+ 0` literal to whichever width
+    // lost the race, possibly disagreeing with `Foo(a, b)`'s own real
+    // compiled value (`add(c, d)`, width 8 by the ordinary max rule).
+    let src = "\
+Foo(x : [n], y : [n]) : [n] <combines> {
+    return x + y
+}
+Bar(a : [p], b : [q]) : [p] <combines> {
+    return Foo(a, b) + 0
+}
+module M {
+    in c : [4]
+    in d : [8]
+    out r : [8] = 0
+    rule go {
+        r := Bar(c, d)
     }
 }
 ";

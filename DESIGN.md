@@ -2610,9 +2610,20 @@ it, `let x = p; return x.data`, which resolves the ordinary way through the
 field-read path) is rejected, not silently resolved.
 
 A generic parameter's own width, used independently of the callee's return
-value (for example, as an argument to `prio` inside a generic callee), is only
-resolvable by following it back to a concrete call site; used elsewhere, this
-fails cleanly rather than compiling to the wrong width.
+value (for example, as an argument to `prio` inside a generic callee), is
+resolvable by following it back to a concrete call site — including through
+further arithmetic/shift/bitwise combination on the way (`x + 1`, `x << 1`, a
+bare literal anywhere alongside it), through a synthesizable builtin's own
+result width (`prio`, `pack`) chased through more arithmetic in turn, and
+through a NESTED call to another user-defined generic function, whose own
+declared return-type expression is evaluated against an `env` built from this
+call's own (recursively resolved) argument widths — the same two-step
+instantiation `type_call` performs at type-check time, re-run at emission time
+(`Emitter::resolve_bits_width`/`resolve_nested_call_width`,
+`src/firrtl/expr.rs`). The one shape that still fails cleanly rather than
+guessing: two of that nested callee's own params sharing one implicit width
+name whose arguments resolve to genuinely conflicting concrete widths — a call
+whose own width truly isn't well-defined, not a gap in the resolver.
 
 Of the builtins, `prio`, `trunc`, and `pack` are synthesizable as calls:
 
@@ -6056,11 +6067,35 @@ failing call the same as a bare guard or fifo op for the existing "must
 precede any write, not nested in `if`/`while`" placement rule.
 
 A generic callee's own body is type-checked once, independent of any call site,
-so an implicit width parameter is never concretely resolved inside it. The
-callee's return-value width comes from the call expression's own concrete
-instantiation, threaded down as an explicit hint. A builtin argument's width
-(needed by `prio`, for example) is resolved the same way, by following the
-argument back through parameter substitution to a concrete call site.
+so an implicit width parameter is never concretely resolved inside it
+(`types.rs`'s own `expr_tys` entries for such a body stay `Width::Unknown`).
+The callee's return-value width comes from the call expression's own concrete
+instantiation, threaded down as an explicit hint. Any OTHER width needed
+inside the body — a builtin argument (`prio`, for example), a literal beside
+a generic-width value, a guard, a shift amount — is resolved at emission time
+by `Emitter::resolve_bits_width` (`src/firrtl/expr.rs`): it chases a value
+back through `self.locals` parameter/local substitution to a concrete
+call-site expression, recombining through arithmetic/shift/bitwise operators
+(`combine_bits_width`, `src/types/mod.rs` — the SAME width rule `type_binop`
+itself uses, not a second, independently-maintained copy), through the two
+synthesizable builtins' own result-width rules (`prio_result_width`, `pack`'s
+plain sum), and through a NESTED call to another user-defined generic
+function (`resolve_nested_call_width`): its own declared return-type
+expression is evaluated (`const_eval_expr`, the SAME evaluator `type_call`'s
+own `eval_ty` uses) against an `env` built by resolving THIS call's own
+arguments recursively and matching them against the callee's implicit-width
+params (`implicit_width_param`) — re-running `type_call`'s own two-step
+instantiation (types/expr.rs) at emission time with concretely-resolved
+widths in hand, rather than the statically-known ones type-check time had.
+Deliberately never recurses into the nested callee's own BODY, only its
+signature, so a mutually-recursive callee pair can't blow the stack here
+(`find_call_cycle`, calls.rs, separately rejects such a pair before either
+side is ever really inlined). Two of that nested callee's own params sharing
+one implicit width name whose arguments resolve to genuinely conflicting
+widths is the one shape that still fails cleanly rather than guessing —
+mirroring `type_call`'s own conflict check, since a naive last-write-wins
+here could size a sibling literal to a width the real inlined value
+disagrees with, precisely the miscompile class this resolver exists to avoid.
 
 ## Elaboration lowering
 

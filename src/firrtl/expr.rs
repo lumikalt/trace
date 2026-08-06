@@ -7,9 +7,10 @@
 
 use super::Emitter;
 use super::fifo::*;
-use crate::ast::{BinOp, Expr, ExprId, UnOp};
-use crate::resolve::DefKind;
-use crate::types::{Ty, Types, Width};
+use crate::ast::{BinOp, Expr, ExprId, Item, UnOp};
+use crate::resolve::{DefId, DefKind};
+use crate::types::{Ty, Width};
+use std::collections::HashMap;
 
 impl<'a> Emitter<'a> {
     /// Top-level entry: no width hint, so a bare literal falls back to
@@ -624,11 +625,182 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// `id`'s own `Bits` width, resolved through `self.locals`'s
+    /// substitution chain when the ordinary static lookup
+    /// (`types.expr_tys`) comes up empty — the case for any expression
+    /// reachable only from a GENERIC callee's own body. `types/mod.rs`'s
+    /// own module doc comment: "Generic bodies (widths depending on
+    /// unsolved implicit params) are shape-checked only; their widths
+    /// check numerically at each concrete call site after instantiation"
+    /// — this IS that per-call-site numeric check, just not limited to
+    /// "the return value" or "a builtin's own argument" the way the
+    /// callee-inlining machinery's OTHER width lookups are: a bare
+    /// reference to a generic param (or a `let` aliasing one, however
+    /// many hops deep) is substituted via `self.locals` — the SAME map
+    /// `compile_expr_hinted`'s own `Ident` arm consults to compile a
+    /// VALUE — recursing until it bottoms out at a REAL, concretely-
+    /// typed expression at the call site. An arithmetic/bitwise/shift
+    /// node built from generic operands (`x + y`, `x << 1`, `0 - x`)
+    /// combines their OWN resolved widths via `combine_bits_width`
+    /// (`types/mod.rs`) — the SAME rule `type_binop` itself uses, not a
+    /// second, independently-maintained copy of it — handling one-side-
+    /// literal absorption (`x + 1`) identically to `type_binop`'s own
+    /// `(Bits, Int)`/`(Int, Bits)` arms. `None` on anything this doesn't
+    /// recognize (a mem read, a call, a struct field, ...) — those
+    /// either already have a concrete width from the fast path above, or
+    /// genuinely have none to resolve, same as before this existed.
+    pub(crate) fn resolve_bits_width(&self, id: ExprId) -> Option<u64> {
+        if let Some(Ty::Bits(Width::Known(w))) = self.types.expr_tys.get(&id) {
+            return Some(*w);
+        }
+        match self.ast.expr(id) {
+            Expr::Ident(_) => {
+                let def = self.res.expr_defs.get(&id)?;
+                let sub = *self.locals.get(def)?;
+                self.resolve_bits_width(sub)
+            }
+            Expr::Binary { op, lhs, rhs }
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::Shl
+                        | BinOp::Shr
+                        | BinOp::AShr
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                ) =>
+            {
+                if matches!(self.ast.expr(*lhs), Expr::Int(_)) {
+                    return self.resolve_bits_width(*rhs);
+                }
+                if matches!(self.ast.expr(*rhs), Expr::Int(_)) {
+                    return self.resolve_bits_width(*lhs);
+                }
+                let a = self.resolve_bits_width(*lhs)?;
+                let b = self.resolve_bits_width(*rhs)?;
+                match crate::types::combine_bits_width(*op, Width::Known(a), Width::Known(b)) {
+                    Width::Known(w) => Some(w),
+                    Width::Unknown => None,
+                }
+            }
+            // The two synthesizable builtins with a REAL, computable
+            // result-width rule (`types/expr.rs`'s own `type_builtin_
+            // call` -- `prio_result_width`, the shared source of truth,
+            // for `prio`; a plain sum, too small a rule to be worth
+            // sharing, for `pack`) -- so a generic body's `let g =
+            // prio(reqs); let g2 = g + 1; return g2` resolves too, not
+            // just a builtin's own DIRECT return. `trunc`'s one-arg form
+            // has no such rule at all (its own doc comment: "width
+            // INFERRED from wherever this call's own result is used",
+            // hint-only by design) and stays `None`, deliberately. A
+            // nested call to another user-defined generic function falls
+            // to `resolve_nested_call_width`, below.
+            Expr::Call { callee, args } => {
+                let def = self.res.expr_defs.get(callee)?;
+                match self.res.def(*def).name.as_str() {
+                    "prio" => {
+                        let arg_w = self.resolve_bits_width(*args.first()?)?;
+                        Some(crate::types::prio_result_width(arg_w))
+                    }
+                    "pack" => {
+                        let mut total = 0u64;
+                        for &a in args {
+                            total += self.resolve_bits_width(a)?;
+                        }
+                        Some(total)
+                    }
+                    _ => match self.res.def(*def).kind {
+                        DefKind::Fn | DefKind::Impl => self.resolve_nested_call_width(*def, args),
+                        _ => None,
+                    },
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A nested call to ANOTHER user-defined generic function --
+    /// `Inner(x)` combined with further arithmetic inside `Outer`'s own
+    /// generic body -- resolves the same two-step way `type_call`
+    /// (types/expr.rs) itself instantiates a call at type-check time:
+    /// build an `env` mapping `Inner`'s own implicit width params to
+    /// concrete widths (here, by resolving THIS call's own arguments
+    /// through `resolve_bits_width` again, recursively, rather than
+    /// reading them off already-known static types), then evaluate
+    /// `Inner`'s declared return type's width expression against that
+    /// `env` (`const_eval_expr` -- the SAME evaluator `type_call`'s own
+    /// `eval_ty` uses under the hood, not a second copy). A param typed
+    /// something other than a bare `bits[N]` (fixed-width, or a
+    /// non-`Bits` type entirely) simply contributes nothing to `env` --
+    /// mirroring `type_call`'s own `if let Some(pdef) = ...` guard --
+    /// and a return type that isn't `bits[...]`-shaped, or whose width
+    /// expression needs an entry `env` doesn't have, falls out to `None`
+    /// the same way every other unresolvable shape here does. Two params
+    /// declared to share one implicit name (`x : [n], y : [n]`) whose
+    /// arguments resolve to genuinely DIFFERENT concrete widths also
+    /// bails to `None` -- mirroring `type_call`'s own conflict check,
+    /// and load-bearing here in a way it merely duplicates there: unlike
+    /// a top-level concrete call site (where `check_assignable` rejects
+    /// the mismatch outright), a nested call inside another generic body
+    /// never reaches that check (both args are `Width::Unknown` during
+    /// the enclosing body's own single generic type-check pass, so the
+    /// comparison is vacuous), and `compile_call`'s own real inlining
+    /// substitutes each param independently with no cross-param
+    /// consistency check of its own -- so a WRONG, order-dependent
+    /// guess here (`env`'s `HashMap::insert` silently keeping whichever
+    /// width was written last) would size a literal or feed `width_of`
+    /// a number that disagrees with what the real inlined value actually
+    /// computes to, exactly the miscompile class the rest of this
+    /// resolver exists to avoid. `None` here just means "this call's own
+    /// width genuinely isn't well-defined," the same honest answer as
+    /// every other unresolvable shape.
+    ///
+    /// Never recurses into `Inner`'s own BODY, only its declared
+    /// signature (params + return-type expression) -- so unlike
+    /// `compile_call`'s own inlining, a mutually-recursive callee pair
+    /// can't blow the stack here even transiently; `find_call_cycle`
+    /// (calls.rs) still separately rejects such a pair before either
+    /// side is ever inlined for real.
+    fn resolve_nested_call_width(&self, def: DefId, args: &[ExprId]) -> Option<u64> {
+        let item = self
+            .res
+            .item_defs
+            .iter()
+            .find(|(_, d)| **d == def)
+            .map(|(item, _)| *item)?;
+        let Item::Fn { params, ret, .. } = self.ast.item(item) else {
+            return None;
+        };
+        if params.len() != args.len() {
+            return None;
+        }
+        let mut env: HashMap<DefId, u64> = HashMap::new();
+        for (param, arg) in params.iter().zip(args) {
+            if let Some(pdef) = crate::types::implicit_width_param(self.ast, self.res, param.ty) {
+                let w = self.resolve_bits_width(*arg)?;
+                if let Some(prev) = env.insert(pdef, w)
+                    && prev != w
+                {
+                    return None;
+                }
+            }
+        }
+        let width_expr = crate::types::bits_width_expr(self.ast, self.res, (*ret)?)?;
+        crate::types::const_eval_expr(self.ast, self.res, width_expr, &env)
+    }
+
     /// A literal operand has no width of its own; it absorbs one from
     /// its sibling. Arithmetic already has the absorbed width recorded
-    /// on the whole expression (`types.expr_tys[id]`); comparisons
-    /// don't (their own type is always `bits[1]`), so fall back to
-    /// whichever side is a concrete, non-literal type.
+    /// on the whole expression (`types.expr_tys[id]`, or — inside a
+    /// generic callee body — `resolve_bits_width`'s own substitution-
+    /// aware fallback); comparisons don't (their own type is always
+    /// `bits[1]`), so fall back to whichever side is a concrete,
+    /// non-literal type.
     pub(crate) fn compile_binop(
         &mut self,
         id: ExprId,
@@ -639,19 +811,13 @@ impl<'a> Emitter<'a> {
         if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::AShr) {
             return self.compile_shift(op, lhs, rhs);
         }
-        let known_width = |types: &Types, e: ExprId| {
-            types.expr_tys.get(&e).and_then(|t| match t {
-                Ty::Bits(Width::Known(w)) => Some(*w),
-                _ => None,
-            })
-        };
         // For every op below, one side being a bare literal (`Ty::Int`)
         // means the checker typed the whole expression as the *other*
         // side's own width (types.rs's mixed-operand rule), so hinting
-        // the literal to `known_width(id)` always lands on the right
-        // value — whether or not this op is one whose "both sides bits"
-        // rule also happens to equal that width (it does for every op
-        // here except Mul, handled below).
+        // the literal to `resolve_bits_width(id)` always lands on the
+        // right value — whether or not this op is one whose "both sides
+        // bits" rule also happens to equal that width (it does for
+        // every op here except Mul, handled below).
         let hint = if matches!(
             op,
             BinOp::Add
@@ -663,11 +829,11 @@ impl<'a> Emitter<'a> {
                 | BinOp::BitOr
                 | BinOp::BitXor
         ) {
-            known_width(self.types, id)
+            self.resolve_bits_width(id)
         } else if matches!(self.ast.expr(lhs), Expr::Int(_)) {
-            known_width(self.types, rhs)
+            self.resolve_bits_width(rhs)
         } else if matches!(self.ast.expr(rhs), Expr::Int(_)) {
-            known_width(self.types, lhs)
+            self.resolve_bits_width(lhs)
         } else {
             None
         };
@@ -686,16 +852,16 @@ impl<'a> Emitter<'a> {
                 let wl = if matches!(self.ast.expr(lhs), Expr::Int(_)) {
                     hint
                 } else {
-                    known_width(self.types, lhs)
+                    self.resolve_bits_width(lhs)
                 }
                 .unwrap_or(1);
                 let wr = if matches!(self.ast.expr(rhs), Expr::Int(_)) {
                     hint
                 } else {
-                    known_width(self.types, rhs)
+                    self.resolve_bits_width(rhs)
                 }
                 .unwrap_or(1);
-                let target = known_width(self.types, id).unwrap_or(wl + wr);
+                let target = self.resolve_bits_width(id).unwrap_or(wl + wr);
                 match (wl + wr).checked_sub(target) {
                     Some(drop) if drop > 0 => format!("tail(mul({l}, {r}), {drop})"),
                     _ => format!("mul({l}, {r})"),
@@ -715,10 +881,10 @@ impl<'a> Emitter<'a> {
                 let wl = if matches!(self.ast.expr(lhs), Expr::Int(_)) {
                     hint
                 } else {
-                    known_width(self.types, lhs)
+                    self.resolve_bits_width(lhs)
                 }
                 .unwrap_or(1);
-                let target = known_width(self.types, id).unwrap_or(wl);
+                let target = self.resolve_bits_width(id).unwrap_or(wl);
                 match target.checked_sub(wl) {
                     Some(pad) if pad > 0 => format!("pad(div({l}, {r}), {target})"),
                     _ => format!("div({l}, {r})"),
@@ -728,17 +894,17 @@ impl<'a> Emitter<'a> {
                 let wl = if matches!(self.ast.expr(lhs), Expr::Int(_)) {
                     hint
                 } else {
-                    known_width(self.types, lhs)
+                    self.resolve_bits_width(lhs)
                 }
                 .unwrap_or(1);
                 let wr = if matches!(self.ast.expr(rhs), Expr::Int(_)) {
                     hint
                 } else {
-                    known_width(self.types, rhs)
+                    self.resolve_bits_width(rhs)
                 }
                 .unwrap_or(1);
                 let firrtl_w = wl.min(wr);
-                let target = known_width(self.types, id).unwrap_or(firrtl_w);
+                let target = self.resolve_bits_width(id).unwrap_or(firrtl_w);
                 match target.checked_sub(firrtl_w) {
                     Some(pad) if pad > 0 => format!("pad(rem({l}, {r}), {target})"),
                     _ => format!("rem({l}, {r})"),

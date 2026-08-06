@@ -263,12 +263,20 @@ disjointness argument anywhere) passes end to end.
     to a plain combinational callee body at all (the old explicit
     `bits[N]` spelling no longer has surface syntax at all — see the
     `[N]` entry below).
-  - A generic callee parameter's own width (`[N]`) is only
-    resolvable for its own return value or by following it through
-    `self.locals` back to a concrete call-site expression — used
-    independently elsewhere in a generic callee body, this fails
-    cleanly ("no concrete width"), not a miscompile, but is still a real
-    sharp edge if this area is touched again.
+  - A generic callee body's own width resolution (`Emitter::
+    resolve_bits_width`, `src/firrtl/expr.rs`) chases a value through
+    `self.locals` substitution, arithmetic/shift/bitwise combination
+    (`combine_bits_width`, shared with `type_binop`), the two
+    synthesizable builtins' own result-width rules (`prio`, `pack`), and
+    a nested call to ANOTHER user-defined generic function
+    (`resolve_nested_call_width`, re-running `type_call`'s own `env`-
+    building + return-type evaluation at emission time) — covering a
+    bare literal beside a generic-width value nested anywhere in the
+    body (guards, shifts, further arithmetic on a builtin's or a nested
+    call's own result), not just a direct return. Two params sharing one
+    implicit width name whose arguments resolve to genuinely conflicting
+    widths still fails cleanly ("no concrete width"), not a miscompile —
+    the one shape left where a call's own width truly isn't well-defined.
 
   See `examples/call.tr`, `examples/call_branch.tr`,
   `examples/call_writes.tr`, `examples/call_prio.tr`,

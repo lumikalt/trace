@@ -7,7 +7,7 @@
 //! bracketed builtin (`type_bracket`) — and solver-1's call
 //! instantiation (`type_call`, `type_builtin_call`).
 
-use super::{OPTION_FIELDS, Ty, TypeChecker, Width, bits_needed, clog2};
+use super::{OPTION_FIELDS, Ty, TypeChecker, Width, bits_needed};
 use crate::ast::{BinOp, Expr, ExprId, Item, UnOp};
 use crate::resolve::{DefId, DefKind};
 use std::collections::HashMap;
@@ -507,31 +507,18 @@ impl<'a> TypeChecker<'a> {
                 if is_comparison {
                     l_ty
                 } else {
-                    match op {
-                        Mul => Ty::Bits(match (a, b) {
-                            (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
-                            _ => Width::Unknown,
-                        }),
-                        Shl | Shr | AShr => {
-                            // A real `Bits` shift amount (a sized literal
-                            // like `8'd20`, say, or any constant-foldable
-                            // expression) is just as checkable as a bare
-                            // `Int` one (`type_binop`'s `(Bits, Int)` arm,
-                            // above) — `check_shift_amount` itself only
-                            // needs a compile-time-constant VALUE, which
-                            // `const_eval` finds the same way regardless
-                            // of which `Ty` the amount's own expression
-                            // happens to carry.
-                            if !lossy {
-                                self.check_shift_amount(rhs, &Ty::Bits(a));
-                            }
-                            Ty::Bits(a)
-                        }
-                        _ => Ty::Bits(match (a, b) {
-                            (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y)),
-                            _ => Width::Unknown,
-                        }),
+                    // A real `Bits` shift amount (a sized literal like
+                    // `8'd20`, say, or any constant-foldable expression)
+                    // is just as checkable as a bare `Int` one
+                    // (`type_binop`'s `(Bits, Int)` arm, above) —
+                    // `check_shift_amount` itself only needs a compile-
+                    // time-constant VALUE, which `const_eval` finds the
+                    // same way regardless of which `Ty` the amount's own
+                    // expression happens to carry.
+                    if matches!(op, Shl | Shr | AShr) && !lossy {
+                        self.check_shift_amount(rhs, &Ty::Bits(a));
                     }
+                    Ty::Bits(super::combine_bits_width(op, a, b))
                 }
             }
             (l, r) => {
@@ -916,7 +903,9 @@ impl<'a> TypeChecker<'a> {
                 Ty::Bits(Width::Known(total))
             }
             "prio" => match arg_tys.first() {
-                Some(Ty::Bits(Width::Known(w))) => Ty::Bits(Width::Known(clog2(*w).max(1))),
+                Some(Ty::Bits(Width::Known(w))) => {
+                    Ty::Bits(Width::Known(super::prio_result_width(*w)))
+                }
                 _ => Ty::Bits(Width::Unknown),
             },
             "sync" => Ty::Unit,

@@ -1793,9 +1793,9 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn width_of(&mut self, id: ExprId) -> u64 {
-        match self.types.expr_tys.get(&id) {
-            Some(Ty::Bits(Width::Known(w))) => *w,
-            _ => {
+        match self.resolve_bits_width(id) {
+            Some(w) => w,
+            None => {
                 self.error(
                     self.ast.expr_spans[id.0 as usize].clone(),
                     "no concrete width for this expression; FIRRTL emission needs one".to_string(),
