@@ -5911,6 +5911,58 @@ downstream rather than erroring cleanly at lowering time. `compute_captures`
 rejects this directly once two captures resolve to the same name, before any
 text is generated.
 
+**A `<sequences>` body's own checked cycle count (2026-08-06)**, TODO.md's
+own "cost opacity" gap (`lower::sequences_cycle_count`, `lower/plan.rs`) —
+stage 1 of scoping a Filament-style timeline-types feature, per an advisor
+consultation: the comb-loop motivation for that feature turned out to be
+false (see "Combinational loops: what the checker does" above — every
+module boundary already costs a cycle unconditionally, a load-bearing
+scheduler invariant, not a gap), so the real, confirmed-open applicability
+is making a transaction's own duration a checked, queryable quantity
+instead of invisible everywhere in the compiler (a stray DESIGN.md line
+had actually already claimed this existed — it didn't, removed separately).
+
+`Some(n)` — exactly `split_into_segments`'s own segment count — for a body
+whose duration is statically fixed (only top-level `tick`s cutting straight-
+line segments); `None` for a `while`/`while let` loop (a runtime trip count)
+or anything that `spawn`s (waiting on it via `sync`/`race` makes the
+CALLER's own duration data-dependent too, even though the trigger itself
+doesn't block). Reuses `split_into_segments`/`find_while_anywhere`/`find_
+spawn_anywhere` directly rather than re-deriving any of this independently
+— this project has a standing lesson about exactly that kind of drift
+(`const_fold` vs `const_eval` silently diverging into a real soundness
+hole, stage 3's own history) — and deliberately does NOT reuse `plan_
+rule`'s own v0-restriction checks (nested `tick`, misplaced `break`, ...):
+this is an informational query run on ordinary source that may be mid-edit
+in the LSP or already known-invalid elsewhere, so a best-effort `None` on
+anything it can't cleanly answer is correct, not a hard error.
+
+Surfaced in two places, both additive, neither touching compilation
+itself: `--explain-schedule` (`Schedule::explain`, `schedule.rs`) prints a
+line per `<sequences>` rule in its own scope, checked directly off `Item::
+Rule`'s own `effects` rather than threading `Effects`/`fx` into `explain`'s
+own signature for a lookup the AST already answers; and the LSP's own rule
+hover (`src/lsp.rs`) appends the same note as a sentence. Both deliberately
+break the byte-identical `--explain-schedule` diff across every `<sequences>`-
+bearing example (13 of them) — expected and confirmed line-by-line (every
+diff a pure ADDITION, nothing else in the pre-existing output changed) before
+trusting it, not treated as a surprise mid-verification. New tests: 3 in
+`tests/lower.rs` (the driving straight-line case against `examples/rmw.tr`'s
+own real 1-tick/2-cycle rule, the `while` case against `examples/while_
+countdown.tr`, a hand-written `spawn`/`sync` case), 2 in `src/lsp.rs`'s own
+test module (bug-reintroduction-verified load-bearing), zero regressions.
+
+Deliberately NOT attempted in this same pass, per the advisor's own
+caution against over-scoping straight into a full Filament-style system
+from one prompt: port-level interval TYPES (this is a rule-level cycle
+COUNT, not yet threaded through module composition/`inst` port typing at
+all), and `schedule.rs`'s own conflict model staying entirely single-cycle
+(no cross-cycle resource-occupancy/affine-sharing reasoning yet — the
+piece that would let two logically-different operations safely share one
+physical unit across a WINDOW of cycles, Dahlia's own applicability). Both
+remain open, unscheduled future work, not silently declared solved by this
+narrower stage-1 cut.
+
 ### `while` lowering
 
 A top-level `while COND { body }` cuts a segment boundary the same way

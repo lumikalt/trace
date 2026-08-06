@@ -73,6 +73,7 @@ use crate::ast::{Ast, Item, ItemId, ScheduleDirective};
 use crate::bounds::Bounds;
 use crate::effects::{EffectSig, Effects};
 use crate::lexer::Span;
+use crate::lower;
 use crate::resolve::{DefId, DefKind, Resolution};
 use crate::types::{Ty, Types};
 use std::collections::{BTreeSet, HashMap};
@@ -568,6 +569,39 @@ impl Schedule {
                 "declaration order; no directive given"
             };
             out.push_str(&format!("  urgency: {}   ({source})\n", names.join(" > ")));
+            // Cost-opacity note (TODO.md's own "Cost model" gap): a
+            // `<sequences>` rule's own cycle count is otherwise invisible
+            // anywhere in this pass -- checked directly from `Item::
+            // Rule`'s own `effects`/`body`, not `Effects`/`fx` (avoids
+            // widening this fn's own signature for a lookup the AST
+            // already answers). `None` (a `while`/`spawn`-bearing body,
+            // data-dependent duration) is reported honestly, not
+            // silently omitted -- see `lower::sequences_cycle_count`'s
+            // own doc comment for exactly which shapes get which answer.
+            for r in &group.order {
+                let Item::Rule {
+                    name,
+                    effects,
+                    body,
+                } = ast.item(*r)
+                else {
+                    continue;
+                };
+                if !effects.iter().any(|e| e.name.text == "sequences") {
+                    continue;
+                }
+                match lower::sequences_cycle_count(ast, body) {
+                    Some(n) => out.push_str(&format!(
+                        "  rule {} <sequences>: {n} cycle{}\n",
+                        name.text,
+                        if n == 1 { "" } else { "s" }
+                    )),
+                    None => out.push_str(&format!(
+                        "  rule {} <sequences>: cycle count depends on control flow (while/spawn)\n",
+                        name.text
+                    )),
+                }
+            }
             if group.conflicts.is_empty() {
                 out.push_str("  no conflicts: all rules can fire every cycle\n");
                 continue;

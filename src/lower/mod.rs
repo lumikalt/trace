@@ -253,6 +253,15 @@ pub fn plan(
     (out, errors)
 }
 
+/// A `<sequences>` body's own checked cycle count, when it has one --
+/// `None` for a data-dependent duration (a `while`/`while let` loop, or
+/// a `spawn`'d callee waited on via `sync`/`race`). See `plan::sequences_
+/// cycle_count`'s own doc comment for the full reasoning; this is just
+/// the crate-visible entry point, mirroring `plan`/`render` above.
+pub fn sequences_cycle_count(ast: &Ast, body: &[StmtId]) -> Option<u32> {
+    plan::sequences_cycle_count(ast, body)
+}
+
 /// Render every planned lowering as a text splice over `src`: each
 /// original rule's span is replaced by its save registers, continuation
 /// register, and segment rules. Everything else in the file is untouched.

@@ -701,6 +701,18 @@ re-propose these from a fresh read of the same chapters:
 
 ## Cost model and formal verification (design-level, not scheduled)
 
+- **Partially addressed (2026-08-06): a `<sequences>` rule's own STRAIGHT-
+  LINE cycle count is now a checked, queryable quantity** (`lower::
+  sequences_cycle_count`, surfaced in `--explain-schedule` and LSP hover —
+  see DESIGN.md's "Sequences lowering" section). This closes the narrowest
+  slice of the cost-opacity complaint below: a fixed-length transaction's
+  own duration is no longer invisible. Still fully open: a `while`/`spawn`-
+  bearing transaction's duration stays unreported (`None`, correctly, not
+  guessed); port-level interval TYPES (composing a callee's own duration
+  into a CALLER's timing, across `inst` boundaries) don't exist at all;
+  and rollback COST specifically (checkpoint/squash machinery once a
+  transaction has crossed a `tick`) is entirely unaddressed — a cycle
+  COUNT existing is not the same as its rollback cost being modeled.
 - Multi-cycle `<sequences>` transactions (`tick`/`spawn`/`sync`) hide the
   real cost of what they express: rollback within one cycle is free
   (nothing has committed yet), but rolling back a transaction that has

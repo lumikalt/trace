@@ -32,7 +32,7 @@ use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
 use crate::schedule::Schedule;
 use crate::types::Types;
-use crate::{bounds, effects, lexer, parser, resolve, schedule, types};
+use crate::{bounds, effects, lexer, lower, parser, resolve, schedule, types};
 use lsp_server::{
     Connection, ExtractError, Message, Notification as ServerNotification,
     Request as ServerRequest, RequestId, Response,
@@ -649,6 +649,10 @@ fn hover(docs: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
     if let Some((lo, hi)) = bound {
         desc.push_str(&format!(" Where {lo} <= {} < {hi}.", def.name));
     }
+    if let Some(note) = sequences_cycle_note(ast, res, def_id) {
+        desc.push(' ');
+        desc.push_str(&note);
+    }
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -802,6 +806,33 @@ fn capitalize_sentence(s: &str) -> String {
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// A `<sequences>` rule's own checked cycle count, as a hover sentence
+/// (`lower::sequences_cycle_count`) — TODO.md's own "cost opacity" gap,
+/// otherwise invisible anywhere in the type system. `None` for anything
+/// that isn't a `<sequences>`-tagged rule at all (an ordinary rule, or
+/// any other def kind) — checked directly off `Item::Rule`'s own
+/// `effects`, same as `schedule.rs`'s own `explain` does, not through
+/// `Effects`/`fx` (`compile`'s own `fx` is never kept on `Compiled`).
+fn sequences_cycle_note(ast: &Ast, res: &Resolution, def_id: DefId) -> Option<String> {
+    let mut item_id = None;
+    for (&iid, &did) in &res.item_defs {
+        if did == def_id {
+            item_id = Some(iid);
+            break;
+        }
+    }
+    let Item::Rule { effects, body, .. } = ast.item(item_id?) else {
+        return None;
+    };
+    if !effects.iter().any(|e| e.name.text == "sequences") {
+        return None;
+    }
+    Some(match lower::sequences_cycle_count(ast, body) {
+        Some(n) => format!("It takes {n} cycle{}.", if n == 1 { "" } else { "s" }),
+        None => "Its cycle count depends on control flow (while/spawn).".to_string(),
+    })
 }
 
 /// Renders a module's own EXTERNAL interface (`in`/`out`/`io` ports
@@ -1130,6 +1161,32 @@ mod tests {
         let h = hover_at(src, 1, 9).expect("hover over the rule's own name");
         let text = hover_text(&h);
         assert_eq!(text, "```trace\nrule my_rule\n```\n\nA rule.");
+    }
+
+    #[test]
+    fn hovering_a_sequences_rule_shows_its_checked_cycle_count() {
+        // One `tick` -> two segments -> two cycles (matches examples/
+        // rmw.tr's own driving case). TODO.md's own "cost opacity" gap --
+        // otherwise this number is invisible anywhere in the compiler.
+        let src = "module M {\n    rule step <sequences> {\n        tick\n    }\n}\n";
+        let h = hover_at(src, 1, 9).expect("hover over the rule's own name");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nrule step\n```\n\nA rule. It takes 2 cycles."
+        );
+    }
+
+    #[test]
+    fn hovering_a_sequences_rule_with_a_while_loop_shows_a_data_dependent_note() {
+        // A `while` loop's own trip count isn't known until runtime --
+        // must report honestly that the cycle count depends on control
+        // flow, not silently omit the note or guess a number.
+        let src = "module WhileCountdown {\n    in x : [8]\n    out iters : [8] = 0\n    reg cnt : [8] = 0\n    reg acc : [8] = 0\n\n    rule r <sequences, fails> {\n        cnt := x\n        acc := 0\n        while cnt <> 0 {\n            cnt := cnt - 1\n            acc := acc + 1\n        }\n        iters := acc\n    }\n}\n";
+        let h = hover_at(src, 6, 9).expect("hover over the rule's own name");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nrule r\n```\n\nA rule. Its cycle count depends on control flow (while/spawn)."
+        );
     }
 
     const ADDER_SRC: &str = "module Adder {\n    in a : [8]\n    in b : [8]\n    out c : [8]\n    out carry : [1]\n    reg internal_state : [8] = 0\n    rule step {\n        c := a + b\n    }\n}\n";

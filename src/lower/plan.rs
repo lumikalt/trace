@@ -292,6 +292,32 @@ fn split_into_segments(ast: &Ast, body: &[StmtId]) -> Vec<Segment> {
     segments
 }
 
+/// A `<sequences>` rule/fn's own checked cycle count, when it has one --
+/// `None` for a body whose duration is data-dependent (a `while`/`while
+/// let` loop's own trip count isn't known until runtime, and neither is
+/// how long a `sync`/`race`d `spawn` callee takes), `Some(n)` otherwise:
+/// exactly `split_into_segments`'s own segment count, since every OTHER
+/// segment boundary (`tick`) is a fixed, statically-known single cycle.
+/// Reuses `split_into_segments`/`find_while_anywhere`/`find_spawn_
+/// anywhere` directly rather than re-deriving any of this independently
+/// -- this project has a standing lesson about exactly that kind of
+/// drift (`const_fold` vs `const_eval` silently diverging into a real
+/// soundness hole, DESIGN.md's stage-3 history).
+///
+/// Deliberately does NOT reuse `plan_rule`'s own v0-restriction checks
+/// (nested `tick`/`spawn`/`while`, misplaced `break`, ...) -- this is an
+/// informational query for hover/`--explain-schedule`, run on ordinary
+/// source that may not even be `<sequences>`-tagged yet (mid-edit in the
+/// LSP) or may already be known-invalid (`plan_rule`'s own error would
+/// fire elsewhere); a best-effort `None` on anything it can't cleanly
+/// answer is correct here, not a hard error.
+pub(crate) fn sequences_cycle_count(ast: &Ast, body: &[StmtId]) -> Option<u32> {
+    if find_while_anywhere(ast, body).is_some() || find_spawn_anywhere(ast, body).is_some() {
+        return None;
+    }
+    Some(split_into_segments(ast, body).len() as u32)
+}
+
 /// Recognizes `let h = spawn Callee(args)` (the ordinary form now that
 /// `let` is required for every fresh local) or `h := spawn Callee(args)`
 /// (still recognized too — an already-`let`-bound `h` reassigned to a

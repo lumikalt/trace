@@ -999,3 +999,70 @@ fn local_type_recorded_for_capture() {
     );
     let _ = &c.res; // keep res alive/used for clarity of what run() returns
 }
+
+fn rule_body(ast: &Ast, name: &str) -> Vec<trace::ast::StmtId> {
+    for item in &ast.items {
+        if let trace::ast::Item::Rule {
+            name: rule_name,
+            body,
+            ..
+        } = item
+            && rule_name.text == name
+        {
+            return body.clone();
+        }
+    }
+    panic!("no rule named `{name}` in this program");
+}
+
+#[test]
+fn sequences_cycle_count_is_the_segment_count_for_a_straight_line_body() {
+    // examples/rmw.tr's own driving case: one `tick` -> two segments ->
+    // two cycles, TODO.md's own "cost opacity" gap made a checked,
+    // queryable quantity instead of invisible everywhere in the
+    // compiler.
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/rmw.tr")).unwrap();
+    let c = run(&src);
+    let body = rule_body(&c.ast, "step");
+    assert_eq!(trace::lower::sequences_cycle_count(&c.ast, &body), Some(2));
+}
+
+#[test]
+fn sequences_cycle_count_is_none_for_a_while_loop() {
+    // A `while` loop's own trip count is a runtime value, not a static
+    // one -- must fail closed to `None`, not guess a number.
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/while_countdown.tr"
+    ))
+    .unwrap();
+    let c = run(&src);
+    let body = rule_body(&c.ast, "r");
+    assert_eq!(trace::lower::sequences_cycle_count(&c.ast, &body), None);
+}
+
+#[test]
+fn sequences_cycle_count_is_none_when_the_body_spawns() {
+    // A `spawn`'d callee's own duration isn't known to the CALLER's
+    // segment-splitting at all -- waiting on it via `sync`/`race` makes
+    // the caller's own duration data-dependent too, same as `while`.
+    let src = "\
+Slow(x : [8]) : [8] <sequences> {
+    tick
+    return x
+}
+
+module M {
+    rule r <sequences> {
+        let h = spawn Slow(1)
+        tick
+        let v = sync[h]
+        tick
+    }
+}
+";
+    let c = run(src);
+    let body = rule_body(&c.ast, "r");
+    assert_eq!(trace::lower::sequences_cycle_count(&c.ast, &body), None);
+}
