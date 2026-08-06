@@ -1800,6 +1800,25 @@ impl<'a> Parser<'a> {
                             .push_expr(Expr::Call { callee: lhs, args }, lo..self.prev_end);
                         continue;
                     }
+                    // `trunc.!(b)` — the same per-application "I know,
+                    // let it through" suffix `a >>.! 300` already has on
+                    // a binary operator (`ast.lossy`, populated the same
+                    // way here: reuse the set, no new AST shape), on a
+                    // CALL instead. Only `.!` immediately followed by `(`
+                    // counts as this postfix form — bare `.!` with
+                    // nothing after belongs to some other position
+                    // entirely and this loop shouldn't consume it here.
+                    Lossy if self.peek_nth(1) == Some(LParen) => {
+                        self.bump();
+                        self.bump();
+                        let args = self.parse_args(RParen)?;
+                        let call = self
+                            .ast
+                            .push_expr(Expr::Call { callee: lhs, args }, lo..self.prev_end);
+                        self.ast.lossy.insert(call);
+                        lhs = call;
+                        continue;
+                    }
                     LBracket => {
                         self.bump();
                         let args = self.parse_args(RBracket)?;

@@ -111,6 +111,79 @@ pub(crate) fn implicit_width_param(ast: &Ast, res: &Resolution, ty: ExprId) -> O
     (res.def(*def).kind == DefKind::ImplicitParam).then_some(*def)
 }
 
+/// A bare `Expr::Ident` resolving to an implicit width param -- the
+/// narrower half of `implicit_width_param` above, WITHOUT that
+/// function's own `bits[...]` unwrap: `invert_implicit_width` (below)
+/// calls this on an ALREADY-unwrapped operand (one side of `n + k`, not
+/// `bits[n + k]` itself), so re-unwrapping would look for a `bits[...]`
+/// that was never there.
+fn as_implicit_width_param(res: &Resolution, id: ExprId) -> Option<DefId> {
+    let def = res.expr_defs.get(&id)?;
+    (res.def(*def).kind == DefKind::ImplicitParam).then_some(*def)
+}
+
+/// Solves a SINGLE implicit width param out of `width_expr` (typically a
+/// generic fn's own return type's width expression, e.g. `n + 1`) given
+/// a target CONCRETE value it needs to equal -- the caller's own
+/// expected-type hint, e.g. a write target's declared width. This is
+/// genuine inverse arithmetic, not a pattern match (`const_eval_expr`
+/// only evaluates FORWARD, known env -> value), so it's deliberately
+/// narrow: a bare param, or that param plus-or-minus a compile-time
+/// CONSTANT (`n + k`/`k + n`/`n - k`/`k - n`) -- `Mul`/`Div`/`clog2`/
+/// `max`/`min`, a param appearing more than once, or `width_expr`
+/// referencing anything other than exactly one implicit param all fail
+/// closed (`None`), the same "any unresolved piece poisons the whole
+/// expression" default `const_eval_expr` already uses, not a guess.
+/// `k` itself is evaluated via `const_eval_expr` with an EMPTY env, so
+/// only a genuine compile-time constant (a literal, `clog2` of one, ...)
+/// counts as `k` -- never another, still-unsolved implicit param.
+pub(crate) fn invert_implicit_width(
+    ast: &Ast,
+    res: &Resolution,
+    width_expr: ExprId,
+    target: u64,
+) -> Option<(DefId, u64)> {
+    match ast.expr(width_expr) {
+        Expr::Ident(_) => {
+            let def = as_implicit_width_param(res, width_expr)?;
+            Some((def, target))
+        }
+        Expr::Binary {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => {
+            if let Some(def) = as_implicit_width_param(res, *lhs) {
+                let k = const_eval_expr(ast, res, *rhs, &HashMap::new())?;
+                Some((def, target.checked_sub(k)?))
+            } else if let Some(def) = as_implicit_width_param(res, *rhs) {
+                let k = const_eval_expr(ast, res, *lhs, &HashMap::new())?;
+                Some((def, target.checked_sub(k)?))
+            } else {
+                None
+            }
+        }
+        Expr::Binary {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        } => {
+            if let Some(def) = as_implicit_width_param(res, *lhs) {
+                // `n - k = target` => `n = target + k`.
+                let k = const_eval_expr(ast, res, *rhs, &HashMap::new())?;
+                Some((def, target.checked_add(k)?))
+            } else if let Some(def) = as_implicit_width_param(res, *rhs) {
+                // `k - n = target` => `n = k - target`.
+                let k = const_eval_expr(ast, res, *lhs, &HashMap::new())?;
+                Some((def, k.checked_sub(target)?))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 impl<'a> TypeChecker<'a> {
     /// A fifo's type is either a bare element type (`bits[8]`, depth 1)
     /// or `[depth]elem_ty` (parser.rs's `parse_fifo_depth_ty`), which

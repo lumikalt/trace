@@ -2368,3 +2368,72 @@ fn where_bound_on_an_output_init_violating_the_bound_is_an_error() {
             .contains("does not satisfy the declared bound")
     );
 }
+
+#[test]
+fn implicit_trunc_argument_width_solves_from_the_write_targets_own_type() {
+    // v24: a 1-arg `trunc(value)` passed as an argument to a generic fn
+    // has no width of its own (`Ty::Bits(Width::Unknown)`) -- but
+    // `Stmt::Assign`'s own declared LHS type is threaded into `type_
+    // call` as a `hint`, letting `Double`'s own `n` solve from matching
+    // `[n + 1]` (the return shape) against `b`'s own `[5]` (purely
+    // type-level, no value-range reasoning at all): `n = 4`. Confirms
+    // both that `type_call` accepts the call AND that the backward-fill
+    // actually wrote a concrete width into `trunc(b)`'s own `expr_tys`
+    // entry (not just used it locally to check assignability), since
+    // that's what FIRRTL emission's own separate resolver needs.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] = 0
+    Double(x : [n]) : [n + 1] { return x << 1 }
+    rule step {
+        a?
+        b := Double(trunc(b))
+    }
+}
+";
+    let (ast, types, errors) = run(src);
+    assert!(errors.is_empty(), "type errors: {errors:?}");
+    let trunc_call = ast
+        .exprs
+        .iter()
+        .enumerate()
+        .find_map(|(i, e)| match e {
+            trace::ast::Expr::Call { args, .. } if args.len() == 1 => {
+                Some(trace::ast::ExprId(i as u32))
+            }
+            _ => None,
+        })
+        .expect("expected exactly one 1-arg call in this program");
+    assert_eq!(
+        types.expr_tys.get(&trunc_call),
+        Some(&trace::types::Ty::Bits(trace::types::Width::Known(4)))
+    );
+}
+
+#[test]
+fn implicit_trunc_width_hint_declines_on_a_non_invertible_return_shape() {
+    // Negative control on `invert_implicit_width`'s own deliberately
+    // narrow scope (bare param, or param +/- a constant only): `Double`
+    // here returns `[n * 2]`, which the inverter refuses to solve (no
+    // `Mul` arm) rather than guess. This must NOT surface as a type
+    // error on its own -- FIRRTL emission's separate, pre-existing
+    // top-down hint mechanism (predating this feature, `firrtl/calls.
+    // rs`) still resolves `n` independently at emission time, so
+    // types.rs correctly has nothing to say here either way; this test
+    // pins that the new hint mechanism's restraint doesn't regress that
+    // pre-existing path into a spurious error.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [8] = 0
+    Double(x : [n]) : [n * 2] { return x }
+    rule step {
+        a?
+        b := Double(trunc(b))
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(errors.is_empty(), "type errors: {errors:?}");
+}

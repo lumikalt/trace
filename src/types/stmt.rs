@@ -48,7 +48,26 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Stmt::Assign { lhs, rhs } => {
-                let rhs_ty = self.type_expr(rhs, locals);
+                // `hint`: the LHS's own already-declared type, looked up
+                // the identical way `type_write`'s `Expr::Ident` arm
+                // does (`state_tys`, a reg/out/mem/fifo's declared type)
+                // -- but BEFORE typing `rhs`, since that's exactly when
+                // it's useful as an expected-type hint. `None` for
+                // anything `type_write` wouldn't recognize this way
+                // (a mem/struct-field write's own `Bracket`/nested
+                // shape, or an LHS that hasn't resolved) -- `type_expr_
+                // with_hint` degrades to the ordinary hint-less path
+                // then, unchanged from before this feature.
+                let hint = match self.ast.expr(lhs) {
+                    Expr::Ident(_) => self
+                        .res
+                        .expr_defs
+                        .get(&lhs)
+                        .and_then(|def| self.state_tys.get(def))
+                        .cloned(),
+                    _ => None,
+                };
+                let rhs_ty = self.type_expr_with_hint(rhs, locals, hint.as_ref());
                 self.type_write(lhs, rhs_ty, rhs, locals);
             }
             Stmt::Let { name, init } => {
@@ -63,7 +82,7 @@ impl<'a> TypeChecker<'a> {
             Stmt::Tick => {}
             Stmt::Break => {}
             Stmt::Return(Some(e)) => {
-                let ty = self.type_expr(e, locals);
+                let ty = self.type_expr_with_hint(e, locals, ret);
                 if let Some(ret) = ret {
                     self.check_assignable(&ty, ret, self.expr_span(e), "return value");
                 }

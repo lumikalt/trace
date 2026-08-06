@@ -1,0 +1,26 @@
+-- `trunc.!(value)` is the deliberate escape hatch for 1-arg `trunc`'s
+-- own losslessness requirement (v24, see `examples/implicit_trunc_
+-- width_from_write_target.tr`) -- the same per-application "I know,
+-- let it through" `.!` suffix a binary operator already has (`a >>.!
+-- 300`), extended to a call.
+--
+-- `Double(x : [n]) : [n + 2]` assigned into an UNGUARDED `b : [5]`
+-- solves `n = 3` (the unique width making `n + 2` equal `5`) purely
+-- from matching return-type shapes -- with no connection at all to
+-- whether `b`'s actual runtime value fits in 3 bits. Plain `trunc(b)`
+-- here is correctly REJECTED (bounds.rs can't prove losslessness);
+-- `trunc.!(b)` opts into the old, pre-v24 silent-masking behavior
+-- instead -- the same treatment the explicit 2-arg form (`trunc(b,
+-- 3)`) has always gotten, a deliberate, spelled-out choice by whoever
+-- wrote `.!`, not a silent compiler guess.
+module M {
+    in a : [1]
+    out b : [5] = 5
+
+    Double(x : [n]) : [n + 2] { return x << 1 }
+
+    rule step {
+        a?
+        b := Double(trunc.!(b))
+    }
+}

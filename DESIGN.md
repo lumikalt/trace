@@ -3918,6 +3918,208 @@ needed.
   one, an else-branch mirror, and the exact user-reported repro), zero
   regressions (948 tests), clippy clean, byte-identical `--explain-schedule`.
 
+- **1-arg `trunc(value)`'s implicit width solves from the write target's own
+  declared type (v24)**, `examples/implicit_trunc_width_from_write_target.tr`
+  — a FOURTH variant of the same v22 driving example the same day: `trunc(b,
+  4)` (explicit width) swapped for `trunc(b)` (1-arg, implicit). `trunc`'s
+  1-arg form has always typed to `Ty::Bits(Width::Unknown)` — through v23 the
+  ONLY thing that could ever resolve it was FIRRTL emission's own separate,
+  later, top-down `hint: Option<u64>` mechanism (`firrtl/calls.rs`), which
+  `types.rs` has no access to at all. Lumi's own framing split this into two
+  claims: Claim A — `b`'s declared width (`[5]`) alone caps `Double`'s `n` at
+  4, PURE TYPE-LEVEL, no value-range reasoning needed — and Claim B — `b`'s
+  PROVEN VALUE RANGE under the guard (`[2, 16)`) makes a NARROWER truncation
+  lossless, which would need `bounds.rs`'s own value-range facts fed back
+  into `types.rs`'s width decisions, a real cross-pass coupling `types.rs`
+  runs before/independent of. Scoped to Claim A only, on explicit
+  confirmation ("Yes, let's go for that").
+
+  `type_call` (`types/expr.rs`) gained a `hint: Option<&Ty>` parameter — the
+  caller's own already-known expected type for the WHOLE call's result,
+  supplied only by `type_expr_with_hint`'s two callers (`Stmt::Assign`'s own
+  declared LHS type, `Stmt::Return`'s own `ret`), `None` everywhere else
+  (deliberately narrow, not general top-down propagation). A new solver,
+  `invert_implicit_width` (`types/eval.rs`), unifies `hint` against the
+  callee's own return-type width EXPRESSION (`bits_width_expr`) to back-solve
+  the implicit param: recognizes a bare param, or param `+`/`-` a constant
+  (`n + k`/`k + n`/`n - k`/`k - n`) ONLY — fails closed (`None`) on `Mul`/
+  `Div`/`clog2`/`max`/`min`, a repeated param occurrence, or a multi-param
+  expression, rather than guess. For `Double(x : [n]) : [n + 1]` against a
+  `[5]`-wide hint, this solves `n = 4` — the UNIQUE width making `n + 1`
+  equal the hint exactly, which for an `Add`-shaped return is also
+  necessarily the WIDEST `n` keeping the result assignable without
+  truncation (any larger `n` would overflow the target).
+
+  Solve ORDER matters and was found wrong empirically, not assumed correct
+  on the first attempt: the hint-based solve was initially run BEFORE the
+  existing arg-based width solve, using `env.insert`'s unconditional
+  conflict-check — this regressed a real existing test
+  (`a_nested_generic_calls_shared_implicit_width_param_conflict_is_a_clean_
+  error_not_a_guess`, `tests/firrtl.rs`): `Bar(a : [p], ..) : [p]` called as
+  `Bar(c, d)` with `c : [4]` assigned into an `[8]`-wide target legitimately
+  solves `p = 4` from the ARGUMENT, then WIDENS the narrower result to fit —
+  not a `p = 8` (hint) vs `p = 4` (arg) conflict. The relationship between a
+  call's return type and a caller's hint is ASSIGNABILITY (widening allowed),
+  not equality, so treating it as an equal-priority constraint against a
+  concrete argument is simply wrong. Fixed by reordering: the arg-based solve
+  runs FIRST (`env.insert`, its own conflict check correct for genuine
+  arg-vs-arg disagreement), the hint-based solve runs LAST and ONLY fills a
+  param NO argument already resolved (`env.entry(pdef).or_insert(w)`).
+
+  A backward-fill loop (after `env` is fully built, before the assignability
+  check) catches the one shape this exists for: an argument that's EXACTLY a
+  bare 1-arg `trunc(value)` call, still `Width::Unknown` locally — if its own
+  declared param type is NOW solvable from `env`, the resolved width is
+  written back into BOTH `arg_tys` (for this call's own assignability check)
+  AND `self.types.expr_tys` (what FIRRTL emission's separate resolver
+  actually reads) — not written back, `trunc(b)`'s call-site `ExprId` would
+  still carry `Width::Unknown` and fail regardless of `type_call` itself now
+  accepting the program. `bounds.rs`'s own `trunc` arm was extended
+  symmetrically to consult `self.ty.expr_tys` for this ONE resolved shape in
+  the 1-arg case (still `None` for a bare `trunc(b)` used directly as a write
+  RHS with no enclosing generic call — no regression to that documented
+  case, confirmed).
+
+  **A real, serious silent-narrowing bug was caught by requested advisor
+  review before this landed** — not by tests, clippy, or the byte-identical
+  `--explain-schedule` diff, none of which could have found it (no existing
+  example exercises a 1-arg `trunc` through a generic call at all). The
+  hint-based solve picks `n` from PURE type-shape matching, with ZERO
+  connection to whether the value actually being truncated fits in that many
+  bits. `Double(x : [n]) : [n + 2]` assigned into an UNGUARDED `b : [5]`
+  solves `n = 3` (the unique width making `n + 2` equal 5) — before this fix,
+  `bounds.rs`'s own `trunc` arm silently fell back to `[0, cap)` whenever it
+  couldn't prove the identity tier, the SAME treatment the EXPLICIT 2-arg
+  form correctly gets (there, the user wrote the width themselves — a
+  deliberate masking choice, same as `value & mask`, not this pass's
+  concern). For the IMPLICIT form, nothing the user wrote chose 3 — the
+  emitted FIRRTL was `bits(__out_b, 2, 0)`, discarding `b`'s real top two
+  bits with NO diagnostic anywhere. Confirmed exploitable end-to-end
+  (`--firrtl` exits 0, wrong hardware) before fixing.
+
+  Fixed at the root, not patched around: `bounds.rs`'s `trunc` arm now
+  distinguishes the two forms — the identity tier (operand already fits) is
+  unchanged for both, but the coarse `[0, cap)` fallback is ONLY taken for
+  the EXPLICIT 2-arg form; the IMPLICIT 1-arg form instead raises a hard
+  error ("cannot prove `trunc(..)` at its inferred width discards no bits")
+  when it can't prove `hi <= cap`. This makes the 1-arg form actually mean
+  what its own design intent was — "truncate to what the scope can prove",
+  not "truncate to whatever satisfies the type checker" — directly resolving
+  (for the width-CHOICE half, at least) the open design question Lumi raised
+  in the same message that confirmed Claim A.
+
+  A SECOND, independent gap surfaced fixing the first: the new error path is
+  reached from `check_item`'s per-item body walk, which has its own
+  five-way "nothing to check anywhere in the program" fast-path gate
+  (`self.bounded`/`fn_ret_bound`/`mem_bounds`/`struct_field_bounds`/
+  `relational_bounds` all empty ⇒ skip the whole walk) — the EXACT `Double
+  (x:[n]):[n+2]` repro above has NO `where` bound anywhere at all, so this
+  gate skipped the walk before the new check could ever run, an instance of
+  the SAME "gated the descent on the wrong condition" bug class this arc has
+  hit repeatedly (v17/v18's own doc comments). Fixed with a sixth condition:
+  a new `collect_implicit_trunc_obligations` pass scans every expr up front
+  for a 1-arg `trunc` call `type_call`'s backward-fill resolved a width for,
+  setting `has_implicit_trunc` — this obligation exists independent of any
+  `where` bound and needs its own seat at the gate.
+
+  Both new checks verified independently load-bearing via bug-reintroduction
+  (not assumed): disabling the error-raise alone reproduced the silent
+  accept; separately re-enabling it but reverting ONLY the gate's sixth
+  condition reproduced it again identically (the walk never reached the
+  check either way) — confirming neither fix alone was sufficient and both
+  are necessary. 5 new tests (`tests/bounds.rs`: the positive implicit-trunc-
+  through-a-generic-call case, the silent-narrowing negative control, a bare-
+  `trunc`-as-write-RHS no-regression check; `tests/types.rs`: the backward-
+  fill actually stamping `expr_tys`, a non-invertible-return-shape (`n * 2`)
+  negative control confirming the solver's own restraint doesn't regress the
+  pre-existing FIRRTL-side resolver), zero regressions (953 tests), clippy
+  clean, byte-identical `--explain-schedule` across all 98 examples.
+
+  **Claim B is architecturally out of reach, permanently, not a deferred
+  TODO** — `bounds::check(ast, res, fx, ty)` takes `&Types` as an input;
+  `types.rs` cannot consume `bounds.rs`'s own proven value ranges without a
+  real pass-ordering cycle. The two ways around that (reorder the pipeline,
+  or give `types.rs` its own second copy of interval/guard-narrowing logic)
+  are both worse than not having the feature: this codebase already has a
+  recorded incident from exactly the second option (`const_fold` vs. `const_
+  eval` silently diverging into a real shipping soundness hole, `bounds.rs`'s
+  stage-3 history above) — a THIRD independent mirror of interval reasoning,
+  just for a width-selection nicety, isn't worth that risk.
+
+  But the underlying WORRY Claim B was chasing — "what if the implicit width
+  chosen isn't actually safe?" — is already fully addressed by this same
+  entry's own silent-narrowing fix above: 1-arg `trunc` now only ever
+  succeeds when `bounds.rs` can PROVE the chosen width is lossless, full
+  stop. What Claim B would ADD beyond that is picking a width NARROWER than
+  what the call site requires when the value's own proven range permits it —
+  and that has no observable benefit: the narrower value gets zero-extended
+  right back to the callee's own declared param width regardless, so it's
+  strictly a smaller mask on the same wire, provably equivalent hardware
+  either way. Recorded here as the actual finding, not left open, so a
+  future session doesn't re-derive this same analysis from scratch.
+
+- **`trunc.!(value)` — an explicit opt-out of 1-arg `trunc`'s own
+  losslessness proof (v25)**, `examples/lossy_trunc_opts_out_of_the_
+  losslessness_proof.tr`. The other half of the same message that confirmed
+  Claim A: a proposed builtin for "silently truncate to whatever the call
+  requires," for when a caller genuinely wants the OLD, pre-v24 behavior on
+  purpose. Scoped by a requested advisor consultation (given the Claim-B
+  analysis above, one real half remained implementable): reuse the EXISTING
+  `.!` mechanism (`ast.lossy`, a `HashSet<ExprId>` side list) a binary
+  operator already has (`a >>.! 300`, "explicit, per-application opt-out" —
+  `type_binop`'s own doc comment) rather than invent new machinery, since
+  the semantics are identical: waive one specific safety check for one
+  specific application, spelled out by whoever wrote it, not a silent
+  compiler guess.
+
+  Parser (`parser.rs`'s postfix loop, right where the existing `LParen` call
+  arm lives): a `Lossy` token (`.!`) immediately followed by `LParen` is
+  consumed as a call-postfix marker — `trunc.!(b)` builds the ORDINARY
+  `Expr::Call { callee: trunc, args: [b] }` node, no new `Expr` shape, and
+  inserts its own `ExprId` into `ast.lossy` (the same set, not a new
+  `lossy_calls` list — a given id is either a `Binary` or a `Call`, never
+  both, so no collision risk sharing the set). Deliberately gated on the
+  paren following IMMEDIATELY: a bare `.!` with nothing after it belongs to
+  whatever other position it's actually written in, not this one.
+
+  `bounds.rs`'s `trunc` arm: `is_implicit` (the flag that gates the v24
+  hard-error path) becomes `!lossy` for the 1-arg form specifically — a
+  lossy 1-arg trunc gets the EXPLICIT 2-arg form's own existing silent `[0,
+  cap)` fallback instead of the proof requirement. Width SOLVING itself
+  needed zero new code: `trunc.!(b)` is still an ordinary 1-arg builtin call
+  to `trunc`, so `is_one_arg_trunc_call`'s backward-fill in `type_call`
+  already fires identically regardless of the `.!` — the escape hatch waives
+  the PROOF obligation only, not the width-solving mechanism, which has
+  nothing to do with whether losslessness gets enforced.
+
+  One more gate to touch, per the advisor's own flagged risk: `collect_
+  implicit_trunc_obligations` (the v24 fix for `check_item`'s "nothing to
+  check" fast path skipping the walk entirely) now EXCLUDES a lossy trunc
+  from setting `has_implicit_trunc` — a lossy trunc can never reach the
+  error this gate exists to open a path to, so forcing the whole body walk
+  to run on its account alone would be pure overhead with no soundness
+  benefit. Confirmed harmless via the same byte-identical `--explain-
+  schedule` diff this whole arc gates every change on, not assumed.
+
+  **A real no-op-fix false positive was caught live, via this session's own
+  now-repeatedly-applied bug-reintroduction discipline** — the first draft
+  of the regression test used a program with NO other bounded thing
+  anywhere (only the lossy trunc itself), so `check_item`'s own fast-path
+  gate skipped the whole body walk before the `trunc` arm's `lossy` check
+  could ever run at all — disabling that check produced NO test failure,
+  proving the test wasn't exercising anything. Fixed the same way the v22
+  `site_ranges`-poisoning test was fixed: added an unrelated `where`-bounded
+  reg purely to force the gate open, then re-verified the disabled-check run
+  now genuinely fails (a real `BoundsError`) before re-enabling.
+
+  3 new tests (`tests/bounds.rs`'s positive case, now load-bearing;
+  `tests/parser.rs`'s own AST-shape check confirming `trunc.!(b)` parses to
+  the identical `Expr::Call` node plain `trunc(b)` does, just with its id
+  also in `ast.lossy`; a fencepost negative control confirming a bare `.!`
+  with nothing immediately after doesn't spuriously populate `ast.lossy`),
+  zero regressions (956 tests), clippy clean, fmt clean, byte-identical
+  `--explain-schedule` across all 98 pre-existing examples.
+
 ## Toward a dependent/refinement type system (SMT-backed, planned)
 
 Not built yet — this section is a committed plan, not a shipped feature.

@@ -1208,6 +1208,48 @@ fn lossy_operator_suffix_works_on_every_binary_operator_not_just_shifts() {
     assert!(ast.lossy.contains(rhs));
 }
 
+/// v25: the same `.!` marker, now on a CALL instead of a binary
+/// operator (`trunc.!(b)`). Same "no new `Expr` shape" idiom as the two
+/// tests above — the resulting node is an ordinary `Expr::Call`, just
+/// with its own id also landing in `ast.lossy`.
+#[test]
+fn lossy_suffix_also_works_on_a_call_not_just_binary_operators() {
+    let ast = parse_ok("rule t {\n x := trunc.!(b)\n}\n");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::Assign { rhs, .. } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*rhs), "(call trunc b)");
+    assert_eq!(ast.lossy.len(), 1, "expected exactly one marked expr");
+    assert!(ast.lossy.contains(rhs));
+
+    // The SAME call, no `.!`, marks nothing.
+    let ast = parse_ok("rule t {\n x := trunc(b)\n}\n");
+    assert!(ast.lossy.is_empty());
+}
+
+/// A bare `.!` with nothing after it (no immediately-following `(`)
+/// must NOT be consumed as this postfix call-marker form — it belongs
+/// to whatever other position it's actually written in (today, only a
+/// binary operator's own RHS position), so `x.! (b)` (space before the
+/// paren doesn't change tokenization, but a `.!` NOT immediately
+/// preceding `(` in the token stream) or any other non-call use is
+/// simply not this shape at all.
+#[test]
+fn lossy_call_suffix_requires_the_paren_immediately_after() {
+    // `x` is a bare ident (not itself a call); `.!` here isn't parsed as
+    // a call marker since nothing calls `x`, so this errors as some
+    // other malformed shape rather than silently accepting a phantom
+    // call. Just confirms this doesn't panic and doesn't spuriously
+    // populate `ast.lossy` on a non-call node.
+    let (tokens, lex_errors) = lexer::lex("rule t {\n x := b.! \n}\n");
+    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+    let (ast, _errors) = parser::parse("rule t {\n x := b.! \n}\n", &tokens);
+    assert!(ast.lossy.is_empty());
+}
+
 #[test]
 fn and_desugars_to_logic_wrapped_operands_folded_with_amp() {
     // `A and B` is pure sugar for `(logic A) & (logic B)` (see

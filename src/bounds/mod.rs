@@ -840,12 +840,14 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         mem_bound_span: HashMap::new(),
         struct_field_bounds: HashMap::new(),
         relational_bounds: Vec::new(),
+        has_implicit_trunc: false,
         reg_out_inits: HashMap::new(),
         failed_relational: HashSet::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
     checker.collect_bounded_params();
+    checker.collect_implicit_trunc_obligations();
     checker.collect_mem_bounds();
     // v18: collect every struct field's own declared bound FIRST, then
     // check every struct-typed reg/out's `= init` against it in a
@@ -1230,6 +1232,21 @@ struct Checker<'a> {
     /// same "collect only what was successfully validated" convention
     /// `self.bounded`/`mem_bounds`/`struct_field_bounds` already follow.
     relational_bounds: Vec<RelationalBound>,
+    /// Whether ANY 1-arg (implicit-width) `trunc(value)` call anywhere
+    /// in the program got a `Width::Known` in `self.ty.expr_tys` --
+    /// i.e. `type_call`'s hint-based backward-fill (v24) resolved a
+    /// width for it. This is its OWN proof obligation (the resolved
+    /// width must be provably lossless, checked in `expr_bound`'s
+    /// `trunc` arm), entirely independent of any `where` bound --
+    /// caught via advisor review: a module with zero `where` bounds
+    /// anywhere still needs `check_item`'s body walk to run so THIS
+    /// check fires, or the walk's existing five-way "nothing to check"
+    /// gate below silently no-ops the whole pass and an unsound
+    /// implicit trunc sails through with no diagnostic at all -- the
+    /// exact "gated the descent on the wrong condition" bug class this
+    /// arc has hit repeatedly (see v17/v18's own doc comments on
+    /// `check_item`).
+    has_implicit_trunc: bool,
     /// Every `reg`/`out`'s own `= init` expression, keyed by `DefId` --
     /// populated by `collect_relational_bounds`'s own walk (piggybacked
     /// onto the same traversal, rather than a separate one) purely so
@@ -1270,6 +1287,34 @@ impl<'a> Checker<'a> {
                     && self.res.def(d).name == name
             })
             .unwrap_or(false)
+    }
+
+    /// Scans every expr in the program for a 1-arg `trunc(value)` call
+    /// that `type_call`'s hint-based backward-fill (v24) resolved a
+    /// `Width::Known` for -- sets `self.has_implicit_trunc` so `check_
+    /// item`'s own "nothing to check" gate can't skip the body walk
+    /// this obligation needs to actually be checked. See `has_implicit_
+    /// trunc`'s own doc comment for why a `where`-blind gate is wrong
+    /// here specifically. A `trunc.!(value)` call (v25, `ast.lossy`) is
+    /// deliberately EXCLUDED here -- it never raises the error this gate
+    /// exists to reach (see the `trunc` arm below), so forcing the whole
+    /// body walk to run on its account alone would be pure overhead, not
+    /// a soundness need -- confirmed via the same byte-identical
+    /// `--explain-schedule` diff this whole arc gates every change on,
+    /// not assumed harmless.
+    fn collect_implicit_trunc_obligations(&mut self) {
+        for i in 0..self.ast.exprs.len() {
+            let id = ExprId(i as u32);
+            if let Expr::Call { callee, args } = self.ast.expr(id)
+                && args.len() == 1
+                && self.is_builtin(*callee, "trunc")
+                && !self.ast.lossy.contains(&id)
+                && matches!(self.ty.expr_tys.get(&id), Some(Ty::Bits(Width::Known(_))))
+            {
+                self.has_implicit_trunc = true;
+                return;
+            }
+        }
     }
 
     /// Every `reg`/`out` with a `where` bound, keyed by its own `DefId`.
@@ -2352,6 +2397,7 @@ impl<'a> Checker<'a> {
             && self.mem_bounds.is_empty()
             && self.struct_field_bounds.is_empty()
             && self.relational_bounds.is_empty()
+            && !self.has_implicit_trunc
         {
             return; // nothing to check anywhere in the program
         }
@@ -3334,30 +3380,108 @@ impl<'a> Checker<'a> {
                 let hi = a_hi.checked_sub(1)?.checked_mul(factor)?.checked_add(1)?;
                 Some((lo, hi))
             }
-            // `trunc(value, width)`, the 2-argument explicit-width form
-            // ONLY (the 1-argument inferred-width form has no width
-            // available to this pass at all, and falls through to the
-            // catch-all below, same v1 restriction as everything else
-            // unrecognized here). Sound in two tiers: if `value`'s own
-            // computed range ALREADY fits within `width` bits, truncation
-            // is exactly the identity (nothing is actually discarded),
-            // so the range passes through unchanged -- this is the tier
-            // that makes `trunc(b, 4)` compose when a guard has already
-            // narrowed `b` below `2^4`. Otherwise, the honest fallback
-            // is still real information, not `None`: a `trunc` result is
-            // ALWAYS within `[0, 2^width)` by construction, regardless of
-            // whether `value` itself is provable at all.
-            Expr::Call { callee, args } if args.len() == 2 && self.is_builtin(*callee, "trunc") => {
-                let inner = self.expr_bound(args[0], state, locals, struct_origins);
-                self.expr_bound(args[1], state, locals, struct_origins);
-                let width = match self.ast.expr(args[1]) {
-                    Expr::Int(v) => *v,
-                    Expr::SizedInt { value, .. } => *value,
-                    _ => return None,
+            // `trunc(value, width)` (2-argument explicit form), or
+            // `trunc(value)` (1-argument inferred form) WHEN its width
+            // was already resolved by `type_call`'s own backward-fill
+            // (`types/expr.rs`, v24) -- i.e. this exact call is an
+            // argument to a generic fn whose return type let the width
+            // solve from the caller's own expected type. A bare 1-arg
+            // `trunc` used directly (`b := trunc(b)`) still has NO
+            // resolvable width here: that form's width is deferred all
+            // the way to FIRRTL emission's own SEPARATE hint mechanism
+            // (`firrtl/calls.rs`), which never writes back into `self.
+            // ty.expr_tys` at all -- this arm only ever sees a width
+            // for the ONE shape `type_call`'s backward-fill actually
+            // resolved, not a general "ask types.rs" capability.
+            //
+            // Sound in two tiers for the EXPLICIT 2-arg form only: if
+            // `value`'s own computed range ALREADY fits within `width`
+            // bits, truncation is exactly the identity (nothing is
+            // actually discarded), so the range passes through
+            // unchanged -- this is the tier that makes `trunc(b, 4)`
+            // compose when a guard has already narrowed `b` below
+            // `2^4`. Otherwise, the honest fallback is still real
+            // information, not `None`: a `trunc` result is ALWAYS
+            // within `[0, 2^width)` by construction, regardless of
+            // whether `value` itself is provable at all -- and since
+            // the user wrote `4` themselves, a truncation that turns
+            // out lossy is THEIR deliberate masking choice, same as
+            // `value & mask`, not this pass's concern.
+            //
+            // The IMPLICIT 1-arg form is different: nothing the user
+            // wrote chose `width` -- `type_call`'s hint-based solve
+            // (v24, `types/expr.rs`) picked it purely from matching the
+            // CALLEE's return-type shape against the caller's own
+            // write-target width, with zero connection to whether
+            // `value` itself actually fits. Silently falling back to
+            // `(0, cap)` here the same way the explicit form does would
+            // make `trunc(b)` a SILENT bit-discarding mask the user
+            // never asked for and the type system never surfaced --
+            // caught via advisor review of a `Double(x:[n]):[n+2]`
+            // case assigned into a `[5]`-wide, unguarded target: the
+            // hint solve picks `n = 3` (the unique width making `n+2`
+            // fit exactly), `trunc(b)` masks away `b`'s top two bits
+            // with no diagnostic anywhere, since this arm's old
+            // fallback just approximated the POST-truncation range
+            // instead of ever checking losslessness was provable in
+            // the first place. So: the implicit form must be able to
+            // prove `hi <= cap`, or it's a hard error instead of a
+            // silent approximation -- this is exactly what makes the
+            // 1-arg form "truncate to what the scope can prove", not
+            // "truncate to whatever clears the type checker".
+            //
+            // `trunc.!(value)` (v25, `ast.lossy`, `parser.rs`'s postfix
+            // loop) is the deliberate escape hatch for when a caller
+            // genuinely wants the OLD, pre-v24 silent-masking behavior
+            // for the implicit form specifically -- same `.!` meaning
+            // `a >>.! 300` already has (`type_binop`'s own doc comment:
+            // "explicit, per-application opt-out"), extended from a
+            // binary operator to a call. Treated identically to the
+            // EXPLICIT 2-arg form below (`is_implicit = false`) even
+            // though its width is still solved via the implicit-form
+            // mechanism -- the escape hatch waives the PROOF obligation,
+            // not the width-solving mechanism itself, which has nothing
+            // to do with whether losslessness gets enforced.
+            Expr::Call { callee, args }
+                if self.is_builtin(*callee, "trunc") && !args.is_empty() =>
+            {
+                let explicit_width = if args.len() == 2 {
+                    self.expr_bound(args[1], state, locals, struct_origins);
+                    match self.ast.expr(args[1]) {
+                        Expr::Int(v) => Some(*v),
+                        Expr::SizedInt { value, .. } => Some(*value),
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
+                let lossy = self.ast.lossy.contains(&id);
+                let (width, is_implicit) = if let Some(w) = explicit_width {
+                    (Some(w), false)
+                } else if args.len() == 1 {
+                    let w = match self.ty.expr_tys.get(&id) {
+                        Some(Ty::Bits(Width::Known(w))) => Some(*w),
+                        _ => None,
+                    };
+                    (w, !lossy)
+                } else {
+                    (None, false)
+                };
+                let width = width?;
+                let inner = self.expr_bound(args[0], state, locals, struct_origins);
                 let cap = 1u64.checked_shl(width as u32)?;
                 match inner {
                     Some((lo, hi)) if hi <= cap => Some((lo, hi)),
+                    _ if is_implicit => {
+                        let span = self.ast.expr_spans[id.0 as usize].clone();
+                        self.error(
+                            span,
+                            format!(
+                                "cannot prove `trunc(..)` at its inferred width ({width} bits) discards no bits; use an explicit `trunc(value, N)` if truncation is intended"
+                            ),
+                        );
+                        Some((0, cap))
+                    }
                     _ => Some((0, cap)),
                 }
             }

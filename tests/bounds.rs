@@ -1541,6 +1541,130 @@ module M {
 }
 
 #[test]
+fn implicit_trunc_width_inferred_from_write_target_composes() {
+    // A third variant of the same driving example: `trunc(b, 4)` (an
+    // explicit width) replaced with `trunc(b)` (1-arg, implicit) --
+    // `type_call`'s hint-based backward-fill (v24, `types/expr.rs`)
+    // solves `Double`'s own `n` from `b`'s declared write-target width
+    // (`[5]`) against `Double`'s `[n + 1]` return shape (`n = 4`),
+    // purely type-level, with zero value-range reasoning of its own --
+    // then this pass's `trunc` arm still independently re-proves that
+    // width is lossless under `b`'s own guard-narrowed range, exactly
+    // like the explicit-width case above.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+
+    Double(x : [n]) : [n + 1] { return x << 1 }
+
+    rule step {
+        a?
+        b < 0b1111
+        b := Double(trunc(b))
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+}
+
+#[test]
+fn implicit_trunc_width_inference_rejects_unproven_truncation() {
+    // Advisor-caught during review of the feature above: the hint-based
+    // width solve is PURELY type-level (matching the callee's return
+    // shape against the caller's write-target width) and has no
+    // connection to whether the value being truncated actually fits.
+    // `Double(x : [n]) : [n + 2]` into an UNGUARDED `b : [5]` solves
+    // `n = 3` (the only width making `n + 2` equal `5`), and without
+    // this check `trunc(b)` would silently mask away `b`'s top two bits
+    // with zero diagnostic -- a real silent-narrowing bug caught before
+    // ever landing, not a hypothetical. Confirmed via bug-reintroduction
+    // (see the `trunc` arm's own doc comment in `bounds/mod.rs`): this
+    // test fails to produce an error at all if the `is_implicit` check
+    // is removed.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] = 5
+
+    Double(x : [n]) : [n + 2] { return x << 1 }
+
+    rule step {
+        a?
+        b := Double(trunc(b))
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1, "errors: {errors:?}");
+    assert!(errors[0].message.contains("discards no bits"));
+}
+
+#[test]
+fn implicit_trunc_as_a_bare_write_rhs_is_still_unresolvable() {
+    // No regression to documented pre-v24 behavior: a 1-arg `trunc`
+    // used directly as a write's RHS (not as an argument to a generic
+    // call) has no caller-side hint to solve a width from at all --
+    // `type_call`'s backward-fill only ever fires for a trunc call
+    // that's itself an ARGUMENT, so this still fails exactly like it
+    // did before this feature existed.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+    rule step {
+        a?
+        b < 0b1111
+        b := trunc(b)
+    }
+}
+";
+    let errors = run(src);
+    assert!(!errors.is_empty(), "expected an error, got none");
+}
+
+#[test]
+fn lossy_trunc_bypasses_the_implicit_width_losslessness_proof() {
+    // v25: `trunc.!(value)` -- the same per-application "I know, let it
+    // through" `.!` suffix `a >>.! 300` already has on a binary
+    // operator (`ast.lossy`), extended to a call. This is the EXACT
+    // `Double(x:[n]):[n+2]` shape that `implicit_trunc_width_inference_
+    // rejects_unproven_truncation` (above) correctly rejects for plain
+    // `trunc(b)` -- `trunc.!(b)` opts INTO the old, pre-v24 silent
+    // masking behavior instead, same treatment the explicit 2-arg form
+    // has always gotten (the fallback `[0, cap)` range, not an error).
+    //
+    // `y`'s own unrelated `where` bound exists ONLY to keep `check_
+    // item`'s five-way "nothing to check" gate open -- a lossy trunc is
+    // deliberately excluded from `has_implicit_trunc` (it can never
+    // raise the error that flag exists to reach), so a program with
+    // ONLY a lossy trunc and no other bounded thing anywhere would
+    // otherwise skip the whole body walk before ever reaching the
+    // `trunc` arm at all, making this test pass identically whether the
+    // `lossy` check works or not -- caught live via bug-reintroduction
+    // (disabling the arm's `lossy` gate alone did NOT fail this test
+    // without `y` present, exactly the no-op-fix trap this arc has hit
+    // before; confirmed it DOES fail once `y` forces the walk to run).
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] = 5
+    reg y : [4] where y < 10 = 0
+
+    Double(x : [n]) : [n + 2] { return x << 1 }
+
+    rule step {
+        a?
+        b := Double(trunc.!(b))
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+}
+
+#[test]
 fn shl_with_literal_amount_composes() {
     let src = "\
 module M {

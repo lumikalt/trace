@@ -19,6 +19,53 @@ impl<'a> TypeChecker<'a> {
         ty
     }
 
+    /// `type_expr`'s hint-aware sibling, used ONLY by `Stmt::Assign`'s
+    /// own LHS-declared-type lookup and `Stmt::Return`'s own `ret` --
+    /// the two positions with a genuinely known expected type available
+    /// BEFORE the expression itself is typed. Narrowly scoped to the
+    /// single shape that benefits: `id` itself being a DIRECT call to a
+    /// user `fn`/`impl`/`spec`, letting `type_call`'s own solve use the
+    /// caller's expected type (see that fn's own doc comment). Anything
+    /// else (a nested call two levels down, any other expr shape at
+    /// all) falls through to the ordinary hint-less `type_expr`
+    /// unchanged -- this is deliberately NOT general top-down hint
+    /// propagation through the whole recursive descent, matching this
+    /// pass's own "opt-in, not blanket" convention everywhere else.
+    pub(crate) fn type_expr_with_hint(
+        &mut self,
+        id: ExprId,
+        locals: &mut HashMap<DefId, Ty>,
+        hint: Option<&Ty>,
+    ) -> Ty {
+        if let Expr::Call { callee, args } = self.ast.expr(id).clone()
+            && let Some(def) = self.res.expr_defs.get(&callee).copied()
+            && matches!(
+                self.res.def(def).kind,
+                DefKind::Fn | DefKind::Impl | DefKind::Spec
+            )
+        {
+            let ty = self.type_call(id, callee, &args, locals, hint);
+            self.types.expr_tys.insert(id, ty.clone());
+            return ty;
+        }
+        self.type_expr(id, locals)
+    }
+
+    /// Whether `id` is EXACTLY a call to the builtin `trunc` with a
+    /// single argument -- `type_call`'s own backward-fill step (see its
+    /// doc comment) only ever recognizes this one shape, not any other
+    /// `Width::Unknown`-producing expression.
+    fn is_one_arg_trunc_call(&self, id: ExprId) -> bool {
+        let Expr::Call { callee, args } = self.ast.expr(id) else {
+            return false;
+        };
+        args.len() == 1
+            && self.res.expr_defs.get(callee).is_some_and(|&d| {
+                let def = self.res.def(d);
+                def.kind == DefKind::Builtin && def.name == "trunc"
+            })
+    }
+
     fn type_expr_inner(&mut self, id: ExprId, locals: &mut HashMap<DefId, Ty>) -> Ty {
         match self.ast.expr(id).clone() {
             Expr::Int(_) => Ty::Int,
@@ -233,7 +280,7 @@ impl<'a> TypeChecker<'a> {
                 Ty::Handle(Box::new(ret))
             }
             Expr::Bracket { callee, args } => self.type_bracket(id, callee, &args, locals),
-            Expr::Call { callee, args } => self.type_call(id, callee, &args, locals),
+            Expr::Call { callee, args } => self.type_call(id, callee, &args, locals, None),
             Expr::ListLit(items) => {
                 let Some((&first, rest)) = items.split_first() else {
                     self.error(
@@ -772,14 +819,36 @@ impl<'a> TypeChecker<'a> {
     /// Solver-1 instantiation: builtins by signature; user fns match
     /// implicit width params against concrete argument widths, then the
     /// return type evaluates under that solution.
+    /// `hint` (new): the caller's own expected type for this WHOLE call's
+    /// result, if one is genuinely known before this call is typed --
+    /// today only `type_expr_with_hint`'s two callers (`Stmt::Assign`'s
+    /// LHS declared type, `Stmt::Return`'s own `ret`) ever supply one,
+    /// `None` everywhere else (a nested call, any other position) --
+    /// deliberately narrow, not general top-down propagation. Lets
+    /// `DefKind::Fn`'s own `env` solve an implicit width param from the
+    /// RESULT side (unifying `hint` against `ret`'s own width expression
+    /// via `invert_implicit_width`) in addition to the arg-width solve
+    /// already below -- needed for `Double(trunc(b))`, where `trunc`'s
+    /// own 1-argument form has no width of its own to contribute an arg
+    /// width from at all (`Ty::Bits(Width::Unknown)`, deferred all the
+    /// way to FIRRTL emission's own separate hint mechanism through v22)
+    /// but the caller's declared write-target width (`b : [5]`) DOES
+    /// pin `n = 4` via `Double`'s own `[n + 1]` return type, with no
+    /// value-level reasoning involved at all -- see this fn's own
+    /// backward-fill step below for why that solved `n` also needs
+    /// writing back into `trunc(b)`'s own `expr_tys` entry, not just
+    /// used locally here, or FIRRTL emission's OWN independent width
+    /// resolver would still see `Width::Unknown` and fail regardless of
+    /// types.rs itself now accepting the program.
     fn type_call(
         &mut self,
         id: ExprId,
         callee: ExprId,
         args: &[ExprId],
         locals: &mut HashMap<DefId, Ty>,
+        hint: Option<&Ty>,
     ) -> Ty {
-        let arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(*a, locals)).collect();
+        let mut arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(*a, locals)).collect();
         let Some(def) = self.res.expr_defs.get(&callee).copied() else {
             return Ty::Unknown;
         };
@@ -805,8 +874,10 @@ impl<'a> TypeChecker<'a> {
                     );
                     return Ty::Unknown;
                 }
-                // Match `bits[N]` params against known arg widths.
                 let mut env: HashMap<DefId, u64> = HashMap::new();
+                // Match `bits[N]` params against known arg widths FIRST
+                // -- this precise, bottom-up solve always takes priority
+                // over the hint-based fallback below.
                 for (param, arg_ty) in params.iter().zip(&arg_tys) {
                     if let Some(pdef) = self.implicit_width_param(param.ty)
                         && let Ty::Bits(Width::Known(w)) = arg_ty
@@ -817,6 +888,55 @@ impl<'a> TypeChecker<'a> {
                             self.expr_span(id),
                             format!("conflicting widths for implicit parameter: {prev} vs {w}"),
                         );
+                    }
+                }
+                // Solve from the caller's own expected-type hint LAST,
+                // and ONLY to fill a param no argument resolved --
+                // found necessary via a real test regression, not
+                // assumed: an earlier version ran this FIRST and let a
+                // disagreeing argument "conflict" with it, but the
+                // relationship between a call's RETURN type and its
+                // hint is ASSIGNABILITY (widening allowed), not
+                // equality, so forcing it as an exact constraint on a
+                // param ALSO tied to a concrete argument is simply
+                // wrong -- confirmed by `a_nested_generic_calls_shared_
+                // implicit_width_param_conflict_is_a_clean_error_not_a_
+                // guess` (tests/firrtl.rs): `Bar(a : [p], ..) : [p]`
+                // called as `Bar(c, d)` with `c : [4]` assigned to an
+                // `[8]`-wide target legitimately solves `p = 4` from
+                // `c`, then widens the (narrower) result to fit -- NOT
+                // a `p = 8` vs `p = 4` conflict. The hint only matters
+                // for a param like `Double`'s own `n` above, which no
+                // argument constrains at all (`trunc(b)`'s own width is
+                // `Width::Unknown` until THIS solve fills it in).
+                if let (Some(Ty::Bits(Width::Known(target))), Some(ret_expr)) = (hint, ret)
+                    && let Some(width_expr) =
+                        super::eval::bits_width_expr(self.ast, self.res, ret_expr)
+                    && let Some((pdef, w)) =
+                        super::eval::invert_implicit_width(self.ast, self.res, width_expr, *target)
+                {
+                    env.entry(pdef).or_insert(w);
+                }
+                // Backward-fill: an argument that's EXACTLY a 1-argument
+                // `trunc(value)` call still carries `Width::Unknown`
+                // (its own width was never resolvable bottom-up) -- if
+                // its OWN param type is now solvable from `env` (either
+                // source above), record that as `trunc`'s real width,
+                // both locally (`arg_tys[i]`, for the assignability
+                // check right below) AND in `expr_tys` (`self.types.
+                // expr_tys`, what FIRRTL emission's own width resolver
+                // actually reads) -- NOT a general hint-propagation
+                // mechanism, deliberately scoped to this one shape,
+                // exactly like every other "opt-in, not blanket" cut in
+                // this pass.
+                for (i, (param, arg)) in params.iter().zip(args).enumerate() {
+                    if matches!(arg_tys[i], Ty::Bits(Width::Unknown))
+                        && self.is_one_arg_trunc_call(*arg)
+                        && let Ty::Bits(Width::Known(w)) = self.eval_ty(param.ty, &env)
+                    {
+                        let resolved = Ty::Bits(Width::Known(w));
+                        self.types.expr_tys.insert(*arg, resolved.clone());
+                        arg_tys[i] = resolved;
                     }
                 }
                 // Check each arg against its (instantiated) param type.
