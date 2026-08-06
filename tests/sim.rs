@@ -2320,6 +2320,35 @@ fn adder_tree_runs_through_real_ports() {
     );
 }
 
+/// Proves DESIGN.md's "Closures and partial application" `map` example
+/// through real firtool and Icarus: `elaborate.rs`'s new `map` builtin
+/// evaluates `Double(_)` once per element of `[a, b, c, d]`, and the
+/// result composes into `AdderTree` exactly like a literal list would --
+/// `((Double(a) + Double(b)) + (Double(c) + Double(d)))` -- computing the
+/// right doubled sum and wrapping modularly past `[32]`, see
+/// sim/map_double_tb.v.
+#[test]
+fn map_double_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/map_double.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/map_double_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves `logic <expr>` end to end: `examples/logic_probe.tr`'s `probe`
 /// rule reads a fifo's occupancy and a guard-only `<fails>` call's
 /// condition as plain status outputs, with neither side effect (no real

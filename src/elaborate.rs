@@ -296,7 +296,7 @@ impl<'a> Interp<'a> {
     ) -> Result<String, ()> {
         let arg_vals: Vec<ElabValue> = args
             .iter()
-            .map(|a| self.eval_elab_expr(*a, &[], 0))
+            .map(|a| self.eval_elab_expr(*a, &[], 0, None))
             .collect::<Result<_, _>>()?;
         let (fn_item, params, body) = self.resolve_elab_target(span.clone(), callee)?;
         let sig = self.fx.sigs.get(&fn_item);
@@ -412,7 +412,7 @@ impl<'a> Interp<'a> {
             let span = self.ast.stmt_spans[stmt.0 as usize].clone();
             match self.ast.stmt(*stmt).clone() {
                 Stmt::Let { name, init } => {
-                    let v = self.eval_elab_expr(init, env, depth)?;
+                    let v = self.eval_elab_expr(init, env, depth, None)?;
                     if let Some(def) = self.def_of_name(&name) {
                         env.push((def, v));
                     }
@@ -440,11 +440,11 @@ impl<'a> Interp<'a> {
                         );
                         return Err(());
                     }
-                    let v = self.eval_elab_expr(rhs, env, depth)?;
+                    let v = self.eval_elab_expr(rhs, env, depth, None)?;
                     env.push((def, v));
                 }
                 Stmt::Return(Some(e)) => {
-                    let v = self.eval_elab_expr(e, env, depth)?;
+                    let v = self.eval_elab_expr(e, env, depth, None)?;
                     return Ok(ElabFlow::Returned(v));
                 }
                 Stmt::Return(None) => {
@@ -459,7 +459,7 @@ impl<'a> Interp<'a> {
                     then_body,
                     else_body,
                 } => {
-                    let c = self.eval_elab_bool(cond, env, depth)?;
+                    let c = self.eval_elab_bool(cond, env, depth, None)?;
                     let branch: &[StmtId] = if c {
                         &then_body
                     } else {
@@ -559,8 +559,9 @@ impl<'a> Interp<'a> {
         id: ExprId,
         env: &[(DefId, ElabValue)],
         depth: usize,
+        placeholder: Option<&ElabValue>,
     ) -> Result<bool, ()> {
-        match self.eval_elab_expr(id, env, depth)? {
+        match self.eval_elab_expr(id, env, depth, placeholder)? {
             ElabValue::Int(v) => Ok(v != 0),
             other => {
                 self.error(
@@ -581,8 +582,9 @@ impl<'a> Interp<'a> {
         id: ExprId,
         env: &[(DefId, ElabValue)],
         depth: usize,
+        placeholder: Option<&ElabValue>,
     ) -> Result<u64, ()> {
-        match self.eval_elab_expr(id, env, depth)? {
+        match self.eval_elab_expr(id, env, depth, placeholder)? {
             ElabValue::Int(v) => Ok(v),
             other => {
                 self.error(
@@ -624,6 +626,7 @@ impl<'a> Interp<'a> {
         id: ExprId,
         env: &[(DefId, ElabValue)],
         depth: usize,
+        placeholder: Option<&ElabValue>,
     ) -> Result<ElabValue, ()> {
         match self.ast.expr(id).clone() {
             Expr::Int(v) => Ok(ElabValue::Int(v)),
@@ -635,17 +638,37 @@ impl<'a> Interp<'a> {
                 }
                 Ok(ElabValue::Circuit(self.text_of(id)))
             }
-            Expr::SizedInt { .. } | Expr::Wildcard => Ok(ElabValue::Circuit(self.text_of(id))),
+            Expr::SizedInt { .. } => Ok(ElabValue::Circuit(self.text_of(id))),
+            // Only meaningful inside a `map` closure argument, where the
+            // caller threads the current element through as `placeholder`
+            // (DESIGN.md's "Closures and partial application" section) --
+            // anywhere else `_` has no elaboration-time meaning at all, a
+            // clean error here rather than the stray literal `"_"` text a
+            // pre-closures version of this arm used to splice in (which
+            // would only have failed later, more confusingly, on re-parse
+            // or type-check of the spliced source).
+            Expr::Wildcard => match placeholder {
+                Some(v) => Ok(v.clone()),
+                None => {
+                    self.error(
+                        self.ast.expr_spans[id.0 as usize].clone(),
+                        "`_` has no meaning here (only valid once, inside a `map` \
+                         closure argument)"
+                            .to_string(),
+                    );
+                    Err(())
+                }
+            },
             Expr::ListLit(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
-                    out.push(self.elab_value_to_text_arg(item, env, depth)?);
+                    out.push(self.elab_value_to_text_arg(item, env, depth, placeholder)?);
                 }
                 Ok(ElabValue::List(out))
             }
             Expr::Unary { op, operand } => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
-                match self.eval_elab_expr(operand, env, depth)? {
+                match self.eval_elab_expr(operand, env, depth, placeholder)? {
                     ElabValue::Int(v) => Ok(ElabValue::Int(eval_elab_unop(op, v))),
                     ElabValue::Circuit(e) => {
                         Ok(ElabValue::Circuit(format!("({}{e})", unop_symbol(op))))
@@ -661,17 +684,17 @@ impl<'a> Interp<'a> {
             }
             Expr::Binary { op, lhs, rhs } => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
-                let l = self.eval_elab_expr(lhs, env, depth)?;
-                let r = self.eval_elab_expr(rhs, env, depth)?;
+                let l = self.eval_elab_expr(lhs, env, depth, placeholder)?;
+                let r = self.eval_elab_expr(rhs, env, depth, placeholder)?;
                 self.eval_elab_binop(span, op, l, r)
             }
             Expr::Call { callee, args } => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
-                self.eval_elab_call_expr(span, callee, &args, env, depth)
+                self.eval_elab_call_expr(span, callee, &args, env, depth, placeholder)
             }
             Expr::Bracket { callee, args } => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
-                self.eval_elab_bracket(span, callee, &args, env, depth)
+                self.eval_elab_bracket(span, callee, &args, env, depth, placeholder)
             }
             Expr::Field { .. } => {
                 // `inst.port` (or similar) — no list/elaboration meaning
@@ -690,7 +713,7 @@ impl<'a> Interp<'a> {
             // position (an `if`/`while` condition) the same way it does
             // in synthesizable code, not changing what `expr` evaluates
             // to.
-            Expr::Logic(inner) => self.eval_elab_expr(inner, env, depth),
+            Expr::Logic(inner) => self.eval_elab_expr(inner, env, depth, placeholder),
             Expr::Guard(_)
             | Expr::Spawn(_)
             | Expr::Range { .. }
@@ -719,9 +742,10 @@ impl<'a> Interp<'a> {
         id: ExprId,
         env: &[(DefId, ElabValue)],
         depth: usize,
+        placeholder: Option<&ElabValue>,
     ) -> Result<String, ()> {
         let span = self.ast.expr_spans[id.0 as usize].clone();
-        match self.eval_elab_expr(id, env, depth)? {
+        match self.eval_elab_expr(id, env, depth, placeholder)? {
             ElabValue::Circuit(s) => Ok(s),
             ElabValue::Int(n) => Ok(n.to_string()),
             ElabValue::List(_) => {
@@ -772,8 +796,8 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// `f(a, b, ...)` inside `<elaborates>` code: `len`/`clog2` compute
-    /// directly; a nested call to another `<elaborates>` function
+    /// `f(a, b, ...)` inside `<elaborates>` code: `len`/`clog2`/`map`
+    /// compute directly; a nested call to another `<elaborates>` function
     /// recurses the interpreter; anything else (an ordinary `<combines>`
     /// callee, or one that writes state) is spliced into a fresh
     /// `name(args)` call, its own text built from evaluated arguments,
@@ -787,13 +811,14 @@ impl<'a> Interp<'a> {
         args: &[ExprId],
         env: &[(DefId, ElabValue)],
         depth: usize,
+        placeholder: Option<&ElabValue>,
     ) -> Result<ElabValue, ()> {
         if self.is_elab_builtin(callee, "len") {
             let [arg] = args else {
                 self.error(span, "`len` takes exactly one argument".to_string());
                 return Err(());
             };
-            return match self.eval_elab_expr(*arg, env, depth)? {
+            return match self.eval_elab_expr(*arg, env, depth, placeholder)? {
                 ElabValue::List(items) => Ok(ElabValue::Int(items.len() as u64)),
                 other => {
                     self.error(
@@ -809,8 +834,55 @@ impl<'a> Interp<'a> {
                 self.error(span, "`clog2` takes exactly one argument".to_string());
                 return Err(());
             };
-            let v = self.eval_elab_int(*arg, env, depth)?;
+            let v = self.eval_elab_int(*arg, env, depth, placeholder)?;
             return Ok(ElabValue::Int(clog2(v)));
+        }
+        // `xs.map(f)` (UFCS sugar for `map(xs, f)`): `f`'s own argument
+        // expression is the closure body, per DESIGN.md's "Closures and
+        // partial application" section -- exactly one `_` required (`map`
+        // always supplies exactly one element per call, so a 0- or 2+-`_`
+        // closure is a plain arity mismatch, same as any other checked
+        // call arity in this language), evaluated once per element with
+        // that element threaded through as `placeholder`. Folds into the
+        // synthesized `List`, the same `ElabValue` shape a list LITERAL
+        // already produces -- so the result composes into `AdderTree`
+        // (or any other list consumer) with no changes there at all.
+        if self.is_elab_builtin(callee, "map") {
+            let [xs_arg, f_arg] = args else {
+                self.error(span, "`map` takes exactly two arguments".to_string());
+                return Err(());
+            };
+            let n = self.count_wildcards(*f_arg);
+            if n != 1 {
+                self.error(
+                    span,
+                    format!(
+                        "`map`'s closure argument must use `_` exactly once (found {n}) -- \
+                         `map` always calls it with exactly one element"
+                    ),
+                );
+                return Err(());
+            }
+            let items = match self.eval_elab_expr(*xs_arg, env, depth, placeholder)? {
+                ElabValue::List(items) => items,
+                other => {
+                    self.error(
+                        span,
+                        format!(
+                            "`map`'s first argument must be a list, got {}",
+                            other.describe()
+                        ),
+                    );
+                    return Err(());
+                }
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let elem = ElabValue::Circuit(item);
+                let v = self.eval_elab_expr(*f_arg, env, depth, Some(&elem))?;
+                out.push(self.elab_value_as_text(span.clone(), v)?);
+            }
+            return Ok(ElabValue::List(out));
         }
         let Some(&def) = self.res.expr_defs.get(&callee) else {
             self.error(span, "cannot find this call's target".to_string());
@@ -828,7 +900,7 @@ impl<'a> Interp<'a> {
         }
         let arg_vals: Vec<ElabValue> = args
             .iter()
-            .map(|a| self.eval_elab_expr(*a, env, depth))
+            .map(|a| self.eval_elab_expr(*a, env, depth, placeholder))
             .collect::<Result<_, _>>()?;
         let fn_item = self
             .res
@@ -860,6 +932,18 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Counts every `Expr::Wildcard` reachable from `id` -- used to check
+    /// a `map` closure argument's arity before evaluating it (exactly
+    /// one, since `map` always supplies exactly one element per call; see
+    /// `eval_elab_call_expr`'s own `"map"` case).
+    fn count_wildcards(&self, id: ExprId) -> usize {
+        let here = usize::from(matches!(self.ast.expr(id), Expr::Wildcard));
+        here + crate::lower::sub_exprs(self.ast, id)
+            .into_iter()
+            .map(|child| self.count_wildcards(child))
+            .sum::<usize>()
+    }
+
     /// `xs[i]` (an element) or `xs[..mid]`/`xs[mid..]` (a sub-list,
     /// `Expr::Range` — the one-sided form exclusive to list slicing).
     fn eval_elab_bracket(
@@ -869,8 +953,9 @@ impl<'a> Interp<'a> {
         args: &[ExprId],
         env: &[(DefId, ElabValue)],
         depth: usize,
+        placeholder: Option<&ElabValue>,
     ) -> Result<ElabValue, ()> {
-        let base = self.eval_elab_expr(callee, env, depth)?;
+        let base = self.eval_elab_expr(callee, env, depth, placeholder)?;
         let ElabValue::List(items) = base else {
             self.error(
                 span,
@@ -887,11 +972,11 @@ impl<'a> Interp<'a> {
         };
         if let Expr::Range { lo, hi } = self.ast.expr(*arg).clone() {
             let lo_v = match lo {
-                Some(e) => self.eval_elab_int(e, env, depth)?,
+                Some(e) => self.eval_elab_int(e, env, depth, placeholder)?,
                 None => 0,
             };
             let hi_v = match hi {
-                Some(e) => self.eval_elab_int(e, env, depth)?,
+                Some(e) => self.eval_elab_int(e, env, depth, placeholder)?,
                 None => items.len() as u64,
             };
             if lo_v > hi_v || hi_v > items.len() as u64 {
@@ -908,7 +993,7 @@ impl<'a> Interp<'a> {
                 items[lo_v as usize..hi_v as usize].to_vec(),
             ))
         } else {
-            let idx = self.eval_elab_int(*arg, env, depth)?;
+            let idx = self.eval_elab_int(*arg, env, depth, placeholder)?;
             match items.get(idx as usize) {
                 Some(e) => Ok(ElabValue::Circuit(e.clone())),
                 None => {

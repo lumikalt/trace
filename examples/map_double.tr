@@ -1,0 +1,34 @@
+-- DESIGN.md's "Closures and partial application" example: `map`, a new
+-- `elaborate.rs` interpreter builtin (alongside its existing `len`/list-
+-- slicing support), transforms a compile-time `list` by evaluating a
+-- `_`-closure once per element -- `xs.map(Double(_))` unrolls entirely at
+-- elaboration time into a fresh list of `Double(a)`, `Double(b)`, ...,
+-- which `AdderTree` (DESIGN.md's own pre-existing example) then reduces
+-- the same way it already reduces a literal list -- see
+-- sim/map_double_tb.v for the proof this computes the right sum through
+-- real hardware, not just that it compiles.
+Double(x : [32]) : [32] <combines> {
+    return x + x
+}
+
+AdderTree(xs : list[32]) : [32] <elaborates> {
+    if len(xs) = 1 { return xs[0] }
+    let mid = len(xs) / 2
+    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])
+}
+
+DoubledSum(xs : list[32]) : [32] <elaborates> {
+    return AdderTree(xs.map(Double(_)))
+}
+
+module Top {
+    in a : [32]
+    in b : [32]
+    in c : [32]
+    in d : [32]
+    out total : [32] = 0
+
+    rule sum {
+        total := DoubledSum([a, b, c, d])
+    }
+}

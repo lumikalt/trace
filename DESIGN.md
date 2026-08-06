@@ -2847,6 +2847,175 @@ type- or elaboration-position constructs with no runtime hardware meaning
 but the AST node it used to name is still synthesized internally by every
 `[N]` type). `sync` and `race` are covered above.
 
+## Closures and partial application (planned)
+
+**First slice shipped (2026-08-06): `map` over an elaboration-time `list`,
+proven through real firtool + Icarus simulation** — see Part 3's own
+"Implementation status" entry and `examples/map_double.tr`. The `_`-as-
+elided-parameter mechanism and scoping rule below are real, not
+hypothetical, for that ONE consumer. Everything else in this section —
+partial application, a closure bound to a callable `let`-local, and the
+`<sequences>`-loop (runtime-length) consumer — is still unbuilt; the
+mechanism/effect-inference discussion below covers the FULL design, not
+just the shipped slice.
+
+Grew out of wanting Chisel-style elaboration-time hardware generation
+(`xs.map(...)`-shaped combinators building N pieces of hardware from a
+host-level list) without a second, host-only language the way Chisel leans
+on Scala for exactly that — trace unifies host metaprogramming and hardware
+description in one language, so the combinator argument itself needs a real
+place in trace's own grammar and effect system, not a Scala closure hiding
+behind the FIRRTL boundary.
+
+**Mechanism, not syntax, was the hard part — and it turned out not to be
+hard.** The first design question was whether the effect system needs true
+polymorphism (an effect variable on `map`'s own signature, unified per call)
+to accept a closure of whatever effect it happens to carry. Lumi ruled out
+both cases that would have forced that (2026-08-06): no separately-compiled
+module system, ever (so a combinator's body is always source-visible at its
+call site), and no near-term ambition for a combinator library large enough
+to need clean per-definition error locality independent of every call site.
+With both ruled out, a closure needs no first-class type and no polymorphic
+signature at all — every closure gets resolved away by substitution before
+it would ever need one, the same way an ordinary function call already is.
+
+### Surface syntax: `_` as an elided parameter
+
+`_` (`Expr::Wildcard`) already has one meaning: a refinement predicate's
+self-reference (`where _ < K`), legal only in a TYPE position — never inside
+an ordinary value-computing expression, where it currently has no meaning
+and falls through to `Ty::Unknown`. This adds a second, disjoint meaning,
+in ordinary expression position: an elided parameter, Scala-style — chosen
+over `it`/`$0`-style single-param naming specifically because it doubles as
+partial application (below) without a second mechanism. The two contexts
+(type-position refinement vs. value-position expression) never overlap, so
+there is no real ambiguity to arbitrate between them — same AST node,
+disjoint grammar positions, exactly the way `Expr::Wildcard` is already
+interpreted contextually today.
+
+```trace
+xs.map(_.valid)          -- \a -> a.valid
+xs.map(Double(_))        -- \a -> Double(a)
+(_ + _)                  -- \a b -> a + b -- two placeholders, one closure
+```
+
+**Scoping rule, pinned exactly rather than left as "the smallest enclosing
+expression" (Scala's own well-known source of confusion):** a `_`'s closure
+body is the entire expression occupying the nearest surrounding VALUE SLOT —
+a single call argument, a `let`'s init, a `:=`'s right-hand side, or a
+`return`'s expression. Every `_` found anywhere inside that one slot's
+expression tree, including through further nested calls, becomes a distinct
+parameter of that ONE closure, left to right:
+
+```trace
+xs.map(Double(_) + 1)    -- \a -> Double(a) + 1 -- the WHOLE argument is the body
+```
+
+A `_` is rejected outright if its nearest value slot sits inside ANOTHER
+value slot that already contains a `_` — no closure-inside-closure nesting.
+This is a deliberate v1 cut, not a resolved case: Scala itself resolves this
+shape with a scope-widening rule real users get surprised by, and this
+language's own house style is to fail closed on a genuinely ambiguous shape
+rather than silently pick a guess (the same reasoning that makes a bare
+non-`[1]` statement a compile-time error instead of a silent no-op). Write
+the inner one as its own named `let` first.
+
+A `_`-closure's body is always a single expression, never a block — which
+falls straight out of the rule above rather than needing its own
+restriction, since a value slot only ever holds one expression to begin
+with.
+
+### Partial application: the same mechanism, not a second one
+
+`Add(_, 5)`, `Add(5, _)`, and `Add(_, _)` are all covered by the rule above
+with no new grammar — partial application isn't a distinct feature here,
+it's what the elided-parameter rule already does whenever the elided slot
+is an argument to a named call instead of a bare placeholder chain.
+
+**Rejected alternative: implicit arity-based currying** (calling `Add(5)`
+alone, `Add` being two-ary, silently meaning `\b -> Add(5, b)`,
+Haskell-style). This language checks call arity as a hard boundary
+everywhere else — backtick-infix sugar is always exactly two arguments (see
+"Calling a function from a rule" above), a variadic builtin like `max`/`min`
+still has a declared minimum — and an implicit "too few arguments quietly
+becomes a closure" rule would make an ordinary arity typo silently compile
+instead of erroring. `Add(5)` alone, with no `_` anywhere, stays a plain
+arity error, exactly as today; every elided argument needs its own explicit
+`_`.
+
+`let`-bound closures reuse existing machinery outright, not new binding
+resolution: `let f = Add(_, 5)` is an ordinary callee-local, and every read
+of `f` already resolves by substituting its ORIGINAL binding expression at
+the use site — precisely what "Calling a function from a rule" above already
+documents for `self.locals` (`let z = x; x := x + 1; return z` resolving `z`
+by re-substituting its binding, not by snapshotting a value). A
+closure-valued local is just one more shape that substitution already knows
+how to carry; `xs.map(f)` expands to `xs.map(Add(_, 5))` before anything
+effect-checks it.
+
+### Effect inference: no new algorithm, two lowering shapes
+
+A closure is never a runtime value — no closure type, nothing storable in a
+reg/wire/struct field, nothing crossing a module boundary as data. It only
+ever exists as an expression subtree substituted whole into whatever
+consumes it, so there is nothing to assign an effect to ahead of time. The
+effect is computed the same way a named `fn`'s already is: `effects.rs`'s
+existing bottom-up walk, run over the fully-substituted expression, at the
+point a higher-order call actually expands.
+
+Two shapes for that expansion, matching the two cases settled on above —
+**both are the SAME technique, not two different ones as an earlier draft
+of this section claimed:** `elaborate.rs`'s own doc comment is explicit
+that elaboration-time list recursion (the `AdderTree` case) is "a REAL
+interpreter... not a splice-and-compile pass like `firrtl::calls`'s
+ordinary callee inlining" — it interprets down to a string of real trace
+SOURCE syntax and splices that over the call's own span, then re-runs the
+whole frontend (lex/parse/resolve/effects/types) on the spliced source,
+"exactly the text-splice-then-reparse round trip `lower::plan`/`lower::
+render` already use for `<sequences>` lowering." So:
+
+- **Elaboration-time-known-length data** (`list[...]`, the `AdderTree`
+  case): a `map`-shaped combinator is a new `elaborate.rs` interpreter
+  builtin, alongside its existing `len`/list-slicing support — it
+  evaluates the closure body once per element, by the SAME interpreter-
+  level substitution `AdderTree`'s own recursion already gets, and folds
+  each result into the synthesized source string, not `calls.rs`.
+- **Runtime-length data** (draining a fifo of unknown occupancy): the call
+  expands into a `<sequences>` `while`-shaped loop instead, reusing the
+  exact "render substituted SOURCE TEXT, re-run the whole pipeline" trick
+  `while`'s own bare-condition support already uses (see "`while`:
+  multi-cycle loops" above) — the closure body becomes the loop body text,
+  then parse/resolve/effects/types/emit all re-run on it unmodified.
+
+`calls.rs`'s body-substitution inlining is the relevant reused mechanism
+only for a closure bound to a CALLEE-local and invoked directly (`let f =
+Add(_, 5); return f(3)` inside a `fn`/`impl` body) — and only there, since
+`self.locals`-style substitution is callee-local-only; a RULE-level `let`
+uses the separate position-snapshot machinery instead (see "Locals"), which
+does not resolve by re-substituting a binding's original expression the
+same way.
+
+**Open interaction, not yet resolved:** today's `while` may only write
+module state directly, never a captured local (see "`while`: multi-cycle
+loops" above) — an accumulator written across the loop boundary is a
+compile-time error. A `fold`-shaped runtime-length combinator's natural
+accumulator is exactly that rejected shape. v1 of such a combinator would
+have to target an existing, explicitly-named `reg`/`out` as its accumulator
+rather than manufacture one implicitly; lifting the underlying `while`-loop
+restriction itself is a separate, unscoped effort, not assumed solved here.
+
+### Not designed here
+
+- The concrete combinator library itself (`map`/`fold`/`zip`/`drain` names,
+  arities, exact signatures) — this section commits to the closure/
+  partial-application mechanism and the effect-inference strategy
+  underneath it, not the specific combinators built on top.
+- Threading a closure argument through an intermediate USER-defined `fn`
+  parameter (a trace-authored higher-order function, not a builtin) —
+  plausibly the same param chase-through "Calling a function: inlining"
+  already does for struct/Option-typed params (see above), extended to a
+  closure-shaped argument, but not designed or attempted yet.
+
 ## The schedule block
 
 Two rules conflict when one writes what the other reads or writes. Conflicting
@@ -7241,6 +7410,23 @@ noted:
   slices (`xs[..mid]`/`xs[mid..]`), via `elaborate.rs`'s own text-splice
   pre-pass, not the ordinary callee-inlining machinery (`examples/
 adder_tree.tr`, DESIGN.md's own `AdderTree`).
+- `map`, the first piece of "Closures and partial application" (see that
+  section above): a new `elaborate.rs` interpreter builtin, alongside its
+  existing `len`/list-slicing support. `xs.map(f)` evaluates `f`'s own
+  argument expression once per element, with `_` (`Expr::Wildcard`)
+  bound to that element via a `placeholder` threaded through the whole
+  `eval_elab_expr` family — a genuine closure, not a special case, since
+  the SAME threading correctly nests (an inner `map`'s own placeholder
+  shadows an outer one, ordinary Rust call-stack scoping, no explicit
+  stack needed). Requires exactly one `_` in the closure argument
+  (checked before evaluating, an ordinary arity error otherwise — `map`
+  always supplies exactly one element per call). The result is an
+  ordinary `ElabValue::List`, composing into any existing list consumer
+  (`AdderTree`) with no changes there at all (`examples/map_double.tr`,
+  `AdderTree(xs.map(Double(_)))`). Partial application, closures as
+  callable `let`-bound locals, and the `<sequences>`-loop (runtime-
+  length) consumer are still unbuilt — see that section's own "Not
+  designed here" and TODO.md.
 - General `struct` types: declaration, exhaustive-field-checked
   construction, whole-value read/write, arbitrary nesting (a struct field
   may itself be a struct, cycle-rejected), flattened to N plain

@@ -1280,6 +1280,37 @@ impl<'a> TypeChecker<'a> {
             "__race_value" => arg_tys.get(1).cloned().unwrap_or(Ty::Unknown),
             // any(range) is a model-checker free variable.
             "any" => Ty::Bits(Width::Unknown),
+            // `map(xs, f)` (DESIGN.md's "Closures and partial
+            // application"): only meaningful inside `<elaborates>` code,
+            // where `elaborate.rs`'s own interpreter evaluates it
+            // directly and the whole call disappears from the spliced
+            // source before this type ever matters downstream -- this
+            // case exists so a wrong-arity/non-list call still gets a
+            // clean error at the USUAL point instead of only surfacing
+            // later, and so the result carries a real element type
+            // (`f`'s own already-inferred type, per `_`'s
+            // `Ty::Unknown`-poisons-silently pass-through above --
+            // NOT `xs`'s own element type, which a type-changing
+            // closure would make wrong).
+            "map" => {
+                if args.len() != 2 {
+                    self.error(
+                        self.expr_span(id),
+                        format!("`map` takes exactly two arguments, got {}", args.len()),
+                    );
+                    return Ty::Unknown;
+                }
+                match &arg_tys[0] {
+                    Ty::List(_) | Ty::Unknown => Ty::List(Box::new(arg_tys[1].clone())),
+                    other => {
+                        self.error(
+                            self.expr_span(id),
+                            format!("`map`'s first argument must be a list, got {other}"),
+                        );
+                        Ty::Unknown
+                    }
+                }
+            }
             _ => Ty::Unknown,
         }
     }

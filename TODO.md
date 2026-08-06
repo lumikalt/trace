@@ -500,6 +500,61 @@ disjointness argument anywhere) passes end to end.
   design needs more than a shift — signed compare/add/mul, or
   sign-aware truncation/widening.
 
+## Closures and partial application (design-level, not scheduled)
+
+Design committed (2026-08-06) — see DESIGN.md's "Closures and partial
+application (planned)" section (right after "Calling a function from a
+rule"). `_` as an elided parameter, Scala-style, doubling as partial
+application with no second mechanism; reuses `Expr::Wildcard`, whose only
+existing meaning is the `where _ < K` refinement self-reference in a TYPE
+position, disjoint from the new value-position meaning, so there is no real
+ambiguity to arbitrate; a precisely pinned value-slot scoping
+rule instead of Scala's own "smallest enclosing expression" (which real
+Scala users get surprised by); closures resolved entirely by substitution,
+never a first-class value, so no new closure type and no effect
+polymorphism needed. Lumi explicitly ruled out both cases that would have
+forced real effect polymorphism — a separately-compiled module system, and
+a combinator library big enough to need per-definition error locality.
+
+**First slice SHIPPED (2026-08-06): `map` over an elaboration-time
+`list`**, proven through real firtool + Icarus simulation
+(`examples/map_double.tr`, `sim/map_double_tb.v`,
+`map_double_runs_through_real_ports`). `map` is a new `elaborate.rs`
+interpreter builtin, alongside its existing `len`/list-slicing support —
+NOT `calls.rs`'s body-substitution inlining (an earlier draft of this
+entry and of DESIGN.md's own section claimed that; `elaborate.rs`'s own
+doc comment is explicit that list recursion is "a REAL interpreter... not
+a splice-and-compile pass like `firrtl::calls`'s ordinary callee
+inlining" — corrected in both places once actually checked against
+source, see advisor's catch). `_` resolves via a `placeholder:
+Option<&ElabValue>` threaded through the whole `eval_elab_expr` family,
+consulted only by the (now two-way) `Expr::Wildcard` arm; requires
+exactly one `_` in the closure argument, checked before evaluating
+(`count_wildcards`). Composes with existing list consumers for free —
+`AdderTree(xs.map(Double(_)))` needed zero changes to `AdderTree` itself.
+
+Still not started. Known open items, not yet designed:
+- The `<sequences>`-loop (runtime-length) consumer, e.g. a `fold`/`drain`
+  over a fifo's unknown occupancy — reuses `while`'s own render-source-
+  text-and-re-run-the-pipeline trick, NOT what `map` uses (`map`'s
+  elaboration-time list is a different mechanism entirely, per the
+  correction above). Its natural accumulator is exactly the shape
+  `while` currently rejects (a captured local written across the loop
+  boundary must target module state only) — v1 would have to require an
+  explicit `reg`/`out` target instead of an implicit accumulator; lifting
+  the underlying `while` restriction is separate, unscoped work.
+- Partial application (`Add(_, 5)` as a standalone value) and a closure
+  bound to a callable `let`-local (`let f = Add(_, 5); f(3)`, reusing
+  `calls.rs`'s callee-local substitution) are both still just design, not
+  code — `map`'s own `_` only ever resolves inside ITS OWN closure
+  argument today, nothing more general yet.
+- The rest of the combinator library (`fold`/`zip`/`drain` names,
+  arities, signatures) is not designed — only `map` is built.
+- Threading a closure argument through an intermediate USER-defined `fn`
+  parameter (not just a builtin) plausibly extends the existing struct/
+  Option param chase-through ("Calling a function: inlining"), but this
+  hasn't been designed or attempted.
+
 ## Verse alignment: more of its failure system and operators (design-level, not scheduled)
 
 `fails` gating (commit `e97795e`) ported Verse's `<decides>`-requires-a-

@@ -254,6 +254,7 @@ const BUILTINS: &[&str] = &[
     "max",
     "min",
     "len",
+    "map",
     "sync",
     "race",
     "prio",
