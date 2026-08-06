@@ -516,38 +516,67 @@ polymorphism needed. Lumi explicitly ruled out both cases that would have
 forced real effect polymorphism — a separately-compiled module system, and
 a combinator library big enough to need per-definition error locality.
 
-**First slice SHIPPED (2026-08-06): `map` over an elaboration-time
-`list`**, proven through real firtool + Icarus simulation
-(`examples/map_double.tr`, `sim/map_double_tb.v`,
-`map_double_runs_through_real_ports`). `map` is a new `elaborate.rs`
-interpreter builtin, alongside its existing `len`/list-slicing support —
-NOT `calls.rs`'s body-substitution inlining (an earlier draft of this
-entry and of DESIGN.md's own section claimed that; `elaborate.rs`'s own
-doc comment is explicit that list recursion is "a REAL interpreter... not
-a splice-and-compile pass like `firrtl::calls`'s ordinary callee
-inlining" — corrected in both places once actually checked against
-source, see advisor's catch). `_` resolves via a `placeholder:
-Option<&ElabValue>` threaded through the whole `eval_elab_expr` family,
-consulted only by the (now two-way) `Expr::Wildcard` arm; requires
-exactly one `_` in the closure argument, checked before evaluating
-(`count_wildcards`). Composes with existing list consumers for free —
-`AdderTree(xs.map(Double(_)))` needed zero changes to `AdderTree` itself.
+**Two of three consumers SHIPPED (2026-08-06), both proven through real
+firtool + Icarus simulation:**
+
+1. **`map` over an elaboration-time `list`**
+   (`examples/map_double.tr`, `map_double_runs_through_real_ports`). A
+   new `elaborate.rs` interpreter builtin, alongside its existing `len`/
+   list-slicing support — NOT `calls.rs`'s body-substitution inlining
+   (an earlier draft of this entry and of DESIGN.md's own section
+   claimed that; `elaborate.rs`'s own doc comment is explicit that list
+   recursion is "a REAL interpreter... not a splice-and-compile pass
+   like `firrtl::calls`'s ordinary callee inlining" — corrected once
+   actually checked against source, see advisor's catch). `_` resolves
+   via a `placeholder: Option<&ElabValue>` threaded through the whole
+   `eval_elab_expr` family; requires exactly one `_` in the closure
+   argument, checked before evaluating (`count_wildcards`). Composes
+   with existing list consumers for free — `AdderTree(xs.map(Double(_)))`
+   needed zero changes to `AdderTree` itself.
+2. **A `let`-bound closure, callable later, possibly more than once**
+   (`let f = Add(_, 5); r1 := f(x); r2 := f(x + 1)`,
+   `examples/closure_let.tr`, `closure_let_runs_through_real_ports`; also
+   proven crossing a `<sequences>` `tick`,
+   `examples/closure_let_sequences.tr`). Lumi picked this fuller scope
+   over the narrower call-site-only alternative after being asked
+   explicitly which was wanted. NEITHER of the two mechanisms originally
+   proposed for this (not `map`'s interpreter-placeholder, not `calls.rs`
+   substitution — the latter is callee-local-only AND only fires at read
+   sites, so it can't give an unused closure zero effect the way this
+   needed) — a FOURTH, new mechanism instead: `closures.rs`, an entirely
+   new, EARLIEST pipeline stage (ahead of the first `effects::check`)
+   that erases every closure-shaped `let` from the source text outright.
+   A bare read (`xs.map(f)`) splices the body VERBATIM, `_` intact — the
+   thing that makes `xs.map(f)` and `xs.map(Add(_, 5))` the same program,
+   so `map`'s own builtin needs zero awareness a closure-local was ever
+   involved. A call (`f(3)`) splices with `_` replaced by that call's own
+   argument, positionally, arity-checked first. `f := ...` is a clean
+   `resolve.rs`-level error (`Resolution::closure_inits`).
+   **Side effect: closed a pre-existing, unrelated gap** — `--firrtl`
+   never actually chained `elaborate`/`lower` before this (every
+   `<elaborates>` example hard-errored through the CLI even though
+   `cargo test` already proved the passes worked); needing a real
+   chained path for closures at all is what finally closed it.
+   `pipeline.rs` (new: `resolve_src`/`check`/`splice_closures`/
+   `splice_elaborate`/`splice_lower`/`schedule_checked`/`emit`) is the
+   ONE shared implementation both `main.rs` and `tests/sim.rs` now call,
+   specifically so the CLI path and the tested path can't silently
+   diverge (this was `devenv.nix`'s `simulate` script's own exposure:
+   three separate `cargo run` invocations, now collapsed to one
+   `--firrtl` call that chains internally).
 
 Still not started. Known open items, not yet designed:
 - The `<sequences>`-loop (runtime-length) consumer, e.g. a `fold`/`drain`
-  over a fifo's unknown occupancy — reuses `while`'s own render-source-
-  text-and-re-run-the-pipeline trick, NOT what `map` uses (`map`'s
-  elaboration-time list is a different mechanism entirely, per the
-  correction above). Its natural accumulator is exactly the shape
-  `while` currently rejects (a captured local written across the loop
-  boundary must target module state only) — v1 would have to require an
-  explicit `reg`/`out` target instead of an implicit accumulator; lifting
-  the underlying `while` restriction is separate, unscoped work.
-- Partial application (`Add(_, 5)` as a standalone value) and a closure
-  bound to a callable `let`-local (`let f = Add(_, 5); f(3)`, reusing
-  `calls.rs`'s callee-local substitution) are both still just design, not
-  code — `map`'s own `_` only ever resolves inside ITS OWN closure
-  argument today, nothing more general yet.
+  over a fifo's unknown occupancy — would reuse `while`'s own render-
+  source-text-and-re-run-the-pipeline trick, a DIFFERENT mechanism from
+  both `map`'s and the `let`-bound closure's own (three genuinely
+  different implementations under one surface syntax, now that this
+  much is built — worth remembering, not assuming one generalizes
+  another). Its natural accumulator is exactly the shape `while`
+  currently rejects (a captured local written across the loop boundary
+  must target module state only) — v1 would have to require an explicit
+  `reg`/`out` target instead of an implicit accumulator; lifting the
+  underlying `while` restriction is separate, unscoped work.
 - The rest of the combinator library (`fold`/`zip`/`drain` names,
   arities, signatures) is not designed — only `map` is built.
 - Threading a closure argument through an intermediate USER-defined `fn`

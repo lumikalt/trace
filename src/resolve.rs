@@ -150,6 +150,14 @@ pub struct Resolution {
     /// `reads`, say) — the def is still real and still worth hovering,
     /// independent of whether using it there is legal.
     pub effect_arg_defs: HashMap<Span, DefId>,
+    /// A `let`-bound local whose init expression contains `_`
+    /// (`Expr::Wildcard`) -- a closure, per DESIGN.md's "Closures and
+    /// partial application": maps the local's own `DefId` to its
+    /// (unevaluated) init expression, the closure's body. Populated here
+    /// rather than left for `closures.rs` to rediscover, since a
+    /// closure-shaped local also needs rejecting on `:=` reassignment
+    /// (`Stmt::Assign`'s arm below) -- one check, two consumers.
+    pub closure_inits: HashMap<DefId, ExprId>,
 }
 
 impl Resolution {
@@ -183,6 +191,16 @@ impl Resolution {
 /// each re-deriving "is this guard-like," the same rationale fifo.rs's
 /// `rule_fifo_ops` documents for fifo-touch questions: independent
 /// re-derivations drift out of agreement with each other.
+/// Whether `id`'s own expression tree contains a `_` (`Expr::Wildcard`)
+/// anywhere -- what makes a `let`'s init a closure body rather than an
+/// ordinary value (DESIGN.md's "Closures and partial application").
+fn contains_wildcard(ast: &Ast, id: ExprId) -> bool {
+    matches!(ast.expr(id), Expr::Wildcard)
+        || crate::lower::sub_exprs(ast, id)
+            .into_iter()
+            .any(|child| contains_wildcard(ast, child))
+}
+
 pub fn is_guard_like(ast: &Ast, res: &Resolution, expr: ExprId) -> bool {
     match ast.expr(expr) {
         Expr::Guard(_) => true,
@@ -907,6 +925,15 @@ impl<'a> Resolver<'a> {
                                              `let {text} = ...` inside this rule to shadow it)"
                                         ),
                                     );
+                                } else if self.res.closure_inits.contains_key(&def) {
+                                    self.error(
+                                        self.ast.expr_spans[lhs.0 as usize].clone(),
+                                        format!(
+                                            "cannot assign to `{text}`: it is a closure \
+                                             (its `let` binds a template, not a value); use \
+                                             `{text}(...)` to call it"
+                                        ),
+                                    );
                                 }
                                 self.res.expr_defs.insert(lhs, def);
                             }
@@ -927,6 +954,9 @@ impl<'a> Resolver<'a> {
                 self.resolve_expr(init, false);
                 let def = self.declare(&name, DefKind::Local);
                 self.declared_locals.push((def, name));
+                if contains_wildcard(self.ast, init) {
+                    self.res.closure_inits.insert(def, init);
+                }
             }
             Stmt::Tick => {}
             Stmt::Break => {}

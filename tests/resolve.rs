@@ -98,6 +98,21 @@ fn assigning_to_a_bare_builtin_name_is_a_clear_error_not_a_silent_no_op() {
 }
 
 #[test]
+fn reassigning_a_closure_local_is_a_clear_error() {
+    // A closure-shaped `let` (its init contains `_`) is a template, not a
+    // value -- `closures.rs`'s own text-splice pass erases it entirely
+    // before anything else runs, so there is no "which binding applies at
+    // this call site" answer a `:=` reassignment could ever mean.
+    let (_, _, errors) = run(
+        "Add(a : [8], b : [8]) : [8] <combines> {\n return a + b\n}\n\
+         rule r {\n let f = Add(_, 5)\n f := Add(_, 6)\n}\n",
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("cannot assign to `f`"));
+    assert!(errors[0].message.contains("closure"));
+}
+
+#[test]
 fn a_local_reg_or_param_named_after_a_builtin_shadows_it_cleanly() {
     run_ok("rule r {\n let max = 5\n}\n");
     run_ok("module M {\n reg max : [8] = 0\n rule r {\n max := max + 1\n }\n}\n");

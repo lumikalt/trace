@@ -1,7 +1,6 @@
 use ariadne::{Label, Report, ReportKind, Source};
-use trace::{
-    bounds, effects, elaborate, firrtl, fmt, lexer, lower, parser, resolve, schedule, types,
-};
+use trace::pipeline::{self, StageError};
+use trace::{fmt, lexer, parser, resolve};
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -9,6 +8,7 @@ fn main() -> std::process::ExitCode {
         return trace::lsp::run();
     }
     let explain = args.iter().any(|a| a == "--explain-schedule");
+    let show_closures = args.iter().any(|a| a == "--closures");
     let show_elaborate = args.iter().any(|a| a == "--elaborate");
     let show_lower = args.iter().any(|a| a == "--lower");
     let show_firrtl = args.iter().any(|a| a == "--firrtl");
@@ -19,8 +19,8 @@ fn main() -> std::process::ExitCode {
         .find(|a| !a.starts_with('-') || a.as_str() == "-")
     else {
         eprintln!(
-            "usage: trace <file.tr | -> [--explain-schedule] [--elaborate] [--lower] \
-             [--firrtl] [--fmt [--write]]\n       trace --lsp"
+            "usage: trace <file.tr | -> [--explain-schedule] [--closures] [--elaborate] \
+             [--lower] [--firrtl] [--fmt [--write]]\n       trace --lsp"
         );
         return std::process::ExitCode::FAILURE;
     };
@@ -74,7 +74,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    if !explain && !show_elaborate && !show_lower && !show_firrtl {
+    if !explain && !show_closures && !show_elaborate && !show_lower && !show_firrtl {
         print!("{}", ast.dump());
     }
 
@@ -86,76 +86,81 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    for err in &effect_errors {
-        report(&path, &src, err.span.clone(), &err.message);
-    }
-    if !effect_errors.is_empty() {
-        return std::process::ExitCode::FAILURE;
+    // Every stage from here on is a splice-and-reparse round trip
+    // (closures -> elaborate -> lower), each producing real trace SOURCE
+    // text that the next stage's `check` re-runs the whole frontend
+    // over — `pipeline.rs` is the ONE place this chain lives, shared
+    // with `tests/sim.rs`'s own use of it, so this CLI path and the
+    // tested path can never silently diverge (this is also, as of this
+    // change, the first time `--firrtl` has ever actually run past
+    // `resolve`/`effects` on the ORIGINAL source — every `<elaborates>`/
+    // closure-using example used to hard-error here, a pre-existing gap
+    // this closes rather than a regression).
+    let resolved = pipeline::Resolved { ast, res };
+
+    let closures_src = match pipeline::splice_closures(&resolved, &src) {
+        Ok(s) => s,
+        Err(errs) => return fail(&path, &src, &errs),
+    };
+    if show_closures {
+        print!("{closures_src}");
+        return std::process::ExitCode::SUCCESS;
     }
 
+    let checked1 = match pipeline::check(&closures_src) {
+        Ok(c) => c,
+        Err(errs) => return fail(&path, &closures_src, &errs),
+    };
+
+    let elaborated_src = match pipeline::splice_elaborate(&checked1, &closures_src) {
+        Ok(s) => s,
+        Err(errs) => return fail(&path, &closures_src, &errs),
+    };
     if show_elaborate {
-        let (edits, elab_errors) = elaborate::plan(&ast, &res, &fx, &src);
-        for err in &elab_errors {
-            report(&path, &src, err.span.clone(), &err.message);
-        }
-        if !elab_errors.is_empty() {
-            return std::process::ExitCode::FAILURE;
-        }
-        print!("{}", elaborate::render(&src, &edits));
+        print!("{elaborated_src}");
         return std::process::ExitCode::SUCCESS;
     }
 
-    let (ty, type_errors) = types::check(&ast, &res, &fx);
-    for err in &type_errors {
-        report(&path, &src, err.span.clone(), &err.message);
-    }
-    if !type_errors.is_empty() {
-        return std::process::ExitCode::FAILURE;
-    }
+    let checked2 = match pipeline::check(&elaborated_src) {
+        Ok(c) => c,
+        Err(errs) => return fail(&path, &elaborated_src, &errs),
+    };
 
+    let lowered_src = match pipeline::splice_lower(&checked2, &elaborated_src) {
+        Ok(s) => s,
+        Err(errs) => return fail(&path, &elaborated_src, &errs),
+    };
     if show_lower {
-        let (lowered, lower_errors) = lower::plan(&ast, &res, &fx, &ty);
-        for err in &lower_errors {
-            report(&path, &src, err.span.clone(), &err.message);
-        }
-        if !lower_errors.is_empty() {
-            return std::process::ExitCode::FAILURE;
-        }
-        print!("{}", lower::render(&ast, &src, &lowered));
+        print!("{lowered_src}");
         return std::process::ExitCode::SUCCESS;
     }
 
-    let (bounds, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
-    for err in &bounds_errors {
-        report(&path, &src, err.span.clone(), &err.message);
-    }
-    if !bounds_errors.is_empty() {
-        return std::process::ExitCode::FAILURE;
-    }
+    let checked3 = match pipeline::check(&lowered_src) {
+        Ok(c) => c,
+        Err(errs) => return fail(&path, &lowered_src, &errs),
+    };
 
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &bounds);
-    for err in &schedule_errors {
-        report(&path, &src, err.span.clone(), &err.message);
-    }
-    if !schedule_errors.is_empty() {
-        return std::process::ExitCode::FAILURE;
-    }
+    let scheduled = match pipeline::schedule_checked(&checked3) {
+        Ok(s) => s,
+        Err(errs) => return fail(&path, &lowered_src, &errs),
+    };
     if explain {
-        print!("{}", sched.explain(&ast, &res));
+        print!("{}", scheduled.sched.explain(&checked3.ast, &checked3.res));
     }
     if show_firrtl {
-        match firrtl::emit(&ast, &res, &fx, &ty, &sched) {
+        match pipeline::emit(&checked3, &scheduled) {
             Ok(text) => print!("{text}"),
-            Err(errs) => {
-                for err in &errs {
-                    report(&path, &src, err.span.clone(), &err.message);
-                }
-                return std::process::ExitCode::FAILURE;
-            }
+            Err(errs) => return fail(&path, &lowered_src, &errs),
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+fn fail(path: &str, src: &str, errors: &[StageError]) -> std::process::ExitCode {
+    for e in errors {
+        report(path, src, e.span.clone(), &e.message);
+    }
+    std::process::ExitCode::FAILURE
 }
 
 /// Splits a trailing hint clause (`"...; use \`trunc(value, 8)\`"`) off a

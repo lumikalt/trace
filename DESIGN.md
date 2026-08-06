@@ -2849,15 +2849,25 @@ but the AST node it used to name is still synthesized internally by every
 
 ## Closures and partial application (planned)
 
-**First slice shipped (2026-08-06): `map` over an elaboration-time `list`,
-proven through real firtool + Icarus simulation** — see Part 3's own
-"Implementation status" entry and `examples/map_double.tr`. The `_`-as-
-elided-parameter mechanism and scoping rule below are real, not
-hypothetical, for that ONE consumer. Everything else in this section —
-partial application, a closure bound to a callable `let`-local, and the
-`<sequences>`-loop (runtime-length) consumer — is still unbuilt; the
-mechanism/effect-inference discussion below covers the FULL design, not
-just the shipped slice.
+**Two of three consumers shipped (2026-08-06), both proven through real
+firtool + Icarus simulation** — see Part 3's own "Implementation status"
+entries:
+- `map` over an elaboration-time `list` (`examples/map_double.tr`) —
+  `_` resolved via `elaborate.rs`'s own interpreter-level `placeholder`.
+- A `let`-bound closure, callable later, possibly more than once
+  (`examples/closure_let.tr`, `examples/closure_let_sequences.tr`) —
+  `_` resolved via a NEW, separate text-splice pass (`closures.rs`),
+  chained into the compiler's own pipeline (`pipeline.rs`) ahead of
+  every other stage. This is genuinely NOT the same mechanism `map` uses
+  (see "Effect inference" below, corrected once this was actually built)
+  — the surface syntax is one thing, but there is no single shared
+  runtime for it underneath.
+
+Still unbuilt: the `<sequences>`-loop (runtime-length) consumer, and the
+rest of the combinator library beyond `map` itself. The mechanism/effect-
+inference discussion below covers the FULL original design, not just the
+shipped slices — read each claim against Part 3's own status list before
+trusting it describes shipped behavior.
 
 Grew out of wanting Chisel-style elaboration-time hardware generation
 (`xs.map(...)`-shaped combinators building N pieces of hardware from a
@@ -2943,15 +2953,52 @@ instead of erroring. `Add(5)` alone, with no `_` anywhere, stays a plain
 arity error, exactly as today; every elided argument needs its own explicit
 `_`.
 
-`let`-bound closures reuse existing machinery outright, not new binding
-resolution: `let f = Add(_, 5)` is an ordinary callee-local, and every read
-of `f` already resolves by substituting its ORIGINAL binding expression at
-the use site — precisely what "Calling a function from a rule" above already
-documents for `self.locals` (`let z = x; x := x + 1; return z` resolving `z`
-by re-substituting its binding, not by snapshotting a value). A
-closure-valued local is just one more shape that substitution already knows
-how to carry; `xs.map(f)` expands to `xs.map(Add(_, 5))` before anything
-effect-checks it.
+**Correction (2026-08-06, caught by `advisor` before any code): a `let`-
+bound closure does NOT "reuse existing machinery outright" the way an
+earlier draft of this paragraph claimed.** `self.locals` substitution
+(`firrtl/calls.rs`) only ever fires at a READ site; it says nothing about
+the DECLARATION site, and `let f = Add(_, 5)` still has to pass through
+types.rs/effects.rs/bounds.rs's ordinary, EAGER `Stmt::Let` handling
+first — every one of which would walk `Add(_, 5)` immediately, with `_`
+an unbound hole, exactly the same shape the `map`/`calls.rs` mixup earlier
+in this section was.
+
+**Shipped (2026-08-06), and not via deferred checking in three passes —
+a fourth compiler pass instead.** Lumi chose the fuller scope (a closure
+callable later, possibly more than once: `let f = Add(_, 5); r1 := f(3);
+r2 := f(7)`, a genuinely useful HDL-template idiom) over the narrower
+call-site-only alternative. Rather than teach types.rs/effects.rs/
+bounds.rs each to skip a closure-shaped `let` and re-check a substituted
+result at every call site, `closures.rs` is a NEW, EARLIEST pipeline
+stage (`pipeline.rs`, ahead of the first `effects::check`) that ERASES
+every closure-shaped `let` from the source text entirely — same
+text-splice-then-reparse idiom `elaborate.rs`'s own list recursion and
+`while`'s bare-condition support already use, a third application of it,
+applied to a construct that isn't `<elaborates>`-specific at all. Two
+splice shapes: a bare read (`xs.map(f)`) substitutes the closure body
+VERBATIM, `_` intact (this is what makes `xs.map(f)` and `xs.map(Add(_,
+5))` the identical program, so `elaborate.rs`'s own `map` builtin needs
+zero awareness a closure-local was ever involved); a call (`f(3)`)
+substitutes each `_` with that call's own argument, positionally, arity-
+checked first (a closure taking N `_`s called with anything but N
+arguments is a plain arity error, matching the arity-is-a-hard-boundary
+culture cited above). The `let` itself is always deleted outright, not
+left behind — this is what gives an UNUSED closure zero effect for
+free: nothing ever walks `Add(_, 5)` as a value-computing statement,
+because after this pass it simply isn't there.
+
+`map`'s own `_` (`elaborate.rs`'s interpreter-level `placeholder`) and a
+`let`-bound closure's `_` (`closures.rs`'s text substitution) are
+confirmed, now that both are built, to be genuinely DIFFERENT mechanisms
+under one surface syntax, not one generalizing the other — stated
+explicitly so a future reader doesn't assume otherwise. `f := ...`
+(reassigning a closure-shaped local) is a clean `resolve.rs`-level error
+(`Resolution::closure_inits`, checked alongside the existing Input/Io/
+Inst/Builtin write-rejections) — there is no "which binding applies at
+this call site" answer under pure text substitution, so this is rejected
+rather than given some ad hoc meaning. Threading a closure argument
+through an intermediate USER-defined `fn` parameter is still open — see
+TODO.md.
 
 ### Effect inference: no new algorithm, two lowering shapes
 
@@ -2987,13 +3034,21 @@ render` already use for `<sequences>` lowering." So:
   multi-cycle loops" above) — the closure body becomes the loop body text,
   then parse/resolve/effects/types/emit all re-run on it unmodified.
 
-`calls.rs`'s body-substitution inlining is the relevant reused mechanism
-only for a closure bound to a CALLEE-local and invoked directly (`let f =
-Add(_, 5); return f(3)` inside a `fn`/`impl` body) — and only there, since
-`self.locals`-style substitution is callee-local-only; a RULE-level `let`
-uses the separate position-snapshot machinery instead (see "Locals"), which
-does not resolve by re-substituting a binding's original expression the
-same way.
+**Correction, now that a `let`-bound closure is actually built: it is
+NEITHER of the two mechanisms this paragraph originally proposed.** Not
+`elaborate.rs`'s `map`-style interpreter (that's `<elaborates>`-only; a
+`let`-bound closure needs to work in `<combines>`/`<sequences>` code
+too), and not `calls.rs`'s `self.locals` substitution either (that's
+callee-local-only and, more fundamentally, only ever fires at a READ
+site — it says nothing about the DECLARATION site, and every other pass
+walks a `let`'s init EAGERLY, which would either choke on `_` or
+silently fold the callee's effects in even when the closure is never
+called). The actual mechanism is a FOURTH one: `closures.rs`, a new,
+earliest pipeline stage that erases every closure-shaped `let` from the
+source text outright before anything else ever runs — see this
+section's own status note at the top, and "Partial application" above,
+for what's shipped and why deferred checking in three passes was
+rejected in favor of this.
 
 **Open interaction, not yet resolved:** today's `while` may only write
 module state directly, never a captured local (see "`while`: multi-cycle
@@ -3006,10 +3061,12 @@ restriction itself is a separate, unscoped effort, not assumed solved here.
 
 ### Not designed here
 
-- The concrete combinator library itself (`map`/`fold`/`zip`/`drain` names,
-  arities, exact signatures) — this section commits to the closure/
-  partial-application mechanism and the effect-inference strategy
-  underneath it, not the specific combinators built on top.
+- The `<sequences>`-loop (runtime-length) consumer itself, e.g. a `fold`/
+  `drain` over a fifo's unknown occupancy — the "Open interaction" above
+  (the `while`-loop accumulator restriction) is unresolved, and no
+  concrete surface syntax for this consumer has been designed at all.
+- The rest of the combinator library beyond `map` (`fold`/`zip`/`drain`
+  names, arities, exact signatures).
 - Threading a closure argument through an intermediate USER-defined `fn`
   parameter (a trace-authored higher-order function, not a builtin) —
   plausibly the same param chase-through "Calling a function: inlining"
@@ -7423,10 +7480,34 @@ adder_tree.tr`, DESIGN.md's own `AdderTree`).
   always supplies exactly one element per call). The result is an
   ordinary `ElabValue::List`, composing into any existing list consumer
   (`AdderTree`) with no changes there at all (`examples/map_double.tr`,
-  `AdderTree(xs.map(Double(_)))`). Partial application, closures as
-  callable `let`-bound locals, and the `<sequences>`-loop (runtime-
-  length) consumer are still unbuilt — see that section's own "Not
-  designed here" and TODO.md.
+  `AdderTree(xs.map(Double(_)))`). The `<sequences>`-loop (runtime-
+  length) consumer is still unbuilt — see that section's own TODO.md
+  entry.
+- A `let`-bound closure, callable later — possibly more than once — a
+  SEPARATE new pipeline stage (`closures.rs`, chained via `pipeline.rs`
+  ahead of every other stage), not the same mechanism `map` uses: it
+  erases every closure-shaped `let` from the source text outright,
+  splicing a bare read verbatim (`_` intact — what makes `xs.map(f)` and
+  `xs.map(Add(_, 5))` the same program) and a call with `_` replaced by
+  that call's own argument, positionally, arity-checked first
+  (`examples/closure_let.tr`, `let f = Add(_, 5); r1 := f(x); r2 :=
+  f(x + 1)`, two independent results from one closure). Proven inside a
+  `<sequences>` rule crossing a `tick` too (`examples/
+  closure_let_sequences.tr`) — the closure is already gone before
+  `lower.rs`'s own multi-segment lowering ever runs, so there is nothing
+  left for `compute_captures` to trip over. `f := ...` (reassigning a
+  closure-shaped local) is a clean `resolve.rs`-level error
+  (`Resolution::closure_inits`). Building this also closed a
+  PRE-EXISTING gap unrelated to closures themselves: `--firrtl` never
+  actually ran `elaborate`/`lower` before this — every `<elaborates>`
+  example (`AdderTree` included) hard-errored through the CLI even
+  though `cargo test` already proved the underlying passes worked;
+  `pipeline.rs` (a new shared staged-compile helper, used by both
+  main.rs and `tests/sim.rs`, so the CLI path and the tested path can't
+  silently diverge) closes it as a side effect of needing a real chained
+  path for closures at all. Threading a closure argument through an
+  intermediate USER-defined `fn` parameter is still unbuilt — see
+  TODO.md.
 - General `struct` types: declaration, exhaustive-field-checked
   construction, whole-value read/write, arbitrary nesting (a struct field
   may itself be a struct, cycle-rejected), flattened to N plain

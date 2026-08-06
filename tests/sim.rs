@@ -14,84 +14,56 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use trace::{bounds, effects, elaborate, lexer, lower, parser, resolve, schedule, types};
+use trace::pipeline::{self, StageError};
 
 fn tool_available(name: &str) -> bool {
     Command::new(name).arg("--version").output().is_ok()
 }
 
+/// The same staged chain `main.rs`'s own `--firrtl` now runs, via
+/// `pipeline.rs` — kept as one shared implementation specifically so
+/// this, the actual proof the chain produces working hardware, can never
+/// silently diverge from what the CLI does (see `pipeline.rs`'s own doc
+/// comment).
 fn generate_firrtl(tr_src: &str) -> String {
-    let (tokens, lex_errors) = lexer::lex(tr_src);
-    assert!(lex_errors.is_empty(), "{lex_errors:?}");
-    let (ast, parse_errors) = parser::parse(tr_src, &tokens);
-    assert!(parse_errors.is_empty(), "{parse_errors:?}");
-    let (res, resolve_errors) = resolve::resolve(&ast);
-    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (_ty, type_errors) = types::check(&ast, &res, &fx);
-    assert!(type_errors.is_empty(), "{type_errors:?}");
+    fn ok<T>(result: Result<T, Vec<StageError>>, src: &str) -> T {
+        result.unwrap_or_else(|errs| panic!("{errs:?}\n{src}"))
+    }
 
-    let (elab_edits, elab_errors) = elaborate::plan(&ast, &res, &fx, tr_src);
-    assert!(elab_errors.is_empty(), "{elab_errors:?}");
-    let elaborated_src = elaborate::render(tr_src, &elab_edits);
+    let resolved = ok(pipeline::resolve_src(tr_src), tr_src);
+    let closures_src = ok(pipeline::splice_closures(&resolved, tr_src), tr_src);
 
-    let (tokens1, lex_errors1) = lexer::lex(&elaborated_src);
-    assert!(lex_errors1.is_empty(), "{lex_errors1:?}\n{elaborated_src}");
-    let (ast1, parse_errors1) = parser::parse(&elaborated_src, &tokens1);
-    assert!(
-        parse_errors1.is_empty(),
-        "{parse_errors1:?}\n{elaborated_src}"
-    );
-    let (res1, resolve_errors1) = resolve::resolve(&ast1);
-    assert!(
-        resolve_errors1.is_empty(),
-        "{resolve_errors1:?}\n{elaborated_src}"
-    );
-    let (fx1, effect_errors1) = effects::check(&ast1, &res1);
-    assert!(
-        effect_errors1.is_empty(),
-        "{effect_errors1:?}\n{elaborated_src}"
-    );
-    let (ty1, type_errors1) = types::check(&ast1, &res1, &fx1);
-    assert!(
-        type_errors1.is_empty(),
-        "{type_errors1:?}\n{elaborated_src}"
+    let checked1 = ok(pipeline::check(&closures_src), &closures_src);
+    let elaborated_src = ok(
+        pipeline::splice_elaborate(&checked1, &closures_src),
+        &closures_src,
     );
 
-    let (lowered, lower_errors) = lower::plan(&ast1, &res1, &fx1, &ty1);
-    assert!(lower_errors.is_empty(), "{lower_errors:?}");
-    let lowered_src = lower::render(&ast1, &elaborated_src, &lowered);
-
-    let (tokens2, lex_errors2) = lexer::lex(&lowered_src);
-    assert!(lex_errors2.is_empty(), "{lex_errors2:?}\n{lowered_src}");
-    let (ast2, parse_errors2) = parser::parse(&lowered_src, &tokens2);
-    assert!(parse_errors2.is_empty(), "{parse_errors2:?}\n{lowered_src}");
-    let (res2, resolve_errors2) = resolve::resolve(&ast2);
-    assert!(
-        resolve_errors2.is_empty(),
-        "{resolve_errors2:?}\n{lowered_src}"
-    );
-    let (fx2, effect_errors2) = effects::check(&ast2, &res2);
-    assert!(
-        effect_errors2.is_empty(),
-        "{effect_errors2:?}\n{lowered_src}"
-    );
-    let (ty2, type_errors2) = types::check(&ast2, &res2, &fx2);
-    assert!(type_errors2.is_empty(), "{type_errors2:?}\n{lowered_src}");
-    let (b2, bounds_errors2) = bounds::check(&ast2, &res2, &fx2, &ty2);
-    assert!(
-        bounds_errors2.is_empty(),
-        "{bounds_errors2:?}\n{lowered_src}"
-    );
-    let (sched2, schedule_errors2) = schedule::schedule(&ast2, &res2, &fx2, &ty2, &b2);
-    assert!(
-        schedule_errors2.is_empty(),
-        "{schedule_errors2:?}\n{lowered_src}"
+    let checked2 = ok(pipeline::check(&elaborated_src), &elaborated_src);
+    let lowered_src = ok(
+        pipeline::splice_lower(&checked2, &elaborated_src),
+        &elaborated_src,
     );
 
-    trace::firrtl::emit(&ast2, &res2, &fx2, &ty2, &sched2)
-        .unwrap_or_else(|e| panic!("emission failed: {e:?}"))
+    let checked3 = ok(pipeline::check(&lowered_src), &lowered_src);
+    let scheduled = ok(pipeline::schedule_checked(&checked3), &lowered_src);
+
+    ok(pipeline::emit(&checked3, &scheduled), &lowered_src)
+}
+
+/// Same as `generate_firrtl`, minus the closures/elaborate/lower splice
+/// stages — for an example that doesn't use either feature, going
+/// straight from `check` to `schedule`/`emit` is the same result and
+/// several dozen fewer lines per call site than repeating the same
+/// three-stage chain inline (this file used to, six times).
+fn generate_firrtl_no_splice(tr_src: &str) -> String {
+    fn ok<T>(result: Result<T, Vec<StageError>>, src: &str) -> T {
+        result.unwrap_or_else(|errs| panic!("{errs:?}\n{src}"))
+    }
+
+    let checked = ok(pipeline::check(tr_src), tr_src);
+    let scheduled = ok(pipeline::schedule_checked(&checked), tr_src);
+    ok(pipeline::emit(&checked, &scheduled), tr_src)
 }
 
 /// `disable_opt`: a port-less module (SUBLEQ, via hierarchical-path
@@ -600,22 +572,7 @@ fn extmodule_tribuf_runs_a_real_bidirectional_bus() {
         "/examples/extmodule_tribuf.tr"
     ))
     .unwrap();
-    let (tokens, lex_errors) = lexer::lex(&src);
-    assert!(lex_errors.is_empty(), "{lex_errors:?}");
-    let (ast, parse_errors) = parser::parse(&src, &tokens);
-    assert!(parse_errors.is_empty(), "{parse_errors:?}");
-    let (res, resolve_errors) = resolve::resolve(&ast);
-    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res, &fx);
-    assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
-    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
-    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
-    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
-        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+    let fir = generate_firrtl_no_splice(&src);
 
     let verilog = firrtl_to_verilog(&fir, false);
     let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/extmodule_tribuf_tb.v");
@@ -643,22 +600,7 @@ fn accumulator_runs_through_real_ports() {
         "/examples/accumulator.tr"
     ))
     .unwrap();
-    let (tokens, lex_errors) = lexer::lex(&src);
-    assert!(lex_errors.is_empty(), "{lex_errors:?}");
-    let (ast, parse_errors) = parser::parse(&src, &tokens);
-    assert!(parse_errors.is_empty(), "{parse_errors:?}");
-    let (res, resolve_errors) = resolve::resolve(&ast);
-    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res, &fx);
-    assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
-    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
-    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
-    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
-        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+    let fir = generate_firrtl_no_splice(&src);
 
     let verilog = firrtl_to_verilog(&fir, false);
     let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/accumulator_tb.v");
@@ -693,22 +635,7 @@ fn optional_rule_sugar_runs_through_real_reset_and_edges() {
         "/examples/optional_rule.tr"
     ))
     .unwrap();
-    let (tokens, lex_errors) = lexer::lex(&src);
-    assert!(lex_errors.is_empty(), "{lex_errors:?}");
-    let (ast, parse_errors) = parser::parse(&src, &tokens);
-    assert!(parse_errors.is_empty(), "{parse_errors:?}");
-    let (res, resolve_errors) = resolve::resolve(&ast);
-    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res, &fx);
-    assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
-    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
-    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
-    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
-        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+    let fir = generate_firrtl_no_splice(&src);
 
     let verilog = firrtl_to_verilog(&fir, false);
     let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/optional_rule_tb.v");
@@ -745,22 +672,7 @@ fn optional_chain_sugar_runs_through_a_genuinely_absent_intermediate_hop() {
         "/examples/optional_chain.tr"
     ))
     .unwrap();
-    let (tokens, lex_errors) = lexer::lex(&src);
-    assert!(lex_errors.is_empty(), "{lex_errors:?}");
-    let (ast, parse_errors) = parser::parse(&src, &tokens);
-    assert!(parse_errors.is_empty(), "{parse_errors:?}");
-    let (res, resolve_errors) = resolve::resolve(&ast);
-    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res, &fx);
-    assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
-    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
-    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
-    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
-        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+    let fir = generate_firrtl_no_splice(&src);
 
     let verilog = firrtl_to_verilog(&fir, false);
     let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/optional_chain_tb.v");
@@ -2349,6 +2261,68 @@ fn map_double_runs_through_real_ports() {
     );
 }
 
+/// Proves DESIGN.md's "Closures and partial application" `let`-bound-
+/// closure example through real firtool and Icarus: `closures.rs`'s
+/// text-splice pass erases `let f = Add(_, 5)` entirely, splicing each
+/// of its two call sites (`f(x)`, `f(x + 1)`) with `_` replaced by that
+/// call's own argument -- proving the SAME closure, called twice with
+/// different arguments, produces two independent, correctly-wrapping
+/// results, see sim/closure_let_tb.v.
+#[test]
+fn closure_let_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/closure_let.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/closure_let_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
+/// Proves a closure-shaped `let` inside a `<sequences>` rule body,
+/// called once before a `tick` and once after, through real firtool and
+/// Icarus -- the empirical proof (per advisor's explicit flag while
+/// designing this feature) that `closures.rs`'s pass erasing the `let`
+/// entirely, before `lower.rs`'s own multi-segment lowering ever runs,
+/// really does leave `compute_captures` (the write-once/read-in-later-
+/// segments invariant) nothing to trip over, rather than just reasoning
+/// that it should. See sim/closure_let_sequences_tb.v.
+#[test]
+fn closure_let_sequences_runs_through_real_cycles() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/closure_let_sequences.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sim/closure_let_sequences_tb.v"
+    );
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves `logic <expr>` end to end: `examples/logic_probe.tr`'s `probe`
 /// rule reads a fifo's occupancy and a guard-only `<fails>` call's
 /// condition as plain status outputs, with neither side effect (no real
@@ -2862,22 +2836,7 @@ fn accumulator_runs_through_real_ports_under_verilator() {
         "/examples/accumulator.tr"
     ))
     .unwrap();
-    let (tokens, lex_errors) = lexer::lex(&src);
-    assert!(lex_errors.is_empty(), "{lex_errors:?}");
-    let (ast, parse_errors) = parser::parse(&src, &tokens);
-    assert!(parse_errors.is_empty(), "{parse_errors:?}");
-    let (res, resolve_errors) = resolve::resolve(&ast);
-    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res, &fx);
-    assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
-    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
-    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
-    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
-        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+    let fir = generate_firrtl_no_splice(&src);
 
     let verilog = firrtl_to_verilog(&fir, false);
     let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/accumulator_tb.v");
@@ -2942,22 +2901,7 @@ fn extmodule_tribuf_runs_a_real_bidirectional_bus_under_verilator() {
         "/examples/extmodule_tribuf.tr"
     ))
     .unwrap();
-    let (tokens, lex_errors) = lexer::lex(&src);
-    assert!(lex_errors.is_empty(), "{lex_errors:?}");
-    let (ast, parse_errors) = parser::parse(&src, &tokens);
-    assert!(parse_errors.is_empty(), "{parse_errors:?}");
-    let (res, resolve_errors) = resolve::resolve(&ast);
-    assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
-    let (fx, effect_errors) = effects::check(&ast, &res);
-    assert!(effect_errors.is_empty(), "{effect_errors:?}");
-    let (ty, type_errors) = types::check(&ast, &res, &fx);
-    assert!(type_errors.is_empty(), "{type_errors:?}");
-    let (b, bounds_errors) = bounds::check(&ast, &res, &fx, &ty);
-    assert!(bounds_errors.is_empty(), "{bounds_errors:?}");
-    let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, &b);
-    assert!(schedule_errors.is_empty(), "{schedule_errors:?}");
-    let fir = trace::firrtl::emit(&ast, &res, &fx, &ty, &sched)
-        .unwrap_or_else(|e| panic!("emission failed: {e:?}"));
+    let fir = generate_firrtl_no_splice(&src);
 
     let verilog = firrtl_to_verilog(&fir, false);
     let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/extmodule_tribuf_tb.v");

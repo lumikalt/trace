@@ -1,0 +1,26 @@
+-- A closure-shaped `let` inside a `<sequences>` rule body, crossing a
+-- `tick`: `closures.rs`'s own text-splice pass erases the `let` and
+-- splices both call sites (`f(x)` before the tick, `f(y)` after)
+-- BEFORE `lower.rs`'s own multi-segment lowering ever runs, so there is
+-- no closure-shaped local left for `compute_captures` (the write-once/
+-- read-in-later-segments invariant) to reason about at all -- this
+-- example exists specifically to prove that empirically, through a real
+-- multi-cycle simulation, rather than leave it as reasoned-about-but-
+-- untested. See sim/closure_let_sequences_tb.v.
+Add(a : [8], b : [8]) : [8] <combines> {
+    return a + b
+}
+
+module Top {
+    in x : [8]
+    in y : [8]
+    out r1 : [8] = 0
+    out r2 : [8] = 0
+
+    rule step <sequences> {
+        let f = Add(_, 5)
+        r1 := f(x)
+        tick
+        r2 := f(y)
+    }
+}

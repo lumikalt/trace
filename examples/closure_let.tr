@@ -1,0 +1,23 @@
+-- DESIGN.md's "Closures and partial application" example: a `let`-bound
+-- closure (`f`), called twice with different arguments. `closures.rs`'s
+-- own text-splice pass erases the `let` entirely and splices each call
+-- site with `_` replaced by that call's own argument -- `f(x)` becomes
+-- `Add(x, 5)`, `f(x + 1)` becomes `Add((x + 1), 5)` -- before anything
+-- else (types.rs/effects.rs/bounds.rs) ever sees a bare `_`. See
+-- sim/closure_let_tb.v for the proof both calls compute the right,
+-- independent result through real hardware.
+Add(a : [8], b : [8]) : [8] <combines> {
+    return a + b
+}
+
+module Top {
+    in x : [8]
+    out r1 : [8] = 0
+    out r2 : [8] = 0
+
+    rule go {
+        let f = Add(_, 5)
+        r1 := f(x)
+        r2 := f(x + 1)
+    }
+}

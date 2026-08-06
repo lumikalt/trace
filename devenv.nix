@@ -125,9 +125,17 @@
       repo_root=$(pwd)
       dir=$(mktemp -d)
       trap 'rm -rf "$dir"' EXIT
-      cargo run -q -- "examples/$name.tr" --elaborate > "$dir/elaborated.tr"
-      cargo run -q -- "$dir/elaborated.tr" --lower > "$dir/lowered.tr"
-      cargo run -q -- "$dir/lowered.tr" --firrtl > "$dir/design.fir"
+      # `--firrtl` chains closures -> elaborate -> lower -> firrtl
+      # internally now (`src/pipeline.rs`), one shared implementation
+      # with the same chain `cargo test` runs -- this used to be three
+      # separate `cargo run` invocations, each re-parsing the PREVIOUS
+      # stage's own printed output; splitting them apart here bought
+      # nothing `--closures`/`--elaborate`/`--lower` (still available
+      # standalone, for debugging one stage in isolation) don't already
+      # give directly, and meant this script's own stage list could
+      # silently drift from `pipeline.rs`'s -- see that module's doc
+      # comment.
+      cargo run -q -- "examples/$name.tr" --firrtl > "$dir/design.fir"
       firtool --disable-opt -lowering-options=disallowLocalVariables "$dir/design.fir" -o "$dir/design.v"
 
       # An `extmodule Name from "path.v"` declaration's `.v` implementation

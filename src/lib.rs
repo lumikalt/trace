@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod bounds;
+pub mod closures;
 pub mod effects;
 pub mod elaborate;
 pub mod firrtl;
@@ -8,6 +9,7 @@ pub mod lexer;
 pub mod lower;
 pub mod lsp;
 pub mod parser;
+pub mod pipeline;
 pub mod resolve;
 pub mod schedule;
 pub mod types;
