@@ -1150,10 +1150,13 @@ improvement.
 Writing a wider value into a narrower target is always an error, naming
 `trunc(value, width)` as the fix (`trunc(value)`, width inferred from the
 write target, also works — see "Inference: two solvers" below). There is no
-silent truncation anywhere in the language. Separately, an oversized-literal
-or total-discard-shift diagnostic on one specific operator application (not
-a write target) can be silenced with a `.!` suffix on that operator, e.g.
-`x >>.! 300` — see the same section for the distinction between the two.
+UNACKNOWLEDGED silent truncation anywhere in the language: every width-
+losing coercion — a write target, an oversized literal, a total-discard
+shift — is a compile-time error unless explicitly opted into, either via
+`trunc` (which narrows for real, emitting an actual bit-slice) or via `.!`
+(which narrows for free at the FIRRTL `connect`/emitted-literal level,
+without an explicit `trunc` call — see "Inference: two solvers" below for
+the full mechanism and its "top-scope only" scoping rule).
 
 Bit-select and slice: `x[i]` selects one bit; `x[hi..lo]` selects an inclusive
 range, both ends given, descending. Both bounds may be compile-time constants; a
@@ -5363,21 +5366,64 @@ would mean growing `<<`'s result width instead of keeping it at the left
 operand's own (the way `*` already grows to `a + b`), a bigger design change
 than a diagnostic addition.
 
-Both of those checks (the literal-fits range check and the shift-amount
-total-discard check) are per-operator-application, not per-value, so a
-single suffix on the operator itself can silence exactly one and leave every
-other use of the same values alone: `.!` after any binary operator (`a
-+.! 100000000`, `x >>.! 300`) marks that one `Expr::Binary` node as an
-explicit "I know, let it through," recorded in a side table
-(`Ast.lossy: HashSet<ExprId>`, same shape as `destructures`) rather than a
-new AST node — `type_binop` checks `self.ast.lossy.contains(&at)` and skips
-`check_literal_fits`/`check_shift_amount` for that one application while an
-unmarked sibling expression using the same operands still errors normally.
-`.!` is scoped narrowly: it silences the two absorption/shift-amount
-sanity checks above, not `check_assignable`'s "would silently truncate"
-check on a write target — `x := a +.! b` where `a + b` is wider than `x`
-still wants `trunc` (either form) to narrow it, `.!` alone does not make
-that assignment legal.
+All of these checks — the literal-fits range check, the shift-amount
+total-discard check, a `SizedInt`'s own too-wide-for-its-declared-width
+check, AND `check_assignable`'s write-position "would silently truncate"
+check (state write, return value, call argument, struct field, memory/
+instance-port write, list/`or`-alternative element, `..` base, fifo
+enqueue — everywhere `check_assignable` runs) — are per-EXPRESSION, not
+per-value: a single suffix marks one specific `ExprId` as an explicit "I
+know, let it through," leaving every other use of the same underlying
+value alone. `.!` is genuinely general: a postfix operator (binds
+tightest, same tier as `?`) applicable after ANY expression — `expr.!` —
+recorded in a side table (`Ast.lossy: HashSet<ExprId>`, same shape as
+`destructures`) rather than a new AST node, so `expr.!` and `expr` type
+to the identical `Ty`, just with `expr`'s own id now present in that set.
+Each check that can raise one of the diagnostics above tests whether ITS
+OWN anchor id is in `ast.lossy` before erroring — `type_binop` (an
+`Expr::Binary`'s own id, `at`), `check_literal_fits`/`check_assignable`
+(self-gated on the exact value argument each was called with), the
+`SizedInt` arm (its own id) — so marking an OUTER node never silences a
+check anchored at a DIFFERENT, unmarked node nested inside it: `Narrow
+(a).!` (marking the call) leaves `a`'s own too-wide-for-`Narrow`'s-param
+check live, while `Narrow(a.!)` (marking the argument directly) silences
+it. This is also why a binary operator additionally keeps its own
+mid-application spelling, `a >>.! 300`/`x +.! 100000000` — written
+between the operator token and its RHS, predating the general postfix
+form — as a convenience: the check it silences is anchored at the WHOLE
+application (`Expr::Binary`'s own id), and by the time `.!` would appear
+postfix after just one operand, only PART of the application exists yet,
+so `a >> 300.!` marks `300` alone, not the shift — write `a >>.! 300` or
+`(a >> 300).!` to reach the shift's own check. Because both spellings
+mark the SAME id, one mark can satisfy two DIFFERENT checks at once when
+that id happens to be both: `x := a +.! b`, with `a + b` wider than `x`,
+silences BOTH the addition's own absorption check AND the write's own
+`check_assignable` truncation check, since the `Expr::Binary` `a +.! b`
+built IS the write's entire RHS — the identical id both checks are
+anchored at, not a coincidence of two separate marks. Nesting the marked
+operator inside a larger RHS breaks that coincidence apart again: `x :=
+(a +.! b) + c` only silences the addition's own check, since the write's
+own anchor is now the OUTER `+`, an unmarked, different id — the write
+still needs its own mark, `x := ((a +.! b) + c).!`, matching the worked
+call-argument example above (an outer node's mark never reaches an inner
+one, and vice versa — only an id marked directly, or one two spellings
+happen to both resolve to, is ever silenced).
+
+Unlike the two sanity checks (which only ever gate a diagnostic, never
+change compiled output), `.!` on a write position or an oversized literal
+genuinely changes what's emitted: a `.!`-silenced write's value reaches
+FIRRTL's `connect` at its own, unnarrowed width — sound because FIRRTL's
+`connect` between two differently-sized real signals truncates implicitly
+(confirmed against firtool: byte-identical to what an explicit `trunc`
+would compile to). A literal is different: FIRRTL's `UInt<w>(v)` syntax
+demands `v` fit `w` bits exactly, even where the surrounding `connect`
+would have truncated a real signal for free — so emission (`firrtl/
+expr.rs`'s `mask_to_width`) masks every literal to its own width
+unconditionally before it's formatted, independent of `.!` (it has to
+run for the mid-operator spelling too, which marks the surrounding
+`Expr::Binary`, not the literal operand itself). `.!` on an oversized
+literal therefore doesn't just silence a diagnostic — it compiles to that
+literal's actual low-order bits (`300.!` against `[4]` compiles to `12`).
 
 A local reassigned within a rule is re-typed to a fixed point across its whole
 body: its tracked width reflects the widest binding across every reassignment,

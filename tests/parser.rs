@@ -1272,24 +1272,66 @@ fn lossy_suffix_also_works_on_a_call_not_just_binary_operators() {
     assert!(ast.lossy.is_empty());
 }
 
-/// A bare `.!` with nothing after it (no immediately-following `(`)
-/// must NOT be consumed as this postfix call-marker form — it belongs
-/// to whatever other position it's actually written in (today, only a
-/// binary operator's own RHS position), so `x.! (b)` (space before the
-/// paren doesn't change tokenization, but a `.!` NOT immediately
-/// preceding `(` in the token stream) or any other non-call use is
-/// simply not this shape at all.
+/// A `.!` with no immediately-following `(` falls through the call-
+/// marker arm and is instead the general postfix form: an explicit
+/// "I know, let it through" on `lhs` itself, whatever `lhs` is — here a
+/// bare ident, marking ITS OWN id, not building any new node (`x.!` and
+/// `x` type to the identical `Expr::Ident`).
 #[test]
-fn lossy_call_suffix_requires_the_paren_immediately_after() {
-    // `x` is a bare ident (not itself a call); `.!` here isn't parsed as
-    // a call marker since nothing calls `x`, so this errors as some
-    // other malformed shape rather than silently accepting a phantom
-    // call. Just confirms this doesn't panic and doesn't spuriously
-    // populate `ast.lossy` on a non-call node.
+fn lossy_suffix_with_no_call_marks_lhs_itself() {
     let (tokens, lex_errors) = lexer::lex("rule t {\n x := b.! \n}\n");
     assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
-    let (ast, _errors) = parser::parse("rule t {\n x := b.! \n}\n", &tokens);
-    assert!(ast.lossy.is_empty());
+    let (ast, errors) = parser::parse("rule t {\n x := b.! \n}\n", &tokens);
+    assert!(errors.is_empty(), "parse errors: {errors:?}");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::Assign { rhs, .. } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*rhs), "b");
+    assert_eq!(ast.lossy.len(), 1, "expected exactly one marked expr");
+    assert!(ast.lossy.contains(rhs));
+}
+
+/// Postfix binds tightest, same as `?`: `.!` right after `a` marks `a`
+/// alone, not the whole `a + b` — silencing the WHOLE binary op still
+/// needs it wrapped, `(a + b).!`.
+#[test]
+fn lossy_suffix_binds_to_the_immediately_preceding_term_not_the_whole_expression() {
+    let ast = parse_ok("rule t {\n x := a.! + b\n}\n");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::Assign { rhs, .. } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*rhs), "(+ a b)");
+    let trace::ast::Expr::Binary { lhs: a, .. } = ast.expr(*rhs) else {
+        panic!("expected a binary expr");
+    };
+    assert_eq!(ast.lossy.len(), 1, "expected exactly one marked expr");
+    assert!(ast.lossy.contains(a));
+    assert!(!ast.lossy.contains(rhs));
+}
+
+/// `(a + b).!` marks the WHOLE binary node — the general postfix form
+/// applied after a parenthesized group reaches the exact same
+/// `Expr::Binary` id `type_binop`'s own `at`-keyed gate checks, so this
+/// is equivalent to the mid-operator spelling `a +.! b` for every
+/// downstream check anchored there.
+#[test]
+fn lossy_suffix_after_a_parenthesized_group_marks_the_whole_binary_node() {
+    let ast = parse_ok("rule t {\n x := (a + b).!\n}\n");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::Assign { rhs, .. } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*rhs), "(+ a b)");
+    assert_eq!(ast.lossy.len(), 1, "expected exactly one marked expr");
+    assert!(ast.lossy.contains(rhs));
 }
 
 #[test]

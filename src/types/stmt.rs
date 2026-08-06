@@ -9,7 +9,6 @@
 
 use super::{Ty, TypeChecker, Width, bits_needed};
 use crate::ast::{Expr, ExprId, Stmt, StmtId};
-use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, is_guard_like};
 use std::collections::HashMap;
 
@@ -84,7 +83,7 @@ impl<'a> TypeChecker<'a> {
             Stmt::Return(Some(e)) => {
                 let ty = self.type_expr_with_hint(e, locals, ret);
                 if let Some(ret) = ret {
-                    self.check_assignable(&ty, ret, self.expr_span(e), "return value");
+                    self.check_assignable(&ty, ret, e, "return value");
                 }
             }
             Stmt::Return(None) => {}
@@ -464,7 +463,7 @@ impl<'a> TypeChecker<'a> {
                     // its write site specifically, but the gap was general
                     // to every write-target kind, not particular to `out`.
                     self.types.expr_tys.insert(lhs, state.clone());
-                    self.check_assignable(&rhs_ty, &state, self.expr_span(rhs), "state write");
+                    self.check_assignable(&rhs_ty, &state, rhs, "state write");
                     self.check_literal_fits(rhs, &state);
                     if matches!(state, Ty::Struct { .. })
                         && !matches!(
@@ -527,7 +526,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 match base {
                     Ty::Mem { elem, .. } => {
-                        self.check_assignable(&rhs_ty, &elem, self.expr_span(rhs), "memory write");
+                        self.check_assignable(&rhs_ty, &elem, rhs, "memory write");
                     }
                     Ty::Unknown => {}
                     other => self.error(
@@ -545,12 +544,7 @@ impl<'a> TypeChecker<'a> {
                     self.types.expr_tys.insert(base, Ty::Unknown);
                     match self.find_port(module_def, &name) {
                         Some((DefKind::Input, port_ty)) => {
-                            self.check_assignable(
-                                &rhs_ty,
-                                &port_ty,
-                                self.expr_span(rhs),
-                                "instance port write",
-                            );
+                            self.check_assignable(&rhs_ty, &port_ty, rhs, "instance port write");
                             self.check_literal_fits(rhs, &port_ty);
                         }
                         Some((DefKind::Io, _)) => self.error(
@@ -667,7 +661,20 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// A constant written into `[w]` must fit in `w` bits.
+    ///
+    /// Self-gated on `value`'s own id in `ast.lossy` — `type_binop`'s two
+    /// call sites ALSO gate externally on the enclosing `Expr::Binary`'s
+    /// own id (`at`, unaffected by this), needed there because `.!`'s
+    /// mid-operator spelling (`300 +.! a`) can mark the operator
+    /// application before either operand is known to be the one actually
+    /// checked (see that arm's own doc comment) — but every OTHER caller
+    /// (reg/output init, struct field, instance port write) has no such
+    /// external gate today, so `300.!` as a too-wide init needs this
+    /// function to recognize its own argument's mark directly.
     pub(crate) fn check_literal_fits(&mut self, value: ExprId, target: &Ty) {
+        if self.ast.lossy.contains(&value) {
+            return;
+        }
         if let Ty::Bits(Width::Known(w)) = target
             && let Some(v) = self.const_eval(value, &HashMap::new())
             && bits_needed(v) > *w
@@ -818,20 +825,41 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// May `value` be written where `target` is expected? Shapes must
-    /// match; a known-wider value needs an explicit `trunc`.
-    pub(crate) fn check_assignable(&mut self, value: &Ty, target: &Ty, span: Span, what: &str) {
+    /// match; a known-wider value needs an explicit `trunc` — or an
+    /// explicit `.!` on `value_id` (the general postfix form, `ast.lossy`
+    /// — see `parser.rs`'s postfix loop), the same "I know, let it
+    /// through" opt-out `check_literal_fits`/`check_shift_amount` already
+    /// have, extended here to the write-position truncation check itself.
+    /// `value_id` is the ExprId `value`'s own `Ty` was computed from —
+    /// threaded through the two recursive calls below according to
+    /// whether that recursion is peeling a TYPE layer off the same
+    /// expression (unchanged id: `(_, Ty::Option(inner))`, an implicit
+    /// `T -> ?T` wrap of the very same value) or descending into a
+    /// genuinely different sub-expression (`Ty::Optional(inner)`, where
+    /// `inner` is `optional <inner>`'s own wrapped expr, not `value_id`
+    /// itself) — only the latter changes which id `.!` needs to mark.
+    pub(crate) fn check_assignable(
+        &mut self,
+        value: &Ty,
+        target: &Ty,
+        value_id: ExprId,
+        what: &str,
+    ) {
+        let span = self.expr_span(value_id);
         match (value, target) {
             (Ty::Unknown, _) | (_, Ty::Unknown) => {}
             (Ty::Int, Ty::Bits(_)) => {} // literal absorbs; range-checked at coercion
             (Ty::Bits(wv), Ty::Bits(wt)) => {
                 if let (Width::Known(v), Width::Known(t)) = (wv, wt)
                     && v > t
+                    && !self.ast.lossy.contains(&value_id)
                 {
                     self.error(
                         span,
                         format!(
                             "{what} would silently truncate [{v}] to [{t}]; \
-                             use `trunc(value, {t})`"
+                             use `trunc(value, {t})`, or `.!` on the value to let it \
+                             through"
                         ),
                     );
                 }
@@ -885,7 +913,7 @@ impl<'a> TypeChecker<'a> {
                     );
                     return;
                 }
-                self.check_assignable(&inner_ty, t_inner, span, what);
+                self.check_assignable(&inner_ty, t_inner, *inner, what);
             }
             // A bare `T`-shaped value implicitly wraps into `?T` present
             // — reached anywhere `check_assignable` already runs (state
@@ -901,7 +929,7 @@ impl<'a> TypeChecker<'a> {
             // through to ordinary equality below instead, matching
             // `Ty::Struct`'s own copy-between-two-values handling.
             (_, Ty::Option(inner)) if !matches!(value, Ty::Option(_)) => {
-                self.check_assignable(value, inner, span, what);
+                self.check_assignable(value, inner, value_id, what);
             }
             _ if value == target => {}
             _ => self.error(span, format!("{what}: expected {target}, got {value}")),

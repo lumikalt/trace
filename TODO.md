@@ -472,13 +472,19 @@ disjointness argument anywhere) passes end to end.
   operand's own — a real semantic change to shift's width rule, not a
   diagnostic addition, and its own separate design conversation if
   wanted later.
-- `.!` suffix marks one specific binary-operator application as an
-  intentional lossy/overflowing op (`a +.! 100000000`, `x >>.! 300`),
-  suppressing `check_literal_fits`/`check_shift_amount` for that one
-  `Expr::Binary` node only — an unmarked sibling expression using the
-  same values still errors normally. `.!` does NOT reach
-  `check_assignable`; `x := a +.! b` still needs `trunc` if `a + b` is
-  wider than `x`.
+- `.!` is a general postfix marker (`expr.!`, plus a binary operator's
+  own mid-application spelling, `a +.! 100000000`/`x >>.! 300`) marking
+  one specific `ExprId` as an intentional lossy/overflowing op —
+  suppresses whichever of `check_literal_fits`/`check_shift_amount`/
+  `check_assignable`/`Expr::SizedInt`'s own check is anchored at exactly
+  that id, never a sibling expression using the same values. DOES reach
+  `check_assignable` now (unlike the earlier binary-operator-only form):
+  `x := a +.! b` silences the write's own truncation check too, since
+  the marked `Expr::Binary` IS the write's whole RHS — the identical id
+  both checks are anchored at. FIRRTL emission masks an oversized
+  literal to its own width (`mask_to_width`, `src/firrtl/expr.rs`)
+  unconditionally, since FIRRTL's literal syntax demands an exact fit
+  even where `.!` let the type checker's own complaint through.
 
 ## Language features with no synthesis path yet
 

@@ -7,6 +7,7 @@
 
 use super::EmitError;
 use super::Emitter;
+use super::expr::mask_to_width;
 use super::fifo::*;
 use super::module_name;
 use super::writes::*;
@@ -1155,6 +1156,7 @@ pub(crate) fn module_block(
         out.push('\n');
     }
     for (_, emit_name, w, init) in regs {
+        let init = mask_to_width(*init, *w);
         let _ = writeln!(
             out,
             "    regreset {emit_name} : UInt<{w}>, clock, reset, UInt<{w}>({init})"

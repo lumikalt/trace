@@ -3895,6 +3895,121 @@ module M {
     run_firtool(&fir, &[]);
 }
 
+/// `.!`'s generalization: unlike the operator-level suppression above,
+/// `.!` on a WRITE's own RHS (silencing `check_assignable`'s truncation
+/// check) genuinely changes what's emitted — the value's own width
+/// reaches the `connect` unnarrowed (no `trunc`'s `bits(...)`/`tail(...)`
+/// inserted), relying on FIRRTL's own `connect` truncating a wider
+/// source into a narrower sink implicitly (confirmed empirically against
+/// firtool: a raw width-mismatched `connect` lowers to a Verilog
+/// `[w-1:0]` slice, byte-identical to what `trunc` would have inserted
+/// explicitly).
+#[test]
+fn lossy_suffix_on_a_write_lets_a_wider_value_reach_the_connect_unnarrowed() {
+    let src = "\
+module M {
+    in a : [16]
+    out result : [8] = 0
+    rule r {
+        result := a.!
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, a"));
+    run_firtool(&fir, &[]);
+}
+
+/// `.!` survives `<sequences>`/`while` lowering — `lower::render` text-
+/// splices the rendered body straight out of the ORIGINAL source spans
+/// (same mechanism `elaborate::render`'s own doc comment describes),
+/// never re-serializing an expression from its `Expr` shape, so a `.!`
+/// written inside a `while` body is still literally present in the
+/// rendered, re-lexed/re-parsed text `emit_from_source` feeds back
+/// through the whole front end a second time — `ast.lossy` (a side
+/// table keyed by `ExprId`) gets rebuilt fresh against the SECOND
+/// parse's own ids, populated the same way any ordinary `.!` is.
+#[test]
+fn lossy_suffix_survives_sequences_lowerings_render_and_reparse() {
+    let src = "\
+module M {
+    in x : [8]
+    in wide : [16]
+    out iters : [4] = 0
+    reg cnt : [8] = 0
+    reg acc : [4] = 0
+
+    rule r <sequences, fails> {
+        cnt := x
+        acc := 0
+        while cnt <> 0 {
+            cnt := cnt - 1
+            acc := wide.!
+        }
+        iters := acc
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(
+        fir.contains("connect acc, mux(neq(cnt, UInt<8>(0)), wide, acc)"),
+        "fir:\n{fir}"
+    );
+    run_firtool(&fir, &[]);
+}
+
+/// Regression: BEFORE `.!` was generalized, `a +.! 100000000` (the
+/// mid-operator spelling, silencing only `check_literal_fits`) still
+/// emitted the literal at its own out-of-range value (`UInt<8>
+/// (100000000)`) — valid enough to pass types.rs, but firtool itself
+/// hard-rejects an out-of-range `UInt<w>(v)` literal ("initializer too
+/// wide for declared width"), confirmed by reverting this arc's own
+/// `mask_to_width` fix and re-running this exact source. `check_literal_
+/// fits`'s job was only ever to warn about a likely mistake, not to
+/// guarantee the literal fits — nothing downstream used to mask it once
+/// the warning was silenced. `mask_to_width` (firrtl/expr.rs) now masks
+/// every literal to its emitted width unconditionally, independent of
+/// `.!`, so this compiles to valid FIRRTL: `100000000 mod 256 == 0`.
+#[test]
+fn lossy_mid_operator_literal_is_masked_to_a_valid_firrtl_literal() {
+    let src = "\
+module M {
+    in a : [8]
+    out result : [8] = 0
+    rule r {
+        result := a +.! 100000000
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("UInt<8>(0)"), "fir:\n{fir}");
+    run_firtool(&fir, &[]);
+}
+
+/// `mask_to_width` pinned at two concrete values (not just "firtool
+/// accepts it"), so a wrong width shows up as a changed constant rather
+/// than silent acceptance — a reg init (`300.!` -> `300 mod 16 == 12`)
+/// and a sized literal (`8'd300.!` -> `300 mod 256 == 44`).
+#[test]
+fn lossy_suffix_on_an_oversized_literal_masks_it_to_the_declared_width() {
+    let src = "\
+module M {
+    reg x : [4] = 300.!
+    out result : [8] = 0
+    rule r {
+        result := 8'd300.!
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(
+        fir.contains("regreset x : UInt<4>, clock, reset, UInt<4>(12)"),
+        "fir:\n{fir}"
+    );
+    assert!(fir.contains("UInt<8>(44)"), "fir:\n{fir}");
+    run_firtool(&fir, &[]);
+}
+
 #[test]
 fn prio_encodes_the_lowest_set_bit_as_a_priority_mux_chain() {
     let src = "\

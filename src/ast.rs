@@ -571,13 +571,34 @@ pub struct Ast {
     /// this list anywhere but types.rs only means a missing diagnostic,
     /// never wrong hardware.
     pub destructures: Vec<Destructure>,
-    /// `Expr::Binary` ids parsed with a trailing `.!` on their operator
-    /// (`a >>.! 300`) — same "side list, not a new shape" rationale as
-    /// `destructures`: consumed only by types.rs's `type_binop` (to skip
-    /// `check_literal_fits`/`check_shift_amount` for that one operator
-    /// application), never needed by resolve/effects/elaborate/lower/
-    /// firrtl, which all only ever look at `op`/`lhs`/`rhs` regardless of
-    /// whether this set contains a given id.
+    /// `ExprId`s marked with `.!`, an explicit "I know, let it through"
+    /// on the exact expression it's written against — same "side list,
+    /// not a new shape" rationale as `destructures`. Two spellings both
+    /// populate this SAME set: the mid-operator form (`a >>.! 300`,
+    /// `parser.rs`'s infix loop, marking the `Expr::Binary` node) and the
+    /// general postfix form (`expr.!`, the postfix loop's own `Lossy`
+    /// arm, marking whatever `expr` already is — a literal, a call
+    /// result, a parenthesized binary op, a write's whole RHS, ...).
+    /// Consulted by types.rs in three places — `type_binop` (skips
+    /// `check_literal_fits`/`check_shift_amount` for a marked `Expr::
+    /// Binary`), `check_literal_fits` itself (self-gated on its own
+    /// `value` argument, for every OTHER caller that has no `type_binop`-
+    /// style external gate: reg/output init, struct field, instance port
+    /// write), `check_assignable` (self-gated on `value_id`, silencing
+    /// the write-position "would silently truncate" check), and the
+    /// `Expr::SizedInt` self-check — and by bounds.rs (a 1-arg `trunc`
+    /// call's own losslessness proof). Never needed by resolve/effects/
+    /// elaborate/lower, which all only ever look at an expr's own shape
+    /// (`op`/`lhs`/`rhs`/`callee`/`args`) regardless of whether this set
+    /// contains its id — marking an id changes what CHECKS run against
+    /// it, never what it computes. The one place it DOES change compiled
+    /// output: firrtl emission's `mask_to_width` (firrtl/expr.rs) masks
+    /// every literal to its own emitted width unconditionally (not
+    /// itself lossy-aware) — the necessary complement to `.!` letting an
+    /// oversized literal past `check_literal_fits`/`Expr::SizedInt`'s own
+    /// check, since FIRRTL's literal syntax demands the value fit
+    /// exactly (confirmed via firtool) even where a `connect` between
+    /// two differently-sized real signals truncates implicitly.
     pub lossy: std::collections::HashSet<ExprId>,
     /// Operand `ExprId`s of an `Expr::Logic` node synthesized by `A and
     /// B`'s parse-time desugar into `(logic A) & (logic B)` (see

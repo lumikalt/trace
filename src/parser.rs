@@ -1800,14 +1800,14 @@ impl<'a> Parser<'a> {
                             .push_expr(Expr::Call { callee: lhs, args }, lo..self.prev_end);
                         continue;
                     }
-                    // `trunc.!(b)` — the same per-application "I know,
-                    // let it through" suffix `a >>.! 300` already has on
-                    // a binary operator (`ast.lossy`, populated the same
-                    // way here: reuse the set, no new AST shape), on a
-                    // CALL instead. Only `.!` immediately followed by `(`
-                    // counts as this postfix form — bare `.!` with
-                    // nothing after belongs to some other position
-                    // entirely and this loop shouldn't consume it here.
+                    // `trunc.!(b)` — `.!` immediately followed by `(`
+                    // reads as a call-postfix marker: build the call
+                    // (`lhs` as callee) FIRST, then mark that call's own
+                    // id lossy, rather than falling to the generic
+                    // `Lossy` arm below (which would mark `lhs` — the
+                    // CALLEE alone, not the call — since at this point
+                    // `(` hasn't been consumed yet). Must come before
+                    // that generic arm for exactly this reason.
                     Lossy if self.peek_nth(1) == Some(LParen) => {
                         self.bump();
                         self.bump();
@@ -1817,6 +1817,30 @@ impl<'a> Parser<'a> {
                             .push_expr(Expr::Call { callee: lhs, args }, lo..self.prev_end);
                         self.ast.lossy.insert(call);
                         lhs = call;
+                        continue;
+                    }
+                    // `expr.!` — the general form: an explicit "I know,
+                    // let it through" on `lhs` ITSELF, whatever it is
+                    // (a literal, a call result, a parenthesized binary
+                    // op, ...), silencing whatever top-scope width-
+                    // safety check is anchored at that exact node —
+                    // `check_literal_fits`/`check_shift_amount` (via
+                    // `type_binop`'s own `at`-keyed gate, when `lhs` is a
+                    // `Binary`), `check_assignable`'s truncate-on-write
+                    // check (when `lhs` is a write's RHS, a call
+                    // argument, a struct field value, ...), or a 1-arg
+                    // `trunc`'s losslessness proof (`bounds.rs`, when
+                    // `lhs` is that call) — never anything nested INSIDE
+                    // `lhs`, since the mark is this exact `ExprId`, not a
+                    // subtree. Same side table as the two special forms
+                    // above (`ast.lossy`, a `HashSet<ExprId>`), no new
+                    // AST node: `lhs`'s identity doesn't change, so
+                    // `a.! + b` still parses `.!` as binding to `a` alone
+                    // (postfix binds tightest, same as `?`) — silencing
+                    // the whole `a + b` needs `(a + b).!` instead.
+                    Lossy => {
+                        self.bump();
+                        self.ast.lossy.insert(lhs);
                         continue;
                     }
                     LBracket => {

@@ -79,7 +79,7 @@ impl<'a> TypeChecker<'a> {
                         {
                             let mut locals = HashMap::new();
                             let init_ty = self.type_expr(init, &mut locals);
-                            self.check_assignable(&init_ty, &ty, self.expr_span(init), "reg init");
+                            self.check_assignable(&init_ty, &ty, init, "reg init");
                         } else {
                             self.check_literal_fits(init, &ty);
                         }
@@ -172,12 +172,7 @@ impl<'a> TypeChecker<'a> {
                         {
                             let mut locals = HashMap::new();
                             let init_ty = self.type_expr(init, &mut locals);
-                            self.check_assignable(
-                                &init_ty,
-                                &ty,
-                                self.expr_span(init),
-                                "output init",
-                            );
+                            self.check_assignable(&init_ty, &ty, init, "output init");
                         } else {
                             self.check_literal_fits(init, &ty);
                         }

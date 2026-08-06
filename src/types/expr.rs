@@ -75,8 +75,16 @@ impl<'a> TypeChecker<'a> {
             // against ITS OWN declared width, rather than deferred to
             // `check_literal_fits` at whatever coercion site it's later
             // used in (matches the same `bits_needed` helper that uses).
+            // Self-gated on `.!` the same way `check_literal_fits` is
+            // (`ast.lossy`, keyed on `id` itself — `8'd300.!` marks THIS
+            // node directly, unlike the mid-operator spelling which has
+            // no bearing on a lone literal): FIRRTL emission
+            // (`firrtl/expr.rs`'s `mask_to_width`) truncates the value to
+            // fit `width` regardless, so a lossy-marked oversized sized
+            // literal compiles to its low `width` bits, same as any
+            // other `.!`-silenced truncation.
             Expr::SizedInt { width, value } => {
-                if bits_needed(value) > width {
+                if bits_needed(value) > width && !self.ast.lossy.contains(&id) {
                     self.error(
                         self.expr_span(id),
                         format!("{value} does not fit in [{width}]"),
@@ -294,7 +302,7 @@ impl<'a> TypeChecker<'a> {
                 let elem = self.type_expr(first, locals);
                 for &item in rest {
                     let t = self.type_expr(item, locals);
-                    self.check_assignable(&t, &elem, self.expr_span(item), "list element");
+                    self.check_assignable(&t, &elem, item, "list element");
                 }
                 Ty::List(Box::new(elem))
             }
@@ -331,7 +339,7 @@ impl<'a> TypeChecker<'a> {
                 let elem = self.type_expr(first, locals);
                 for &alt in rest {
                     let t = self.type_expr(alt, locals);
-                    self.check_assignable(&t, &elem, self.expr_span(alt), "`or` alternative");
+                    self.check_assignable(&t, &elem, alt, "`or` alternative");
                 }
                 elem
             }
@@ -385,12 +393,7 @@ impl<'a> TypeChecker<'a> {
                     seen.insert(fname.clone(), *value);
                     match declared.iter().find(|(dname, _)| dname == fname) {
                         Some((_, dty)) => {
-                            self.check_assignable(
-                                &vty,
-                                dty,
-                                self.expr_span(*value),
-                                "struct field",
-                            );
+                            self.check_assignable(&vty, dty, *value, "struct field");
                             self.check_literal_fits(*value, dty);
                         }
                         None => {
@@ -408,7 +411,7 @@ impl<'a> TypeChecker<'a> {
                 match base {
                     Some(base) => {
                         let base_ty = self.type_expr(base, locals);
-                        self.check_assignable(&base_ty, &result, self.expr_span(base), "`..` base");
+                        self.check_assignable(&base_ty, &result, base, "`..` base");
                     }
                     None => {
                         let missing: Vec<&str> = declared
@@ -659,7 +662,7 @@ impl<'a> TypeChecker<'a> {
                         return Ty::Unit;
                     }
                     let arg = self.type_expr(args[0], locals);
-                    self.check_assignable(&arg, &elem, self.expr_span(args[0]), "enqueue");
+                    self.check_assignable(&arg, &elem, args[0], "enqueue");
                     Ty::Unit
                 }
                 other => {
@@ -942,7 +945,7 @@ impl<'a> TypeChecker<'a> {
                 // Check each arg against its (instantiated) param type.
                 for (param, (arg_ty, arg)) in params.iter().zip(arg_tys.iter().zip(args)) {
                     let pty = self.eval_ty(param.ty, &env);
-                    self.check_assignable(arg_ty, &pty, self.expr_span(*arg), "argument");
+                    self.check_assignable(arg_ty, &pty, *arg, "argument");
                 }
                 match ret {
                     Some(r) => self.eval_ty(r, &env),

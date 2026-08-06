@@ -864,6 +864,121 @@ fn lossy_suffix_suppresses_the_literal_fits_and_shift_amount_checks() {
          b := (a >>.! 300) + (a >> 300)\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("shift by 300"));
+
+    // A deliberate asymmetry, both halves pinned here: `check_literal_
+    // fits` self-gates on its own `value` argument (the generalization,
+    // stmt.rs), so marking the LITERAL OPERAND directly also works, not
+    // just the whole `Expr::Binary` — `a + 100000000.!` silences the
+    // same check `a +.! 100000000` does. `check_shift_amount` does NOT
+    // gain a matching self-gate (its only callers are already gated
+    // externally by `type_binop`'s own `at`-keyed check), so the same
+    // operand-marking spelling does NOT reach it: `a >> 300.!` still
+    // errors — only `a >>.! 300`/`(a >> 300).!` (marking the whole
+    // application) silences a shift's own check.
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a + 100000000.!\n }\n}\n");
+    let (_, _, errors) =
+        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >> 300.!\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("discards every bit"));
+}
+
+/// `.!`'s generalization: a genuine postfix marker on ANY expression
+/// (not just a binary operator's own mid-application spelling), also
+/// silencing `check_assignable`'s write-position "would silently
+/// truncate" check — previously out of `.!`'s scope entirely (DESIGN.md
+/// used to say so explicitly).
+#[test]
+fn lossy_suffix_also_suppresses_the_write_position_assignability_check() {
+    // Unmarked: the ordinary truncation error.
+    let (_, _, errors) =
+        run("module M {\n in a : [16]\n out b : [8] = 0\n rule r {\n b := a\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("would silently truncate"));
+
+    // Marked directly on the write's RHS: silenced.
+    run_ok("module M {\n in a : [16]\n out b : [8] = 0\n rule r {\n b := a.!\n }\n}\n");
+}
+
+/// The defining property of the general form: marking an OUTER node
+/// does not reach into a DIFFERENT, unmarked node nested inside it —
+/// "top-scope only." A call's own id and one of its arguments' ids are
+/// two distinct `ExprId`s, so marking the call doesn't silence the
+/// argument's own `check_assignable`, but marking the argument directly
+/// does.
+#[test]
+fn lossy_suffix_does_not_reach_into_an_unmarked_argument() {
+    let src = |lossy_call: bool, lossy_arg: bool| {
+        format!(
+            "Narrow(x : [8]) : [8] <combines> {{\n return x\n }}\n\
+             module M {{\n in a : [16]\n out b : [8] = 0\n rule r {{\n \
+             b := Narrow(a{}){}\n }}\n}}\n",
+            if lossy_arg { ".!" } else { "" },
+            if lossy_call { ".!" } else { "" },
+        )
+    };
+    // Marking the CALL doesn't silence the argument's own check.
+    let (_, _, errors) = run(&src(true, false));
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .message
+            .contains("argument would silently truncate")
+    );
+
+    // Marking the ARGUMENT itself does.
+    run_ok(&src(false, true));
+}
+
+/// The mid-operator spelling and the general postfix spelling mark the
+/// SAME id — so one mark can satisfy two DIFFERENT checks at once, when
+/// that id happens to be anchor for both. `a +.! b`, written as an
+/// entire write's RHS, silences BOTH the addition's own absorption
+/// check AND the write's own `check_assignable` truncation check,
+/// since the `Expr::Binary` built IS the write's whole RHS — not a
+/// special case, just the same id satisfying two checks it happens to
+/// be the anchor for. Nesting it breaks the coincidence: wrapped inside
+/// a larger, unmarked expression, only the inner check is silenced.
+#[test]
+fn lossy_mid_operator_mark_also_reaches_the_write_check_when_it_is_the_whole_rhs() {
+    // The addition IS the entire write's RHS: one mark, two checks.
+    run_ok(
+        "module M {\n in a : [8]\n in b : [8]\n out x : [4] = 0\n rule r {\n \
+             x := a +.! b\n }\n}\n",
+    );
+
+    // Nested inside a larger, unmarked sum: only the inner check is
+    // silenced — the write's own anchor is the OUTER `+`, unmarked.
+    let (_, _, errors) = run(
+        "module M {\n in a : [8]\n in b : [8]\n in c : [8]\n out x : [4] = 0\n rule r {\n \
+         x := (a +.! b) + c\n }\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("would silently truncate"));
+
+    // Marking the outer sum too silences the write's own check as well.
+    run_ok(
+        "module M {\n in a : [8]\n in b : [8]\n in c : [8]\n out x : [4] = 0\n rule r {\n \
+         x := ((a +.! b) + c).!\n }\n}\n",
+    );
+}
+
+/// Recursion threading: `out : ?[4] := wide.!` peels the TARGET's
+/// `Option` layer (same expression, same id — `check_assignable`'s
+/// `(_, Ty::Option(inner))` arm) before reaching the `Bits`-vs-`Bits`
+/// truncation arm, so the mark on `wide` must survive that peel.
+#[test]
+fn lossy_suffix_survives_the_implicit_option_wrap_recursion() {
+    let (_, _, errors) = run(
+        "module M {\n in a : [16]\n out b : ?[4] = false\n rule r {\n \
+             b := optional a\n }\n}\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("would silently truncate"));
+
+    run_ok(
+        "module M {\n in a : [16]\n out b : ?[4] = false\n rule r {\n \
+         b := optional a.!\n }\n}\n",
+    );
 }
 
 #[test]

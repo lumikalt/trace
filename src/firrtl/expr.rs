@@ -150,7 +150,7 @@ impl<'a> Emitter<'a> {
             }
             Expr::Int(v) => {
                 let w = hint.unwrap_or_else(|| self.width_of(id));
-                Ok(format!("UInt<{w}>({v})"))
+                Ok(format!("UInt<{w}>({})", mask_to_width(v, w)))
             }
             // Unlike a bare `Int`, this already has its own definite
             // width (types.rs types it as `Bits(Known(width))`, not the
@@ -164,7 +164,9 @@ impl<'a> Emitter<'a> {
             // rule) — FIRRTL's own primops (`add`, etc.) already handle
             // that, the same way `tail(add(l, r), 1)` already trusts them
             // to for any two differently-sized real operands.
-            Expr::SizedInt { width, value } => Ok(format!("UInt<{width}>({value})")),
+            Expr::SizedInt { width, value } => {
+                Ok(format!("UInt<{width}>({})", mask_to_width(value, width)))
+            }
             // A comparison used directly as a VALUE (not through `logic`,
             // which calls `compile_binop` straight — see its own doc
             // comment, calls.rs) yields `lhs`'s own value on success,
@@ -1038,5 +1040,25 @@ impl<'a> Emitter<'a> {
             BinOp::AShr => format!("asUInt(dshr(asSInt({l}), {r}))"),
             _ => unreachable!("compile_shift only called for Shl/Shr/AShr"),
         })
+    }
+}
+
+/// Masks a literal's raw value down to `w` bits before it's embedded in
+/// FIRRTL's `UInt<w>(v)` literal syntax — a no-op when `v` already fits.
+/// Needed as of `.!`'s generalization to `check_literal_fits`/`Expr::
+/// SizedInt`'s own too-wide check (types.rs): unlike a `connect` between
+/// two differently-sized real signals (which FIRRTL/firtool truncates
+/// implicitly, confirmed empirically), the LITERAL syntax itself demands
+/// `v` fit `w` exactly — firtool hard-errors ("initializer too wide for
+/// declared width") on an out-of-range literal even where the
+/// surrounding `connect` would have truncated a real signal for free.
+/// `.!` bypassing the type-checker's own complaint doesn't change that
+/// FIRRTL-level constraint, so emission has to do the truncation `.!`
+/// asked for itself, on the literal's own value, before it ever reaches
+/// firtool.
+pub(crate) fn mask_to_width(v: u64, w: u64) -> u64 {
+    match 1u64.checked_shl(w as u32) {
+        Some(cap) => v % cap,
+        None => v,
     }
 }
