@@ -1830,6 +1830,50 @@ impl<'a> Parser<'a> {
                     Dot => {
                         self.bump();
                         let name = self.expect_ident("field name")?;
+                        // D-like UFCS: `a.b(args)` is sugar for
+                        // `b(a, args)`, gated on `(` immediately
+                        // following the name — with nothing after, `a.b`
+                        // stays ordinary field access (struct field,
+                        // inst port, `.valid`/`.data`, `.result`/
+                        // `.done`). Desugars directly to the same
+                        // `Expr::Call { callee, args }` shape an ordinary
+                        // prefix call produces (identical rationale to
+                        // backtick infix above): every downstream pass
+                        // already walks `Call` uniformly, so `b` resolves,
+                        // type-checks (including its first parameter
+                        // accepting `a`'s type), and compiles exactly as
+                        // if written prefix, arity errors included. Since
+                        // fields are never callable in this language,
+                        // this rewrite is unconditional — there's no
+                        // competing "field access" reading of `a.b(...)`
+                        // to preserve.
+                        if self.at(LParen) {
+                            self.bump();
+                            let mut args = vec![lhs];
+                            args.extend(self.parse_args(RParen)?);
+                            let callee = self.ast.push_expr(Expr::Ident(name.text), name.span);
+                            lhs = self
+                                .ast
+                                .push_expr(Expr::Call { callee, args }, lo..self.prev_end);
+                            continue;
+                        }
+                        // `a.trunc.!(8)` — UFCS's own lossy-call spelling,
+                        // the same `.!`-immediately-before-`(` marker the
+                        // bare `trunc.!(b)` arm above has, just after a
+                        // UFCS-shaped name instead of a bare one.
+                        if self.at(Lossy) && self.peek_nth(1) == Some(LParen) {
+                            self.bump();
+                            self.bump();
+                            let mut args = vec![lhs];
+                            args.extend(self.parse_args(RParen)?);
+                            let callee = self.ast.push_expr(Expr::Ident(name.text), name.span);
+                            let call = self
+                                .ast
+                                .push_expr(Expr::Call { callee, args }, lo..self.prev_end);
+                            self.ast.lossy.insert(call);
+                            lhs = call;
+                            continue;
+                        }
                         lhs = self.ast.push_expr(
                             Expr::Field {
                                 base: lhs,

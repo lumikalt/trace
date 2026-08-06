@@ -2010,6 +2010,32 @@ fn call_inlines_a_pure_function_with_a_let_and_a_trailing_return() {
     run_firtool(&fir, &["--disable-opt"]);
 }
 
+/// D-like UFCS (`a.Avg(b)`): `parser.rs` desugars this to the identical
+/// `Expr::Call` node `Avg(a, b)` would produce, so it inlines exactly
+/// the same way — same generated FIRRTL as `call_inlines_a_pure_
+/// function_with_a_let_and_a_trailing_return` above, just reached
+/// through the dotted spelling.
+#[test]
+fn ufcs_dot_call_inlines_identically_to_the_prefix_spelling() {
+    let src = "\
+Avg(a : [8], b : [8]) : [8] <combines> {
+    let sum = a + b
+    return sum >> 1
+}
+module Top {
+    in a : [8]
+    in b : [8]
+    out result : [8] = 0
+    rule compute {
+        result := a.Avg(b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_result, pad(shr(tail(add(a, b), 1), 1), 8)"));
+    assert!(!fir.contains("module Avg"));
+}
+
 #[test]
 fn nested_call_to_the_same_function_does_not_clobber_the_outer_arguments() {
     // Regression test for a real silent miscompile caught before this

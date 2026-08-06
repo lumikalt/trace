@@ -164,6 +164,48 @@ fn backtick_callee_can_be_a_builtin_or_a_user_function() {
     );
 }
 
+/// D-like UFCS: `a.b(args)` desugars to `b(a, args)`, the identical
+/// `Expr::Call` shape a prefix call produces — same "no downstream
+/// awareness of the surface spelling" idiom backtick infix has above.
+#[test]
+fn ufcs_dot_call_desugars_to_an_ordinary_call() {
+    assert_eq!(stmt_sexpr("x := a.Avg(b)"), "(:= x (call Avg a b))");
+    assert_eq!(stmt_sexpr("x := a.f()"), "(:= x (call f a))");
+}
+
+/// With nothing after the name, `a.b` stays ordinary field access —
+/// only `(` immediately following turns it into a call.
+#[test]
+fn ufcs_only_fires_when_a_call_immediately_follows() {
+    assert_eq!(stmt_sexpr("x := a.field"), "(:= x (. a field))");
+}
+
+/// Chains left-to-right like any other postfix operator.
+#[test]
+fn ufcs_dot_calls_chain() {
+    assert_eq!(
+        stmt_sexpr("x := a.Inc().Double()"),
+        "(:= x (call Double (call Inc a)))"
+    );
+}
+
+/// Composes with the `.!` lossy-call suffix: `a.trunc.!(8)` is
+/// `trunc.!(a, 8)`, marked in `ast.lossy` exactly like the bare
+/// `trunc.!(b)` spelling.
+#[test]
+fn ufcs_composes_with_the_lossy_call_suffix() {
+    let ast = parse_ok("rule t {\n x := a.trunc.!(8)\n}\n");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    let trace::ast::Stmt::Assign { rhs, .. } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*rhs), "(call trunc a 8)");
+    assert_eq!(ast.lossy.len(), 1, "expected exactly one marked expr");
+    assert!(ast.lossy.contains(rhs));
+}
+
 #[test]
 fn postfix_still_reaches_inside_a_prefix_operand_after_the_bp_bump() {
     // `PREFIX_BP`/`POSTFIX_BP` both shifted up (17/19 -> 19/21) to make

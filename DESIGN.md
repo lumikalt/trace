@@ -2470,6 +2470,24 @@ an infix operator has no natural spelling for more — so a variadic builtin
 like `max`/`min` still needs its ordinary prefix call syntax for three or
 more arguments.
 
+A call also has a D-like UFCS spelling: `a.b(args)` is exactly `b(a, args)`,
+gated purely on `(` immediately following the name — `a.b` with nothing
+after stays ordinary field access (struct field, inst port, `.valid`/
+`.data`, `.result`/`.done`). Same "pure parse-time sugar, no downstream
+awareness" shape as backtick infix above (`parser.rs`'s postfix loop, the
+`` Dot `` arm): `a.b(args)` builds the identical `Expr::Call { callee: b,
+args: [a, ...args] }` node a prefix call would, so `b` resolves, type-checks
+(including its first parameter accepting `a`'s type — an ordinary argument-
+type mismatch if it doesn't, no special UFCS diagnostic), and compiles
+exactly as if written prefix. Since fields are never callable in this
+language, the rewrite is unconditional whenever `(` follows a dotted name —
+there's no competing field-access reading of `a.b(...)` to preserve, so
+`b` need not even exist as a struct field on `a`'s type. Works with a
+builtin too (`x.zext(4)` is `zext(x, 4)`), since the resulting shape is
+indistinguishable from a prefix call. Chains left-to-right like any other
+postfix (`a.Inc().Double()` is `Double(Inc(a))`), and composes with the
+lossy-call suffix (`a.trunc.!(8)` is `trunc.!(a, 8)`).
+
 A callee's body may:
 
 - bind zero or more `let`s,
