@@ -71,6 +71,11 @@
           "comment": "uN (u8, u32, ...) is sugar for bits[N] — see src/parser.rs's u_width, same treatment as `bit` above.",
           "name": "keyword.declaration.trace",
           "match": "\\bu[0-9]+\\b"
+        },
+        {
+          "comment": "`where` (a reg/out/param/return bound, `x : [8] where x < 10`) is a CONTEXTUAL identifier, not a real lexer keyword unlike everything else in this file's #keywords — src/parser.rs's `parse_where_bound` checks `at_ident_text(\"where\")`, not a dedicated TokenKind. Same accepted-collision tradeoff #effect-words already documents (a variable genuinely named `where` highlights as this keyword too): there's no bracket delimiter to scope a dedicated region against, the way #effects-list's `<...>` lets it be more precise.",
+          "name": "keyword.declaration.trace",
+          "match": "\\bwhere\\b"
         }
       ]
     },
@@ -144,8 +149,9 @@
       }
     },
     "operators": {
+      "comment": "`.!` (src/lexer.rs's Lossy token, `.!`) is an explicit per-expression \"I know, let it through\" — an escape hatch on a binary operator (`a >>.! 300`) or, more generally, any expression (`wide.!`, `trunc.!(b)`), see DESIGN.md's \"Inference: two solvers\". Listed explicitly, ahead of the generic single-char fallback below: without it, `.` alone matches from the character class and the bare `!` that follows is left completely unmatched (no scope at all) — `!` never appears validly on its own in this language (a real lexer keyword `not` replaced the old symbolic `!`, see #keywords), only as this suffix's second character.",
       "name": "keyword.operator.trace",
-      "match": ":=|<>|<=|>=|<<|>>>|>>|\\.\\.|\\+:|-:|[:=<>.?|^&+\\-*/%~]"
+      "match": ":=|<>|<=|>=|<<|>>>|>>|\\.\\.|\\.!|\\+:|-:|[:=<>.?|^&+\\-*/%~]"
     },
     "punctuation": {
       "name": "punctuation.trace",
