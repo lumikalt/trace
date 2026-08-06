@@ -6957,6 +6957,44 @@ once rather than only for bounded defs, accepted deliberately for
 consistency (a def either gets the code-block treatment or it doesn't; a
 per-kind split would need its own justification this change doesn't have).
 
+**A module's own hover shows its EXTERNAL interface, not its full body —
+`in`/`out`/`io` ports only, plus every `rule` it declares below, in real
+FIRING order.** A new `module_hover` (`src/lsp.rs`), tried right alongside
+`fn_signature` before the generic scalar fallback: walks `Item::Module`'s
+own child `items` and keeps only `Input`/`Output`/`Io` ports for the fenced
+code block (`reg`/`mem`/`fifo`/`inst`/`fn`/`spec`/`impl`/`struct`/
+`schedule`/`invariant`/`attach` are all skipped) — deliberate, not an
+oversight: none of those are ever visible or reachable from OUTSIDE the
+module (an `inst x : M` can only ever touch `x`'s own ports), so a hover
+meant to answer "what is this module, from the outside" has no business
+listing them, exactly like `fn_signature`'s own port-only rendering answers
+"how do I call this," not "how is it implemented."
+
+The rule list below the code block needed a real firing order, not source
+order — `Compiled` gained a `sched: Option<schedule::Schedule>` field,
+computed one step further down the SAME "a phase after the first one with
+errors never runs" chain `bounds` (this section, above) already follows:
+`schedule::schedule` takes `&Bounds` as an input, so it only runs once
+`bounds` is ALSO genuinely error-free, mirroring `main.rs`'s own third
+early-return exactly. `module_hover` looks up this module's own
+`GroupSchedule` (matched by `module == Some(item_id)`) and reads its
+`order` field (`schedule.rs`'s own doc comment: "Rules in final urgency
+order, most urgent first") instead of the AST's own declaration-order
+`items` walk — falling back to declaration order only when `sched` itself
+is unavailable (an earlier-phase error, or a module with zero rules never
+gets a `GroupSchedule` entry at all). Verified with a dedicated test
+(`hovering_a_module_lists_rules_in_firing_order_not_declaration_order`)
+that declares `rule b` BEFORE `rule a` but adds `urgency a > b`, and
+bug-reintroduction-confirmed load-bearing: reverting the lookup to plain
+declaration order reproduces the wrong (source) order instead of the real
+one, so this genuinely discriminates the two, not just "some order shows
+up." 4 new tests total (the interface+firing-order case above, the same
+module hovered from an `inst` USE site rather than its declaration — same
+rendering either way, since `thing_at` resolves both to the identical
+`DefId` — and an empty-module edge case: no ports, no rules, `module Empty
+{}` with `No rules.` below rather than an empty ports block rendered
+oddly), zero regressions, clippy/fmt clean.
+
 The grammar is regex-based — still pattern matching, not semantic
 analysis, so it can be fooled (a
 comparison `x < reads` against a variable actually named `reads` reads as

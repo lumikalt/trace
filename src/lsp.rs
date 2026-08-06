@@ -26,12 +26,13 @@
 //! exists yet); a file with only type errors still gets go-to-definition
 //! (needs only `Resolution`) but hover without type info (needs `Types`).
 
-use crate::ast::{Ast, Expr, ExprId, FnKind, Item, effects_str};
+use crate::ast::{Ast, Expr, ExprId, FnKind, Item, ItemId, effects_str};
 use crate::bounds::Bounds;
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
+use crate::schedule::Schedule;
 use crate::types::Types;
-use crate::{bounds, effects, lexer, parser, resolve, types};
+use crate::{bounds, effects, lexer, parser, resolve, schedule, types};
 use lsp_server::{
     Connection, ExtractError, Message, Notification as ServerNotification,
     Request as ServerRequest, RequestId, Response,
@@ -334,6 +335,15 @@ struct Compiled {
     /// user-facing diagnostics the LSP never shows today), out of scope
     /// for what this field exists to add.
     bounds: Option<Bounds>,
+    /// Each module's own rule-firing order (`GroupSchedule::order`), for
+    /// `module_hover`'s own rule list -- `None` under the SAME "a phase
+    /// after the first one with errors never runs" discipline `bounds`
+    /// above already follows, one step further down the same chain
+    /// `main.rs` runs: needs a clean `bounds` (no bounds errors) same as
+    /// `bounds` itself needs a clean `ty`. Its own errors are, again,
+    /// deliberately not surfaced as diagnostics -- same established
+    /// scope cut as `bounds`'s own field doc above.
+    sched: Option<Schedule>,
 }
 
 fn compile(src: &str, index: &LineIndex) -> Compiled {
@@ -359,6 +369,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             res: None,
             ty: None,
             bounds: None,
+            sched: None,
         };
     }
 
@@ -373,6 +384,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             res: None,
             ty: None,
             bounds: None,
+            sched: None,
         };
     }
 
@@ -387,6 +399,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             res: Some(res),
             ty: None,
             bounds: None,
+            sched: None,
         };
     }
 
@@ -401,6 +414,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             res: Some(res),
             ty: None,
             bounds: None,
+            sched: None,
         };
     }
 
@@ -415,14 +429,32 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
     // Its own errors are deliberately NOT pushed as diagnostics here
     // (unlike every phase above) -- a separate, pre-existing gap, out of
     // scope for what this pass exists to add (hover's own bound line).
-    let bounds = if type_errors.is_empty() {
-        Some(bounds::check(&ast, &res, &fx, &ty).0)
+    let bounds_result = if type_errors.is_empty() {
+        Some(bounds::check(&ast, &res, &fx, &ty))
     } else {
         None
     };
+    // Same discipline one step further down the same chain: `schedule::
+    // schedule` takes `&Bounds` as an input, so it's only meaningful
+    // once `bounds` is ALSO genuinely valid (zero bounds errors) --
+    // matching `main.rs`'s own early return after `bounds_errors`. Its
+    // own errors are, again, deliberately not surfaced as diagnostics.
+    let sched = match &bounds_result {
+        Some((bounds, bounds_errors)) if bounds_errors.is_empty() => {
+            let (sched, schedule_errors) = schedule::schedule(&ast, &res, &fx, &ty, bounds);
+            if schedule_errors.is_empty() {
+                Some(sched)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let bounds = bounds_result.map(|(b, _)| b);
     Compiled {
         diagnostics,
         bounds,
+        sched,
         ast: Some(ast),
         res: Some(res),
         ty: Some(ty),
@@ -562,6 +594,18 @@ fn hover(docs: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: format!("```trace\n{sig}\n```\n\n{desc}"),
+            }),
+            range: Some(index.range(&range)),
+        });
+    }
+    // A module's own "type" is its external interface — same idea as
+    // fn/spec/impl's signature above, its own richer rendering instead
+    // of the generic scalar fallback below.
+    if let Some(value) = module_hover(ast, res, src, def_id, compiled.sched.as_ref()) {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
             }),
             range: Some(index.range(&range)),
         });
@@ -758,6 +802,94 @@ fn capitalize_sentence(s: &str) -> String {
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// Renders a module's own EXTERNAL interface (`in`/`out`/`io` ports
+/// only) as a fenced declaration, plus the names of every `rule` it
+/// declares below, IN FIRING ORDER — deliberately omitting every other
+/// child item (`reg`/`mem`/`fifo`/`inst`/`fn`/`spec`/`impl`/`struct`/
+/// `schedule`/`invariant`/`attach`): those are implementation detail,
+/// never visible or referenceable from OUTSIDE the module (an `inst x :
+/// M` can only ever read/write `x`'s own ports, never reach into `x`'s
+/// internal state), so a hover meant to answer "what is this module,
+/// from the outside" has no business listing them. `None` for anything
+/// that isn't a module def, or (defensively) if `res.item_defs` has no
+/// entry for one that is — `hover`'s own generic declaration-keyword/
+/// description rendering is the fallback either way, same convention
+/// `fn_signature` below already established.
+fn module_hover(
+    ast: &Ast,
+    res: &Resolution,
+    src: &str,
+    def_id: DefId,
+    sched: Option<&Schedule>,
+) -> Option<String> {
+    let mut item_id = None;
+    for (&iid, &did) in &res.item_defs {
+        if did == def_id {
+            item_id = Some(iid);
+            break;
+        }
+    }
+    let item_id = item_id?;
+    let Item::Module { name, items } = ast.item(item_id) else {
+        return None;
+    };
+    let port_line = |keyword: &str, port_name: &str, ty: ExprId| {
+        format!(
+            "    {keyword} {port_name} : {}",
+            &src[ast.expr_spans[ty.0 as usize].clone()]
+        )
+    };
+    let mut ports = Vec::new();
+    let mut declared_rule_ids: Vec<ItemId> = Vec::new();
+    for &child in items {
+        match ast.item(child) {
+            Item::Input { name, ty } => ports.push(port_line("in", &name.text, *ty)),
+            Item::Output { name, ty, .. } => ports.push(port_line("out", &name.text, *ty)),
+            Item::Io { name, ty } => ports.push(port_line("io", &name.text, *ty)),
+            Item::Rule { .. } => declared_rule_ids.push(child),
+            _ => {}
+        }
+    }
+    let code = if ports.is_empty() {
+        format!("module {} {{}}", name.text)
+    } else {
+        format!("module {} {{\n{}\n}}", name.text, ports.join("\n"))
+    };
+    // The scheduler's own `order` (most urgent first) is this module's
+    // REAL firing order, not just declaration order — falls back to
+    // `declared_rule_ids` (source order) whenever `sched` itself is
+    // unavailable (a schedule error elsewhere in the file, or the whole
+    // pass never ran because an earlier phase already had errors, see
+    // `Compiled::sched`'s own doc comment) or has no group for this
+    // exact module (a module with zero rules never gets a `GroupSchedule`
+    // entry at all — `schedule.rs`'s own `group` only pushes one when
+    // `rules` is non-empty).
+    let rule_ids: Vec<ItemId> = sched
+        .and_then(|s| s.groups.iter().find(|g| g.module == Some(item_id)))
+        .map(|g| g.order.clone())
+        .unwrap_or(declared_rule_ids);
+    let rule_names: Vec<String> = rule_ids
+        .iter()
+        .filter_map(|&id| match ast.item(id) {
+            Item::Rule { name, .. } => Some(name.text.clone()),
+            _ => None,
+        })
+        .collect();
+    let rules_line = if rule_names.is_empty() {
+        "No rules.".to_string()
+    } else {
+        format!(
+            "Rules, in firing order: {}",
+            rule_names
+                .iter()
+                .map(|r| format!("`{r}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Some(format!("```trace\n{code}\n```\n\n{rules_line}"))
 }
 
 /// Renders a fn/spec/impl's own declared signature as it's written in
@@ -998,6 +1130,61 @@ mod tests {
         let h = hover_at(src, 1, 9).expect("hover over the rule's own name");
         let text = hover_text(&h);
         assert_eq!(text, "```trace\nrule my_rule\n```\n\nA rule.");
+    }
+
+    const ADDER_SRC: &str = "module Adder {\n    in a : [8]\n    in b : [8]\n    out c : [8]\n    out carry : [1]\n    reg internal_state : [8] = 0\n    rule step {\n        c := a + b\n    }\n}\n";
+
+    #[test]
+    fn hovering_a_module_shows_its_external_interface_and_rules() {
+        // Only `in`/`out`/`io` ports show up in the code block — `reg
+        // internal_state` is implementation detail, invisible from
+        // outside the module (an `inst` can only reach `Adder`'s own
+        // ports), so it must NOT appear here even though it's a real
+        // child item of this exact module.
+        let h = hover_at(ADDER_SRC, 0, 7).expect("hover over the module's own name");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nmodule Adder {\n    in a : [8]\n    in b : [8]\n    out c : [8]\n    out carry : [1]\n}\n```\n\nRules, in firing order: `step`"
+        );
+    }
+
+    #[test]
+    fn hovering_a_module_name_at_an_inst_site_shows_the_same_interface() {
+        // `inst x : Adder`'s own `Adder` is a live `Expr::Ident` use
+        // (`Item::Inst::module`), not a declaration site — resolves
+        // through the ordinary `ident_at`/`expr_defs` path, same as any
+        // other use, and gets the identical rich rendering.
+        let src = format!("{ADDER_SRC}module Top {{\n    inst x : Adder\n}}\n");
+        let h = hover_at(&src, 11, 13).expect("hover over the inst site's module name");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nmodule Adder {\n    in a : [8]\n    in b : [8]\n    out c : [8]\n    out carry : [1]\n}\n```\n\nRules, in firing order: `step`"
+        );
+    }
+
+    #[test]
+    fn hovering_a_module_with_no_ports_or_rules_shows_empty_braces_and_no_rules() {
+        let src = "module Empty {\n    reg x : [1] = 0\n}\n";
+        let h = hover_at(src, 0, 7).expect("hover over the module's own name");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nmodule Empty {}\n```\n\nNo rules."
+        );
+    }
+
+    #[test]
+    fn hovering_a_module_lists_rules_in_firing_order_not_declaration_order() {
+        // `b` is declared BEFORE `a` in source, but `urgency a > b`
+        // reorders them — the rules line must reflect the SCHEDULER's
+        // own order (`schedule::GroupSchedule::order`), not source
+        // order, or this test would pass even with `module_hover` still
+        // reading straight off `items` in AST order.
+        let src = "module Reorder {\n    rule b {\n    }\n    rule a {\n    }\n    schedule {\n        urgency a > b\n    }\n}\n";
+        let h = hover_at(src, 0, 7).expect("hover over the module's own name");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nmodule Reorder {}\n```\n\nRules, in firing order: `a`, `b`"
+        );
     }
 
     #[test]
