@@ -699,13 +699,17 @@ pub struct Bounds {
     /// own flat, whole-program range whenever that expression sits
     /// under a narrowing condition (`if i < 10 { m[i] := x }` proves a
     /// tighter range for THIS `m[i]`'s own index than `i`'s raw
-    /// declared bound). Populated only for a mem access's own index
+    /// declared bound). Populated for a mem access's own index
     /// expression (`check_calls_in`'s widened stop-list, `expr_bound`'s
-    /// `Expr::Bracket` arm) -- absence here is never a signal that the
-    /// expression is unprovable, only that this pass never computed
-    /// (or never visited) a site-specific fact for it; `schedule.rs`'s
-    /// own `real_range` falls back to its independent walk whenever a
-    /// lookup here misses.
+    /// `Expr::Bracket` arm), and (v20) for every plain `Ident` read of a
+    /// bounded def `expr_bound` visits at the outermost walk (`lsp.rs`'s
+    /// hover consults this so `if cnt < 99 { ... } else { ... }` shows
+    /// each branch's own narrowed range at `cnt`'s specific occurrence,
+    /// not just the def's flat whole-program `ranges` entry) -- absence
+    /// here is never a signal that the expression is unprovable, only
+    /// that this pass never computed (or never visited) a site-specific
+    /// fact for it; `schedule.rs`'s own `real_range` falls back to its
+    /// independent walk whenever a lookup here misses.
     pub site_ranges: HashMap<ExprId, (u64, u64)>,
     /// Every VERIFIED `invariant` (DESIGN.md's "Tier 3, not v0" circular-
     /// buffer case) -- an `Item::Invariant` this pass recognized but
@@ -3259,12 +3263,28 @@ impl<'a> Checker<'a> {
             Expr::Int(v) => Some((*v, v.checked_add(1)?)),
             Expr::SizedInt { value, .. } => Some((*value, value.checked_add(1)?)),
             Expr::Ident(_) => {
-                let def = self.res.expr_defs.get(&id)?;
-                if let Some(&b) = state.get(def) {
+                let def = *self.res.expr_defs.get(&id)?;
+                let b = if let Some(&b) = state.get(&def) {
                     Some(b)
                 } else {
-                    locals.get(def).copied().flatten()
+                    locals.get(&def).copied().flatten()
+                };
+                // Exported for hover's own per-site display (LSP), same
+                // map `Expr::Bracket` below already populates for a mem
+                // index -- guarded to the OUTERMOST walk (`inline_depth
+                // == 0`) because `inline_call_result` re-visits a callee
+                // body's OWN Ident nodes under a DIFFERENT, call-site-
+                // specific `state` for every caller that inlines it; only
+                // the callee's own canonical `check_item` pass (its
+                // declared param bound, not a caller's substituted one)
+                // should ever claim this `ExprId`, so a nested inline
+                // pass here must not overwrite it.
+                if self.inline_depth == 0
+                    && let Some(b) = b
+                {
+                    self.site_ranges.insert(id, b);
                 }
+                b
             }
             Expr::Binary {
                 op: BinOp::Add,

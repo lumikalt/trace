@@ -637,13 +637,20 @@ fn hover(docs: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
                 .or_else(|| ty.state_tys.get(&def_id))
         }),
     };
-    // A proven `where` range (`bounds::Bounds::ranges`, reg/out/param
-    // only) is the SAME static fact regardless of whether the cursor is
-    // on the declaration or a later use site — unlike `ty` above, it
-    // needs no per-`ExprId`/declaration-site split, one `def_id` lookup
-    // covers both. Absent whenever the def has no declared bound at all,
-    // same as `ty` being absent for an untyped def (a rule/module/...).
-    let bound = compiled.bounds.as_ref().and_then(|b| b.ranges.get(&def_id));
+    // A proven `where` range: `bounds::Bounds::site_ranges` (keyed by
+    // THIS specific use site's own `ExprId`) is tried first, same
+    // per-expr-before-def-fallback shape `ty` above already uses --
+    // `if cnt < 99 { cnt := cnt + 1 } else { cnt := 0 }` proves `cnt`'s
+    // OWN occurrence in the `if` branch a tighter `[0, 99)` than its
+    // flat declared `[0, 100)`, and the `else` branch's occurrence an
+    // even tighter `[99, 100)` — falling back to the def-keyed `ranges`
+    // (the SAME flat fact regardless of declaration vs. use site, unlike
+    // `site_ranges`) whenever there's no `expr` at all (the declaration
+    // site itself) or this particular occurrence has no site-specific
+    // fact recorded for it.
+    let bound = expr
+        .and_then(|e| compiled.bounds.as_ref().and_then(|b| b.site_ranges.get(&e)))
+        .or_else(|| compiled.bounds.as_ref().and_then(|b| b.ranges.get(&def_id)));
     // Same two-part rendering the fn/spec/impl branch above already
     // uses (a fenced, syntax-highlighted declaration line, description
     // below) rather than the flat "`name: ty` — kind" scalar string this
@@ -658,8 +665,16 @@ fn hover(docs: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
         (None, None) => def.name.clone(),
     };
     let mut desc = format!("{}.", capitalize_sentence(def.kind.describe()));
-    if let Some((lo, hi)) = bound {
-        desc.push_str(&format!(" Where {lo} <= {} < {hi}.", def.name));
+    if let Some(&(lo, hi)) = bound {
+        // A branch can narrow a range down to exactly one value (the
+        // `else` of `if cnt < 99` combined with `cnt`'s own declared
+        // `< 100` upper bound proves `cnt == 99` there) -- reads as a
+        // plain equality rather than a one-element `<=`/`<` range.
+        if hi == lo + 1 {
+            desc.push_str(&format!(" Where {} = {lo}.", def.name));
+        } else {
+            desc.push_str(&format!(" Where {lo} <= {} < {hi}.", def.name));
+        }
     }
     if let Some(note) = sequences_cycle_note(ast, res, def_id) {
         desc.push(' ');
@@ -963,6 +978,8 @@ fn fn_signature(ast: &Ast, res: &Resolution, src: &str, def_id: DefId) -> Option
         kind,
         params,
         ret,
+        ret_bound,
+        ret_lower,
         effects,
         ..
     } = ast.item(item_id)
@@ -980,23 +997,36 @@ fn fn_signature(ast: &Ast, res: &Resolution, src: &str, def_id: DefId) -> Option
         FnKind::Spec => "spec ",
         FnKind::Impl { .. } => "impl ",
     };
+    let src_of = |e: ExprId| &src[ast.expr_spans[e.0 as usize].clone()];
     let params = params
         .iter()
         .map(|p| {
-            format!(
-                "{} : {}",
-                p.name,
-                &src[ast.expr_spans[p.ty.0 as usize].clone()]
-            )
+            let mut s = format!("{} : {}", p.name, src_of(p.ty));
+            if let Some(bound) = p.bound {
+                match p.lower {
+                    Some(lower) => {
+                        s.push_str(&format!(" where {} <= {}", src_of(lower), src_of(bound)))
+                    }
+                    None => s.push_str(&format!(" where {}", src_of(bound))),
+                }
+            }
+            s
         })
         .collect::<Vec<_>>()
         .join(", ");
     let mut sig = format!("{keyword}{name}({params})");
     if let Some(ret) = ret {
-        sig.push_str(&format!(
-            " : {}",
-            &src[ast.expr_spans[ret.0 as usize].clone()]
-        ));
+        sig.push_str(&format!(" : {}", src_of(*ret)));
+    }
+    if let Some(ret_bound) = ret_bound {
+        match ret_lower {
+            Some(lower) => sig.push_str(&format!(
+                " where {} <= {}",
+                src_of(*lower),
+                src_of(*ret_bound)
+            )),
+            None => sig.push_str(&format!(" where {}", src_of(*ret_bound))),
+        }
     }
     sig.push_str(&effects_str(effects));
     if let FnKind::Impl { refines } = kind {
@@ -1125,6 +1155,47 @@ mod tests {
         assert_eq!(
             hover_text(&h),
             "```trace\nreg counter : [8]\n```\n\nA register."
+        );
+    }
+
+    // Mirrors `examples/output_bounded.tr`: an `if`/`else` narrows `cnt`'s
+    // flat declared `[0, 100)` per-branch -- `bound`'s original `b.ranges.
+    // get(&def_id)` lookup was a whole-program fact, so hovering EITHER
+    // branch's own `cnt` occurrence used to show the same unnarrowed
+    // `Where 0 <= cnt < 100.` regardless of which branch the cursor was
+    // in, even though `bounds.rs`'s own `check_stmt` already computes a
+    // tighter per-branch `state` internally (live user report: hovering
+    // `cnt` in either branch should reflect the narrowing that branch's
+    // own condition proves, not the def's flat declared range).
+    const IF_ELSE_BOUNDED_SRC: &str = "module M {\n    out cnt : [8] where cnt < 100 = 0\n    rule r {\n        if cnt < 99 {\n            cnt := cnt + 1\n        } else {\n            cnt := 0\n        }\n    }\n}\n";
+
+    #[test]
+    fn hovering_a_narrowed_variable_in_an_if_branch_shows_the_narrowed_range() {
+        // The `if` branch's own LHS write target, line 4 col 12.
+        let h =
+            hover_at(IF_ELSE_BOUNDED_SRC, 4, 12).expect("hover over the if branch's write target");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nout cnt : [8]\n```\n\nAn output port. Where 0 <= cnt < 99."
+        );
+        // Same branch's RHS read, line 4 col 19 -- same narrowed range.
+        let h = hover_at(IF_ELSE_BOUNDED_SRC, 4, 19).expect("hover over the if branch's read");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nout cnt : [8]\n```\n\nAn output port. Where 0 <= cnt < 99."
+        );
+    }
+
+    #[test]
+    fn hovering_a_narrowed_variable_in_an_else_branch_shows_the_exact_value() {
+        // The negated condition (`cnt >= 99`) combined with `cnt`'s own
+        // declared `< 100` upper bound narrows the `else` branch down to
+        // exactly one value -- rendered as an equality, not a range.
+        let h = hover_at(IF_ELSE_BOUNDED_SRC, 6, 12)
+            .expect("hover over the else branch's write target");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nout cnt : [8]\n```\n\nAn output port. Where cnt = 99."
         );
     }
 
@@ -1315,6 +1386,24 @@ mod tests {
         assert_eq!(
             hover_text(&h),
             "```trace\nOuter(x : [8]) : [8] <combines>\n```\n\nA function."
+        );
+    }
+
+    // Mirrors `examples/return_bound_check.tr`: a param `where` bound and
+    // a `where _ < N` return bound (v13). `fn_signature` originally only
+    // pulled `p.ty`/`ret`'s own spans, silently dropping `p.bound`/
+    // `ret_bound` entirely -- caught live by hovering `Bump` and seeing
+    // neither `where` clause show up.
+    const BOUNDED_FN_SRC: &str = "module RetBoundCheck {\n    reg total : [8] where total < 40 = 0\n\n    \
+                                   Bump(i : [8] where i < 10) : [8] where _ < 20 {\n        return i + 5\n    }\n\n    \
+                                   rule step {\n        total := Bump(3)\n    }\n}\n";
+
+    #[test]
+    fn hovering_a_function_with_param_and_return_bounds_shows_both_where_clauses() {
+        let h = hover_at(BOUNDED_FN_SRC, 3, 4).expect("hover over Bump's own declaration");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nBump(i : [8] where i < 10) : [8] where _ < 20\n```\n\nA function."
         );
     }
 
