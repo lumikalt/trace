@@ -1845,6 +1845,25 @@ design:**
   `module.rs`'s depth-1 Deq emission already branches on `.select`
   (`when sel: connect valid, 0` vs. unconditional) — also pre-existing,
   needed zero changes.
+
+  **Correction (2026-08-07):** the depth-1 claim above was true, but its
+  silence about depth > 1 hid a real, live miscompile: `emit_fifo_depth_n`
+  (module.rs, the depth-N sibling of the depth-1 code just described)
+  ignored `.select` entirely, unconditionally updating `head`/`count`
+  every cycle the enclosing rule fired — so `if let x = f.Deq[]` (or
+  bare `if f.Deq[]`) on a depth > 1 fifo decremented `count` off an
+  already-empty fifo every idle cycle, wrapping it to a bogus nonzero
+  value after just one cycle. No check rejected the combination either
+  (`check_branch_fifo_op_depth`/`check_or_shape` only reject `Branch`-
+  selected ops and `or` alternatives on depth > 1, not `Cond`). Confirmed
+  live before any fix: `examples/fifo_depth_if_let.tr` +
+  `sim/fifo_depth_if_let_tb.v` failed against real firtool + Icarus
+  simulation with `was_present` stuck at 1 with garbage data, exactly as
+  predicted, before the fix below landed. Fixed by gating `emit_fifo_
+  depth_n`'s `head`/`count` connects on `Cond`'s guard the same way the
+  depth-1 path already did — see "FIFO synthesis emission"'s own
+  follow-up paragraph. `tests/sim.rs`'s `fifo_depth_if_let_gates_head_
+  and_count_on_the_guard` pins the fix.
 - The 8 near-identical `let Expr::Guard(opt) = self.ast.expr(init).clone()
   else { unreachable!(...) }` sites across writes.rs/calls.rs (the
   `if_let_binds` value-threading machinery the Option feature's own
@@ -6558,6 +6577,37 @@ module FifoPassthrough {
 A local's value, referenced after being bound (`let x = input.Deq[]`, then `x`
 used later), is inlined by recompiling whatever it was bound to — FIRRTL has no
 `let`-bound name of its own, only wires and declarations.
+
+**Depth-N + a conditional `Deq` (`if let`/bare-`if` on the fifo's own
+presence — "`if let`: a fifo op's own presence" above): gated, not
+unconditional.** The depth-1 path above (and the depth-1 `if let` write-
+up) already branches on the op's `select` when clearing `valid`. The
+depth-N path did not — a real gap, not a deliberate v0 restriction:
+`emit_fifo_depth_n` connected `head`/`count` every cycle the enclosing
+rule fired, regardless of whether the `Deq`'s own guard actually held,
+silently corrupting `count` (decrementing an already-empty fifo) on
+every idle cycle. Nothing rejected the combination, so this was a live
+miscompile the moment `if let`'s fifo case shipped, not a hypothetical
+one — reproduced first (`examples/fifo_depth_if_let.tr` +
+`sim/fifo_depth_if_let_tb.v` failing against real firtool+Icarus with
+`was_present` stuck at 1 and garbage data after a single idle cycle)
+before writing the fix, per this project's own discipline. Fixed by
+threading the same `Cond`/`None` branch the depth-1 path already has
+through `emit_fifo_depth_n`: a `Cond`-selected `Deq`'s `head`/`count`
+update now sits inside its own `when {guard} :`, with the co-located
+Enq (if any) getting its OWN `count` increment in the `else` branch —
+since a guard-false cycle means no dequeue actually happened, so a
+paired Enq is really just a plain enqueue that cycle, not a pass-
+through. The Enq's own slot write is unaffected either way: it already
+used `head + count`'s pre-edge value, which is the correct tail slot
+whether or not the paired dequeue's guard holds. `FifoSelect::Branch`
+(an ordinary `if`/`else` branch, not `if let`'s own condition) stays
+rejected on depth > 1 by the pre-existing `check_branch_fifo_op_depth` —
+unaffected, and unreachable inside `emit_fifo_depth_n`'s own `Cond`/
+`None` match by construction. Verified against real firtool + Icarus
+simulation, including several idle cycles both before the first push
+and after the pushed item drains — the load-bearing assertions, since a
+single push-then-pop round trip alone wouldn't have caught the bug.
 
 ## Port-based memory access
 

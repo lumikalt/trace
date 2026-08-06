@@ -2427,6 +2427,37 @@ fn if_let_fifo_deq_drives_a_real_dequeue_exactly_when_present_under_verilator() 
     );
 }
 
+/// `examples/fifo_depth_if_let.tr`: `if let x = f.Deq[]` on a depth > 1
+/// fifo. Regression test for a real miscompile in `emit_fifo_depth_n`
+/// (module.rs) that ignored the deq op's `FifoSelect::Cond` guard
+/// entirely, updating `head`/`count` unconditionally every cycle
+/// `consumer` fired — corrupting `count` (decrementing an already-empty
+/// fifo, wrapping to a bogus nonzero value) after a single idle cycle.
+/// `sim/fifo_depth_if_let_tb.v`'s idle-cycle checks (both before the
+/// first push and after the pushed item drains) are what actually catch
+/// this; a single push-then-pop round trip alone would not.
+#[test]
+fn fifo_depth_if_let_gates_head_and_count_on_the_guard() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/fifo_depth_if_let.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/fifo_depth_if_let_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+}
+
 /// Proves `if let x = Classify(a) { ... }` end to end:
 /// `examples/if_let_failing_call.tr`'s `compute` rule fires every cycle
 /// (`if let` never gates the rule), and `result`/`was_present` track

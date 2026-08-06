@@ -1,0 +1,34 @@
+-- `if let x = fifo.Deq[] { ... }` on a depth > 1 fifo -- the SAME
+-- shape `if_let_fifo.tr` exercises at depth 1, generalized. `consumer`
+-- fires every cycle regardless of occupancy (same as if_let_fifo.tr),
+-- so `emit_fifo_depth_n`'s head/count update for this rule's `Deq[]`
+-- MUST be gated on the if-let's own guard (`FifoSelect::Cond`) -- it
+-- used to update head/count unconditionally every cycle the rule
+-- fired, corrupting `count` (decrementing off an already-empty fifo,
+-- wrapping to a bogus nonzero value) after just one idle cycle. See
+-- DESIGN.md's "FIFO synthesis emission" and sim/fifo_depth_if_let_tb.v,
+-- which asserts `was_present` stays 0 across several idle cycles both
+-- before the first push and after the pushed item drains.
+module FifoDepthIfLet {
+    fifo f : {3}[8]
+
+    in push : [1]
+    in push_val : [8]
+    out last : [8] = 0
+    out was_present : [1] = 0
+
+    rule producer {
+        (push = 1)?
+        f.Enq[push_val]
+    }
+
+    rule consumer {
+        if let x = f.Deq[] {
+            last := x
+            was_present := 1
+        } else {
+            last := 0
+            was_present := 0
+        }
+    }
+}
