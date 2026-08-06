@@ -713,6 +713,29 @@ re-propose these from a fresh read of the same chapters:
   and rollback COST specifically (checkpoint/squash machinery once a
   transaction has crossed a `tick`) is entirely unaddressed — a cycle
   COUNT existing is not the same as its rollback cost being modeled.
+  **Scoped stage 2 (port-level interval types) the same day and found no
+  viable next step, not just an unscheduled one.** `inst`/module ports have
+  no invocation boundary to anchor an interval against — every `out` port
+  is a continuously-live, per-cycle resource with no fixed start/end event
+  (unlike Filament's own model, where a component is invoked once and its
+  ports' validity windows are relative to that invocation); a literal port
+  interval type doesn't have an obvious meaning here without a much larger,
+  foundational change to the execution model, not an additive feature.
+  `spawn`/`sync` DOES have real invocation shape (a handle's start/end are
+  well-defined), so it looked like the more promising foundation — but the
+  two concrete things it could be used for both dissolve on inspection:
+  concurrent spawns of a callee touching shared module state already get
+  correctly serialized by the ordinary per-cycle scheduler conflict
+  analysis (verified directly: two rules each spawning a callee that
+  writes the same `reg` produce a derived stall between their lowered
+  segments, same as any two hand-written rules would — nothing unchecked);
+  and a static "you synced too early" check on `sequences_cycle_count`
+  can't work because the count is a lower bound, not an exact duration
+  (fallible ops inside a segment retry), so it would reject programs that
+  are correct at runtime, to catch a case (`sync` firing before the callee
+  is done) that's already harmless since `sync` retries until `done`
+  regardless. Stage 1 is where this line of work correctly stops until
+  something changes the premises above.
 - Multi-cycle `<sequences>` transactions (`tick`/`spawn`/`sync`) hide the
   real cost of what they express: rollback within one cycle is free
   (nothing has committed yet), but rolling back a transaction that has

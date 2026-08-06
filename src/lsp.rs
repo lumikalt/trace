@@ -585,11 +585,23 @@ fn hover(docs: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
     // the same as the source itself, plus a placeholder description line
     // since there are no doc comments to pull a real one from yet.
     if let Some(sig) = fn_signature(ast, res, src, def_id) {
-        let desc = match def.kind {
+        let mut desc = match def.kind {
             DefKind::Spec => "A spec.",
             DefKind::Impl => "An impl.",
             _ => "A function.",
-        };
+        }
+        .to_string();
+        // A `<sequences>` FN is a legal `spawn` callee -- its own cycle
+        // count matters just as much here as it does for a rule (same
+        // `sequences_cycle_note`, same TODO.md "cost opacity" gap), but
+        // this branch returns before ever reaching the generic fallback
+        // below, where a rule's own note is appended -- without this, a
+        // spawn callee's duration stayed invisible in hover specifically
+        // (found immediately after shipping the rule-only version).
+        if let Some(note) = sequences_cycle_note(ast, res, def_id) {
+            desc.push(' ');
+            desc.push_str(&note);
+        }
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -808,13 +820,15 @@ fn capitalize_sentence(s: &str) -> String {
     }
 }
 
-/// A `<sequences>` rule's own checked cycle count, as a hover sentence
-/// (`lower::sequences_cycle_count`) — TODO.md's own "cost opacity" gap,
-/// otherwise invisible anywhere in the type system. `None` for anything
-/// that isn't a `<sequences>`-tagged rule at all (an ordinary rule, or
-/// any other def kind) — checked directly off `Item::Rule`'s own
-/// `effects`, same as `schedule.rs`'s own `explain` does, not through
-/// `Effects`/`fx` (`compile`'s own `fx` is never kept on `Compiled`).
+/// A `<sequences>` rule OR fn's own checked cycle count, as a hover
+/// sentence (`lower::sequences_cycle_count`) — TODO.md's own "cost
+/// opacity" gap, otherwise invisible anywhere in the type system. A
+/// `<sequences>` FN is a legal `spawn` callee, so its own duration
+/// matters exactly as much as a rule's — checked directly off `Item::
+/// Rule`/`Item::Fn`'s own `effects`, same as `schedule.rs`'s own
+/// `explain` does, not through `Effects`/`fx` (`compile`'s own `fx` is
+/// never kept on `Compiled`). `None` for anything that isn't a
+/// `<sequences>`-tagged rule/fn at all.
 fn sequences_cycle_note(ast: &Ast, res: &Resolution, def_id: DefId) -> Option<String> {
     let mut item_id = None;
     for (&iid, &did) in &res.item_defs {
@@ -823,8 +837,10 @@ fn sequences_cycle_note(ast: &Ast, res: &Resolution, def_id: DefId) -> Option<St
             break;
         }
     }
-    let Item::Rule { effects, body, .. } = ast.item(item_id?) else {
-        return None;
+    let (effects, body) = match ast.item(item_id?) {
+        Item::Rule { effects, body, .. } => (effects, body),
+        Item::Fn { effects, body, .. } => (effects, body),
+        _ => return None,
     };
     if !effects.iter().any(|e| e.name.text == "sequences") {
         return None;
@@ -1186,6 +1202,22 @@ mod tests {
         assert_eq!(
             hover_text(&h),
             "```trace\nrule r\n```\n\nA rule. Its cycle count depends on control flow (while/spawn)."
+        );
+    }
+
+    #[test]
+    fn hovering_a_sequences_fn_used_as_a_spawn_callee_shows_its_cycle_count_too() {
+        // A `<sequences>` FN (not a rule) is a legal `spawn` callee --
+        // found immediately after shipping the rule-only version that
+        // `fn_signature`'s own branch returns before ever reaching
+        // `sequences_cycle_note`, so a callee's own duration stayed
+        // invisible in hover specifically, unlike the rule that spawns
+        // it. Same mechanism, reached from the OTHER hover branch.
+        let src = "Slow(x : [8]) : [8] <sequences> {\n    tick\n    return x\n}\n\nmodule M {\n    rule r <sequences> {\n        let h = spawn Slow(1)\n        tick\n        let v = sync[h]\n        tick\n    }\n}\n";
+        let h = hover_at(src, 0, 1).expect("hover over the fn's own name");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nSlow(x : [8]) : [8] <sequences>\n```\n\nA function. It takes 2 cycles."
         );
     }
 
