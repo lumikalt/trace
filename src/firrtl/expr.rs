@@ -729,6 +729,29 @@ impl<'a> Emitter<'a> {
                         let b = self.resolve_bits_width(*args.get(2)?)?;
                         Some(a.max(b))
                     }
+                    // `max`'s own result width is the MAX of whichever
+                    // arguments resolve to a real `Bits` width; `min`'s is
+                    // the MIN (see `types.rs`'s own `"max"|"min"` arm doc
+                    // comment on why the two directions differ — `min`
+                    // can never exceed its narrowest operand). Both
+                    // deliberately `filter_map`, not `?`-propagated like
+                    // every arm above: a bare `Int` argument (`max(a,
+                    // 10)`) contributes no width of its own (it's a
+                    // literal that absorbs into the others, same as
+                    // `type_binop`'s `(Bits, Int)` rule), not a resolution
+                    // FAILURE the way an unresolvable `Bits` operand would
+                    // be. If NONE resolve, this call is the deliberately
+                    // compile-time-only all-`Int` shape (`types.rs` typed
+                    // it `Ty::Int`), which has no `Bits` width at all --
+                    // `None` here is the correct answer, not a gap.
+                    "max" => args
+                        .iter()
+                        .filter_map(|&a| self.resolve_bits_width(a))
+                        .max(),
+                    "min" => args
+                        .iter()
+                        .filter_map(|&a| self.resolve_bits_width(a))
+                        .min(),
                     _ => match self.res.def(*def).kind {
                         DefKind::Fn | DefKind::Impl => self.resolve_nested_call_width(*def, args),
                         _ => None,

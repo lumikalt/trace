@@ -3581,6 +3581,100 @@ module M {
     }));
 }
 
+/// `max`/`min` join `clog2`/`len` in the same deliberate compile-time-only
+/// gap as the test just above, but ONLY when EVERY argument is itself a
+/// compile-time constant (both `3`/`5` here) -- they type as `Ty::Int` and
+/// fold inside a type-position width expression
+/// (`examples/generic_width_max_min.tr`) instead of becoming a circuit
+/// that compares two constants. The moment a real runtime `Bits` value is
+/// involved, this is a genuine synthesizable comparator+mux instead --
+/// see `max_and_min_of_real_bits_values_synthesize_a_comparator_mux`,
+/// just below.
+#[test]
+fn max_and_min_called_directly_are_still_unsynthesizable() {
+    for name in ["max", "min"] {
+        let src = format!(
+            "module M {{\n out result : [8] = 0\n rule r {{\n result := {name}(3, 5)\n }}\n}}\n"
+        );
+        let err = emit_from_source(&src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains(&format!(
+                "calling the builtin `{name}` is not yet supported"
+            ))),
+            "{name}: {err:?}"
+        );
+    }
+}
+
+/// The dual-purpose half of the pair just above: at least one argument
+/// is now a real port (`Bits`, not `Int`), so this synthesizes a genuine
+/// comparator-gated `mux` instead of hitting the compile-time-only gap.
+#[test]
+fn max_and_min_of_real_bits_values_synthesize_a_comparator_mux() {
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    out biggest : [8] = 0
+    out smallest : [8] = 0
+    rule r {
+        biggest := max(a, b)
+        smallest := min(a, b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_biggest, bits(mux(gt(b, a), b, a), 7, 0)"));
+    assert!(fir.contains("connect __out_smallest, bits(mux(lt(b, a), b, a), 7, 0)"));
+    run_firtool(&fir, &[]);
+}
+
+/// A bare `Int` literal argument absorbs into its `Bits` sibling's width
+/// (`type_binop`'s `(Bits, Int)` rule, reused for `max`/`min`'s own
+/// mixed-argument case) -- `compile_max_min` must compile it HINTED to
+/// the call's own result width, not bare, or `Expr::Int`'s own emission
+/// (`hint.unwrap_or_else(|| self.width_of(id))`) would fail to find a
+/// width for a plain integer with no context of its own.
+#[test]
+fn max_absorbs_a_bare_int_literal_argument() {
+    let src = "\
+module M {
+    in a : [8]
+    out result : [8] = 0
+    rule r {
+        result := max(a, 100)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(
+        fir.contains("connect __out_result, bits(mux(gt(UInt<8>(100), a), UInt<8>(100), a), 7, 0)")
+    );
+    run_firtool(&fir, &[]);
+}
+
+/// Variadic: more than two arguments left-fold into nested `mux`es, same
+/// shape `examples/call_max_min.tr` proves through real simulation.
+#[test]
+fn max_of_three_arguments_left_folds_into_nested_muxes() {
+    let src = "\
+module M {
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    out result : [8] = 0
+    rule r {
+        result := max(a, b, c)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains(
+        "connect __out_result, bits(mux(gt(c, mux(gt(b, a), b, a)), c, mux(gt(b, a), b, a)), 7, 0)"
+    ));
+    run_firtool(&fir, &[]);
+}
+
 #[test]
 fn pack_concatenates_msb_first() {
     let src = "\
@@ -4001,6 +4095,43 @@ module M {
 
 // `mux`'s selector-width rejection (`must be bits[1]`) is a type-check
 // error, not an emission one -- pinned in tests/types.rs instead.
+
+/// `max`/`min` resolve inside a generic callee's own declared return
+/// type width expression (`bits[max(n, m)]`), instantiated at a concrete
+/// call site the same way `implicit_width_params_instantiate_at_call_
+/// sites` (tests/types.rs) already proves `clog2` does. This is the
+/// emission-level counterpart: `n`/`m` solve to 4/8 from `a`/`b`'s own
+/// port widths, so `Wider`'s `zext(x, max(n, m))` compiles to a real
+/// `pad(a, 8)` -- exercising `compile_zext`'s own `hint` fix in the same
+/// motion, since `max(n, m)` itself only resolves at the concrete call
+/// site, never inside the generic body's own single type-check pass.
+#[test]
+fn max_and_min_resolve_a_generic_callees_return_width_at_the_call_site() {
+    let src = "\
+Wider(x : [n], y : [m]) : [max(n, m)] <combines> {
+    return zext(x, max(n, m))
+}
+
+Narrower(x : [n], y : [m]) : [min(n, m)] <combines> {
+    return trunc(x, min(n, m))
+}
+
+module M {
+    in a : [4]
+    in b : [8]
+    out wide : [8] = 0
+    out narrow : [4] = 0
+    rule r {
+        wide := Wider(a, b)
+        narrow := Narrower(a, b)
+    }
+}
+";
+    let fir = emit_from_source(src).expect("emission should succeed");
+    assert!(fir.contains("connect __out_wide, pad(a, 8)"));
+    assert!(fir.contains("connect __out_narrow, bits(a, 3, 0)"));
+    run_firtool(&fir, &[]);
+}
 
 #[test]
 fn user_call_nested_inside_a_builtins_argument_composes() {

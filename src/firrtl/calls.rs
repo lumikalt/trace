@@ -16,8 +16,12 @@
 //! fixed-priority `mux` chain), `compile_trunc`/`compile_zext`/
 //! `compile_sext` (width changes), `compile_pack`/`compile_reverse`
 //! (`cat` chains), `compile_popcount` (an `add` chain), `compile_rotate`
-//! (a two-slice `cat`, `rotl`/`rotr` sharing one function), and
-//! `compile_mux` (a direct FIRRTL `mux`).
+//! (a two-slice `cat`, `rotl`/`rotr` sharing one function),
+//! `compile_mux` (a direct FIRRTL `mux`), and `compile_max_min` (a
+//! left-folded chain of comparator-gated `mux`es, `max`/`min` sharing
+//! one function — the one builtin here that's ALSO sometimes NOT
+//! synthesizable, when every argument is a compile-time constant; see
+//! its own doc comment).
 
 use super::Emitter;
 use super::fifo::fifo_guard_cond;
@@ -458,9 +462,17 @@ impl<'a> Emitter<'a> {
     /// `mux` are synthesizable today; `bits`/`wire`/`list`/`any` never
     /// reach here at all (`bits[N]` is a type-position construct, `any`
     /// is spec/`chooses`-only, both handled entirely by types.rs/
-    /// effects.rs before emission), and `clog2`/`len` remain
-    /// compile-time-only (real gaps, no in-repo caller needs them
-    /// synthesizable yet) — fall through to an explicit error.
+    /// effects.rs before emission), and `clog2`/`len` are DELIBERATELY
+    /// compile-time-only, no runtime meaning at all — fall through to an
+    /// explicit error. `max`/`min` are the one dual-purpose pair: when
+    /// `types.rs` typed this call `Ty::Int` (every argument itself a
+    /// compile-time constant), it's the same explicit gap as `clog2`
+    /// below — `max`/`min` exist there specifically to fold inside a
+    /// type-position width expression (`bits[max(n, m)]`, see `types/
+    /// eval.rs`'s `const_eval_expr`), not to become a degenerate
+    /// constant-comparing circuit nobody asked for. Once at least one
+    /// argument is a real runtime `Bits` value, though, `compile_max_min`
+    /// synthesizes an actual comparator+mux chain.
     pub(crate) fn compile_builtin_call(
         &mut self,
         id: ExprId,
@@ -473,12 +485,14 @@ impl<'a> Emitter<'a> {
             "prio" => self.compile_prio(id, args, hint),
             "trunc" => self.compile_trunc(id, args, hint),
             "pack" => self.compile_pack(id, args),
-            "zext" => self.compile_zext(id, args),
-            "sext" => self.compile_sext(id, args),
+            "zext" => self.compile_zext(id, args, hint),
+            "sext" => self.compile_sext(id, args, hint),
             "popcount" => self.compile_popcount(id, args, hint),
             "reverse" => self.compile_reverse(id, args),
             "rotl" => self.compile_rotate(id, args, true),
             "rotr" => self.compile_rotate(id, args, false),
+            "max" => self.compile_max_min(id, args, hint, true),
+            "min" => self.compile_max_min(id, args, hint, false),
             "mux" => self.compile_mux(id, args),
             "__race_value" => self.compile_race_value(id, args, hint),
             name => {
@@ -647,13 +661,30 @@ impl<'a> Emitter<'a> {
     /// `width == value`'s own width case without a special case here (a
     /// genuinely narrower `width` is a `types.rs` error already, which
     /// halts the pipeline before emission is reached).
-    fn compile_zext(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+    ///
+    /// `hint`, preferred over `width_of(id)` exactly like `compile_trunc`
+    /// does: `width` is a real argument here (unlike `trunc`'s inferred
+    /// 1-arg form), so this normally resolves directly through `types.rs`'s
+    /// own `Ty::Bits(Width::Known(_))` — but inside a GENERIC callee body,
+    /// a width expression built from an unsolved implicit param (e.g.
+    /// `zext(a, max(n, m))`) types to `Width::Unknown` there too (the
+    /// `"zext"|"sext"` arm's own `type_builtin_call` doc comment), so the
+    /// top-down `hint` this call was found latent to have been silently
+    /// DROPPING (never threaded past `compile_builtin_call`) is exactly
+    /// what resolves it at the concrete call site, same channel `trunc`
+    /// already relies on.
+    fn compile_zext(
+        &mut self,
+        id: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
         let span = self.ast.expr_spans[id.0 as usize].clone();
         if args.len() != 2 {
             self.error(span, "`zext` takes (value, width)".to_string());
             return Err(());
         }
-        let w = self.width_of(id);
+        let w = hint.unwrap_or_else(|| self.width_of(id));
         let value_str = self.compile_expr(args[0])?;
         Ok(format!("pad({value_str}, {w})"))
     }
@@ -667,14 +698,20 @@ impl<'a> Emitter<'a> {
     /// (`asUInt`) — the identical `asUInt(pad(asSInt(...), w))` shape
     /// `compile_shift`'s `AShr` case already uses and has confirmed
     /// against real firtool + simulation, reused here rather than
-    /// re-deriving and re-verifying the same primop composition.
-    fn compile_sext(&mut self, id: ExprId, args: &[ExprId]) -> Result<String, ()> {
+    /// re-deriving and re-verifying the same primop composition. `hint`:
+    /// same reasoning as `compile_zext`'s own doc comment.
+    fn compile_sext(
+        &mut self,
+        id: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+    ) -> Result<String, ()> {
         let span = self.ast.expr_spans[id.0 as usize].clone();
         if args.len() != 2 {
             self.error(span, "`sext` takes (value, width)".to_string());
             return Err(());
         }
-        let w = self.width_of(id);
+        let w = hint.unwrap_or_else(|| self.width_of(id));
         let value_str = self.compile_expr(args[0])?;
         Ok(format!("asUInt(pad(asSInt({value_str}), {w}))"))
     }
@@ -859,6 +896,81 @@ impl<'a> Emitter<'a> {
         let a = self.compile_expr(args[1])?;
         let b = self.compile_expr(args[2])?;
         Ok(format!("mux({sel}, {a}, {b})"))
+    }
+
+    /// `max(a, b, ...)`/`min(a, b, ...)`: when `types.rs` typed this call
+    /// `Ty::Int` (every argument itself a compile-time constant), this is
+    /// the same deliberate, explicit gap `clog2`/`len` already have —
+    /// `max`/`min` exist there to fold inside a type-position width
+    /// expression (`types/eval.rs`'s `const_eval_expr`), not to become a
+    /// circuit that compares two constants. Otherwise (at least one
+    /// argument a real `Bits` value), a left fold of pairwise `mux(cmp,
+    /// next, acc)` — `max` keeps `next` when `gt(next, acc)`, `min` when
+    /// `lt(next, acc)`; ties don't matter, since either arm of an equal
+    /// comparison is the same value. Every argument is compiled HINTED
+    /// to the call's own result width `w` (not `compile_expr` bare):
+    /// a real `Bits` operand ignores the hint and emits at its own
+    /// declared width regardless (FIRRTL's `gt`/`lt` already compare
+    /// differently-width `UInt` operands correctly) — but a bare
+    /// INT-typed argument absorbed into a wider `Bits` sibling (`max(a,
+    /// 10)`, `a : [8]`) has no width of its own at all (`Expr::Int`'s own
+    /// `compile_expr` arm needs a hint or `width_of` to know what to
+    /// emit), so skipping the hint here would make EXACTLY that shape
+    /// fail despite `types.rs` already having accepted it (`check_
+    /// literal_fits` there confirms `10` fits `w`).
+    ///
+    /// The trailing `bits(acc, w-1, 0)` matters in a way `compile_mux`
+    /// above never needed: FIRRTL's own `mux` result width is `max` of
+    /// its two arms' widths, REGARDLESS of which builtin built it — fine
+    /// for `max` (`types.rs`'s own width rule there is ALSO the max of
+    /// every `Bits` argument, so the chain's natural width already
+    /// equals `w`) but wrong for `min`, whose declared width is instead
+    /// the NARROWEST argument's own width (`min(a, b)` can never exceed
+    /// either operand, so it never needs more bits than the smaller one
+    /// — `types.rs`'s own doc comment on this). A `min(a, b)` with `a :
+    /// [4]`, `b : [8]` would otherwise emit an 8-bit `mux` chain while
+    /// `types.rs` declared the call `[4]`, silently lying about its own
+    /// width the identical way `compile_popcount`'s own missing
+    /// truncation once did — caught by advisor before shipping, not by
+    /// this file's own tests, which (before this fix) only ever compiled
+    /// EQUAL-width `max`/`min` arguments.
+    fn compile_max_min(
+        &mut self,
+        id: ExprId,
+        args: &[ExprId],
+        hint: Option<u64>,
+        is_max: bool,
+    ) -> Result<String, ()> {
+        let span = self.ast.expr_spans[id.0 as usize].clone();
+        let name = if is_max { "max" } else { "min" };
+        if args.len() < 2 {
+            self.error(span, format!("`{name}` takes at least two arguments"));
+            return Err(());
+        }
+        if matches!(self.types.expr_tys.get(&id), Some(Ty::Int)) {
+            self.error(
+                span,
+                format!(
+                    "calling the builtin `{name}` is not yet supported in FIRRTL emission \
+                     when every argument is a compile-time constant (v0 restriction: `{name}` \
+                     is foldable directly inside a type-position width expression instead, \
+                     e.g. `bits[{name}(n, m)]`)"
+                ),
+            );
+            return Err(());
+        }
+        let w = hint.unwrap_or_else(|| self.width_of(id));
+        let mut acc = self.compile_expr_hinted(args[0], Some(w))?;
+        for &a in &args[1..] {
+            let next = self.compile_expr_hinted(a, Some(w))?;
+            let cmp = if is_max {
+                format!("gt({next}, {acc})")
+            } else {
+                format!("lt({next}, {acc})")
+            };
+            acc = format!("mux({cmp}, {next}, {acc})");
+        }
+        Ok(format!("bits({acc}, {}, 0)", w.saturating_sub(1)))
     }
 
     /// `__race_value(d1, r1, d2, r2, ...)`: lower.rs's own rewrite of a

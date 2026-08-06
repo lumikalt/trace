@@ -856,6 +856,78 @@ impl<'a> TypeChecker<'a> {
     fn type_builtin_call(&mut self, id: ExprId, name: &str, args: &[ExprId], arg_tys: &[Ty]) -> Ty {
         match name {
             "clog2" | "len" => Ty::Int,
+            // `max(a, b, ...)`/`min(a, b, ...)`: dual-purpose, unlike
+            // every other builtin here. When EVERY argument is `Ty::Int`
+            // (bare integer literals, `clog2(..)` results, implicit
+            // width params — the same shapes a type-position width
+            // expression is built from), this stays compile-time-only,
+            // same class as `clog2`: typed `Ty::Int`, foldable directly
+            // inside `bits[max(n, m)]` via `const_eval_expr` (types/
+            // eval.rs), not synthesizable as an ordinary call. The
+            // moment at least one argument is a real `Bits` VALUE (a
+            // port, register, or anything else with runtime width), this
+            // is a synthesizable comparator+mux instead (`compile_max_
+            // min`, firrtl/calls.rs) — same "`Int` absorbs into `Bits`,
+            // checked to fit" rule `type_binop`'s own `(Bits, Int)` arm
+            // already uses for a bare arithmetic operand, applied
+            // pairwise across however many arguments there are. Arity IS
+            // checked here (at least two arguments — a one-argument
+            // `max`/`min` is just its argument, not a meaningful call).
+            "max" | "min" => {
+                if args.len() < 2 {
+                    self.error(
+                        self.expr_span(id),
+                        format!("`{name}` takes at least two arguments"),
+                    );
+                    return Ty::Unknown;
+                }
+                if arg_tys.iter().all(|t| matches!(t, Ty::Int)) {
+                    return Ty::Int;
+                }
+                // `max`'s result can need as many bits as its WIDEST
+                // `Bits` argument (the larger of a `[4]` and an `[8]` can
+                // need all 8 bits) — but `min`'s result can never exceed
+                // its NARROWEST argument's own domain (`min(a, b) <= a`
+                // and `<= b`, always), so it only ever needs the
+                // NARROWEST argument's width. Using `max` for both here
+                // would reject a perfectly legal `min(a, b)` write into a
+                // target no wider than the smaller operand — a `min`
+                // result can never actually overflow that.
+                let combine = if name == "max" { u64::max } else { u64::min };
+                let mut width: Option<Width> = None;
+                for ty in arg_tys {
+                    match ty {
+                        Ty::Bits(w) => {
+                            width = Some(match width {
+                                None => *w,
+                                Some(Width::Known(a)) => match w {
+                                    Width::Known(b) => Width::Known(combine(a, *b)),
+                                    Width::Unknown => Width::Unknown,
+                                },
+                                Some(Width::Unknown) => Width::Unknown,
+                            });
+                        }
+                        Ty::Int => {}
+                        Ty::Unknown => return Ty::Unknown,
+                        other => {
+                            self.error(
+                                self.expr_span(id),
+                                format!("`{name}` needs `bits`/`int` arguments, got {other}"),
+                            );
+                            return Ty::Unknown;
+                        }
+                    }
+                }
+                let result = Ty::Bits(width.expect("checked not all Ty::Int above"));
+                if let Ty::Bits(Width::Known(_)) = &result {
+                    for (arg, ty) in args.iter().zip(arg_tys) {
+                        if matches!(ty, Ty::Int) {
+                            self.check_literal_fits(*arg, &result);
+                        }
+                    }
+                }
+                result
+            }
             // `trunc(value, width)`: the ordinary explicit form, typed
             // directly from the const-evaluated `width` argument, same
             // as always.

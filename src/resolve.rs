@@ -223,14 +223,19 @@ pub struct ResolveError {
 /// Callable names with no user definition. `sync`/`race` parse as idents;
 /// `prio` is a priority encoder; `zext`/`sext` widen (zero/sign extend);
 /// `popcount` counts set bits; `reverse` reverses bit order; `rotl`/
-/// `rotr` rotate by a compile-time-constant amount; `mux` is an explicit
-/// 2-way combinational select; the rest are the primitive vocabulary
-/// DESIGN.md examples assume. `__race_value` is compiler-internal —
-/// lower.rs's own rendering of a value-producing `race[...]`, never
-/// written by a user (see types.rs's `type_builtin_call`). `logic` is
-/// NOT here — it's a real prefix operator (`Expr::Logic`, ast.rs, a
-/// dedicated lexer keyword), not an identifier resolved against this
-/// list the way the call-syntax builtins below are.
+/// `rotr` rotate (constant or dynamic amount); `mux` is an explicit 2-way
+/// combinational select; `max`/`min` are dual-purpose — compile-time-only
+/// (usable in a type-position width expression, `bits[max(n, m)]`, same
+/// as `clog2`) when every argument is itself compile-time-constant, but
+/// a genuine synthesizable comparator+mux the moment at least one
+/// argument is a real runtime `Bits` value; the rest are the primitive
+/// vocabulary DESIGN.md examples assume.
+/// `__race_value` is compiler-internal — lower.rs's own rendering of a
+/// value-producing `race[...]`, never written by a user (see types.rs's
+/// `type_builtin_call`). `logic` is NOT here — it's a real prefix
+/// operator (`Expr::Logic`, ast.rs, a dedicated lexer keyword), not an
+/// identifier resolved against this list the way the call-syntax
+/// builtins below are.
 const BUILTINS: &[&str] = &[
     "bits",
     "wire",
@@ -246,6 +251,8 @@ const BUILTINS: &[&str] = &[
     "rotl",
     "rotr",
     "mux",
+    "max",
+    "min",
     "len",
     "sync",
     "race",
@@ -888,6 +895,15 @@ impl<'a> Resolver<'a> {
                                             "cannot assign to `{text}` directly: it is a \
                                              module instance; write a specific port instead \
                                              (`{text}.port := ...`)"
+                                        ),
+                                    );
+                                } else if self.res.def(def).kind == DefKind::Builtin {
+                                    self.error(
+                                        self.ast.expr_spans[lhs.0 as usize].clone(),
+                                        format!(
+                                            "cannot assign to `{text}`: it is a builtin, not a \
+                                             declared local; pick a different name (or use \
+                                             `let {text} = ...` inside this rule to shadow it)"
                                         ),
                                     );
                                 }

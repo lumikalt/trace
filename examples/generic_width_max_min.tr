@@ -1,0 +1,19 @@
+Wider(x : [n], y : [m]) : [max(n, m)] <combines> {
+    return zext(x, max(n, m))
+}
+
+Narrower(x : [n], y : [m]) : [min(n, m)] <combines> {
+    return trunc(x, min(n, m))
+}
+
+module Top {
+    in a : [4]
+    in b : [8]
+    out wide : [8] = 0
+    out narrow : [4] = 0
+
+    rule r {
+        wide := Wider(a, b)
+        narrow := Narrower(a, b)
+    }
+}

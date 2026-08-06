@@ -106,6 +106,198 @@ module M {
     );
 }
 
+/// Arity is validated in VALUE position (`type_builtin_call`, reached by
+/// an ordinary `x := max(...)` rule-body expression), not in the
+/// type-position width-expression path (`[max(...)]`, `types/eval.rs`'s
+/// `const_eval_expr`) -- that pure evaluator has no error-reporting side
+/// channel at all and silently resolves to `Width::Unknown` on ANY
+/// unrecognized shape, the same pre-existing behavior `clog2`'s own
+/// misuse already has there (no test relies on THAT producing a message,
+/// so this doesn't newly break it, just doesn't extend past it).
+#[test]
+fn max_and_min_require_at_least_two_arguments() {
+    for name in ["max", "min"] {
+        let src = format!(
+            "module M {{\n out result : [8] = 0\n rule ru {{\n result := {name}(4)\n }}\n}}\n"
+        );
+        let (_, _, errors) = run(&src);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("at least two arguments")),
+            "{name}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn max_and_min_fold_directly_in_a_type_position_width_expression() {
+    // Not just an argument to another generic instantiation (see
+    // `implicit_width_params_instantiate_at_call_sites`, just above, for
+    // that shape with `clog2`) -- `max`/`min` also fold as a bare
+    // constant width expression, no implicit params involved at all.
+    run_ok("module M {\n reg r : [max(4, 8)] = 0\n rule ru {\n r := r\n }\n}\n");
+    run_ok("module M {\n reg r : [min(4, 8)] = 0\n rule ru {\n r := r\n }\n}\n");
+
+    let src = "\
+module M {
+    reg r : [max(4, 8)] = 0
+    reg g : [7] = 0
+    rule ru {
+        g := r
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("trunc"));
+}
+
+#[test]
+fn max_and_min_instantiate_at_call_sites_matching_two_implicit_widths() {
+    // Mirrors `implicit_width_params_instantiate_at_call_sites`'s own
+    // `clog2` shape: `n`/`m` solve from the call site's own argument
+    // widths (4 and 8), so `max(n, m)` resolves to 8 and `min(n, m)`
+    // resolves to 4.
+    let src = "\
+Wider(x : [n], y : [m]) : [max(n, m)] <combines> {
+    return zext(x, max(n, m))
+}
+
+module M {
+    in a : [4]
+    in b : [8]
+    reg w : [8] = 0
+
+    rule r {
+        w := Wider(a, b)
+    }
+}
+";
+    run_ok(src);
+
+    let src_narrow = "\
+Wider(x : [n], y : [m]) : [max(n, m)] <combines> {
+    return zext(x, max(n, m))
+}
+
+module M {
+    in a : [4]
+    in b : [8]
+    reg w : [7] = 0
+
+    rule r {
+        w := Wider(a, b)
+    }
+}
+";
+    let (_, _, errors) = run(src_narrow);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("trunc"));
+}
+
+#[test]
+fn max_of_bits_values_types_as_the_max_of_their_widths() {
+    // Not `Ty::Int` (compile-time constant folding) at all once a real
+    // `Bits` argument is present -- this is the dual-purpose half of
+    // `max`/`min`, distinct from `max_and_min_fold_directly_in_a_type_
+    // position_width_expression`'s all-`Int` case above. `max`'s width is
+    // the MAX of its two Bits arguments' own widths (mirroring `mux`'s
+    // own rule) -- `max(a, b)` can need every bit either operand has,
+    // regardless of which one happens to be numerically larger at
+    // runtime. `min`'s own, DIFFERENT rule is pinned separately, just
+    // below (`min_of_bits_values_types_as_the_min_of_their_widths`) --
+    // reusing `max`'s rule for `min` too was a real bug caught by
+    // advisor review before shipping: `min(a, b)` can never exceed
+    // either operand, so it only ever needs the NARROWER one's width.
+    run_ok(
+        "module M {\n in a : [4]\n in b : [8]\n out r : [8] = 0\n rule ru {\n r := max(a, b)\n }\n}\n",
+    );
+
+    let src = "\
+module M {
+    in a : [4]
+    in b : [8]
+    out r : [7] = 0
+    rule ru {
+        r := max(a, b)
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("trunc"));
+}
+
+#[test]
+fn min_of_bits_values_types_as_the_min_of_their_widths() {
+    // `min(a, b) <= a` and `<= b` always, so it never needs more bits
+    // than the NARROWER operand -- unlike `max`, just above. A `[4]`
+    // target is legal here even though `b` is `[8]`; rejecting it (the
+    // bug this test exists to pin) would wrongly reject a write that can
+    // never actually overflow.
+    run_ok(
+        "module M {\n in a : [4]\n in b : [8]\n out r : [4] = 0\n rule ru {\n r := min(a, b)\n }\n}\n",
+    );
+
+    // A target one bit narrower than even the smaller operand is still
+    // correctly rejected.
+    let src = "\
+module M {
+    in a : [4]
+    in b : [8]
+    out r : [3] = 0
+    rule ru {
+        r := min(a, b)
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("trunc"));
+}
+
+#[test]
+fn max_absorbs_a_bare_int_literal_checked_to_fit_the_bits_sibling() {
+    // Mirrors `type_binop`'s own `(Bits, Int)` absorption rule
+    // (`check_literal_fits`), reused for `max`/`min`'s mixed-argument
+    // case: a literal that fits is silently fine; one that doesn't is
+    // the same "does not fit" diagnostic a plain `a + 300` (`a : [8]`)
+    // already gets.
+    run_ok("module M {\n in a : [8]\n out r : [8] = 0\n rule ru {\n r := max(a, 100)\n }\n}\n");
+
+    let src = "\
+module M {
+    in a : [8]
+    out r : [8] = 0
+    rule ru {
+        r := max(a, 1000)
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("does not fit"));
+}
+
+#[test]
+fn max_rejects_a_non_bits_non_int_argument() {
+    let src = "\
+Foo() <combines> {
+}
+
+module M {
+    reg s : [8] = 0
+    out r : [8] = 0
+    rule ru {
+        r := max(s, Foo())
+    }
+}
+";
+    let (_, _, errors) = run(src);
+    assert!(errors.iter().any(|e| e.message.contains("needs `bits`")));
+}
+
 #[test]
 fn mul_sums_widths() {
     let src = "\

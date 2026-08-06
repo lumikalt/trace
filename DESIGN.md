@@ -2660,7 +2660,15 @@ Of the builtins, `prio`, `trunc`, `pack`, `zext`, `sext`, `popcount`,
   fix, not silent truncation. Every value in this language is already a plain
   FIRRTL `UInt` (see the `sequences`-lowering notes on `AShr`), so `zext` is a
   direct `pad`; `sext` casts to `SInt`, pads (which sign-extends `SInt`), then
-  casts back.
+  casts back. When `width` itself doesn't resolve to a concrete number until a
+  generic callee's own concrete call site (e.g. `zext(x, max(n, m))` inside a
+  function generic over `n`/`m`), resolution goes through the same top-down
+  `hint` channel `trunc`'s 1-argument form relies on — which reaches a direct
+  return value or write target, but NOT an operand nested inside further
+  arithmetic (`return zext(x, max(n, m)) + zext(y, max(n, m))` fails cleanly,
+  "no concrete width for this expression" — `compile_binop` computes each
+  operand's hint from its own static type, not from an outer hint), the exact
+  same boundary `trunc`'s own doc comment already names.
 - **`popcount(bits)`** counts set bits, result width `clog2(width + 1)` (not
   `clog2(width)` — a `w`-bit argument's count ranges `0..=w`, `w + 1` distinct
   values). Built as an `add` chain over each individual bit; no dedicated
@@ -2685,6 +2693,45 @@ Of the builtins, `prio`, `trunc`, `pack`, `zext`, `sext`, `popcount`,
   takes toward its own callers). Result width is the max of `a`'s and `b`'s
   widths — FIRRTL's own `mux` primop already pads the narrower arm itself, so
   this lowers directly to one `mux(sel, a, b)`, no manual padding needed.
+
+`max`/`min` are dual-purpose, unlike every other builtin above — when every
+argument is a compile-time constant, they're compile-time-only instead (see
+below, just past this list, for that case, which folds inside a type-position
+width expression rather than becoming a circuit). Once at least one argument
+is a real `Bits` VALUE, `max(a, b, ...)`/`min(a, b, ...)` (variadic,
+≥2 arguments) is genuinely synthesizable too: a left fold of pairwise
+`mux(gt(next, acc), next, acc)` (`max`) or `mux(lt(next, acc), next, acc)`
+(`min`), which correctly handles ties (either arm is the same value) and any
+number of arguments. A bare `Int` literal argument absorbs into its `Bits`
+sibling's width exactly like `type_binop`'s own `(Bits, Int)` rule
+(`check_literal_fits`-checked), and is compiled HINTED to the call's own
+result width — unlike a real `Bits` operand, which ignores the hint and
+emits at its own declared width regardless (FIRRTL's `gt`/`lt` already
+compare correctly across differently-width `UInt` operands).
+
+The two directions' RESULT WIDTH is deliberately asymmetric, not both "the
+max of the arguments' widths" the way `mux` is: `max`'s result can need every
+bit its widest `Bits` argument has, but `min(a, b) <= a` and `<= b` always,
+so `min` only ever needs its NARROWEST argument's own width — a `min` of a
+`[4]` and an `[8]` types `[4]`, and correctly fits into a `[4]` write target.
+Since FIRRTL's own `mux` primop widths are `max`-of-arms regardless of which
+builtin built the chain, `compile_max_min` wraps the whole fold in a trailing
+`bits(acc, w-1, 0)` to bring a `min` result back down to its OWN declared
+width `w` (a no-op for `max`, whose chain's natural width already equals
+`w`) — the identical "the emitted string is wider than `types.rs` declared"
+trap `compile_popcount` already has its own truncation for, caught here by
+advisor review rather than a failing test (every test that shipped alongside
+the first version happened to use equal-width arguments).
+
+The literal-fit check stays conservative in the same direction, though:
+`min(a, 300)` with `a : [8]` still errors ("300 does not fit in [8]") even
+though 300 can never be the result — `min`'s result width folds from its
+`Bits` arguments alone (never widened by a literal), but `check_literal_fits`
+doesn't know a `min` literal is only ever an upper bound, not a candidate
+result, and applies the same absorb-into-the-result-width rule `type_binop`
+uses for every other `(Bits, Int)` pair (`b + 100` with `b : [4]` errors
+the same way). Deliberately not special-cased — consistent, if occasionally
+over-strict, beats a `min`-only carve-out.
 
 `logic <expr>` is different: a real prefix OPERATOR (`Expr::Logic`, ast.rs), not
 a call — no parens, no comma-separated arguments. Unlike every other prefix
@@ -2741,12 +2788,27 @@ enforces the same boundary with an explicit check rather than a separate
 effect category, since trace has no `<decides>`/`<transacts>` type-level
 split.
 
-`clog2` and `len` type as `Ty::Int`: they are compile-time-only, not synthesizable
-values. `wire`, `list`, and `any` are type- or elaboration-position constructs
-with no runtime hardware meaning (`bits` no longer has surface syntax of its
-own — see "Expression surface" — but the AST node it used to name is still
-synthesized internally by every `[N]` type). `sync` and `race` are covered
-above.
+`clog2` and `len` type as `Ty::Int`: they are compile-time-only, not
+synthesizable values, full stop. `max`/`min` are the one builtin pair that
+straddles the line — variadic (at least two arguments, folded pairwise) and,
+when EVERY argument is itself `Ty::Int`, they type as `Ty::Int` too and exist
+specifically to appear inside a type-position width expression — `bits[max(n,
+m)]`, matching two differently-sized generic parameters up to their common
+width — evaluated by `const_eval_expr` (`types/eval.rs`), the single
+evaluator both `type_call`'s own implicit-width instantiation and firrtl's
+emission-time nested-generic-call resolution (`Emitter::resolve_nested_call_
+width`) already share, so `max`/`min` resolve in both places for free rather
+than needing separate support. But the moment at least one argument is a real
+`Bits` VALUE, `max`/`min` type as `Bits` instead (`max`/`min` of the `Bits`
+arguments' own widths respectively — see this section's own builtins list,
+above, for why the two directions differ — `Int` siblings absorbing and
+checked to fit) and ARE
+synthesizable — see this section's own builtins list, just above, for
+`compile_max_min`'s comparator+mux construction. `wire`, `list`, and `any` are
+type- or elaboration-position constructs with no runtime hardware meaning
+(`bits` no longer has surface syntax of its own — see "Expression surface" —
+but the AST node it used to name is still synthesized internally by every
+`[N]` type). `sync` and `race` are covered above.
 
 ## The schedule block
 
@@ -6487,7 +6549,14 @@ noted:
   guard, including the Enq+Deq pass-through case split across the call
   boundary — `examples/call_guard.tr`, `examples/call_fifo.tr`), the
   synthesizable builtins `prio`/`trunc`/`pack`/`zext`/`sext`/`popcount`/
-  `reverse`/`rotl`/`rotr`/`mux` (`examples/call*.tr`).
+  `reverse`/`rotl`/`rotr`/`mux`/`max`/`min` (`examples/call*.tr`).
+- `max`/`min`, dual-purpose: compile-time-only (`Ty::Int`, like `clog2`) and
+  usable inside a type-position width expression to match two
+  differently-sized generic parameters up to their common width, e.g.
+  `bits[max(n, m)]` (`examples/generic_width_max_min.tr`) — but a genuine
+  synthesizable comparator+mux, variadic over any number of arguments, the
+  moment at least one is a real runtime `Bits` value
+  (`examples/call_max_min.tr`).
 - `logic <expr>`: a fallible expression's success as a plain `[1]` value,
   discharged rather than propagated, with no side effect of its own
   (`examples/logic_probe.tr`).

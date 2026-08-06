@@ -45,7 +45,13 @@ pub(crate) fn bits_width_expr(ast: &Ast, res: &Resolution, ty: ExprId) -> Option
 /// call the SAME evaluator `TypeChecker::const_eval` (below, now a thin
 /// wrapper) uses, instead of an independently-maintained second copy --
 /// the same "const_fold/const_eval drift" class of bug this codebase has
-/// already found and fixed more than once.
+/// already found and fixed more than once. `clog2`/`max`/`min` are the
+/// builtins recognized here -- `max`/`min` fold left with a plain
+/// `u64::MIN`/`u64::MAX` seed rather than the first argument, so an
+/// empty-after-the-first fold still short-circuits to `None` the instant
+/// any ONE argument doesn't resolve (`try_fold`'s own `?` inside the
+/// closure), matching every other arm's "any unresolved piece poisons
+/// the whole expression" behavior.
 pub(crate) fn const_eval_expr(
     ast: &Ast,
     res: &Resolution,
@@ -76,6 +82,14 @@ pub(crate) fn const_eval_expr(
         Expr::Call { callee, args } => {
             if is_builtin_ref(res, *callee, "clog2") && args.len() == 1 {
                 Some(clog2(const_eval_expr(ast, res, args[0], env)?))
+            } else if is_builtin_ref(res, *callee, "max") && args.len() >= 2 {
+                args.iter()
+                    .map(|a| const_eval_expr(ast, res, *a, env))
+                    .try_fold(u64::MIN, |acc, v| Some(acc.max(v?)))
+            } else if is_builtin_ref(res, *callee, "min") && args.len() >= 2 {
+                args.iter()
+                    .map(|a| const_eval_expr(ast, res, *a, env))
+                    .try_fold(u64::MAX, |acc, v| Some(acc.min(v?)))
             } else {
                 None
             }

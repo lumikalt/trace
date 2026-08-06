@@ -126,7 +126,7 @@
     },
     "builtins": {
       "name": "support.function.builtin.trace",
-      "match": "\\b(bits|wire|list|any|clog2|pack|trunc|zext|sext|popcount|reverse|rotl|rotr|mux|len|prio|logic)\\b"
+      "match": "\\b(bits|wire|list|any|clog2|pack|trunc|zext|sext|popcount|reverse|rotl|rotr|mux|max|min|len|prio|logic)\\b"
     },
     "calls": {
       "comment": "identifier( — covers both calls and fn/spec/impl declarations, which have no leading keyword in this language.",

@@ -140,10 +140,10 @@ init-satisfies-bound check) also folds literal arithmetic — so `reg cnt : [8] 
 bounded` at all, leaving `cnt := cnt + 100` completely unchecked with zero diagnostic.
 Fixed by widening `const_fold` to match `const_eval`'s arithmetic exactly (`Add`/`Sub`/
 `Mul`/`Div`/`Rem`/`Shl`/`Shr`, `checked_*` semantics). One narrower residual, documented not
-silent: `const_eval`'s `clog2(..)` case still isn't recognized (no `Resolution` access to
-identify the builtin from a free function) — no test/example needs it in a where-bound
-today. Regression test added, byte-identical `--explain-schedule` (nothing in the existing
-suite used a non-literal where-bound), zero regressions.
+silent: `const_eval`'s `clog2(..)`/`max(..)`/`min(..)` cases still aren't recognized (no
+`Resolution` access to identify the builtin from a free function) — no test/example needs
+any of them in a where-bound today. Regression test added, byte-identical `--explain-schedule`
+(nothing in the existing suite used a non-literal where-bound), zero regressions.
 
 `_`-placeholder unification is done: `resolve.rs`'s `check_bound_self_reference` (reg/out/
 param) now accepts `_` alongside the literal name (mem/return/struct-field have required
@@ -266,6 +266,40 @@ disjointness argument anywhere) passes end to end.
     rotate amount can be either a compile-time constant (a single static
     two-slice `cat`) or a dynamic expression (a double-width `cat` fed
     through `dshr`, `n` reduced modulo `value`'s own width via `rem`).
+    `max`/`min` are DUAL-purpose (the only builtins that are): variadic
+    (≥2 args), and when every argument is itself `Ty::Int` they're
+    compile-time-only, foldable inside a type-position width expression
+    matching two differently-sized generic params up to their common
+    width (`bits[max(n, m)]`, folded pairwise in `const_eval_expr`,
+    `types/eval.rs` — that folding has no error-reporting side channel,
+    so a bad arity there silently resolves to `Width::Unknown` rather
+    than a named diagnostic, same pre-existing shape `clog2` misuse
+    already has); the moment at least one argument is a real `Bits`
+    value, they're a genuine synthesizable comparator+mux instead
+    (`compile_max_min`, left-folded pairwise `mux(gt/lt(next, acc), next,
+    acc)`, a bare `Int` sibling absorbing and checked to fit exactly like
+    `type_binop`'s own `(Bits, Int)` rule). Called directly as an
+    ordinary VALUE (not in a type position) DOES validate arity, in
+    `type_builtin_call`, for both cases. The two directions' result width
+    is asymmetric, NOT both "max of the arguments' widths" like `mux` —
+    `max` needs its widest `Bits` argument's width, `min` only its
+    NARROWEST (`min(a, b)` can never exceed either operand) — caught by
+    advisor review before shipping (reusing `max`'s width rule for `min`
+    too silently rejected legal narrow-target writes), fixed alongside a
+    trailing `bits(acc, w-1, 0)` truncation in `compile_max_min` (FIRRTL's
+    own `mux` width is max-of-arms regardless of which direction built
+    the chain, so `min`'s narrower declared width needs bringing back
+    down explicitly — the same class of gap `compile_popcount`'s own
+    truncation exists for).
+    `zext`/`sext`'s width argument reaching `hint` (fixed this session —
+    it was silently dropped, never threaded past `compile_builtin_call`,
+    latent until `max`/`min` gave it a real generic-body caller) now
+    resolves a direct return/write-target position but still fails
+    cleanly, not silently, when nested inside further arithmetic in a
+    generic body (`return zext(x, max(n,m)) + zext(y, max(n,m))`) — the
+    identical boundary `trunc`'s 1-argument form already has, `compile_
+    binop` computing each operand's hint from its own static type rather
+    than an outer one.
   - A generic callee body's own width resolution (`Emitter::
     resolve_bits_width`, `src/firrtl/expr.rs`) chases a value through
     `self.locals` substitution, arithmetic/shift/bitwise combination
@@ -292,7 +326,9 @@ disjointness argument anywhere) passes end to end.
   `examples/call_popcount.tr`, `examples/call_reverse.tr`,
   `examples/call_rotl.tr`, `examples/call_rotr.tr`,
   `examples/call_rotl_dynamic.tr`, `examples/call_rotr_dynamic.tr`,
-  `examples/call_mux.tr`,
+  `examples/call_mux.tr`, `examples/call_max_min.tr`,
+  `examples/call_max_min_mixed_width.tr`,
+  `examples/generic_width_max_min.tr`,
   `examples/call_nested.tr`, `examples/call_nested_writes.tr`,
   `examples/call_guard.tr`, `examples/call_fifo.tr`.
 - `<elaborates>` recursion/unrolling (`src/elaborate.rs`) exists —

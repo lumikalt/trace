@@ -1402,6 +1402,90 @@ fn call_mux_runs_through_real_ports() {
 }
 
 #[test]
+fn generic_width_max_min_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/generic_width_max_min.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sim/generic_width_max_min_tb.v"
+    );
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: wide=3 narrow=3"),
+        "wide/narrow did not settle at 3/3 (the last check's a=0x3):\n{output}"
+    );
+}
+
+#[test]
+fn call_max_min_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_max_min.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_max_min_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: biggest=255 smallest=0"),
+        "biggest/smallest did not settle at 255/0 (the last check's a=0, b=255, c=128):\n{output}"
+    );
+}
+
+#[test]
+fn call_max_min_mixed_width_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_max_min_mixed_width.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sim/call_max_min_mixed_width_tb.v"
+    );
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: biggest=255 smallest=15"),
+        "biggest/smallest did not settle at 255/15 (the last check's a=15, b=255):\n{output}"
+    );
+}
+
+#[test]
 fn sized_literal_runs_through_real_ports() {
     if !tool_available("firtool") || !tool_available("iverilog") {
         eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");

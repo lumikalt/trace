@@ -84,6 +84,27 @@ fn input_ports_are_read_only() {
 }
 
 #[test]
+fn assigning_to_a_bare_builtin_name_is_a_clear_error_not_a_silent_no_op() {
+    // `max`/`min` (common HDL variable names) are exactly the case that
+    // makes this matter -- before this check existed, `max := 5` was a
+    // completely silent no-op: `max` already resolves (root scope,
+    // `DefKind::Builtin`), so `:=`'s own "bind a local only when
+    // unresolved" rule never created one, and nothing else validated the
+    // resolved kind was actually writable.
+    let (_, _, errors) = run("rule r {\n max := 5\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot assign to `max`"));
+    assert!(errors[0].message.contains("builtin"));
+}
+
+#[test]
+fn a_local_reg_or_param_named_after_a_builtin_shadows_it_cleanly() {
+    run_ok("rule r {\n let max = 5\n}\n");
+    run_ok("module M {\n reg max : [8] = 0\n rule r {\n max := max + 1\n }\n}\n");
+    run_ok("Foo(max : [8]) : [8] <combines> {\n return max\n}\n");
+}
+
+#[test]
 fn output_ports_are_writable_state() {
     let (_, res) = run_ok(
         "module M {\n out x : [8] = 0\n \

@@ -1,0 +1,12 @@
+module Top {
+    in a : [8]
+    in b : [8]
+    in c : [8]
+    out biggest : [8] = 0
+    out smallest : [8] = 0
+
+    rule r {
+        biggest := max(a, b, c)
+        smallest := min(a, b, c)
+    }
+}
