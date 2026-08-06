@@ -6917,6 +6917,46 @@ several hand-picked adversarial prefixes (`""`, `"module M {"`, `"schedule
 malformed/mid-edit input — a panic would kill the whole server, not just
 fail one request, unlike a CLI invocation.
 
+**A variable's hover now also shows its proven `where` bound, and every
+scalar hover was reformatted to the fn/spec/impl branch's own fenced
+code-block style, not the flat "`name: ty` — kind" string it used to be.**
+`Compiled` (`src/lsp.rs`) gained a `bounds: Option<bounds::Bounds>` field —
+`compile` runs `bounds::check` itself, gated on `type_errors.is_empty()`
+(the same "a phase after the first one with errors never runs" discipline
+this module's own doc comment already states and `main.rs` follows for this
+exact pass, since `bounds::check` takes `&Types` as an input and a `Types`
+built from an already-invalid AST would make its output meaningless). Its
+own errors are deliberately NOT surfaced as diagnostics — a real, separate
+gap (the LSP never showed a bounds error like "cannot verify this write
+stays within the declared bound" at all, before or after this change), left
+open rather than folded silently into this narrower change.
+
+`hover`'s own final branch (every def besides fn/spec/impl, effect
+keywords, and effect-row arguments) now renders the SAME two-part shape the
+fn/spec/impl branch already had: a fenced ` ```trace ` code block holding a
+declaration-style line (a new `decl_keyword` table maps each `DefKind` to
+its own real source keyword — `reg`/`out`/`in`/`io`/`mem`/`fifo`/`inst`/
+`let`/`rule`/`module`/`extmodule`/`struct`; `Param`/`ImplicitParam`/
+`InstPort`/`Builtin` have none, since none of those are ever written as a
+standalone declaration in source, so the line is just the bare name), then
+a description paragraph below it — `def.kind.describe()` capitalized into
+a real sentence (`capitalize_sentence`, a new small helper: `describe`'s
+own strings stay lowercase, written to read naturally mid-sentence, their
+only use before this change), with the bound — when `Bounds::ranges` has
+an entry for this `def_id` — appended as a second sentence (`"Where {lo}
+<= {name} < {hi}."`), not crammed onto the code line itself (which would
+need it to also be legal `trace` syntax to stay correctly highlighted).
+The bound is a whole-program fact about the `DefId`, not a per-use-site
+one, so — unlike `ty`, which is looked up differently at a declaration
+site (`local_tys`/`state_tys`) versus a use site (`expr_tys`) — one lookup
+covers hovering the declaration and every later use identically. Every
+existing hover-text test updated to the new format (an 8-test surface,
+not narrowly scoped to just the two new bound-carrying tests) — a
+mechanical but real cost of adopting the richer rendering everywhere at
+once rather than only for bounded defs, accepted deliberately for
+consistency (a def either gets the code-block treatment or it doesn't; a
+per-kind split would need its own justification this change doesn't have).
+
 The grammar is regex-based — still pattern matching, not semantic
 analysis, so it can be fooled (a
 comparison `x < reads` against a variable actually named `reads` reads as

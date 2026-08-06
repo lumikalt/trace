@@ -27,10 +27,11 @@
 //! (needs only `Resolution`) but hover without type info (needs `Types`).
 
 use crate::ast::{Ast, Expr, ExprId, FnKind, Item, effects_str};
+use crate::bounds::Bounds;
 use crate::lexer::Span;
 use crate::resolve::{DefId, DefKind, Resolution};
 use crate::types::Types;
-use crate::{effects, lexer, parser, resolve, types};
+use crate::{bounds, effects, lexer, parser, resolve, types};
 use lsp_server::{
     Connection, ExtractError, Message, Notification as ServerNotification,
     Request as ServerRequest, RequestId, Response,
@@ -42,9 +43,9 @@ use lsp_types::notification::{
 use lsp_types::request::{GotoDefinition, HoverRequest};
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, Location, MarkedString, MarkupContent,
-    MarkupKind, OneOf, Position, PositionEncodingKind, PublishDiagnosticsParams, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent, MarkupKind,
+    OneOf, Position, PositionEncodingKind, PublishDiagnosticsParams, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -321,6 +322,18 @@ struct Compiled {
     ast: Option<Ast>,
     res: Option<Resolution>,
     ty: Option<Types>,
+    /// A def's proven `where` range (`bounds::Bounds::ranges`), for
+    /// hover's own "variable bounds" line. `None` whenever `ty` itself
+    /// is `None` OR carries a type error -- `bounds::check` takes `&
+    /// Types` as an input, so running it against a `Types` built from an
+    /// already-invalid AST would be meaningless, same "a phase after the
+    /// first one with errors never runs" discipline `main.rs` already
+    /// follows for this exact pass (this module's own doc comment).
+    /// Deliberately NOT surfaced as diagnostics here (unlike every
+    /// earlier phase) -- that's a real, separate gap (bounds errors are
+    /// user-facing diagnostics the LSP never shows today), out of scope
+    /// for what this field exists to add.
+    bounds: Option<Bounds>,
 }
 
 fn compile(src: &str, index: &LineIndex) -> Compiled {
@@ -345,6 +358,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             ast: None,
             res: None,
             ty: None,
+            bounds: None,
         };
     }
 
@@ -358,6 +372,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             ast: Some(ast),
             res: None,
             ty: None,
+            bounds: None,
         };
     }
 
@@ -371,6 +386,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             ast: Some(ast),
             res: Some(res),
             ty: None,
+            bounds: None,
         };
     }
 
@@ -384,6 +400,7 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
             ast: Some(ast),
             res: Some(res),
             ty: None,
+            bounds: None,
         };
     }
 
@@ -391,8 +408,21 @@ fn compile(src: &str, index: &LineIndex) -> Compiled {
     for err in &type_errors {
         push(&err.span, &err.message);
     }
+    // `bounds::check` takes `&Types` as an input -- only meaningful to
+    // run once `ty` is genuinely valid (zero type errors), same "a phase
+    // after the first one with errors never runs" discipline this
+    // module's own doc comment already states and `main.rs` follows.
+    // Its own errors are deliberately NOT pushed as diagnostics here
+    // (unlike every phase above) -- a separate, pre-existing gap, out of
+    // scope for what this pass exists to add (hover's own bound line).
+    let bounds = if type_errors.is_empty() {
+        Some(bounds::check(&ast, &res, &fx, &ty).0)
+    } else {
+        None
+    };
     Compiled {
         diagnostics,
+        bounds,
         ast: Some(ast),
         res: Some(res),
         ty: Some(ty),
@@ -551,12 +581,35 @@ fn hover(docs: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
                 .or_else(|| ty.state_tys.get(&def_id))
         }),
     };
-    let text = match ty {
-        Some(ty) => format!("`{}: {ty}` — {}", def.name, def.kind.describe()),
-        None => format!("`{}` — {}", def.name, def.kind.describe()),
+    // A proven `where` range (`bounds::Bounds::ranges`, reg/out/param
+    // only) is the SAME static fact regardless of whether the cursor is
+    // on the declaration or a later use site — unlike `ty` above, it
+    // needs no per-`ExprId`/declaration-site split, one `def_id` lookup
+    // covers both. Absent whenever the def has no declared bound at all,
+    // same as `ty` being absent for an untyped def (a rule/module/...).
+    let bound = compiled.bounds.as_ref().and_then(|b| b.ranges.get(&def_id));
+    // Same two-part rendering the fn/spec/impl branch above already
+    // uses (a fenced, syntax-highlighted declaration line, description
+    // below) rather than the flat "`name: ty` — kind" scalar string this
+    // used to be — the bound (when present) reads as its own sentence
+    // in that description, not crammed onto the code line itself, which
+    // would need it to also be legal `trace` syntax to stay properly
+    // highlighted.
+    let code = match (decl_keyword(def.kind), ty) {
+        (Some(kw), Some(ty)) => format!("{kw} {} : {ty}", def.name),
+        (Some(kw), None) => format!("{kw} {}", def.name),
+        (None, Some(ty)) => format!("{} : {ty}", def.name),
+        (None, None) => def.name.clone(),
     };
+    let mut desc = format!("{}.", capitalize_sentence(def.kind.describe()));
+    if let Some((lo, hi)) = bound {
+        desc.push_str(&format!(" Where {lo} <= {} < {hi}.", def.name));
+    }
     Some(Hover {
-        contents: HoverContents::Scalar(MarkedString::String(text)),
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("```trace\n{code}\n```\n\n{desc}"),
+        }),
         range: Some(index.range(&range)),
     })
 }
@@ -658,6 +711,55 @@ fn effect_doc(name: &str) -> Option<String> {
     ))
 }
 
+/// The keyword a def's own declaration is spelled with in source
+/// (`reg`/`out`/`in`/...), for hover's own fenced code-block line (see
+/// `hover`, which renders `"{keyword} {name} : {ty}"` when both are
+/// known). `None` for a kind with no real declaration keyword of its
+/// own to echo — a param's own name (`x` in `Outer(x : [8])`) is
+/// written bare, an `ImplicitParam`/`InstPort` is never written at all
+/// (synthesized/bound by appearing free elsewhere), a builtin has no
+/// declaration in `.tr` source to echo, and `Fn`/`Spec`/`Impl` never
+/// reach this path in practice (`fn_signature` handles them first) —
+/// listed explicitly rather than falling through a wildcard so adding a
+/// future `DefKind` forces a real decision here, not a silent `None`.
+fn decl_keyword(kind: DefKind) -> Option<&'static str> {
+    match kind {
+        DefKind::Reg => Some("reg"),
+        DefKind::Mem => Some("mem"),
+        DefKind::Fifo => Some("fifo"),
+        DefKind::Input => Some("in"),
+        DefKind::Output => Some("out"),
+        DefKind::Io => Some("io"),
+        DefKind::Inst => Some("inst"),
+        DefKind::Local => Some("let"),
+        DefKind::Rule => Some("rule"),
+        DefKind::Module => Some("module"),
+        DefKind::ExtModule => Some("extmodule"),
+        DefKind::Struct => Some("struct"),
+        DefKind::Builtin
+        | DefKind::InstPort
+        | DefKind::Param
+        | DefKind::ImplicitParam
+        | DefKind::Fn
+        | DefKind::Spec
+        | DefKind::Impl => None,
+    }
+}
+
+/// `"a register"` -> `"A register"` — `DefKind::describe`'s own strings
+/// are lowercase (written to read naturally mid-sentence, their only use
+/// before this), but hover's description now stands alone as its own
+/// sentence below the fenced code block (matching the fn/spec/impl
+/// branch's `"A function."`/etc — see `hover`), so it needs the leading
+/// capital those hand-written strings already have.
+fn capitalize_sentence(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Renders a fn/spec/impl's own declared signature as it's written in
 /// source (`fn Outer(x : [8]) : [8] <combines>`), by slicing each
 /// parameter/return type annotation's own span directly out of `src`
@@ -666,7 +768,8 @@ fn effect_doc(name: &str) -> Option<String> {
 /// generic-parameter display edge cases a `Ty`-based rendering would.
 /// `None` for anything that isn't a fn/spec/impl def, or (defensively) if
 /// `res.item_defs` somehow has no entry for one that is — the caller falls
-/// back to the plain `name — kind` hover in either case.
+/// back to `hover`'s own generic declaration-keyword/description
+/// rendering in either case.
 fn fn_signature(ast: &Ast, res: &Resolution, src: &str, def_id: DefId) -> Option<String> {
     let mut item_id = None;
     for (&iid, &did) in &res.item_defs {
@@ -726,6 +829,7 @@ fn fn_signature(ast: &Ast, res: &Resolution, src: &str, def_id: DefId) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::MarkedString;
 
     /// Drives `hover`/`goto_definition` directly against a one-document
     /// `docs` map — no stdio framing needed, since both take `&HashMap`/
@@ -804,7 +908,45 @@ mod tests {
         // `Expr::Ident` arm, not anything `out`-specific.
         let h = hover_at(SRC, 3, 10).expect("hover over the write target");
         let text = hover_text(&h);
-        assert_eq!(text, "`counter: [8]` — a register");
+        assert_eq!(text, "```trace\nreg counter : [8]\n```\n\nA register.");
+    }
+
+    const BOUNDED_SRC: &str = "module M {\n    reg counter : [8] where counter < 200 = 0\n    rule r {\n        counter := counter + 1\n    }\n}\n";
+
+    #[test]
+    fn hovering_a_bounded_variable_shows_its_proven_range() {
+        // `counter`'s own use site, line 3 -- same column offsets as
+        // `SRC` above, since only the declaration line (1) differs
+        // between the two sources. `bounds::Bounds::ranges` is a
+        // whole-program fact about the def, not a per-site one, so the
+        // SAME suffix shows up hovering the declaration below too.
+        let h = hover_at(BOUNDED_SRC, 3, 22).expect("hover over a use site");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nreg counter : [8]\n```\n\nA register. Where 0 <= counter < 200."
+        );
+    }
+
+    #[test]
+    fn hovering_a_bounded_variables_declaration_site_shows_the_same_range() {
+        let h = hover_at(BOUNDED_SRC, 1, 8).expect("hover over the declaration site");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nreg counter : [8]\n```\n\nA register. Where 0 <= counter < 200."
+        );
+    }
+
+    #[test]
+    fn hovering_an_unbounded_variable_shows_no_bound_suffix() {
+        // `SRC`'s own `counter` has no `where` clause at all -- confirms
+        // the description stays a single, plain sentence (no trailing
+        // "Where ..." for a def absent from `Bounds::ranges`), not just
+        // that SOME text shows up.
+        let h = hover_at(SRC, 3, 10).expect("hover over the write target");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nreg counter : [8]\n```\n\nA register."
+        );
     }
 
     const OUT_SRC: &str =
@@ -814,7 +956,10 @@ mod tests {
     fn hovering_an_output_ports_write_site_shows_its_type() {
         // `v := 1`, line 3 char 8 — `v`'s own write-target span.
         let h = hover_at(OUT_SRC, 3, 8).expect("hover over the output port's write site");
-        assert_eq!(hover_text(&h), "`v: [8]` — an output port");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nout v : [8]\n```\n\nAn output port."
+        );
     }
 
     #[test]
@@ -826,7 +971,7 @@ mod tests {
         let text = hover_text(&h);
         assert!(text.contains("counter"), "{text}");
         assert!(text.contains("[8]"), "{text}");
-        assert!(text.contains("a register"), "{text}");
+        assert!(text.contains("A register"), "{text}");
     }
 
     #[test]
@@ -852,7 +997,7 @@ mod tests {
         let src = "module M {\n    rule my_rule {\n    }\n}\n";
         let h = hover_at(src, 1, 9).expect("hover over the rule's own name");
         let text = hover_text(&h);
-        assert_eq!(text, "`my_rule` — a rule");
+        assert_eq!(text, "```trace\nrule my_rule\n```\n\nA rule.");
     }
 
     #[test]
@@ -948,10 +1093,13 @@ mod tests {
         // Resolution::effect_arg_defs` to the actual `in`/`reg` they
         // name, same as any other state reference.
         let a = hover_at(EFFECT_ROW_SRC, 3, 24).expect("hover over the reads row's `a`");
-        assert_eq!(hover_text(&a), "`a: [8]` — an input port");
+        assert_eq!(
+            hover_text(&a),
+            "```trace\nin a : [8]\n```\n\nAn input port."
+        );
 
         let r = hover_at(EFFECT_ROW_SRC, 3, 36).expect("hover over the writes row's `r`");
-        assert_eq!(hover_text(&r), "`r: [8]` — a register");
+        assert_eq!(hover_text(&r), "```trace\nreg r : [8]\n```\n\nA register.");
     }
 
     #[test]
