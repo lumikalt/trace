@@ -5812,9 +5812,31 @@ only, mechanism for that shape, tier 3 or not.
   one circuit) is therefore not something anything `trace` itself emits
   can produce today.
 
-The airtight fix is Filament-style timeline types on ports, which make
-cross-module feedback inexpressible by construction. That is a large feature,
-not v0.
+**Corrected (found while scoping a Filament-style timeline-types feature,
+2026-08-06): cross-module combinational feedback is ALREADY structurally
+inexpressible today, not a gap waiting on a future feature.** `firrtl/
+module.rs:250-256`'s own comment states the real invariant directly: every
+rule-visible `out` is register-backed BECAUSE driving it combinationally
+would expose a rule's speculative, pre-commit value, which would break
+"writes are speculative until the clock edge" — the invariant the WHOLE
+scheduler is built on, not an incidental choice. That makes every module
+boundary cost at least one cycle unconditionally, as a load-bearing
+consequence of the transactional-rules model itself, not a currently-
+unexploited hole. `io`/`attach` (this module's own ports) can't create a
+computed feedback path either — an `io` port is never read/written in a
+rule body at all (`Item::Io`'s own doc comment), only structurally wired
+via `attach`, so nothing ever combines its value into a new output. The
+ONLY real exposure left is CIRCT issue #7435 (above) — a tooling blind
+spot requiring MULTIPLE `public module`s in one circuit, which `firrtl::
+emit`'s own single-top-module enforcement already sidesteps unconditionally
+today, not contingent on a future type-system feature landing. Filament-
+style timeline types would still have real value here (making an already-
+true invariant explicit/composable/checkable, rather than true-by-
+convention-only) — but framing it as "the airtight fix" for an open safety
+hole was simply wrong; there is no hole. The actual open gap this prior-art
+citation should point at instead is cost opacity in `<sequences>`
+transactions (TODO.md's "Cost model and formal verification" section) —
+not yet designed or scheduled.
 
 ## Sequences lowering
 
@@ -5888,8 +5910,6 @@ register (`reg x : [8] = 0` emitted twice), which fails to re-resolve
 downstream rather than erroring cleanly at lowering time. `compute_captures`
 rejects this directly once two captures resolve to the same name, before any
 text is generated.
-
-A `sequences` rule reports its own cost: segment count and saved-register bits.
 
 ### `while` lowering
 
@@ -7222,7 +7242,12 @@ Not yet implemented:
 - **Kôika** (MIT) — formally verified one-rule-at-a-time Bluespec descendant,
   in Coq.
 - **Filament** (Cornell CAPRA) — timeline types: which cycle each signal is
-  valid in. The long-term answer for cross-module combinational-loop safety.
+  valid in. NOT needed for cross-module combinational-loop safety (already
+  structurally guaranteed by the register-backed-`out` invariant, see
+  "Combinational loops: what the checker does" above) — the real
+  applicability here is making `<sequences>` transaction duration/latency a
+  checked, composable, first-class quantity instead of invisible to the
+  type system (TODO.md's "Cost model" section).
 - **Dahlia** (Cornell CAPRA) — time-sensitive affine types for predictable
   memory banking. The long-term answer for array-conflict precision (tier 3).
 - **Clash** — pure functional signals, reference point.
