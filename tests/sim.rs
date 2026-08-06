@@ -1486,6 +1486,32 @@ fn call_max_min_mixed_width_runs_through_real_ports() {
 }
 
 #[test]
+fn backtick_infix_call_runs_through_real_ports() {
+    if !tool_available("firtool") || !tool_available("iverilog") {
+        eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");
+        return;
+    }
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/call_backtick.tr"
+    ))
+    .unwrap();
+    let fir = generate_firrtl(&src);
+    let verilog = firrtl_to_verilog(&fir, false);
+    let testbench = concat!(env!("CARGO_MANIFEST_DIR"), "/sim/call_backtick_tb.v");
+    let output = simulate(&verilog, testbench);
+
+    assert!(
+        output.contains("SIMULATION PASSED"),
+        "simulation did not report PASSED:\n{output}"
+    );
+    assert!(
+        output.contains("final: avg=7 biggest=7"),
+        "avg/biggest did not settle at 7/7 (the last check's a=b=7):\n{output}"
+    );
+}
+
+#[test]
 fn sized_literal_runs_through_real_ports() {
     if !tool_available("firtool") || !tool_available("iverilog") {
         eprintln!("firtool/iverilog not on PATH; skipping (run via `devenv shell` or `t`)");

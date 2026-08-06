@@ -318,6 +318,17 @@ disjointness argument anywhere) passes end to end.
     resolve to genuinely conflicting widths still fails cleanly ("no
     concrete width"), not a miscompile — the one shape left where a
     call's own width truly isn't well-defined.
+  - Any two-argument call — a user `fn`/`impl` or a builtin alike — also
+    has a Haskell-style backtick infix spelling (`parser.rs`, `` Backtick
+    `` token/`BACKTICK_BP`): `` a `Avg` b `` is exactly `Avg(a, b)`, ``
+    a `max` b `` is exactly `max(a, b)`. Pure parse-time sugar — builds
+    the identical `Expr::Call` node a prefix call would, so nothing
+    downstream (resolve/effects/types/firrtl) needs to know the surface
+    spelling was infix. Binds tighter than every named binary operator
+    (Haskell's own default `infixl 9` backtick fixity) but looser than
+    prefix/postfix; left-associative. Always exactly two arguments — a
+    variadic builtin like `max`/`min` still needs its ordinary prefix
+    call syntax for three or more.
 
   See `examples/call.tr`, `examples/call_branch.tr`,
   `examples/call_writes.tr`, `examples/call_prio.tr`,
@@ -328,7 +339,7 @@ disjointness argument anywhere) passes end to end.
   `examples/call_rotl_dynamic.tr`, `examples/call_rotr_dynamic.tr`,
   `examples/call_mux.tr`, `examples/call_max_min.tr`,
   `examples/call_max_min_mixed_width.tr`,
-  `examples/generic_width_max_min.tr`,
+  `examples/generic_width_max_min.tr`, `examples/call_backtick.tr`,
   `examples/call_nested.tr`, `examples/call_nested_writes.tr`,
   `examples/call_guard.tr`, `examples/call_fifo.tr`.
 - `<elaborates>` recursion/unrolling (`src/elaborate.rs`) exists —

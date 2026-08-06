@@ -70,8 +70,20 @@ fn infix_bp(kind: TokenKind) -> Option<(u8, u8)> {
     Some(bp)
 }
 
-const PREFIX_BP: u8 = 17;
-const POSTFIX_BP: u8 = 19;
+const PREFIX_BP: u8 = 19;
+const POSTFIX_BP: u8 = 21;
+/// Binding power for Haskell-style `` x `f` y `` infix function
+/// application (sugar for `f(x, y)`, `Expr::Call` under the hood — see
+/// the parse loop below). Tighter than every entry in `infix_bp`'s table
+/// (which tops out at `(15, 16)` for `*`/`/`/`%`), so `` a `div` b + 1 ``
+/// reads as `` (a `div` b) + 1 ``, matching Haskell's own default
+/// `infixl 9` backtick fixity — but looser than `PREFIX_BP`/`POSTFIX_BP`,
+/// so `` not a `f` b `` still parses as `` (not a) `f` b ``, the same
+/// "prefix ops bind only to their immediate operand" shape every other
+/// real binop here already has. The two numbers differ by 1, making it
+/// left-associative the same mechanism `*`/`/`/`%` share their own tier
+/// with: `` a `f` b `f` c `` = `` (a `f` b) `f` c ``.
+const BACKTICK_BP: (u8, u8) = (17, 18);
 
 /// Minimum binding power for type positions (`: ty`). Excludes comparison
 /// and range operators so the `<` of a following effect list (`: [1]
@@ -1934,6 +1946,39 @@ impl<'a> Parser<'a> {
                     );
                 }
                 lhs = acc;
+                continue;
+            }
+
+            // `` x `f` y `` — Haskell-style backtick infix application,
+            // parsed by hand (not through `infix_bp`'s table) since,
+            // unlike every other entry there, the "operator" itself is a
+            // spelled-out name that needs its own ident-parse and closing
+            // backtick, not a single fixed token. Desugars directly to
+            // the same `Expr::Call { callee, args: [lhs, rhs] }` shape an
+            // ordinary `f(lhs, rhs)` call produces — every downstream
+            // pass (resolve/effects/types/firrtl) already walks `Call`
+            // uniformly regardless of surface syntax, so `f` resolves,
+            // type-checks, and compiles exactly as if it had been
+            // written prefix, arity errors included.
+            if kind == Backtick {
+                if BACKTICK_BP.0 < min_bp {
+                    break;
+                }
+                self.bump();
+                let name_span = self.cur_span();
+                let name = self.expect_ident("a function name after `` ` ``")?;
+                let callee = self
+                    .ast
+                    .push_expr(Expr::Ident(name.text), name_span.clone());
+                self.expect(Backtick, "closing `` ` ``").ok()?;
+                let rhs = self.parse_expr(BACKTICK_BP.1)?;
+                lhs = self.ast.push_expr(
+                    Expr::Call {
+                        callee,
+                        args: vec![lhs, rhs],
+                    },
+                    lo..self.prev_end,
+                );
                 continue;
             }
 

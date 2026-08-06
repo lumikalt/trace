@@ -2454,6 +2454,22 @@ module Top {
 }
 ```
 
+Any two-argument call — a user `fn`/`impl` or a builtin alike — also has a
+Haskell-style backtick infix spelling: `` a `Avg` b `` is exactly `Avg(a, b)`,
+`` a `max` b `` is exactly `max(a, b)`. This is pure parse-time sugar
+(`parser.rs`'s Pratt loop, `` Backtick `` token) — `` a `f` b `` builds the
+identical `Expr::Call { callee: f, args: [a, b] }` node a prefix call would,
+so it resolves/type-checks/compiles exactly the same way, guard-folding and
+generic-width resolution included, with no downstream awareness that the
+surface spelling was infix. Binds tighter than every named binary operator
+(`` a `div` b + 1 `` reads as `` (a `div` b) + 1 ``, matching Haskell's own
+default `infixl 9` backtick fixity) but looser than prefix/postfix, so
+`` not a `f` b `` still parses as `` (not a) `f` b ``; left-associative, so
+`` a `f` b `f` c `` is `` (a `f` b) `f` c ``. Always exactly two arguments —
+an infix operator has no natural spelling for more — so a variadic builtin
+like `max`/`min` still needs its ordinary prefix call syntax for three or
+more arguments.
+
 A callee's body may:
 
 - bind zero or more `let`s,

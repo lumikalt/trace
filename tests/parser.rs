@@ -115,6 +115,109 @@ fn calls_and_fields_chain() {
 }
 
 #[test]
+fn backtick_infix_call_desugars_to_an_ordinary_call() {
+    assert_eq!(stmt_sexpr("x := a `max` b"), "(:= x (call max a b))");
+}
+
+#[test]
+fn backtick_binds_tighter_than_every_named_binary_operator() {
+    // Matches Haskell's own default `infixl 9` backtick fixity: function
+    // application reads tighter than `+`, `*`, comparisons, everything in
+    // `infix_bp`'s table.
+    assert_eq!(
+        stmt_sexpr("x := a `div` b + 1"),
+        "(:= x (+ (call div a b) 1))"
+    );
+    assert_eq!(
+        stmt_sexpr("x := a `div` b * c"),
+        "(:= x (* (call div a b) c))"
+    );
+    assert_eq!(stmt_sexpr("x := a `f` b = c"), "(:= x (= (call f a b) c))");
+}
+
+#[test]
+fn backtick_is_left_associative() {
+    assert_eq!(
+        stmt_sexpr("x := a `f` b `f` c"),
+        "(:= x (call f (call f a b) c))"
+    );
+}
+
+#[test]
+fn backtick_binds_looser_than_prefix_operators() {
+    // `not`/`-`/`~` bind only to their immediate operand (`PREFIX_BP`
+    // beats `BACKTICK_BP`), so `not a` forms first, then the backtick
+    // call applies — the same shape every other real binop here has
+    // relative to a prefix op.
+    assert_eq!(stmt_sexpr("x := not a `f` b"), "(:= x (call f (not a) b))");
+}
+
+#[test]
+fn backtick_callee_can_be_a_builtin_or_a_user_function() {
+    assert_eq!(
+        stmt_sexpr("x := a `max` (b `max` c)"),
+        "(:= x (call max a (call max b c)))"
+    );
+    assert_eq!(
+        stmt_sexpr("x := a `Combine` b"),
+        "(:= x (call Combine a b))"
+    );
+}
+
+#[test]
+fn postfix_still_reaches_inside_a_prefix_operand_after_the_bp_bump() {
+    // `PREFIX_BP`/`POSTFIX_BP` both shifted up (17/19 -> 19/21) to make
+    // room for `BACKTICK_BP` between the old prefix tier and the named
+    // binops. The postfix loop's own gate (`POSTFIX_BP >= min_bp`, an
+    // inverted comparison relative to the infix `l_bp < min_bp` break)
+    // depends on the GAP between the two constants, not their absolute
+    // values — pinned here since nothing else in this file previously
+    // exercised a postfix operator applied to a prefix operand.
+    assert_eq!(stmt_sexpr("x := not a?"), "(:= x (not (? a)))");
+    assert_eq!(stmt_sexpr("x := not a[3]"), "(:= x (not (index a 3)))");
+    assert_eq!(stmt_sexpr("x := ~a.field"), "(:= x (~ (. a field)))");
+}
+
+#[test]
+fn backtick_requires_a_closing_backtick() {
+    let (tokens, _) = lexer::lex("rule t {\n x := a `f b\n}\n");
+    let (_, errors) = parser::parse("rule t {\n x := a `f b\n}\n", &tokens);
+    assert!(!errors.is_empty());
+    assert!(errors[0].message.contains("closing"));
+}
+
+#[test]
+fn backtick_requires_a_name_inside() {
+    let (tokens, _) = lexer::lex("rule t {\n x := a `+` b\n}\n");
+    let (_, errors) = parser::parse("rule t {\n x := a `+` b\n}\n", &tokens);
+    assert!(!errors.is_empty());
+    assert!(errors[0].message.contains("function name"));
+}
+
+#[test]
+fn backtick_parse_error_does_not_cascade_into_the_next_statement() {
+    // `expect_ident`'s failure path calls `self.sync()` (skips to the
+    // next newline/`}`) even though it's reached from deep inside an
+    // expression here, not its usual declaration-position callers — the
+    // same recovery boundary `one_error_not_a_cascade` already pins for
+    // the rest of the grammar. One bad backtick call must not knock out
+    // an unrelated following statement.
+    let src = "rule t {\n x := a `+` b\n y := 5\n}\n";
+    let (tokens, _) = lexer::lex(src);
+    let (ast, errors) = parser::parse(src, &tokens);
+    assert_eq!(errors.len(), 1, "expected exactly one error: {errors:?}");
+    let Item::Rule { body, .. } = ast.item(ast.roots[0]) else {
+        panic!("expected rule");
+    };
+    assert_eq!(body.len(), 1, "the malformed statement should be dropped");
+    let trace::ast::Stmt::Assign { lhs, rhs } = ast.stmt(body[0]) else {
+        panic!("expected an assignment");
+    };
+    assert_eq!(ast.expr_sexpr(*lhs), "y");
+    assert_eq!(ast.expr_sexpr(*rhs), "5");
+}
+
+#[test]
 fn decl_keywords_are_contextual() {
     // `mem` is a keyword only at declaration position; DESIGN.md's Rmw
     // example reads and writes a state named `mem`.

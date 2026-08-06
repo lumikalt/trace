@@ -214,6 +214,12 @@ pub enum TokenKind {
     Lossy,
     #[token("?")]
     Question,
+    /// Haskell-style infix function application: `` x `f` y ``, sugar for
+    /// `f(x, y)` (see `parser.rs`'s `BACKTICK_BP`). Never appears as a
+    /// standalone token elsewhere in the grammar, so no priority/longest-
+    /// match interaction with any other token is possible.
+    #[token("`")]
+    Backtick,
     #[token("|")]
     Pipe,
     #[token("^")]

@@ -1,0 +1,22 @@
+-- `` a `f` b `` is sugar for `f(a, b)` -- Haskell-style backtick infix
+-- application, desugared entirely at parse time (`Expr::Call`, same
+-- shape a prefix `f(a, b)` produces) so it resolves/type-checks/
+-- compiles identically to an ordinary call. Exercised against BOTH a
+-- user-defined pure function (`Avg`) and a builtin (`max`), proving the
+-- sugar isn't special-cased to either.
+Avg(a : [8], b : [8]) : [8] <combines> {
+    let sum = a + b
+    return sum >> 1
+}
+
+module Top {
+    in a : [8]
+    in b : [8]
+    out avg : [8] = 0
+    out biggest : [8] = 0
+
+    rule r {
+        avg := a `Avg` b
+        biggest := a `max` b
+    }
+}
