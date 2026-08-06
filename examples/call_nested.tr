@@ -6,11 +6,11 @@
 -- widened intermediate the call boundary might otherwise hide -- see
 -- sim/call_nested_tb.v.
 Inner(x : [8]) : [8] <combines> {
-    return x + 1
+    return (x + 1).!
 }
 
 Outer(x : [8]) : [8] <combines> {
-    let doubled = Inner(x) * 2
+    let doubled = trunc(Inner(x) * 2, 8)
     return doubled
 }
 

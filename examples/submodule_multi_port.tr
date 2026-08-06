@@ -4,7 +4,7 @@ module Child {
     out c : [8] = 0
 
     rule pass {
-        c := a + b
+        c := (a + b).!
     }
 }
 

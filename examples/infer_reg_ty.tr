@@ -12,7 +12,7 @@ module InferRegTy {
     out sum : [8] = 0
 
     rule step {
-        acc := acc + inc
+        acc := (acc + inc).!
         sum := acc
     }
 }

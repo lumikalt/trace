@@ -34,6 +34,6 @@ module OptionalChain {
 
     rule nav {
         result := a?.b?.c
-        count := count + 1
+        count := (count + 1).!
     }
 }

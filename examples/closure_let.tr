@@ -7,7 +7,7 @@
 -- sim/closure_let_tb.v for the proof both calls compute the right,
 -- independent result through real hardware.
 Add(a : [8], b : [8]) : [8] <combines> {
-    return a + b
+    return (a + b).!
 }
 
 module Top {
@@ -18,6 +18,6 @@ module Top {
     rule go {
         let f = Add(_, 5)
         r1 := f(x)
-        r2 := f(x + 1)
+        r2 := f((x + 1).!)
     }
 }

@@ -151,7 +151,7 @@ fn rmw_emits_and_compiles() {
     assert!(fir.contains("writer => w_m"));
     // Read gates the value update; write is gated by the other segment.
     assert!(fir.contains("connect v, m.r0.data"));
-    assert!(fir.contains("connect m.w_m.data, tail(add(v, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect m.w_m.data, tail(add(v, UInt<9>(1)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -166,7 +166,7 @@ fn subleq_emits_and_compiles() {
 
     // The branch (SUBLEQ's defining instruction) must reach pc as a mux,
     // not be silently dropped for living inside if/else.
-    assert!(fir.contains("connect pc, mux(leq(r, UInt<16>(0)), c, tail(add(pc, UInt<16>(3)), 1))"));
+    assert!(fir.contains("connect pc, mux(leq(r, UInt<16>(0)), c, tail(add(pc, UInt<17>(3)), 1))"));
 
     run_firtool(&fir, &[]);
 }
@@ -207,7 +207,7 @@ fn accumulator_emits_real_ports() {
     assert!(fir.contains("connect sum, __out_sum"));
     // The rule reads the *register*, not the port, and reads the input
     // port directly (no register backs it).
-    assert!(fir.contains("connect __out_sum, tail(add(__out_sum, inc), 1)"));
+    assert!(fir.contains("connect __out_sum, add(__out_sum, inc)"));
 
     // No `--disable-opt`: an observable output port alone must be
     // enough to keep firtool from dead-code-eliminating the design.
@@ -394,7 +394,7 @@ fn mem_disjoint_affine_needs_no_conflict_free_annotation() {
     let fir =
         emit_from_source(&read_example("mem_disjoint_affine.tr")).expect("emission should succeed");
     assert!(fir.contains("connect m.w_m.addr, i"));
-    assert!(fir.contains("connect m.r0.addr, tail(add(i, UInt<4>(1)), 1)"));
+    assert!(fir.contains("connect m.r0.addr, tail(add(i, UInt<5>(1)), 1)"));
     assert!(fir.contains("node fires_write = UInt<1>(1)"));
     assert!(fir.contains("node fires_read = UInt<1>(1)"));
     assert!(!fir.contains("not(fires_write)"));
@@ -420,7 +420,7 @@ fn mem_disjoint_non_power_of_two_needs_no_conflict_free_annotation() {
     let fir = emit_from_source(&read_example("mem_disjoint_non_power_of_two.tr"))
         .expect("emission should succeed");
     assert!(fir.contains("connect m.w_m.addr, i"));
-    assert!(fir.contains("connect m.r0.addr, tail(add(i, UInt<4>(1)), 1)"));
+    assert!(fir.contains("connect m.r0.addr, tail(add(i, UInt<5>(1)), 1)"));
     assert!(fir.contains("node fires_write = UInt<1>(1)"));
     assert!(fir.contains("node fires_read = UInt<1>(1)"));
     assert!(!fir.contains("not(fires_write)"));
@@ -446,7 +446,7 @@ fn mem_disjoint_bounded_needs_no_annotation_on_the_mem_pair() {
     // specifically needed none.)
     let fir = emit_from_source(&read_example("mem_disjoint_bounded.tr"))
         .expect("emission should succeed");
-    assert!(fir.contains("connect m.w_m.addr, tail(add(i, UInt<4>(1)), 1)"));
+    assert!(fir.contains("connect m.w_m.addr, tail(add(i, UInt<5>(1)), 1)"));
     assert!(fir.contains("connect m.r0.addr, i"));
     assert!(fir.contains("node fires_write = UInt<1>(1)"));
     assert!(fir.contains("node fires_read = UInt<1>(1)"));
@@ -489,9 +489,9 @@ fn mem_disjoint_banked_needs_no_conflict_free_annotation() {
     // the other two cases.
     let fir =
         emit_from_source(&read_example("mem_disjoint_banked.tr")).expect("emission should succeed");
-    assert!(fir.contains("connect m.w_m.addr, tail(mul(UInt<4>(2), i), 4)"));
+    assert!(fir.contains("connect m.w_m.addr, tail(mul(UInt<8>(2), i), 4)"));
     assert!(
-        fir.contains("connect m.r0.addr, tail(add(tail(mul(UInt<4>(2), j), 4), UInt<4>(1)), 1)")
+        fir.contains("connect m.r0.addr, tail(add(tail(mul(UInt<8>(2), j), 4), UInt<9>(1)), 1)")
     );
     assert!(fir.contains("node fires_write = UInt<1>(1)"));
     assert!(fir.contains("node fires_read = UInt<1>(1)"));
@@ -593,7 +593,7 @@ module M {
     rule r {
         (want = 1)?
         let x = f.Deq[]
-        f.Enq[x + 1]
+        f.Enq[(x + 1).!]
     }
     in want : [1]
 }
@@ -710,14 +710,14 @@ module M {
     fifo f : [8]
     rule r {
         let x = f.Deq[]
-        f.Enq[x + 1]
+        f.Enq[(x + 1).!]
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("node fires_r = __fifo_f_valid"));
     assert!(fir.contains("connect __fifo_f_valid, UInt<1>(1)"));
-    assert!(fir.contains("connect __fifo_f_data, tail(add(__fifo_f_data, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect __fifo_f_data, tail(add(__fifo_f_data, UInt<9>(1)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -729,7 +729,7 @@ module M {
     reg x : [8] = 0
     rule r {
         f.Enq[x]
-        f.Enq[x + 1]
+        f.Enq[(x + 1).!]
     }
 }
 ";
@@ -771,7 +771,7 @@ module M {
     reg out : [8] = 0
     rule r {
         let x = f.Deq[]
-        out := x + 1
+        out := (x + 1).!
     }
 }
 ";
@@ -789,7 +789,7 @@ module M {
     rule r {
         let x = f.Deq[]
         let y = f.Deq[]
-        out := x + y
+        out := (x + y).!
     }
 }
 ";
@@ -871,7 +871,7 @@ module M {
     fifo f : [8]
     reg x : [8] = 0
     rule r {
-        x := x + 1
+        x := (x + 1).!
         f.Enq[x]
     }
 }
@@ -953,7 +953,7 @@ module M {
     fifo input : [8]
     out result : [8] = 0
     rule compute {
-        result := input.Deq[] + 1
+        result := (input.Deq[] + 1).!
     }
 }
 ";
@@ -1088,14 +1088,12 @@ module M {
         let z = m[0]
         let y = z + m[1]
         z := m[2]
-        result := y + z
+        result := (y + z).!
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains(
-        "connect __out_result, tail(add(tail(add(m.r0.data, m.r1.data), 1), m.r2.data), 1)"
-    ));
+    assert!(fir.contains("connect __out_result, add(add(m.r0.data, m.r1.data), m.r2.data)"));
     run_firtool(&fir, &[]);
 }
 
@@ -1500,7 +1498,7 @@ module Adder {
     in b : [8]
     out sum : [8] = 0
     rule add {
-        sum := a + b
+        sum := (a + b).!
     }
 }
 module Top {
@@ -1549,7 +1547,7 @@ module Top {
         in b : [8]
         out sum : [8] = 0
         rule add {
-            sum := a + b
+            sum := (a + b).!
         }
     }
     inst adder : Adder
@@ -1612,12 +1610,12 @@ module M {
     in x : [8]
     out y : [8] = 0
     rule r {
-        y := x * 3
+        y := (x * 3).!
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_y, tail(mul(x, UInt<8>(3)), 8)"));
+    assert!(fir.contains("connect __out_y, tail(mul(x, UInt<16>(3)), 8)"));
     run_firtool(&fir, &[]);
 }
 
@@ -1657,12 +1655,12 @@ module M {
     in x : [16]
     out result : [16] = 0
     rule r {
-        result := x + 8'd6
+        result := (x + 8'd6).!
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_result, tail(add(x, UInt<8>(6)), 1)"));
+    assert!(fir.contains("connect __out_result, add(x, UInt<8>(6))"));
     run_firtool(&fir, &[]);
 }
 
@@ -1692,7 +1690,7 @@ module M {
     reg a = 8'd6
     out b = 16'hFF00
     rule r {
-        a := a + 1
+        a := (a + 1).!
         b := 1
     }
 }
@@ -1998,7 +1996,7 @@ fn call_inlines_a_pure_function_with_a_let_and_a_trailing_return() {
     // `Avg`'s body (`let sum = a + b; return sum >> 1`) spliced straight
     // into the call site, exactly as if it had been written inline —
     // no trace of a call, no separate `module Avg`.
-    assert!(fir.contains("connect __out_result, pad(shr(tail(add(a, b), 1), 1), 8)"));
+    assert!(fir.contains("connect __out_result, pad(shr(bits(add(a, b), 7, 0), 1), 8)"));
     assert!(!fir.contains("module Avg"));
 
     // firtool hoists the shared `a + b` into a named temp under default
@@ -2019,7 +2017,7 @@ fn call_inlines_a_pure_function_with_a_let_and_a_trailing_return() {
 fn ufcs_dot_call_inlines_identically_to_the_prefix_spelling() {
     let src = "\
 Avg(a : [8], b : [8]) : [8] <combines> {
-    let sum = a + b
+    let sum = trunc(a + b, 8)
     return sum >> 1
 }
 module Top {
@@ -2032,7 +2030,7 @@ module Top {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_result, pad(shr(tail(add(a, b), 1), 1), 8)"));
+    assert!(fir.contains("connect __out_result, pad(shr(bits(add(a, b), 7, 0), 1), 8)"));
     assert!(!fir.contains("module Avg"));
 }
 
@@ -2077,7 +2075,7 @@ module M {
     out result : [8] = 0
 
     Bump(x : [8]) : [8] <combines> {
-        return v + x
+        return (v + x).!
     }
 
     rule r {
@@ -2086,7 +2084,7 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_result, tail(add(v, a), 1)"));
+    assert!(fir.contains("connect __out_result, add(v, a)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2102,7 +2100,7 @@ fn call_reaching_a_different_modules_state_is_an_error() {
     let src = "\
 module M {
     reg v : [8] = 0
-    Bump(x : [8]) : [8] <combines> { return v + x }
+    Bump(x : [8]) : [8] <combines> { return (v + x).! }
     module N {
         in a : [8]
         out result : [8] = 0
@@ -2126,11 +2124,11 @@ fn a_callee_may_call_another_callee_for_a_pure_value() {
     // shows up as a wrong number, not just "it compiled."
     let src = "\
 Inner(x : [8]) : [8] <combines> {
-    return x + 1
+    return (x + 1).!
 }
 Outer(x : [8]) : [8] <combines> {
     let doubled = Inner(x) * 2
-    return doubled
+    return (doubled).!
 }
 module M {
     in a : [8]
@@ -2142,7 +2140,9 @@ module M {
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(
-        fir.contains("connect __out_result, tail(mul(tail(add(a, UInt<8>(1)), 1), UInt<8>(2)), 8)")
+        fir.contains(
+            "connect __out_result, tail(mul(tail(add(a, UInt<9>(1)), 1), UInt<16>(2)), 8)"
+        )
     );
     run_firtool(&fir, &[]);
 }
@@ -2155,12 +2155,12 @@ fn calling_the_same_nested_function_twice_independently_is_not_a_cycle() {
     // `Outer` happens to reference `Inner`.
     let src = "\
 Inner(x : [8]) : [8] <combines> {
-    return x + 1
+    return (x + 1).!
 }
 Outer(x : [8]) : [8] <combines> {
     let a = Inner(x)
-    let b = Inner(x + 1)
-    return a + b
+    let b = Inner((x + 1).!)
+    return (a + b).!
 }
 module M {
     in x : [8]
@@ -2208,7 +2208,7 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_r, tail(add(tail(add(a, a), 1), UInt<4>(0)), 1)"));
+    assert!(fir.contains("connect __out_r, tail(add(add(a, a), UInt<6>(0)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2350,7 +2350,7 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect r, tail(add(r, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect r, tail(add(r, UInt<9>(1)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2381,7 +2381,7 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_r, tail(add(tail(add(a, b), 1), UInt<9>(0)), 1)"));
+    assert!(fir.contains("connect __out_r, tail(add(add(a, b), UInt<10>(0)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2489,7 +2489,7 @@ module M {
 
     Inner(x : [8]) : [8] <combines, writes {w}> {
         w := x
-        return x + 1
+        return (x + 1).!
     }
     Outer(x : [8]) : [8] <combines, writes {w}> {
         let t = Inner(x)
@@ -2537,7 +2537,7 @@ module M {
     }
     Outer(x : [8]) : [8] <combines, writes {v}> {
         Inner(x)
-        return x + 1
+        return (x + 1).!
     }
 
     rule compute {
@@ -2547,7 +2547,7 @@ module M {
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("connect v, a"));
-    assert!(fir.contains("connect __out_result, tail(add(a, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect __out_result, tail(add(a, UInt<9>(1)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2565,7 +2565,7 @@ module M {
     out result : [8] = 0
 
     Helper(x : [8]) : [8] <combines> {
-        return x + 1
+        return (x + 1).!
     }
     Bump(x : [8]) : [8] <combines, writes {v}> {
         v := Helper(x)
@@ -2578,7 +2578,7 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect v, tail(add(a, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect v, tail(add(a, UInt<9>(1)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2595,11 +2595,11 @@ module M {
     out result : [8] = 0
 
     Inner(x : [8]) : [8] <combines> {
-        return x + 1
+        return (x + 1).!
     }
     Outer(x : [8]) : [8] <combines> {
         Inner(x)
-        return x + 1
+        return (x + 1).!
     }
 
     rule r {
@@ -2608,7 +2608,7 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("connect __out_result, tail(add(a, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect __out_result, tail(add(a, UInt<9>(1)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2628,7 +2628,7 @@ module M {
 
     Bump(x : [8]) : [8] <combines> {
         v := x
-        return x + 1
+        return (x + 1).!
     }
 
     rule r {
@@ -2638,7 +2638,7 @@ module M {
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("connect v, a"));
-    assert!(fir.contains("connect __out_result, tail(add(a, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect __out_result, tail(add(a, UInt<9>(1)), 1)"));
     run_firtool(&fir, &["--disable-opt"]);
 }
 
@@ -2651,7 +2651,7 @@ module M {
 
     Bump(x : [8]) : [8] <combines> {
         v := x
-        return x + 1
+        return (x + 1).!
     }
 
     rule r {
@@ -2747,7 +2747,7 @@ module M {
 
     Bump(x : [8]) : [8] <combines> {
         v := x
-        return x + 1
+        return (x + 1).!
     }
 
     rule r1 {
@@ -2811,11 +2811,11 @@ module M {
 
     Bump(x : [8]) : [8] <combines> {
         v := x
-        return x + 1
+        return (x + 1).!
     }
 
     rule r {
-        result := Bump(a) + 1
+        result := (Bump(a) + 1).!
     }
 }
 ";
@@ -2836,7 +2836,7 @@ module M {
 
     Bump(x : [8]) : [8] <combines> {
         v := x
-        return x + 1
+        return (x + 1).!
     }
 
     rule r {
@@ -2864,7 +2864,7 @@ fn call_folds_a_guard_that_references_a_preceding_callee_local() {
 Classify(x : [8]) : [8] <combines, fails> {
     let y = x + 1
     (y <> 0)?
-    return y
+    return (y).!
 }
 module Top {
     in a : [8]
@@ -2875,7 +2875,7 @@ module Top {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("node fires_compute = neq(tail(add(a, UInt<8>(1)), 1), UInt<8>(0))"));
+    assert!(fir.contains("node fires_compute = neq(tail(add(a, UInt<9>(1)), 1), UInt<9>(0))"));
     run_firtool(&fir, &["--disable-opt"]);
 }
 
@@ -2940,13 +2940,13 @@ module M {
     in b : [8]
     out ok : [8] = 0
     rule r {
-        ok := a + (a > b)
+        ok := (a + (a > b)).!
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("node fires_r = gt(a, b)"));
-    assert!(fir.contains("connect __out_ok, tail(add(a, a), 1)"));
+    assert!(fir.contains("connect __out_ok, add(a, a)"));
     run_firtool(&fir, &["--disable-opt"]);
 }
 
@@ -2973,14 +2973,14 @@ module M {
     in c : [8]
     in d : [8]
     rule r <fails> {
-        x := a + (a > b)
+        x := (a + (a > b)).!
         y := c > d
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("node fires_r = and(gt(a, b), gt(c, d))"));
-    assert!(fir.contains("connect x, tail(add(a, a), 1)"));
+    assert!(fir.contains("connect x, add(a, a)"));
     assert!(fir.contains("connect y, c"));
     run_firtool(&fir, &["--disable-opt"]);
 }
@@ -3001,7 +3001,7 @@ module M {
     in d : [8]
     rule r <fails> {
         x := a
-        y := c + (c > d)
+        y := (c + (c > d)).!
     }
 }
 ";
@@ -3031,7 +3031,7 @@ module M {
     in c : [1]
     rule r {
         if c = 1 {
-            v := a + (a > b)
+            v := (a + (a > b)).!
         }
     }
 }
@@ -3149,7 +3149,7 @@ module M {
     Bump(x : [8]) : [8] <combines, fails> {
         (x <> 0)?
         v := x
-        return x + 1
+        return (x + 1).!
     }
     rule r {
         result := Bump(a)
@@ -3184,7 +3184,7 @@ module Top {
     in a : [8]
     out result : [8] = 0
     rule compute {
-        result := Classify(a) + 1
+        result := (Classify(a) + 1).!
     }
 }
 ";
@@ -4411,7 +4411,7 @@ module M {
     }
 
     rule incr {
-        counter := counter + 1
+        counter := (counter + 1).!
     }
 
     schedule {
@@ -4670,7 +4670,7 @@ module M {
     reg v : [8] = 0
     out ready : [1] = 0
     rule r {
-        v := v + 1
+        v := (v + 1).!
         ready := logic f.Deq[]
     }
 }
@@ -4684,7 +4684,7 @@ module M {
 fn logic_rejects_a_call_that_never_fails() {
     let src = "\
 Pure(x : [8]) : [8] <combines> {
-    return x + 1
+    return (x + 1).!
 }
 module M {
     in a : [8]
@@ -5060,7 +5060,7 @@ module M {
     out counter : [8] = 0
     rule r {
         result := a.Deq[] or b.Deq[] or 0
-        counter := counter + 1
+        counter := (counter + 1).!
     }
 }
 ";
@@ -5286,7 +5286,7 @@ fn a_callee_local_reassignment_is_rejected_not_silently_dropped() {
 Bump(a : [8]) : [8] <combines> {
     let x = a
     x := x + 1
-    return x
+    return (x).!
 }
 module M {
     in a : [8]
@@ -5319,7 +5319,7 @@ module M {
     Bump(a : [8]) <combines, writes {r}> {
         let x = a
         x := x + 1
-        r := x
+        r := (x).!
     }
     rule go {
         Bump(a)
@@ -5338,7 +5338,7 @@ Chk(a : [8]) : [8] <combines, fails> {
     let y = a
     y := y + 1
     (y <> 0)?
-    return y
+    return (y).!
 }
 module Top {
     in a : [8]
@@ -5363,7 +5363,7 @@ module M {
     Bump(a : [8], c : [1]) <combines, writes {r}> {
         let x = a
         if c? { x := x + 1 } else { x := x + 2 }
-        r := x
+        r := (x).!
     }
     rule go {
         Bump(a, c)
@@ -5960,7 +5960,7 @@ module M {
     }
 
     rule bad {
-        val := opt? + 1
+        val := (opt? + 1).!
     }
 }
 ";
@@ -7465,14 +7465,14 @@ module M {
         if let x = opt? {
             v := x
         }
-        w := w + 1
+        w := (w + 1).!
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("node fires_r = UInt<1>(1)"));
     assert!(fir.contains("connect v, mux(opt_valid, opt_data, v)"));
-    assert!(fir.contains("connect w, tail(add(w, UInt<8>(1)), 1)"));
+    assert!(fir.contains("connect w, tail(add(w, UInt<9>(1)), 1)"));
     run_firtool(&fir, &[]);
 }
 
@@ -7627,7 +7627,7 @@ module M {
     in b : [8]
     rule r {
         if let x = opt? {
-            v := a + (a > b)
+            v := (a + (a > b)).!
         }
     }
 }
@@ -7961,7 +7961,7 @@ module M {
 
     rule r <sequences, fails> {
         while f.Deq[] {
-            acc := acc + 1
+            acc := (acc + 1).!
         }
         result := acc
     }
@@ -7970,7 +7970,7 @@ module M {
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("node fires_r_s1 = and(eq(__cont_r, UInt<2>(1)), not(fires_r_s0))"));
     assert!(fir.contains("when __fifo_f_valid :\n        connect __fifo_f_valid, UInt<1>(0)"));
-    assert!(fir.contains("connect acc, mux(__fifo_f_valid, tail(add(acc, UInt<8>(1)), 1), acc)"));
+    assert!(fir.contains("connect acc, mux(__fifo_f_valid, tail(add(acc, UInt<9>(1)), 1), acc)"));
     assert!(fir.contains("connect __cont_r, mux(__fifo_f_valid, UInt<2>(1), UInt<2>(2))"));
     run_firtool(&fir, &[]);
 }
@@ -8002,7 +8002,7 @@ module M {
         let limit = bound
         cnt := 0
         while cnt <> limit {
-            cnt := cnt + 1
+            cnt := (cnt + 1).!
         }
         result := cnt
     }
@@ -8030,7 +8030,7 @@ module M {
 
     Bump(p : [8], o : ?[8]) : [8] <sequences> {
         if let x = o? {
-            acc := p + x
+            acc := (p + x).!
         } else {
             acc := p
         }
@@ -8077,7 +8077,7 @@ module M {
             opt := false
         }
         while let v = opt? {
-            acc := acc + 1
+            acc := (acc + 1).!
             cnt := cnt - 1
             if (cnt - 1) <> 0 {
                 opt := cnt - 1
@@ -8092,7 +8092,7 @@ module M {
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("regreset __cont_r"));
     assert!(fir.contains("connect __cont_r, mux(opt_valid, UInt<2>(1), UInt<2>(2))"));
-    assert!(fir.contains("connect acc, mux(opt_valid, tail(add(acc, UInt<8>(1)), 1), acc)"));
+    assert!(fir.contains("connect acc, mux(opt_valid, tail(add(acc, UInt<9>(1)), 1), acc)"));
     run_firtool(&fir, &[]);
 }
 
@@ -8166,15 +8166,15 @@ module M {
             acc := v
         } else {
             let v = cnt + 1
-            cnt := v
-            acc := v
+            cnt := (v).!
+            acc := (v).!
         }
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     let expected = "mux(eq(flag, UInt<1>(1)), tail(sub(cnt, UInt<8>(1)), 1), \
-                     tail(add(cnt, UInt<8>(1)), 1))";
+                     tail(add(cnt, UInt<9>(1)), 1))";
     assert!(fir.contains(&format!("connect cnt, {expected}")));
     assert!(fir.contains(&format!("connect acc, {expected}")));
     run_firtool(&fir, &[]);
@@ -8195,7 +8195,7 @@ module M {
     reg count : [4] = 0
 
     rule step? {
-        count := count + 1
+        count := (count + 1).!
     }
 }
 ";
@@ -8414,7 +8414,7 @@ module M {
     rule r <sequences> {
         cnt := 0
         while go = 1 {
-            cnt := cnt + 1
+            cnt := (cnt + 1).!
             if cnt >= limit {
                 break
             }
@@ -8448,7 +8448,7 @@ module M {
 
     rule r <sequences> {
         while go = 1 {
-            v := v + 1
+            v := (v + 1).!
             if a = 1 {
                 if b = 1 {
                     break
@@ -8481,7 +8481,7 @@ module M {
     rule r <sequences, fails> {
         cnt := 0
         while let v = opt? {
-            cnt := cnt + v
+            cnt := (cnt + v).!
             opt := false
             if cnt >= limit {
                 break
@@ -8531,7 +8531,7 @@ module M {
     rule r <sequences> {
         while go = 1 {
             break
-            v := v + 1
+            v := (v + 1).!
         }
     }
 }
@@ -8556,7 +8556,7 @@ module M {
             if c = 1 {
                 break
             }
-            v := v + 1
+            v := (v + 1).!
         }
     }
 }

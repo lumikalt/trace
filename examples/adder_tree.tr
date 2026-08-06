@@ -8,7 +8,7 @@
 AdderTree(xs : list[32]) : [32] <elaborates> {
     if len(xs) = 1 { return xs[0] }
     let mid = len(xs) / 2
-    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])
+    return (AdderTree(xs[..mid]) + AdderTree(xs[mid..])).!
 }
 
 module Top {

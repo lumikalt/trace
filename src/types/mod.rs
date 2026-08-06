@@ -4,19 +4,24 @@
 //! to functions with implicit width parameters (`bits[N]`) instantiate
 //! them by matching concrete argument widths — the unification half.
 //!
-//! Solver 2 (widths): widths are computed with monotone rules (`+`/`-`
-//! keep max width, `*` sums, comparisons give 1) and only *checked* where
-//! both sides are known. Rebinding a local widens its width; bodies
-//! re-type until the local table is stable, with a divergence cap.
+//! Solver 2 (widths): widths are computed with monotone rules (`-` keeps
+//! max width, `+` keeps max width AND GROWS BY ONE (the carry bit — no
+//! silent wraparound, DESIGN.md's "Growing addition"), `*` sums,
+//! comparisons give 1) and only *checked* where both sides are known.
+//! Rebinding a local widens its width; bodies re-type until the local
+//! table is stable, with a divergence cap.
 //!
 //! Generic bodies (widths depending on unsolved implicit params) are
 //! shape-checked only; their widths check numerically at each concrete
 //! call site after instantiation.
 //!
-//! Width rules follow Chisel-style modular arithmetic: `a + b` has width
-//! `max(|a|,|b|)`, and an integer literal absorbs into the other
-//! operand's width (it must fit). Writing a wider value into a narrower
-//! register is an error that names `trunc` — no silent truncation.
+//! Width rules follow Chisel-style modular arithmetic for every operator
+//! EXCEPT `+` (`a - b`/`a & b`/etc. have width `max(|a|,|b|)`, no growth;
+//! `a + b` has width `max(|a|,|b|)+1`, growing to hold the carry — the
+//! ONE deliberate departure from Chisel's own default `+`), and an
+//! integer literal absorbs into the other operand's width (it must fit).
+//! Writing a wider value into a narrower register is an error that names
+//! `trunc` — no silent truncation, `+`'s own carry bit included.
 
 use crate::ast::{Ast, BinOp, ExprId, ItemId};
 use crate::lexer::Span;
@@ -32,18 +37,27 @@ pub enum Width {
 }
 
 /// The `Width` a `Bits op Bits` expression combines to — `Mul` sums the
-/// two, `Shl`/`Shr`/`AShr` keep the LEFT operand's own width (a shift
-/// amount never widens/narrows the shifted value's own type), everything
-/// else (`Add`/`Sub`/`Div`/`Rem`/`BitAnd`/`BitOr`/`BitXor`) takes the max
-/// — Chisel-style modular arithmetic, this module's own doc comment.
-/// `type_binop` (`types/expr.rs`) is this rule's PRIMARY use, but it's a
-/// free function specifically so `firrtl`'s own emission-time width
-/// resolver (`Emitter::resolve_bits_width`, for a generic callee body's
-/// own expressions, whose static `expr_tys` entry is deliberately
-/// `Unknown` per this module's own doc comment) can call the SAME rule
-/// instead of an independently-maintained second copy — the exact
-/// "const_fold`/`const_eval` drift" class of bug this codebase has
-/// already found and fixed more than once. A comparison's own result
+/// two; `Add` takes the max and grows by one (the carry bit: `n+1` bits
+/// always, provably, holds the true sum of two `n`-bit unsigned values —
+/// DESIGN.md's "Growing addition: no silent carry-bit truncation");
+/// `Shl`/`Shr`/`AShr` keep the LEFT operand's own width (a shift amount
+/// never widens/narrows the shifted value's own type); everything else
+/// (`Sub`/`Div`/`Rem`/`BitAnd`/`BitOr`/`BitXor`) takes the max with no
+/// growth — `Sub` deliberately NOT grown alongside `Add` despite the
+/// obvious symmetry: unsigned underflow needs a genuinely different
+/// mechanism than a width bit (there's no `n+1`-bit representation of
+/// "less than zero" in an unsigned encoding), a separate, unstarted
+/// design, not silently bundled in here; `Div`/`Rem` can never exceed
+/// their dividend/divisor's own width so growing them would just force
+/// pointless truncation elsewhere; `BitAnd`/`BitOr`/`BitXor` have no
+/// carry by construction. `type_binop` (`types/expr.rs`) is this rule's
+/// PRIMARY use, but it's a free function specifically so `firrtl`'s own
+/// emission-time width resolver (`Emitter::resolve_bits_width`, for a
+/// generic callee body's own expressions, whose static `expr_tys` entry
+/// is deliberately `Unknown` per this module's own doc comment) can call
+/// the SAME rule instead of an independently-maintained second copy —
+/// the exact "const_fold`/`const_eval` drift" class of bug this codebase
+/// has already found and fixed more than once. A comparison's own result
 /// (`Ty::Bits(w)` is never this function's concern) never reaches here —
 /// `type_binop` returns `l`'s own type for those, before this rule would
 /// apply at all.
@@ -51,6 +65,10 @@ pub(crate) fn combine_bits_width(op: BinOp, a: Width, b: Width) -> Width {
     match op {
         BinOp::Mul => match (a, b) {
             (Width::Known(x), Width::Known(y)) => Width::Known(x + y),
+            _ => Width::Unknown,
+        },
+        BinOp::Add => match (a, b) {
+            (Width::Known(x), Width::Known(y)) => Width::Known(x.max(y) + 1),
             _ => Width::Unknown,
         },
         BinOp::Shl | BinOp::Shr | BinOp::AShr => a,

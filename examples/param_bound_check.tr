@@ -4,7 +4,7 @@ module ParamBoundCheck {
     reg y : [8] where y < 50 = 0
 
     Bump(i : [8] where i < 10) {
-        cnt := i + 1
+        cnt := (i + 1).!
     }
 
     rule step {

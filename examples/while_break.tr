@@ -17,8 +17,8 @@ module WhileBreak {
         cnt := 0
         acc := 0
         while go = 1 {
-            acc := acc + 1
-            cnt := cnt + 1
+            acc := (acc + 1).!
+            cnt := (cnt + 1).!
             if cnt >= limit {
                 break
             }

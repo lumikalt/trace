@@ -489,6 +489,7 @@ fn plan_spawn(
     };
     let Item::Fn {
         params,
+        ret,
         body: callee_body,
         ..
     } = ast.item(callee_item).clone()
@@ -642,11 +643,35 @@ fn plan_spawn(
         );
     }
 
-    let result_ty = types
-        .expr_tys
-        .get(&return_expr)
-        .cloned()
-        .unwrap_or(Ty::Unknown);
+    // Prefer the fn's own DECLARED return type over `return_expr`'s
+    // inferred type: growing addition means an un-narrowed return value
+    // (`return x + 10`, no `trunc`/`.!`) infers a WIDER type than the
+    // signature promises (`x + 10` is `[9]` when `x` is `[8]`, even
+    // though `Race`'s own `: [8]` return annotation is what callers
+    // actually see and what `.result`'s register below must match) --
+    // reading `expr_tys[return_expr]` here would size the register to
+    // the grown width, then a downstream consumer built against the
+    // DECLARED `[8]` (e.g. `__race_value` feeding an `[8]` output) sees
+    // a width mismatch. `bits_width_expr`/`const_eval_expr` are the
+    // same free functions `firrtl`'s own emission-time resolver uses
+    // (see their doc comments) specifically so this isn't a second,
+    // independently-drifting width evaluator; falls back to the return
+    // expression's own inferred type when the declared return type isn't
+    // a plain `[N]` (no declared return type, or a shape these two
+    // functions don't resolve, e.g. one depending on an implicit param
+    // this call site hasn't solved).
+    let declared_result_ty = ret.and_then(|r| {
+        let w = crate::types::bits_width_expr(ast, res, r)?;
+        let width = crate::types::const_eval_expr(ast, res, w, &HashMap::new())?;
+        Some(Ty::Bits(Width::Known(width)))
+    });
+    let result_ty = declared_result_ty.unwrap_or_else(|| {
+        types
+            .expr_tys
+            .get(&return_expr)
+            .cloned()
+            .unwrap_or(Ty::Unknown)
+    });
     if !matches!(result_ty, Ty::Bits(Width::Known(_))) {
         errors.push(LowerError {
             span: ast.expr_spans[return_expr.0 as usize].clone(),

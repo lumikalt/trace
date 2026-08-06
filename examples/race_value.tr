@@ -9,11 +9,11 @@ module RaceValue {
 
     A(x : [8]) : [8] <sequences> {
         tick
-        return x + 10
+        return (x + 10).!
     }
     B(x : [8]) : [8] <sequences> {
         tick
-        return x + 20
+        return (x + 20).!
     }
 
     rule pick <sequences> {

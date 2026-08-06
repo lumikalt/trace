@@ -24,7 +24,7 @@ module Accumulator {
     out sum : [8] = 0
 
     rule accumulate {
-        sum := sum + inc
+        sum := (sum + inc).!
     }
 }
 

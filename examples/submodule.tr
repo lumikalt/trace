@@ -4,7 +4,7 @@ module Adder {
     out sum : [8] = 0
 
     rule add {
-        sum := a + b
+        sum := (a + b).!
     }
 }
 

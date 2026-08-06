@@ -10,6 +10,6 @@ module OptionalRule {
     out count : [4] = 0
 
     rule step? {
-        count := count + 1
+        count := (count + 1).!
     }
 }

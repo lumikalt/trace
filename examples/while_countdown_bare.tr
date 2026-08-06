@@ -18,7 +18,7 @@ module WhileCountdown {
         acc := 0
         while cnt <> 0 {
             cnt := cnt - 1
-            acc := acc + 1
+            acc := (acc + 1).!
         }
         iters := acc
     }

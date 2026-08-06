@@ -23,7 +23,7 @@
 -- either value alone), proving the loop actually iterated more than
 -- once, not just that the wiring compiles.
 Add(a : [8], b : [8]) : [8] <combines> {
-    return a + b
+    return (a + b).!
 }
 
 module FifoFoldClosure {

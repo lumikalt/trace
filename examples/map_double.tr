@@ -8,13 +8,13 @@
 -- sim/map_double_tb.v for the proof this computes the right sum through
 -- real hardware, not just that it compiles.
 Double(x : [32]) : [32] <combines> {
-    return x + x
+    return (x + x).!
 }
 
 AdderTree(xs : list[32]) : [32] <elaborates> {
     if len(xs) = 1 { return xs[0] }
     let mid = len(xs) / 2
-    return AdderTree(xs[..mid]) + AdderTree(xs[mid..])
+    return (AdderTree(xs[..mid]) + AdderTree(xs[mid..])).!
 }
 
 DoubledSum(xs : list[32]) : [32] <elaborates> {

@@ -27,11 +27,11 @@ module MemDisjointBanked {
 
     rule write {
         m[2*i] := x
-        write_count := write_count + 1
+        write_count := (write_count + 1).!
     }
 
     rule read {
         y := m[2*j + 1]
-        read_count := read_count + 1
+        read_count := (read_count + 1).!
     }
 }

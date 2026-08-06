@@ -102,11 +102,11 @@ module CircularBufferDisjoint {
         (push_count - pop_count < 8)?
         m[head] := push_data
         if head < 7 {
-            head := head + 1
+            head := (head + 1).!
         } else {
             head := 0
         }
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
 
     rule pop {
@@ -114,10 +114,10 @@ module CircularBufferDisjoint {
         (push_count <> pop_count)?
         pop_data := m[tail]
         if tail < 7 {
-            tail := tail + 1
+            tail := (tail + 1).!
         } else {
             tail := 0
         }
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }

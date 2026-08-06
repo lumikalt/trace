@@ -59,10 +59,10 @@ fn declaration_order_breaks_ties() {
 module M {
     reg a : [8] = 0
     rule first {
-        a := a + 1
+        a := (a + 1).!
     }
     rule second {
-        a := a + 2
+        a := (a + 2).!
     }
 }
 ";
@@ -102,10 +102,10 @@ fn mutually_exclusive_exempts() {
 module M {
     reg a : [8] = 0
     rule p {
-        a := a + 1
+        a := (a + 1).!
     }
     rule q {
-        a := a + 2
+        a := (a + 2).!
     }
     schedule {
         mutually_exclusive { p, q }
@@ -133,7 +133,7 @@ module M {
     reg a : [8] = 0
     reg b : [8] = 0
     rule p {
-        a := a + 1
+        a := (a + 1).!
     }
     rule q {
         b := a
@@ -163,10 +163,10 @@ fn conflict_free_rejects_a_writewrite_conflict() {
 module M {
     reg a : [8] = 0
     rule p {
-        a := a + 1
+        a := (a + 1).!
     }
     rule q {
-        a := a + 2
+        a := (a + 2).!
     }
     schedule {
         conflict_free { p, q }
@@ -188,10 +188,10 @@ fn urgency_overrides_declaration_order() {
 module M {
     reg a : [8] = 0
     rule p {
-        a := a + 1
+        a := (a + 1).!
     }
     rule q {
-        a := a + 2
+        a := (a + 2).!
     }
     schedule {
         urgency q > p
@@ -212,10 +212,10 @@ fn urgency_cycle_is_an_error() {
 module M {
     reg a : [8] = 0
     rule p {
-        a := a + 1
+        a := (a + 1).!
     }
     rule q {
-        a := a + 2
+        a := (a + 2).!
     }
     schedule {
         urgency p > q
@@ -1075,7 +1075,7 @@ module M {
     out y : [8] = 0
     rule bump {
         if i < 8 {
-            i := i + 1
+            i := (i + 1).!
         } else {
             i := 0
         }
@@ -1228,14 +1228,14 @@ module M {
     out y : [8] = 0
     rule bump_i {
         if i < 4 {
-            i := i + 1
+            i := (i + 1).!
         } else {
             i := 0
         }
     }
     rule bump_j {
         if j < 9 {
-            j := j + 1
+            j := (j + 1).!
         } else {
             j := 5
         }
@@ -1560,14 +1560,14 @@ fn separate_modules_do_not_conflict() {
 module A {
     reg a : [8] = 0
     rule p {
-        a := a + 1
+        a := (a + 1).!
     }
 }
 
 module B {
     reg a : [8] = 0
     rule q {
-        a := a + 1
+        a := (a + 1).!
     }
 }
 ";
@@ -1675,22 +1675,22 @@ module CircularBufferDisjoint {
         (push_count - pop_count < 8)?
         m[head] := push_data
         if head < 7 {
-            head := head + 1
+            head := (head + 1).!
         } else {
             head := 0
         }
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
     rule pop {
         (pop_en = 1)?
         (push_count <> pop_count)?
         pop_data := m[tail]
         if tail < 7 {
-            tail := tail + 1
+            tail := (tail + 1).!
         } else {
             tail := 0
         }
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }
 ";
@@ -1743,22 +1743,22 @@ module CircularBufferDisjoint {
         (push_count - pop_count <= 8)?
         m[head] := push_data
         if head < 7 {
-            head := head + 1
+            head := (head + 1).!
         } else {
             head := 0
         }
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
     rule pop {
         (pop_en = 1)?
         (push_count <> pop_count)?
         pop_data := m[tail]
         if tail < 7 {
-            tail := tail + 1
+            tail := (tail + 1).!
         } else {
             tail := 0
         }
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }
 ";

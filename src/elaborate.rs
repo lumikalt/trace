@@ -686,7 +686,28 @@ impl<'a> Interp<'a> {
                 let span = self.ast.expr_spans[id.0 as usize].clone();
                 let l = self.eval_elab_expr(lhs, env, depth, placeholder)?;
                 let r = self.eval_elab_expr(rhs, env, depth, placeholder)?;
-                self.eval_elab_binop(span, op, l, r)
+                let result = self.eval_elab_binop(span, op, l, r)?;
+                // `.!` on THIS node (`id`) is a mark on the ORIGINAL
+                // `ExprId`, which doesn't survive past this function —
+                // `eval_elab_binop` rebuilds a fresh `Circuit` string
+                // from `l`/`r`'s own already-evaluated text rather than
+                // extracting `id`'s source span verbatim (unlike
+                // `closures.rs`'s splice, there's no single span here
+                // that covers "the whole binary op" for a RECURSIVE
+                // circuit value — `l_text`/`r_text` may themselves be
+                // synthesized from nested calls with no source span of
+                // their own). Re-spelling `.!` onto the rebuilt text is
+                // the same trick as the parser's own span-widening for
+                // this arm: whatever pass re-parses the final rendered
+                // module sees literal `.!` characters and re-marks
+                // whatever node they end up attached to, same as if the
+                // programmer had written it there directly.
+                match result {
+                    ElabValue::Circuit(s) if self.ast.lossy.contains(&id) => {
+                        Ok(ElabValue::Circuit(format!("{s}.!")))
+                    }
+                    other => Ok(other),
+                }
             }
             Expr::Call { callee, args } => {
                 let span = self.ast.expr_spans[id.0 as usize].clone();

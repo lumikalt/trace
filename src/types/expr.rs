@@ -546,13 +546,34 @@ impl<'a> TypeChecker<'a> {
                         self.check_literal_fits(rhs, &Ty::Bits(w));
                     }
                 }
-                if is_comparison { l_ty } else { Ty::Bits(w) }
+                // Once the literal is verified to fit in `w` bits (just
+                // above), it's an ordinary `w`-bit operand for width-
+                // combining purposes too — `Add`'s own carry-bit growth
+                // (DESIGN.md's "Growing addition") applies here exactly
+                // as it does to the `(Bits, Bits)` arm below, so `a +
+                // 200` (`a : [8]`) is caught the same way `a + b` is, not
+                // silently exempted just because one side is a literal.
+                // Shifts keep their own width unchanged, same as always
+                // — a shift amount's width was never part of the result.
+                if is_comparison {
+                    l_ty
+                } else if matches!(op, Shl | Shr | AShr) {
+                    Ty::Bits(w)
+                } else {
+                    Ty::Bits(super::combine_bits_width(op, w, w))
+                }
             }
             (Ty::Int, Ty::Bits(w)) => {
                 if !lossy && !matches!(op, Shl | Shr | AShr) {
                     self.check_literal_fits(lhs, &Ty::Bits(w));
                 }
-                if is_comparison { l_ty } else { Ty::Bits(w) }
+                if is_comparison {
+                    l_ty
+                } else if matches!(op, Shl | Shr | AShr) {
+                    Ty::Bits(w)
+                } else {
+                    Ty::Bits(super::combine_bits_width(op, w, w))
+                }
             }
             (Ty::Bits(a), Ty::Bits(b)) => {
                 if is_comparison {

@@ -184,7 +184,7 @@ module M {
     reg i : [4] where i < 9 = 0
     rule bump {
         if i < 8 {
-            i := i + 1
+            i := (i + 1).!
         } else {
             i := 0
         }
@@ -202,7 +202,7 @@ fn unguarded_increment_is_rejected() {
 module M {
     reg i : [4] where i < 9 = 0
     rule bump {
-        i := i + 1
+        i := (i + 1).!
     }
 }
 ";
@@ -225,7 +225,7 @@ fn where_bound_limit_composed_from_literal_arithmetic_is_still_enforced() {
 module M {
     reg cnt : [8] where cnt < 8 + 2 = 0
     rule bump {
-        cnt := cnt + 100
+        cnt := (cnt + 100).!
     }
 }
 ";
@@ -246,7 +246,7 @@ fn wildcard_self_reference_on_a_reg_bound_is_enforced_identically_to_the_name_fo
 module M {
     reg i : [4] where _ < 9 = 0
     rule bump {
-        i := i + 1
+        i := (i + 1).!
     }
 }
 ";
@@ -300,7 +300,7 @@ fn where_bound_le_operator_is_recognized() {
 module M {
     reg cnt : [8] where cnt <= 5 = 0
     rule step {
-        cnt := cnt + 6
+        cnt := (cnt + 6).!
     }
 }
 ";
@@ -334,7 +334,7 @@ fn commuted_where_bound_operator_is_recognized() {
 module M {
     reg cnt : [8] where 10 > cnt = 0
     rule step {
-        cnt := cnt + 20
+        cnt := (cnt + 20).!
     }
 }
 ";
@@ -357,7 +357,7 @@ fn where_bound_ge_zero_at_full_width_still_catches_width_overflow() {
 module M {
     reg cnt : [4] where cnt >= 0 = 0
     rule step {
-        cnt := cnt + 1
+        cnt := (cnt + 1).!
     }
 }
 ";
@@ -409,7 +409,7 @@ module M {
     reg i : [4] where i < 9 = 0
     rule bump {
         if i < 9 {
-            i := i + 1
+            i := (i + 1).!
         }
     }
 }
@@ -439,7 +439,7 @@ module M {
     reg i : [4] where i < 10 = 0
     rule bump {
         if i <= 8 {
-            i := i + 1
+            i := (i + 1).!
         }
     }
 }
@@ -459,7 +459,7 @@ module M {
     reg i : [4] where i < 9 = 0
     rule bump {
         if i <= 8 {
-            i := i + 1
+            i := (i + 1).!
         }
     }
 }
@@ -481,7 +481,7 @@ module M {
     rule step {
         a?
         b <= 0b1110
-        b := b + 1
+        b := (b + 1).!
     }
 }
 ";
@@ -513,7 +513,7 @@ module M {
     rule step {
         a?
         b <> 0b11111
-        b := b + 1
+        b := (b + 1).!
     }
 }
 ";
@@ -534,7 +534,7 @@ module M {
     rule step {
         a?
         (b <> 0b11111)?
-        b := b + 1
+        b := (b + 1).!
     }
 }
 ";
@@ -557,7 +557,7 @@ module M {
     out b : [5] where _ > 1 = 5
     rule step {
         a?
-        b := b + 1
+        b := (b + 1).!
         b <> 0b11111
     }
 }
@@ -713,7 +713,7 @@ module M {
     out cnt : [8] where cnt < 100 = 0
     rule count {
         if cnt <> 99 {
-            cnt := cnt + 1
+            cnt := (cnt + 1).!
         } else {
             cnt := 0
         }
@@ -762,7 +762,7 @@ module M {
     reg cnt : [8] where cnt < 100 = 0
     rule count {
         if cnt <> 50 {
-            cnt := cnt + 50
+            cnt := (cnt + 50).!
         }
     }
 }
@@ -856,7 +856,7 @@ module M {
     reg i : [4] where i < 9 = 0
     rule bump {
         if 8 < i {
-            i := i + 1
+            i := (i + 1).!
         }
     }
 }
@@ -876,7 +876,7 @@ fn multiplication_by_a_literal_is_proven() {
 module M {
     reg i : [4] where i < 9 = 0
     rule bump {
-        i := i * 1
+        i := (i * 1).!
     }
 }
 ";
@@ -895,7 +895,7 @@ module M {
     reg cnt : [8] where cnt < 100 = 1
     rule double {
         if cnt < 10 {
-            cnt := cnt * 2
+            cnt := (cnt * 2).!
         } else {
             cnt := 1
         }
@@ -916,7 +916,7 @@ fn unguarded_multiplication_that_could_exceed_the_bound_is_rejected() {
 module M {
     reg cnt : [8] where cnt < 100 = 1
     rule double {
-        cnt := cnt * 2
+        cnt := (cnt * 2).!
     }
 }
 ";
@@ -937,7 +937,7 @@ module M {
     reg i : [3] where i < 20 = 0
     rule bump {
         if i < 4 {
-            i := i * 3
+            i := (i * 3).!
         } else {
             i := 0
         }
@@ -964,7 +964,7 @@ module M {
     reg cnt : [8] where cnt < 8 = 0
     rule bump {
         if cnt < 5 {
-            cnt := cnt * 2
+            cnt := (cnt * 2).!
         } else {
             cnt := 0
         }
@@ -990,7 +990,7 @@ module M {
     reg cnt : [8] where cnt < 10 = 0
     rule bump {
         if cnt < 5 {
-            cnt := cnt * 2
+            cnt := (cnt * 2).!
         } else {
             cnt := 0
         }
@@ -1010,7 +1010,7 @@ fn write_inside_a_called_fn_is_caught() {
 module M {
     reg i : [4] where i < 9 = 0
     Bump() {
-        i := i + 1
+        i := (i + 1).!
     }
     rule bump {
         Bump()
@@ -1033,7 +1033,7 @@ module M {
     rule bump {
         if i < 8 {
             let next = i + 1
-            i := next
+            i := (next).!
         } else {
             i := 0
         }
@@ -1054,7 +1054,7 @@ module M {
     rule bump <sequences> {
         while i < 5 {
             let step = i + 1
-            i := step
+            i := (step).!
             tick
         }
     }
@@ -1072,7 +1072,7 @@ module M {
     rule bump <sequences> {
         while i < 9 {
             let step = i + 1
-            i := step
+            i := (step).!
             tick
         }
     }
@@ -1094,7 +1094,7 @@ fn unbounded_reg_is_unaffected() {
 module M {
     reg i : [4] = 0
     rule bump {
-        i := i + 1
+        i := (i + 1).!
     }
 }
 ";
@@ -1143,7 +1143,7 @@ module M {
     reg i : [3] where i < 20 = 0
     rule bump {
         if i < 7 {
-            i := i + 1 + 1
+            i := (i + 1 + 1).!
         } else {
             i := 0
         }
@@ -1166,7 +1166,7 @@ module M {
     reg j : [4] where 5 <= j < 10 = 5
     rule bump {
         if j < 9 {
-            j := j + 1
+            j := (j + 1).!
         } else {
             j := 5
         }
@@ -1201,7 +1201,7 @@ module M {
     out i : [4] where i < 9 = 0
     rule bump {
         if i < 8 {
-            i := i + 1
+            i := (i + 1).!
         } else {
             i := 0
         }
@@ -1217,7 +1217,7 @@ fn out_unguarded_increment_is_rejected() {
 module M {
     out i : [4] where i < 9 = 0
     rule bump {
-        i := i + 1
+        i := (i + 1).!
     }
 }
 ";
@@ -1238,7 +1238,7 @@ module M {
     reg x : [8] where x < 10 = 0
     reg cnt : [8] where cnt < 20 = 0
     Bump(i : [8] where i < 10) {
-        cnt := i + 1
+        cnt := (i + 1).!
     }
     rule step {
         Bump(x)
@@ -1260,7 +1260,7 @@ module M {
     reg y : [8] where y < 50 = 0
     reg cnt : [8] where cnt < 20 = 0
     Bump(i : [8] where i < 10) {
-        cnt := i + 1
+        cnt := (i + 1).!
     }
     rule step {
         Bump(y)
@@ -1303,7 +1303,7 @@ module M {
     reg j : [8] where 5 <= j < 10 = 5
     reg cnt : [8] where cnt < 20 = 0
     Bump(i : [8] where 5 <= i < 10) {
-        cnt := i + 1
+        cnt := (i + 1).!
     }
     rule step {
         Bump(j)
@@ -1322,7 +1322,7 @@ fn return_value_within_the_declared_bound_is_proven() {
     let src = "\
 module M {
     Bump(i : [8] where i < 10) : [8] where _ < 20 {
-        return i + 5
+        return (i + 5).!
     }
     rule step {
         Bump(3)
@@ -1342,7 +1342,7 @@ fn return_value_exceeding_the_declared_bound_is_rejected() {
     let src = "\
 module M {
     BadBump(i : [8] where i < 10) : [8] where _ < 20 {
-        return i + 100
+        return (i + 100).!
     }
 }
 ";
@@ -1363,10 +1363,10 @@ fn call_result_composes_into_a_bounded_write_via_declared_ret_bound() {
 module M {
     reg total : [8] where total < 40 = 0
     Bump(i : [8] where i < 10) : [8] where _ < 20 {
-        return i + 5
+        return (i + 5).!
     }
     rule step {
-        total := Bump(3) + Bump(4)
+        total := (Bump(3) + Bump(4)).!
     }
 }
 ";
@@ -1391,10 +1391,10 @@ fn return_bound_composition_uses_the_full_declared_width_not_narrower() {
 module M {
     reg total : [8] where total < 40 = 0
     Bump(i : [8] where i < 10) : [8] where _ < 21 {
-        return i + 5
+        return (i + 5).!
     }
     rule step {
-        total := Bump(3) + Bump(4)
+        total := (Bump(3) + Bump(4)).!
     }
 }
 ";
@@ -1419,7 +1419,7 @@ module M {
     Bump(i : [8]) : [8] where _ < 20 {
     }
     rule step {
-        total := Bump(3) + Bump(4)
+        total := (Bump(3) + Bump(4)).!
     }
 }
 ";
@@ -1444,10 +1444,10 @@ fn call_with_no_postcondition_composes_via_body_substitution_inlining() {
 module M {
     reg total : [8] where total < 40 = 0
     Bump(i : [8] where i < 10) : [8] {
-        return i + 5
+        return (i + 5).!
     }
     rule step {
-        total := Bump(3) + Bump(4)
+        total := (Bump(3) + Bump(4)).!
     }
 }
 ";
@@ -1467,10 +1467,10 @@ module M {
     reg total : [8] where total < 40 = 0
     Bump(i : [8] where i < 10) : [8] {
         let extra = 5
-        return i + extra
+        return (i + extra).!
     }
     rule step {
-        total := Bump(3) + Bump(4)
+        total := (Bump(3) + Bump(4)).!
     }
 }
 ";
@@ -1751,10 +1751,10 @@ fn declared_postcondition_still_takes_priority_over_inlining() {
 module M {
     reg total : [8] where total < 44 = 0
     Bump(i : [8] where i < 10) : [8] where _ < 30 {
-        return i + 5
+        return (i + 5).!
     }
     rule step {
-        total := Bump(3) + Bump(4)
+        total := (Bump(3) + Bump(4)).!
     }
 }
 ";
@@ -2019,7 +2019,7 @@ module M {
         return i
     }
     rule step {
-        total := unbounded + Bump(50)
+        total := (unbounded + Bump(50)).!
     }
 }
 ";
@@ -3024,7 +3024,7 @@ module M {
         while i < 3 {
             total := x
             x := q
-            i := i + 1
+            i := (i + 1).!
             tick
         }
     }
@@ -3160,22 +3160,22 @@ module CircularBufferDisjoint {
         (push_count - pop_count < 8)?
         m[head] := push_data
         if head < 7 {
-            head := head + 1
+            head := (head + 1).!
         } else {
             head := 0
         }
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
     rule pop {
         (pop_en = 1)?
         (push_count <> pop_count)?
         pop_data := m[tail]
         if tail < 7 {
-            tail := tail + 1
+            tail := (tail + 1).!
         } else {
             tail := 0
         }
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }
 ";
@@ -3201,12 +3201,12 @@ module M {
     rule push {
         (push_en = 1)?
         (push_count - pop_count <= 8)?
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
     rule pop {
         (pop_en = 1)?
         (push_count <> pop_count)?
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }
 ";
@@ -3236,7 +3236,7 @@ module M {
     invariant a - b < 9
     rule bump {
         (a - b < 8)?
-        a := a + 1
+        a := (a + 1).!
     }
 }
 ";
@@ -3255,7 +3255,7 @@ module M {
     reg b : [4] = 0
     invariant a - b < 9
     rule bump {
-        a := a + 1
+        a := (a + 1).!
     }
 }
 ";
@@ -3279,7 +3279,7 @@ module M {
     reg b : [4] = 0
     invariant (a - b) % 3 < 2
     rule bump {
-        a := a + 1
+        a := (a + 1).!
     }
 }
 ";
@@ -3303,7 +3303,7 @@ module M {
     reg b : [4] = 0
     invariant a - b < 20
     rule bump {
-        a := a + 1
+        a := (a + 1).!
     }
 }
 ";
@@ -3334,7 +3334,7 @@ module M {
     rule bump {
         (a - b < 8)?
         if flag = 1 {
-            a := a + 1
+            a := (a + 1).!
         }
     }
 }
@@ -3366,7 +3366,7 @@ module M {
     rule bump {
         (a - b < 3)?
         (a - b > 5)?
-        a := a + 10
+        a := (a + 10).!
     }
 }
 ";
@@ -3385,7 +3385,7 @@ module M {
     invariant a - b < 9
     rule bump {
         (a - b < 3)?
-        a := a + 10
+        a := (a + 10).!
     }
 }
 ";
@@ -3408,7 +3408,7 @@ module M {
     reg b : [4] = 0
     invariant 2 * a - b < 9
     rule bump {
-        a := a + 1
+        a := (a + 1).!
     }
 }
 ";
@@ -3432,7 +3432,7 @@ module M {
     reg b : [4] = 0
     invariant a - b < 9
     Bump() {
-        a := a + 1
+        a := (a + 1).!
     }
     rule bump {
         (a - b < 8)?
@@ -3461,7 +3461,7 @@ module M {
     invariant a - b - c < 9
     rule bump_a {
         (a - b - c < 8)?
-        a := a + 1
+        a := (a + 1).!
     }
     rule bump_b {
         (a <> b)?
@@ -3510,22 +3510,22 @@ module CircularBufferDisjoint {
         (push_count - pop_count < 8)?
         m[head] := push_data
         if head < 7 {
-            head := head + 1
+            head := (head + 1).!
         } else {
             head := 0
         }
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
     rule pop {
         (pop_en = 1)?
         (push_count <> pop_count)?
         pop_data := m[tail]
         if tail < 7 {
-            tail := tail + 1
+            tail := (tail + 1).!
         } else {
             tail := 0
         }
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }
 ";
@@ -3590,22 +3590,22 @@ module CircularBufferDisjoint {
         (push_count - pop_count < 8)?
         m[head] := push_data
         if head < 7 {
-            head := head + 1
+            head := (head + 1).!
         } else {
             head := 0
         }
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
     rule pop {
         (pop_en = 1)?
         (push_count <> pop_count)?
         pop_data := m[tail]
         if tail < 7 {
-            tail := tail + 1
+            tail := (tail + 1).!
         } else {
             tail := 0
         }
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }
 ";
@@ -3656,22 +3656,22 @@ module CircularBufferDisjoint {
         (push_count - pop_count <= 8)?
         m[head] := push_data
         if head < 7 {
-            head := head + 1
+            head := (head + 1).!
         } else {
             head := 0
         }
-        push_count := push_count + 1
+        push_count := (push_count + 1).!
     }
     rule pop {
         (pop_en = 1)?
         (push_count <> pop_count)?
         pop_data := m[tail]
         if tail < 7 {
-            tail := tail + 1
+            tail := (tail + 1).!
         } else {
             tail := 0
         }
-        pop_count := pop_count + 1
+        pop_count := (pop_count + 1).!
     }
 }
 ";

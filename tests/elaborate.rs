@@ -199,3 +199,81 @@ fn an_elaborates_call_composes_with_an_unrelated_state_write_in_the_same_rule() 
     assert!(errors.is_empty(), "elab errors: {errors:?}");
     assert_eq!(edits.len(), 1);
 }
+
+/// Elaborates, then re-runs the WHOLE front end (lex/parse/resolve/
+/// effects/types) on the spliced text, mirroring what `firrtl.rs`'s own
+/// `emit_from_source` does -- `run` above stops at `elaborate::plan`'s
+/// own edits, which never sees a growing-add truncation error at all
+/// (elaborate.rs's interpreter "never consults `Ty`", per its own
+/// module doc comment); only re-parsing the rendered text and type-
+/// checking IT catches one.
+fn elab_then_typecheck(src: &str) -> Vec<trace::types::TypeError> {
+    let (edits, errors) = run(src);
+    assert!(errors.is_empty(), "elab errors: {errors:?}");
+    let rendered = render(src, &edits);
+    let (tokens, lex_errors) = lexer::lex(&rendered);
+    assert!(lex_errors.is_empty(), "{lex_errors:?}\n{rendered}");
+    let (ast2, parse_errors) = parser::parse(&rendered, &tokens);
+    assert!(parse_errors.is_empty(), "{parse_errors:?}\n{rendered}");
+    let (res2, resolve_errors) = resolve::resolve(&ast2);
+    assert!(resolve_errors.is_empty(), "{resolve_errors:?}\n{rendered}");
+    let (fx2, effect_errors) = effects::check(&ast2, &res2);
+    assert!(effect_errors.is_empty(), "{effect_errors:?}\n{rendered}");
+    let (_, type_errors) = trace::types::check(&ast2, &res2, &fx2);
+    type_errors
+}
+
+/// The question that motivated this whole feature: `list.map(_ + 2)`,
+/// does the compiler prove/catch an overflow-prone closure body spliced
+/// in per element? `map` itself has no opinion (`eval_elab_binop` just
+/// concatenates circuit text, "never consults `Ty` at all") -- it's
+/// growing addition's OWN check, firing once the elaborated text is
+/// re-parsed and re-typechecked, that actually catches it. See
+/// DESIGN.md's "Growing addition: no silent carry-bit truncation".
+#[test]
+fn map_closure_overflow_is_caught_by_growing_add_and_fixed_by_lossy_marker() {
+    // A two-element list (`[a]` alone is ambiguous with the `[N]` ->
+    // `bits[N]` type-sugar and parses as that instead of a one-element
+    // list literal) that only ever reads the FIRST mapped element back
+    // out -- isolating the map closure's own `_ + 2` as the only thing
+    // that can trip growing-add's check, with no reduction/combine step
+    // of its own in play to confound it.
+    let unmarked = "Sum2(xs : list[8]) : [8] <elaborates> {\n\
+                        let ys = xs.map(_ + 2)\n\
+                        return ys[0]\n\
+                    }\n\
+                    module Top {\n\
+                        in a : [8]\n\
+                        in b : [8]\n\
+                        out total : [8] = 0\n\
+                        rule go {\n\
+                            total := Sum2([a, b])\n\
+                        }\n\
+                    }\n";
+    let errors = elab_then_typecheck(unmarked);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("silently truncate")),
+        "expected growing-add's own truncation check to catch the \
+         unmarked map closure's overflow, got: {errors:?}"
+    );
+
+    // `trunc` isn't supported in `<elaborates>` code (elaborate.rs's own
+    // interpreter rejects it), so `.!` -- not `trunc` -- is the fix
+    // available inside a map closure.
+    let fixed = "Sum2(xs : list[8]) : [8] <elaborates> {\n\
+                     let ys = xs.map((_ + 2).!)\n\
+                     return ys[0]\n\
+                 }\n\
+                 module Top {\n\
+                     in a : [8]\n\
+                     in b : [8]\n\
+                     out total : [8] = 0\n\
+                     rule go {\n\
+                         total := Sum2([a, b])\n\
+                     }\n\
+                 }\n";
+    let errors = elab_then_typecheck(fixed);
+    assert!(errors.is_empty(), "`.!` should make this sound: {errors:?}");
+}

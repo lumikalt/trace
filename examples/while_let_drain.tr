@@ -33,7 +33,7 @@ module WhileLetDrain {
             opt := false
         }
         while let v = opt? {
-            acc := acc + 1
+            acc := (acc + 1).!
             let new_cnt = cnt - 1
             cnt := new_cnt
             if new_cnt <> 0 {

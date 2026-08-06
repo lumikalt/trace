@@ -25,7 +25,7 @@ module StructNested {
     rule fill {
         let d = input.Deq[]
         f := Frame{ header: Header{ valid: 1, seq: seq }, data: d }
-        seq := seq + 1
+        seq := (seq + 1).!
     }
 
     rule pass {

@@ -18,7 +18,7 @@ module Fetch2 {
 
     rule fetch2 <sequences> {
         let h1 = spawn ReadBank0(pc)
-        let h2 = spawn ReadBank1(pc + 1)
+        let h2 = spawn ReadBank1((pc + 1).!)
         tick sync[h1, h2]
         ir := pack(h1.result, h2.result)
     }

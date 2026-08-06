@@ -14,7 +14,7 @@ module Top {
     }
 
     Outer(x : [8]) : [8] <combines> {
-        Inner(x + 1)
+        Inner((x + 1).!)
         return x
     }
 

@@ -677,11 +677,33 @@ impl<'a> Emitter<'a> {
                         | BinOp::BitXor
                 ) =>
             {
+                // A literal operand absorbs its sibling's width, same as
+                // `type_binop`'s own `(Bits, Int)`/`(Int, Bits)` arms
+                // (`types/expr.rs`) — including THEIR growth-rule routing
+                // (`Add`'s carry bit), mirrored here rather than left to
+                // drift, the exact "const_fold`/`const_eval` drift" class
+                // of bug `combine_bits_width`'s own doc comment names.
+                // Shifts keep the shifted value's width unchanged, same
+                // as always.
+                let grow = |w: u64| -> Option<u64> {
+                    if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::AShr) {
+                        Some(w)
+                    } else {
+                        match crate::types::combine_bits_width(
+                            *op,
+                            Width::Known(w),
+                            Width::Known(w),
+                        ) {
+                            Width::Known(w) => Some(w),
+                            Width::Unknown => None,
+                        }
+                    }
+                };
                 if matches!(self.ast.expr(*lhs), Expr::Int(_)) {
-                    return self.resolve_bits_width(*rhs);
+                    return grow(self.resolve_bits_width(*rhs)?);
                 }
                 if matches!(self.ast.expr(*rhs), Expr::Int(_)) {
-                    return self.resolve_bits_width(*lhs);
+                    return grow(self.resolve_bits_width(*lhs)?);
                 }
                 let a = self.resolve_bits_width(*lhs)?;
                 let b = self.resolve_bits_width(*rhs)?;
@@ -880,7 +902,35 @@ impl<'a> Emitter<'a> {
         let l = self.compile_expr_hinted(lhs, hint)?;
         let r = self.compile_expr_hinted(rhs, hint)?;
         Ok(match op {
-            BinOp::Add => format!("tail(add({l}, {r}), 1)"),
+            // `add` grows by exactly one bit (the carry) natively in
+            // FIRRTL — matches the checker's own width rule (DESIGN.md's
+            // "Growing addition: no silent carry-bit truncation") in the
+            // ordinary case, so this mirrors `Mul`'s own shape just below
+            // rather than truncating unconditionally the way this arm
+            // used to (back when `Add`'s own type never grew): only trim
+            // when the checker's target is narrower than what the raw
+            // `add` naturally produces (the literal-absorption case,
+            // same reasoning as `Mul`'s).
+            BinOp::Add => {
+                let wl = if matches!(self.ast.expr(lhs), Expr::Int(_)) {
+                    hint
+                } else {
+                    self.resolve_bits_width(lhs)
+                }
+                .unwrap_or(1);
+                let wr = if matches!(self.ast.expr(rhs), Expr::Int(_)) {
+                    hint
+                } else {
+                    self.resolve_bits_width(rhs)
+                }
+                .unwrap_or(1);
+                let natural = wl.max(wr) + 1;
+                let target = self.resolve_bits_width(id).unwrap_or(natural);
+                match natural.checked_sub(target) {
+                    Some(drop) if drop > 0 => format!("tail(add({l}, {r}), {drop})"),
+                    _ => format!("add({l}, {r})"),
+                }
+            }
             BinOp::Sub => format!("tail(sub({l}, {r}), 1)"),
             BinOp::Mul => {
                 // `mul` sums both compiled operand widths. When neither

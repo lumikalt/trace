@@ -340,7 +340,7 @@ module M {
             acc := acc + n
             n := n - 1
         }
-        result := acc
+        result := (acc).!
     }
 }
 ";
@@ -442,7 +442,7 @@ module M {
             acc := acc + v
             opt := false
         }
-        result := acc
+        result := (acc).!
     }
 }
 ";
@@ -492,7 +492,7 @@ module M {
         let w = 1 + 1
         x := w
         tick
-        x := x + 1
+        x := (x + 1).!
     }
 }
 ";
@@ -521,7 +521,7 @@ module M {
     rule r <sequences> {
         let v = 8'd5
         tick
-        out := v + 1
+        out := (v + 1).!
     }
 }
 ";
@@ -546,7 +546,7 @@ fn let_bound_value_crossing_a_tick_in_a_spawn_callee_now_works() {
 Foo() : [8] <sequences> {
     let v = 8'd5
     tick
-    return v + 1
+    return (v + 1).!
 }
 
 module M {
@@ -574,7 +574,7 @@ module M {
     out out : [8] = 0
     rule r <sequences> {
         let v = 8'd5
-        out := v + 1
+        out := (v + 1).!
         tick
     }
 }
@@ -671,7 +671,7 @@ module Fetch2 {
 
     rule fetch2 <sequences> {
         let h1 = spawn ReadBank0(pc)
-        let h2 = spawn ReadBank1(pc + 1)
+        let h2 = spawn ReadBank1((pc + 1).!)
         tick sync[h1, h2]
         ir := pack(h1.result, h2.result)
     }
@@ -875,12 +875,12 @@ fn race_structural_shape() {
     let src = "\
 Fast(x : [8]) : [8] <sequences> {
     tick
-    return x + 1
+    return (x + 1).!
 }
 Slow(x : [8]) : [8] <sequences> {
     tick
     tick
-    return x + 2
+    return (x + 2).!
 }
 
 module M {

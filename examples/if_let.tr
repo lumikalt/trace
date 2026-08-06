@@ -21,6 +21,6 @@ module IfLet {
         }
         -- `other` still commits every cycle, whether or not `opt` was
         -- present -- an `if let` branch never gates the rest of the rule.
-        other := other + 1
+        other := (other + 1).!
     }
 }

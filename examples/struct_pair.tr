@@ -57,6 +57,6 @@ module StructPair {
     reg counter : Pair = Pair{ valid: 1, data: 0 }
 
     rule bump {
-        counter := Pair{ data: counter.data + 1, ..counter }
+        counter := Pair{ data: trunc(counter.data + 1, 8), ..counter }
     }
 }

@@ -9,6 +9,6 @@ module Rmw {
     rule step <sequences> {
         let v = m[addr]
         tick
-        m[addr] := v + 1
+        m[addr] := (v + 1).!
     }
 }

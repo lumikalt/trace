@@ -1,5 +1,5 @@
 Avg(a : [8], b : [8]) : [8] <combines> {
-    let sum = a + b
+    let sum = trunc(a + b, 8)
     return sum >> 1
 }
 

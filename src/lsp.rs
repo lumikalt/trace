@@ -1120,7 +1120,7 @@ mod tests {
         assert_eq!(text, "```trace\nreg counter : [8]\n```\n\nA register.");
     }
 
-    const BOUNDED_SRC: &str = "module M {\n    reg counter : [8] where counter < 200 = 0\n    rule r {\n        counter := counter + 1\n    }\n}\n";
+    const BOUNDED_SRC: &str = "module M {\n    reg counter : [8] where counter < 200 = 0\n    rule r {\n        counter := (counter + 1).!\n    }\n}\n";
 
     #[test]
     fn hovering_a_bounded_variable_shows_its_proven_range() {
@@ -1129,7 +1129,7 @@ mod tests {
         // between the two sources. `bounds::Bounds::ranges` is a
         // whole-program fact about the def, not a per-site one, so the
         // SAME suffix shows up hovering the declaration below too.
-        let h = hover_at(BOUNDED_SRC, 3, 22).expect("hover over a use site");
+        let h = hover_at(BOUNDED_SRC, 3, 23).expect("hover over a use site");
         assert_eq!(
             hover_text(&h),
             "```trace\nreg counter : [8]\n```\n\nA register. Where 0 <= counter < 200."
@@ -1167,7 +1167,7 @@ mod tests {
     // tighter per-branch `state` internally (live user report: hovering
     // `cnt` in either branch should reflect the narrowing that branch's
     // own condition proves, not the def's flat declared range).
-    const IF_ELSE_BOUNDED_SRC: &str = "module M {\n    out cnt : [8] where cnt < 100 = 0\n    rule r {\n        if cnt < 99 {\n            cnt := cnt + 1\n        } else {\n            cnt := 0\n        }\n    }\n}\n";
+    const IF_ELSE_BOUNDED_SRC: &str = "module M {\n    out cnt : [8] where cnt < 100 = 0\n    rule r {\n        if cnt < 99 {\n            cnt := (cnt + 1).!\n        } else {\n            cnt := 0\n        }\n    }\n}\n";
 
     #[test]
     fn hovering_a_narrowed_variable_in_an_if_branch_shows_the_narrowed_range() {
@@ -1179,7 +1179,7 @@ mod tests {
             "```trace\nout cnt : [8]\n```\n\nAn output port. Where 0 <= cnt < 99."
         );
         // Same branch's RHS read, line 4 col 19 -- same narrowed range.
-        let h = hover_at(IF_ELSE_BOUNDED_SRC, 4, 19).expect("hover over the if branch's read");
+        let h = hover_at(IF_ELSE_BOUNDED_SRC, 4, 20).expect("hover over the if branch's read");
         assert_eq!(
             hover_text(&h),
             "```trace\nout cnt : [8]\n```\n\nAn output port. Where 0 <= cnt < 99."

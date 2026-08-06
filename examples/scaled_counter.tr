@@ -3,7 +3,7 @@ module ScaledCounter {
 
     rule double {
         if cnt < 10 {
-            cnt := cnt * 2
+            cnt := (cnt * 2).!
         } else {
             cnt := 1
         }

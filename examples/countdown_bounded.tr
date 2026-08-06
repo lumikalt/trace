@@ -20,7 +20,7 @@ module CountdownBounded {
             cnt := cnt - 1
         } else {
             cnt := 99
-            done_count := done_count + 1
+            done_count := (done_count + 1).!
         }
     }
 }

@@ -1838,9 +1838,31 @@ impl<'a> Parser<'a> {
                     // `a.! + b` still parses `.!` as binding to `a` alone
                     // (postfix binds tightest, same as `?`) — silencing
                     // the whole `a + b` needs `(a + b).!` instead.
+                    //
+                    // `lhs`'s own recorded span is widened to `lo..
+                    // self.prev_end` (covering the trailing `.!` text
+                    // too), unlike every other arm here which leaves an
+                    // EXISTING node's span alone and only computes a NEW
+                    // span for the NEW node it builds. Splice-then-
+                    // reparse passes (`closures.rs`, `elaborate.rs`,
+                    // spawn rendering) extract source text by exactly
+                    // `ast.expr_spans[id]` and hand it to a fresh parse —
+                    // if `lhs`'s span stopped short of `.!`, the
+                    // extracted fragment would silently lose the mark
+                    // (this table is keyed by `ExprId`, which doesn't
+                    // survive a reparse) even though the ORIGINAL source
+                    // spelled it right there. Widening the span costs
+                    // nothing in the normal (non-spliced) path — nothing
+                    // reads `expr_spans[lhs.0]` as "exactly `lhs`'s
+                    // grammar production, no trailing postfix" — and
+                    // makes every splice boundary that happens to land
+                    // exactly on a `.!`-marked node self-healing: the
+                    // extracted text still says `.!`, and the reparse
+                    // re-marks it correctly on whatever node it becomes.
                     Lossy => {
                         self.bump();
                         self.ast.lossy.insert(lhs);
+                        self.ast.expr_spans[lhs.0 as usize] = lo..self.prev_end;
                         continue;
                     }
                     LBracket => {

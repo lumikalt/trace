@@ -15,10 +15,10 @@ module Checksum {
 
     rule sum {
         let s = 0
-        s := s + m[0]
-        s := s + m[1]
-        s := s + m[2]
-        s := s + m[3]
+        s := trunc(s + m[0], 16)
+        s := trunc(s + m[1], 16)
+        s := trunc(s + m[2], 16)
+        s := trunc(s + m[3], 16)
         result := s
     }
 }

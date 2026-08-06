@@ -4518,6 +4518,282 @@ needed.
   zero regressions (956 tests), clippy clean, fmt clean, byte-identical
   `--explain-schedule` across all 98 pre-existing examples.
 
+## Growing addition: no silent carry-bit truncation (shipped)
+
+Shipped 2026-08-07, largely as designed below. Lumi's ask, prompted by a
+question about whether `list.map(_ + 2)` gets any overflow proof (it didn't,
+before this):
+`a + b`'s result should need `max(|a|,|b|)+1` bits, with dropping back down to
+`max(|a|,|b|)` requiring the SAME explicit acknowledgment (`trunc`/`.!`) any
+other narrowing already requires — not `combine_bits_width`'s current
+`max(|a|,|b|)` rule, which drops the carry unconditionally and silently.
+
+**This reverses a deliberate, documented, foundational choice, not a bug.**
+`types/mod.rs`'s own module doc comment names it explicitly: "Width rules
+follow Chisel-style modular arithmetic: `a + b` has width `max(|a|,|b|)`" —
+`combine_bits_width`'s catch-all arm (`types/mod.rs`, covers `Add`/`Sub`/
+`Div`/`Rem`/`BitAnd`/`BitOr`/`BitXor`) has always worked this way, chosen
+consciously (mirroring Chisel's own default `+`, as opposed to Chisel's
+growing `+&`). It predates this arc by a long way, and virtually every
+existing example relies on it — this is why "draft a design first" was the
+right call before touching anything, not a small follow-on fix.
+
+**The reuse angle that makes this smaller than it looks: `check_assignable`
+already does exactly this check, generically, and `Mul` already proves it
+works.** `Mul`'s width rule already sums the two operand widths (`n+m`, not
+`max(n,m)`) — confirmed by direct probe, not assumed: `r := a * b` with
+`a`/`b`/`r` all `[8]` is a real compile error today, "state write would
+silently truncate [16] to [8]; use `trunc(value, 8)`, or `.!` on the value to
+let it through" (`check_assignable`, `types/stmt.rs:851` — a pure `Ty::Bits`
+width comparison, `wv > wt`, with no special-casing for *which* operator
+produced the wider value). So growing `Add`'s own width rule to `max(n,m)+1`
+needs no new CHECKING machinery — assigning the grown result into a
+same-width destination already hits this exact error, with `trunc`/`.!` as
+the already-built, already-tested escape hatch (`ast.lossy`, the mechanism
+"`trunc.!`" above just finished shipping). Emission is a genuinely different
+story — see below, this is NOT also free.
+
+**Emission needs a real, if precedented, change: `compile_binop`'s `Add` arm
+currently truncates the carry bit unconditionally, independent of the type
+rule.** `firrtl/expr.rs:883`: `BinOp::Add => format!("tail(add({l}, {r}),
+1)")` — always drops exactly one bit, regardless of what `types.rs` computed.
+Once `Add`'s TYPE is `max(n,m)+1`, that unconditional `tail` is simply wrong
+for the un-narrowed case (the checked type says `n+1` bits, the emitted
+FIRRTL yields `n` — firtool would reject the mismatch, or worse, something
+downstream would silently misinterpret the width). The fix mirrors `Mul`'s
+OWN emission, already shipped (`firrtl/expr.rs:885-908`): `Mul` doesn't
+truncate unconditionally either — it computes `target = resolve_bits_width
+(id)` (the checker's own already-computed width for this expression), compares
+it to the raw compiled-operand widths (`wl + wr`), and only emits `tail(mul
+(l, r), drop)` when `drop = (wl + wr) - target` is actually positive (the
+literal-absorption case); the ordinary two-`Bits` case emits raw `mul(l, r)`
+untouched, since FIRRTL's own `mul` primitive already produces exactly
+`wl + wr` bits natively. `Add` needs the identical shape: FIRRTL's own `add`
+primitive already produces `max(wl, wr) + 1` bits natively (why today's
+`tail(_, 1)` only ever needs to drop exactly one bit) — matching the NEW
+type rule exactly in the ordinary case, so the fix is to STOP truncating by
+default and instead compute `drop` the same way `Mul` does, truncating only
+when the checker's own target width is narrower than what `add` naturally
+produces (the literal-absorption case, same as `Mul`'s). Not new machinery —
+mirroring an already-shipped pattern — but a real code change this design
+would be incomplete without naming.
+
+**Nested/chained addition grows linearly, and `.!`/`trunc` marks are
+per-expression-id, not inherited by nesting — a real surface-syntax
+consequence, not just a migration detail.** `(a + b) + c`, all `[8]`: the
+inner `a + b` types as `[9]`; the outer add is `combine_bits_width(Add, 9,
+8)` → `max(9,8)+1` = `[10]`. Nothing about that growth itself errors — no
+check fires on an intermediate subexpression merely BEING wide, only on
+something narrower actually CONSUMING it (an assignment, primarily). So a
+bare, unbroken chain `x := (a + b) + c` (`x : [8]`) trips exactly ONE
+`check_assignable` obligation, at the outermost write — `x := ((a + b) +
+c).!` (mark the whole RHS, the write's own id) is enough, per the ALREADY-
+documented per-id marking rule above (a mark on one id never reaches a
+different, unmarked id it's nested inside or contains). The more expensive
+case is a LITERAL appearing partway through a chain (`x := (a + b) + 5`),
+which per the ALREADY-shipped worked example above needs its OWN separate
+mark if the literal doesn't fit `combine_bits_width`'s growth cleanly —
+`x := ((a +.! b) + c).!`-shaped, two marks, not one, exactly as that section
+already works out for a different trigger. One real mitigating factor worth
+naming: growth only compounds across UNBROKEN expression nesting — storing
+an intermediate sum into a named `reg`/`let` (`y := a + b; z := y + c`)
+forces `check_assignable` to fire (and `.!`/`trunc` to be resolved) at EACH
+storage point, naturally bounding growth to one extra bit per step rather
+than accumulating across an entire multi-term expression tree. Code that
+already prefers named intermediates over deep nesting (which this codebase's
+own examples mostly do) is cheaper to migrate than code that doesn't.
+
+**A real implementation gap `combine_bits_width` alone won't close: literal
+absorption bypasses it entirely.** `type_binop`'s `(Ty::Bits(w), Ty::Int)`/
+`(Ty::Int, Ty::Bits(w))` arms (`types/expr.rs:525-554`) return `Ty::Bits(w)`
+directly — they never call `combine_bits_width` at all. So naively changing
+only `combine_bits_width`'s `Add` arm would grow `a + b` (two `Bits` values)
+to `[9]` while leaving `a + 5` (a `Bits` plus a literal) at `[8]`, an
+inconsistent, arbitrary-looking hole: `check_literal_fits` (the check these
+arms already run) only verifies the LITERAL's own value fits the target
+width — `a + 200` where `a : [8]` passes it cleanly (200 fits in 8 bits) with
+zero protection against the SUM overflowing when `a > 55`. Closing this means
+these two arms also need to route through the growth rule for `Add`
+specifically (matching the `(Bits, Bits)` arm's own `Shl`/`Shr`/`AShr`
+exclusion — a shift amount's width must keep NOT entering the result, same
+as today).
+
+**Which operators actually change — worked out per-operator, not applied
+uniformly:**
+- **`Add`**: changes, `max(n,m) → max(n,m)+1`. `n+1` bits always, provably,
+  fully captures the true sum of two `n`-bit unsigned values — the clean case
+  this whole design is built around.
+- **`Mul`**: already correct (`n+m`), already enforced — the existing proof
+  this mechanism works, needs zero changes.
+- **`Div`/`Rem`**: unaffected, and should stay unaffected — a quotient can
+  never exceed the dividend's own value, a remainder can never reach the
+  divisor's, so `max(n,m)` is already exactly right; growing it would just
+  be noise forcing pointless `.!`s.
+- **`BitAnd`/`BitOr`/`BitXor`**: unaffected — bitwise ops have no carry by
+  construction, `max(n,m)` is exactly correct at any width.
+- **`Sub` is explicitly OUT of scope for this design, not silently lumped in
+  with `Add`.** Unsigned subtraction underflows (`a - b` when `b > a` wraps
+  to a huge value), and growing the width by 1 bit does NOT fix this the way
+  it fixes `Add` — there's no `n+1`-bit representation of "a value smaller
+  than zero" in an unsigned encoding. Catching this needs a genuinely
+  different mechanism (an implicit `fails`/`?` obligation the caller must
+  discharge, or a `where`-bound proof that `a >= b`), not a width change —
+  a separate design, not started here.
+- **`Shl` (and by extension a raw bit-slice write) has an analogous, but
+  differently-shaped, silent-data-loss risk** — bits shifted off the top are
+  gone, no carry bit involved, and `combine_bits_width`'s `Shl|Shr|AShr => a`
+  arm deliberately keeps the shifted value's own width unchanged today. Named
+  here so it isn't silently forgotten, explicitly NOT folded into this
+  design — Lumi asked about addition specifically, and shift truncation is a
+  different enough shape (which bits are lost, not how many) to warrant its
+  own scoping conversation rather than being bundled in by inference.
+
+**Interaction with the Z3 bounds system — confirmed independent today, and
+this design does NOT change that.** `check_assignable` is a pure, static
+`Ty::Bits` width comparison with no access to `bounds.rs`/Z3 at all; `.!`
+waives only THAT check. A `where`-bounded reg's write obligation
+(`bounds.rs`, e.g. the existing `out b : [5] where _ > 1 = 5; ...; b := b + 1`
+example, safe today because `Add` doesn't grow and the write is proven
+against the DECLARED bound, not the raw bit-width) is completely separate
+machinery and stays exactly as sound either way. The real consequence: once
+`Add` grows, a `where`-bounded write like that example's `b := b + 1` would
+ALSO need `trunc`/`.!` to satisfy `check_assignable`'s now-stricter raw-width
+check, even though `bounds.rs` already independently proves it's safe — a
+real but minor ergonomic tax on existing bounds-proven code, not a soundness
+gap (the `.!` doesn't weaken `bounds.rs`'s own, still-fully-independent
+proof). **Not designed here:** teaching `check_assignable` to consult
+`bounds.rs` and skip its own error when Z3 already proves containment against
+the target's declared bound — a real, natural follow-up, but a genuinely
+separate integration (`check_assignable` currently has zero coupling to
+`bounds`/`Z3` at all) that would meaningfully grow this design's own scope;
+deferred, not required for v1's correctness.
+
+**What this means for `map`/closures/`elaborate` — nothing new needed, by
+construction.** `list.map(_ + 2)`'s `_ + 2` is spliced as literal source text
+(`elaborate.rs`) and re-typed by the ordinary `types.rs` pipeline once per
+element, exactly like `closures.rs`'s let-bound closures and `lower.rs`'s
+`while`/`if` rendering already are. Whatever `Add`'s width rule says applies
+identically here, automatically — the same "composes for free, no new
+mechanism" shape the `<sequences>`-loop closure consumer above already
+demonstrated for `while let`. This directly closes the gap Lumi's original
+question named: today, `list.map(_ + 2)` gets no overflow check because
+NOTHING gets one; once `Add` itself is checked, `map` inherits it with zero
+map-specific code.
+
+**Blast radius, the real cost of this design — now measured.** ~48 of
+`examples/*.tr`, plus `tests/bounds.rs` (60 of 74 tests), `tests/firrtl.rs`
+(65 of 298), `tests/lower.rs` (8 of 33), `tests/schedule.rs` (11 of 55),
+`tests/types.rs` (5 of 117), and `src/lsp.rs`'s 4 inline hover tests all
+needed a `trunc`/`.!` added at some write/return/argument site to stay
+green. Every one of them was migrated; the whole suite (`cargo test`,
+`cargo clippy --all-targets`, `cargo fmt --check`) is clean. The
+"grows the type, reuses `check_assignable`" mechanism itself really was as
+small as `Mul`'s precedent suggested — the migration surface was the real
+cost, exactly as predicted, and it was absorbable in one pass rather than
+open-ended.
+
+**Correction: `.!` didn't survive splice-then-reparse passes, and this was
+a parser bug, not three separate pass-specific bugs.** `.!`'s general
+postfix form (`expr.!`) marks the existing node `lhs` in `ast.lossy`
+without building a new AST node — and, before this fix, without touching
+`lhs`'s own recorded span either. `closures.rs` (call-argument splicing),
+`elaborate.rs`'s structural rebuild, and spawn's own return-value handling
+all extract source text by exactly `ast.expr_spans[id]` and hand it to a
+fresh parse; a span that stops short of the trailing `.!` characters means
+the reparsed fragment never sees the mark at all — silently, since
+`ast.lossy` is keyed by `ExprId`, which doesn't survive a reparse. The fix
+is in the parser's `Lossy` postfix arm alone: widen `lhs`'s own span to
+`lo..self.prev_end` (covering the `.!` text) when marking it. Nothing reads
+`expr_spans[lhs.0]` as "exactly `lhs`'s grammar production, no trailing
+postfix," so this costs nothing in the ordinary (non-spliced) path, and it
+fixed `closures.rs` argument splicing and spawn's return-value rendering
+for free — no pass-specific code needed. `elaborate.rs`'s own case needed
+one small, genuinely separate fix on top: its interpreter (`eval_elab_
+binop`) rebuilds a fresh `Circuit` string by concatenating already-
+evaluated operand text rather than extracting the outer expression's
+source span verbatim (there often isn't one — `l_text`/`r_text` may
+themselves be synthesized from nested recursive calls), so the span-widen
+alone doesn't reach it; `eval_elab_expr`'s `Expr::Binary` arm now re-
+appends `.!` to the freshly-built text when the original expression id was
+marked, the same "make the mark literal text so a reparse re-discovers it"
+trick, applied where no single span covers the whole rebuilt value.
+
+**Correction: a reassigned local compounds growth across statements, and
+`.!` doesn't stop it — this needed `trunc`, not `.!`, a newly-discovered
+instance of the ALREADY-documented "`.!` never narrows, so a reused value
+needs `trunc` instead" principle above.** `checksum.tr`'s `s := s + m[i]`,
+repeated four times for four different `i`, was migrated first to `s := (s
++ m[i]).!` on each line — compiles, but `s`'s own inferred width grows by
+one bit at EACH reassignment (each RHS is `combine_bits_width(Add, width
+(s), 16)`, and `.!` only silences the check, never narrows what actually
+gets stored back into `s`), reaching `[20]` after four statements where
+`result : [16]` expected `[16]`. The nested-chain paragraph above already
+named this exact failure mode for a single expression's own nesting
+(`.!` marks don't inherit, storing an intermediate forces a resolution
+point) — this is the same fact playing out across `:=` reassignments of
+one local rather than across one expression's own subexpressions. Fixed by
+using `trunc(s + m[i], 16)` at each reassignment instead, which really
+does narrow `s`'s stored value back to `[16]` before the next statement
+reads it.
+
+**Correction: the literal-absorption fix also closed a pre-existing,
+previously-undetected soundness gap for `Mul`, not just `Add`.**
+`type_binop`'s `(Ty::Bits(w), Ty::Int)`/`(Ty::Int, Ty::Bits(w))` arms used
+to return `Ty::Bits(w)` unconditionally, for every operator — meaning `a *
+2` (a `Bits` times a literal) NEVER got `Mul`'s own already-shipped `n+m`
+growth check at all, silently absorbing the literal at `a`'s own width
+with zero protection, even though `a * b` (two `Bits` values) already
+caught this. Routing both arms through `combine_bits_width` (this design's
+own literal-absorption fix, needed for `Add` to reach `a + <literal>`)
+fixes this for every affected operator uniformly, not just `Add` — a
+strictly-safer side effect, not a scope creep, since it was already a real
+gap `Mul`'s own precedent should have covered from the start.
+
+**Correction: `SpawnPlan.result_ty` read the return expression's own
+inferred type, not the function's declared return type — a real,
+independent compiler bug this feature newly exercised (not fixable by any
+source annotation).** `lower/plan.rs`'s `result_ty` used to read `types.
+expr_tys[return_expr]` directly. `.!` never changes an expression's own
+stored type (only suppresses the check at wherever it's consumed) — so a
+`<sequences>`-spawned function returning `(x + 10).!` sized its own
+`.result` register at the GROWN width, not the function's declared one,
+producing a genuine width mismatch at whatever downstream position
+consumed `.result` (e.g. `race`'s own value-select logic). Fixed to prefer
+the function's own declared return type (`ret`, evaluated via the same
+`bits_width_expr`/`const_eval_expr` free functions `firrtl`'s own
+emission-time resolver already uses, so this isn't a second,
+independently-drifting width evaluator), falling back to the return
+expression's inferred type only when no plain `[N]` return type is
+declared.
+
+**Confirmed, not just asserted: `map`/closures really do compose for free.**
+`tests/elaborate.rs`'s `map_closure_overflow_is_caught_by_growing_add_and_
+fixed_by_lossy_marker` proves the actual motivating question end to end: an
+unmarked `xs.map(_ + 2)`, spliced and re-typechecked, now reports a real
+"silently truncate" error at whatever position eventually consumes the
+mapped-and-reduced result — no map-specific code was needed to make this
+happen, exactly as this section originally predicted. `.!` (not `trunc`,
+which `elaborate.rs`'s own interpreter still rejects — "this builtin is not
+supported in `<elaborates>` code") is the available fix inside a map
+closure.
+
+**The bounds.rs ergonomic tax, reassessed after measuring it.** This
+design called it "a real but minor ergonomic tax" — in raw count it's
+substantial (60 of 74 tests in `tests/bounds.rs` alone needed a `.!`),
+but that file is pathologically concentrated: nearly every test there is a
+bare `x := x + 1`-shaped repro by construction, which is the single case
+`check_assignable`'s width-only, bounds-blind check taxes hardest. Two
+verified directly (`guarded_increment_is_proven` reaches `bounds.rs` and
+still proves sound with `.!`; `unguarded_increment_is_rejected` reaches
+`bounds.rs` and is still rejected with `bounds.rs`'s own "cannot verify"
+message, not masked by the new check) confirm `.!` is exactly the
+orthogonal, non-weakening annotation this design predicted. One sharper
+edge worth naming, not fixing here: `counter := (counter + 1).!` on a
+`where counter < 200` reg spells "I know this truncates" onto a write Z3
+has already proven does NOT truncate — a real semantic wart, not just
+verbosity. "Teach `check_assignable` to consult `bounds.rs`" remains
+deliberately deferred, unchanged from the original call.
+
 ## Toward a dependent/refinement type system (SMT-backed, planned)
 
 Not built yet — this section is a committed plan, not a shipped feature.

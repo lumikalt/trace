@@ -30,9 +30,18 @@ fn run_ok(src: &str) -> (Ast, Types) {
 }
 
 #[test]
-fn modular_add_keeps_register_width() {
-    // The doc's own SUBLEQ idiom must type: pc := pc + 3 into [16].
-    run_ok("module M {\n reg pc : [16] = 0\n rule r {\n pc := pc + 3\n }\n}\n");
+fn growing_add_needs_lossy_marker_to_fit_back_into_register_width() {
+    // `+` grows by a carry bit (`max(n, m) + 1`) rather than silently
+    // wrapping at the operand width — DESIGN.md's "Growing addition: no
+    // silent carry-bit truncation". `pc + 3` is `[17]` when `pc : [16]`,
+    // so a bare `pc := pc + 3` is now rejected...
+    let (_, _, errors) = run("module M {\n reg pc : [16] = 0\n rule r {\n pc := pc + 3\n }\n}\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("silently truncate"));
+
+    // ...and needs `.!` (the doc's own SUBLEQ idiom) to let the grown
+    // value through, same as any other write whose RHS naturally grew.
+    run_ok("module M {\n reg pc : [16] = 0\n rule r {\n pc := (pc + 3).!\n }\n}\n");
 }
 
 #[test]
@@ -723,7 +732,7 @@ fn literals_must_fit() {
 #[test]
 fn an_oversized_literal_combined_with_a_bits_value_via_a_binop_is_an_error() {
     let (_, _, errors) =
-        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a + 300\n }\n}\n");
+        run("module M {\n in a : [8]\n out b : [16] = 0\n rule r {\n b := a + 300\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("300 does not fit in [8]"));
 
@@ -732,7 +741,7 @@ fn an_oversized_literal_combined_with_a_bits_value_via_a_binop_is_an_error() {
     // (each checks a different child `ExprId`), so this exercises the
     // other one specifically, not just the same arm from the other side.
     let (_, _, errors) =
-        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := 300 + a\n }\n}\n");
+        run("module M {\n in a : [8]\n out b : [16] = 0\n rule r {\n b := 300 + a\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("300 does not fit in [8]"));
 
@@ -749,7 +758,7 @@ fn an_oversized_literal_combined_with_a_bits_value_via_a_binop_is_an_error() {
     assert!(errors[0].message.contains("300 does not fit in [8]"));
 
     // A literal that DOES fit is still fine, on either side.
-    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a + 20\n }\n}\n");
+    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := (a + 20).!\n }\n}\n");
 
     // A shift's second operand is a COUNT, not a value in the shifted
     // operand's own width domain, so `check_literal_fits` (a "does this
@@ -860,7 +869,7 @@ fn lossy_suffix_suppresses_the_literal_fits_and_shift_amount_checks() {
     // `.!` marks THAT operator application specifically — an UNMARKED
     // sibling elsewhere in the same statement still errors normally, so
     // this isn't a blanket per-statement or per-rule suppression.
-    let (_, _, errors) = run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n \
+    let (_, _, errors) = run("module M {\n in a : [8]\n out b : [16] = 0\n rule r {\n \
          b := (a >>.! 300) + (a >> 300)\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("shift by 300"));
@@ -875,7 +884,7 @@ fn lossy_suffix_suppresses_the_literal_fits_and_shift_amount_checks() {
     // operand-marking spelling does NOT reach it: `a >> 300.!` still
     // errors — only `a >>.! 300`/`(a >> 300).!` (marking the whole
     // application) silences a shift's own check.
-    run_ok("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a + 100000000.!\n }\n}\n");
+    run_ok("module M {\n in a : [8]\n out b : [16] = 0\n rule r {\n b := a + 100000000.!\n }\n}\n");
     let (_, _, errors) =
         run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a >> 300.!\n }\n}\n");
     assert_eq!(errors.len(), 1);
@@ -991,11 +1000,14 @@ fn sized_literals_type_directly_and_check_their_own_width() {
     assert!(errors[0].message.contains("20 does not fit in [4]"));
 
     // A real Bits type, not the coercible Ty::Int a bare literal gets:
-    // combining it with a wider value widens to the max, the same rule
-    // two differently-sized real registers already get, not an error.
+    // combining it with a wider value combines by `combine_bits_width`,
+    // the same rule two differently-sized real registers already get
+    // (not the "absorb the literal's own width and stop" a bare `Int`
+    // literal gets) — `+`'s own growth (`max(n, m) + 1`) still applies
+    // on top, hence the `.!`.
     run_ok(
         "module M {\n in x : [16]\n out result : [16] = 0\n rule r {\n \
-         result := x + 8'd6\n }\n}\n",
+         result := (x + 8'd6).!\n }\n}\n",
     );
 }
 

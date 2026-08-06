@@ -19,7 +19,7 @@ module MemWriteBranch {
     out count : [8] = 0
 
     rule step {
-        count := count + 1
+        count := (count + 1).!
         if we = 1 {
             m[addr] := data
         }

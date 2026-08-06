@@ -30,12 +30,12 @@ module MemDisjointRw {
 
     rule write {
         m[3] := x
-        write_count := write_count + 1
+        write_count := (write_count + 1).!
     }
 
     rule read {
         y := m[7]
-        read_count := read_count + 1
+        read_count := (read_count + 1).!
     }
 
     schedule {

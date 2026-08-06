@@ -4,7 +4,7 @@ module Top {
     out bit3 : [1] = 0
 
     rule compute {
-        result := x + 8'd6
+        result := (x + 8'd6).!
         bit3 := x[8'd3]
     }
 }
