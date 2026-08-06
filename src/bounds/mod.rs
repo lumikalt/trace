@@ -45,10 +45,11 @@
 //!   argument's soundness rests on a modular (not real-integer) fact a
 //!   proven bound doesn't slot into, and no example needs the
 //!   combination.
-//! - `narrow_for_condition` narrows the UPPER end on `if <reg> < <const>`
-//!   and the LOWER end on `if <reg> > <const>`/`if <reg> >= <const>`. A
-//!   `<>`-shaped guard narrows EITHER end, but only when the excluded
-//!   constant equals the CURRENT frozen bound's own floor or ceiling
+//! - `narrow_for_condition` narrows the UPPER end on `if <reg> < <const>`/
+//!   `if <reg> <= <const>` and the LOWER end on `if <reg> > <const>`/
+//!   `if <reg> >= <const>`. A `<>`-shaped guard narrows EITHER end, but
+//!   only when the excluded constant equals the CURRENT frozen bound's
+//!   own floor or ceiling
 //!   exactly (`if <reg> <> <lower>` narrows the lower end up by one;
 //!   `if <reg> <> <upper - 1>` narrows the upper end down by one) —
 //!   excluding any OTHER constant would split the range into two
@@ -825,6 +826,8 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         ty,
         bounded: HashMap::new(),
         fn_params: HashMap::new(),
+        fn_bodies: HashMap::new(),
+        inline_depth: 0,
         fn_ret_bound: HashMap::new(),
         ret_bound_span: HashMap::new(),
         current_ret_bound: None,
@@ -1102,6 +1105,24 @@ struct Checker<'a> {
     /// against a bounded param's declared bound. Cheap to clone once
     /// per fn during collection rather than re-deriving per call site.
     fn_params: HashMap<DefId, Vec<Param>>,
+    /// Every `Item::Fn`'s own `DefId` mapped to its cloned `body` — the
+    /// no-declared-postcondition composition path `expr_bound`'s
+    /// `Expr::Call` arm falls back to (body-substitution inlining):
+    /// when a callee declared NO `where` bound on its return, rather
+    /// than composing to `None` unconditionally, bind each param's own
+    /// `DefId` to the call's actual argument range and recurse into a
+    /// SINGLE `return <expr>` body directly. Populated alongside `fn_
+    /// params` in `collect_bounded_params` for the same reason (cheap
+    /// to clone once per fn during collection).
+    fn_bodies: HashMap<DefId, Vec<StmtId>>,
+    /// Recursion guard for the body-substitution inlining above — a
+    /// direct or mutually-recursive fn (`Bump(x) { return Bump(x-1) }`)
+    /// would otherwise recurse into `expr_bound` without bound. Only
+    /// this ONE path increments/decrements it (every other recursive
+    /// `expr_bound` call already terminates on AST structure alone), so
+    /// a single `self` counter is enough — no need to thread a depth
+    /// parameter through every arm's signature.
+    inline_depth: u32,
     /// Every `Item::Fn`'s own `DefId` mapped to its declared return
     /// postcondition (v13) — the mirror of a bounded param, but keyed
     /// by the FN's own def rather than a param's (a return value has
@@ -1235,6 +1256,22 @@ impl<'a> Checker<'a> {
         self.errors.push(BoundsError { span, message });
     }
 
+    /// Whether `callee` resolves to the named builtin -- the same
+    /// `DefKind::Builtin` recognition `types/expr.rs`'s own bracket-call
+    /// arm uses, reused here so `expr_bound`'s `trunc` arm doesn't need
+    /// its own string-matching copy of "is this actually the builtin,
+    /// not a user fn/param shadowing the name."
+    fn is_builtin(&self, callee: ExprId, name: &str) -> bool {
+        self.res
+            .expr_defs
+            .get(&callee)
+            .map(|&d| {
+                self.res.def(d).kind == crate::resolve::DefKind::Builtin
+                    && self.res.def(d).name == name
+            })
+            .unwrap_or(false)
+    }
+
     /// Every `reg`/`out` with a `where` bound, keyed by its own `DefId`.
     /// The bound's shape (`Binary { Lt, Ident(self), <const> }`) is
     /// guaranteed by construction: the parser only ever builds a
@@ -1286,6 +1323,7 @@ impl<'a> Checker<'a> {
                     ret,
                     ret_bound,
                     ret_lower,
+                    body,
                     ..
                 } => {
                     for param in params {
@@ -1296,6 +1334,7 @@ impl<'a> Checker<'a> {
                     }
                     if let Some(&fn_def) = self.res.item_defs.get(&id) {
                         self.fn_params.insert(fn_def, params.clone());
+                        self.fn_bodies.insert(fn_def, body.clone());
                         // v13: the mirror of the param loop above, but
                         // for the fn's own declared return postcondition.
                         // `ret.is_none()` here means resolve.rs already
@@ -2822,6 +2861,16 @@ impl<'a> Checker<'a> {
                 BinOp::Lt => {
                     narrowed.insert(def, (*lo, k.min(*hi)));
                 }
+                // `i <= k` is `i < k + 1` -- the same upper-narrowing
+                // formula as `Lt`, shifted by one. `checked_add` fails
+                // closed (leaves `state` unnarrowed) on `k == u64::MAX`,
+                // where "narrower than `hi`" is vacuous anyway (nothing
+                // this engine tracks has an upper bound that high).
+                BinOp::Le => {
+                    if let Some(ceil) = k.checked_add(1) {
+                        narrowed.insert(def, (*lo, ceil.min(*hi)));
+                    }
+                }
                 BinOp::Gt => {
                     if let Some(floor) = k.checked_add(1) {
                         narrowed.insert(def, (floor.max(*lo), *hi));
@@ -2926,6 +2975,8 @@ impl<'a> Checker<'a> {
             let raw = match op {
                 // else of `i < k` is `i >= k`.
                 BinOp::Lt => Some((k.max(*lo), *hi)),
+                // else of `i <= k` is `i > k`, i.e. lower bound `k + 1`.
+                BinOp::Le => k.checked_add(1).map(|floor| (floor.max(*lo), *hi)),
                 // else of `i > k` is `i <= k`, i.e. `i < k + 1`.
                 BinOp::Gt => k.checked_add(1).map(|ceil| (*lo, ceil.min(*hi))),
                 // else of `i >= k` is `i < k`.
@@ -3032,12 +3083,121 @@ impl<'a> Checker<'a> {
         None
     }
 
+    /// Body-substitution inlining, `expr_bound`'s `Expr::Call` arm's own
+    /// fallback for a callee with NO declared return postcondition
+    /// (v13's `fn_ret_bound` still takes priority when present — an
+    /// explicit annotation is cheaper to re-check than re-deriving, and
+    /// stays authoritative for a body this pass can't/won't inline).
+    /// Recognizes ONLY a single-statement `[Stmt::Return(Some(_))]`
+    /// body (a multi-statement body could contain its own `Stmt::Let`s
+    /// this walk doesn't track) -- anything else composes to `None`,
+    /// same fail-closed default as every other unrecognized shape here.
+    ///
+    /// Binds each param's own `DefId` directly into a CLONE of the
+    /// caller's `state` (not a fresh one): a call is structurally
+    /// inlined at emission time (`firrtl/calls.rs`'s generic-call
+    /// instantiation), so a callee body referencing a module-level
+    /// reg/out directly (not just its own params) sees the exact same
+    /// live values the call site does -- only the params are genuinely
+    /// callee-local. `locals`/`struct_origins` are NOT threaded through
+    /// from the caller: lexical scoping means a `Local` `Ident` inside
+    /// the callee's body could only be one of the callee's OWN `let`
+    /// bindings, which the single-`Return`-statement restriction above
+    /// already rules out entirely, so an empty map here is exactly
+    /// correct, not a simplification that loses soundness.
+    ///
+    /// `inline_depth` guards a direct or mutually recursive fn
+    /// (`Bump(x) { return Bump(x - 1) }`) from recursing without bound
+    /// — every OTHER recursive `expr_bound` call already terminates on
+    /// AST structure alone, so this is the one path that needs it.
+    ///
+    /// The recursive `expr_bound` call below is snapshotted and its own
+    /// pushed errors DISCARDED (found empirically: a real, duplicate-
+    /// error double-count, the same class of bug v14's own "double-push"
+    /// fix guarded against for the shadow-check reconstruction). `check_
+    /// item`'s own per-item walk ALREADY visits this callee's body
+    /// exactly once, unconditionally, checking every nested call's
+    /// argument against the callee's OWN declared param bounds -- that
+    /// canonical check is at least as strict as any call-site-specific
+    /// re-evaluation here: a param with no bound composes to `None`
+    /// there regardless of what a caller's ACTUAL substituted value
+    /// would resolve to, so it already fails closed with its own error;
+    /// a param WITH a declared bound is separately, independently
+    /// enforced to hold at every one of ITS OWN call sites, so the
+    /// canonical walk's use of that declared bound can never be looser
+    /// than a specific call's real value. Either way, an error surfaced
+    /// ONLY by substituting this specific call's arguments is always a
+    /// duplicate (same violation, possibly a more specific message) of
+    /// one the canonical walk already reports -- discarding it loses no
+    /// real diagnostic, only the redundant copy.
+    fn inline_call_result(
+        &mut self,
+        fn_def: DefId,
+        params: &[Param],
+        arg_bounds: &[Option<(u64, u64)>],
+        caller_state: &HashMap<DefId, (u64, u64)>,
+    ) -> Option<(u64, u64)> {
+        const MAX_INLINE_DEPTH: u32 = 8;
+        if self.inline_depth >= MAX_INLINE_DEPTH {
+            return None;
+        }
+        let body = self.fn_bodies.get(&fn_def)?.clone();
+        let [stmt] = body.as_slice() else {
+            return None;
+        };
+        let Stmt::Return(Some(ret_expr)) = self.ast.stmt(*stmt) else {
+            return None;
+        };
+        let ret_expr = *ret_expr;
+        let mut callee_state = caller_state.clone();
+        for (param, computed) in params.iter().zip(arg_bounds) {
+            if let Some(range) = computed {
+                let param_def = def_of_name(self.res, &param.name);
+                callee_state.insert(param_def, *range);
+            }
+        }
+        let empty_locals = HashMap::new();
+        let empty_struct_origins = HashMap::new();
+        let errors_before = self.errors.len();
+        // `site_ranges` is snapshotted/restored the same way `errors`
+        // is, for a DIFFERENT reason than the duplicate-error one: this
+        // map's own doc comment states its soundness invariant plainly
+        // — "no `ExprId` is ever visited... more than once under a
+        // different `state`, so a plain `insert` is correct." Body-
+        // substitution inlining breaks that: a mem index `ExprId`
+        // living inside the callee's body is now reachable from MANY
+        // call sites, each substituting a DIFFERENT param range, and a
+        // plain `insert` would let the LAST call site's fact silently
+        // overwrite an earlier one for the SAME `ExprId` -- exactly the
+        // v16 mem-disjointness soundness hole this map exists to avoid,
+        // reopened through inlining instead of a direct `expr_bound`
+        // call. Found via advisor review with a concrete repro
+        // (`Get(i){return m[i]}` called as both `Get(3)` and `Get(7)`),
+        // not assumed. Restoring the WHOLE map (not truncating, since
+        // it's keyed by `ExprId` rather than append-only) discards any
+        // per-callsite-specific fact this recursion would otherwise
+        // fabricate as a whole-program one.
+        let site_ranges_before = self.site_ranges.clone();
+        self.inline_depth += 1;
+        let result = self.expr_bound(
+            ret_expr,
+            &callee_state,
+            &empty_locals,
+            &empty_struct_origins,
+        );
+        self.inline_depth -= 1;
+        self.errors.truncate(errors_before);
+        self.site_ranges = site_ranges_before;
+        result
+    }
+
     /// The value range an expression is provably confined to, as a
     /// `(lower, upper)` pair (lower inclusive, upper exclusive), or
     /// `None` if this pass can't establish one. A bare bounded reg/
-    /// local/param reference, a literal, `Add`, `Sub`, or `Mul` of two
-    /// such compose — see this module's own doc comment for why
-    /// everything else (a shift, ...) is deliberately left unsupported.
+    /// local/param reference, a literal, `Add`, `Sub`, `Mul`, a literal-
+    /// shift `Shl`, an already-in-range `trunc`, or a callee's own
+    /// declared/inlined result compose — see this module's own doc
+    /// comment for why anything else stays deliberately unsupported.
     /// `&mut self` (v12): a `Call` is visited here too, and checking its
     /// arguments against the callee's declared param bounds is a real
     /// SIDE EFFECT (pushes errors), not just a value computation — see
@@ -3136,6 +3296,71 @@ impl<'a> Checker<'a> {
                 let hi = a_max.checked_mul(b_max)?.checked_add(1)?;
                 Some((lo, hi))
             }
+            // `x << k`, k a literal shift amount ONLY -- a dynamic
+            // shift amount has no fixed scaling factor to reason about
+            // as an interval, so it's left unrecognized (falls to the
+            // catch-all below), same "opt-in, not blanket" restriction
+            // every other shape here already has. `rhs` is still
+            // descended into for its own side effects (a nested `Call`'s
+            // argument obligations), same v14 "evaluate both operands
+            // before either `?`-unwrap" reasoning as `Add`/`Sub`/`Mul`
+            // above, even though only `lhs`'s VALUE is used here.
+            //
+            // Modeled as multiplication by `2^k` (via `checked_mul`,
+            // the exact `Mul` arm's own pattern above) rather than
+            // `checked_shl` directly on `a_lo`/`a_hi` -- found via
+            // advisor review, not assumed: `u64::checked_shl` only
+            // fails when the SHIFT AMOUNT itself is `>= 64`, not when
+            // the shifted VALUE'S high bits would be silently dropped
+            // (`(1u64 << 63).checked_shl(1) == Some(0)`, not `None`) --
+            // a real overflow that would have wrongly under-reported
+            // `hi`, exactly the class of bug `Mul`'s own `checked_mul`
+            // idiom exists to prevent.
+            Expr::Binary {
+                op: BinOp::Shl,
+                lhs,
+                rhs,
+            } => {
+                let a = self.expr_bound(*lhs, state, locals, struct_origins);
+                self.expr_bound(*rhs, state, locals, struct_origins);
+                let (a_lo, a_hi) = a?;
+                let k = match self.ast.expr(*rhs) {
+                    Expr::Int(v) => *v,
+                    Expr::SizedInt { value, .. } => *value,
+                    _ => return None,
+                };
+                let factor = 1u64.checked_shl(k as u32)?;
+                let lo = a_lo.checked_mul(factor)?;
+                let hi = a_hi.checked_sub(1)?.checked_mul(factor)?.checked_add(1)?;
+                Some((lo, hi))
+            }
+            // `trunc(value, width)`, the 2-argument explicit-width form
+            // ONLY (the 1-argument inferred-width form has no width
+            // available to this pass at all, and falls through to the
+            // catch-all below, same v1 restriction as everything else
+            // unrecognized here). Sound in two tiers: if `value`'s own
+            // computed range ALREADY fits within `width` bits, truncation
+            // is exactly the identity (nothing is actually discarded),
+            // so the range passes through unchanged -- this is the tier
+            // that makes `trunc(b, 4)` compose when a guard has already
+            // narrowed `b` below `2^4`. Otherwise, the honest fallback
+            // is still real information, not `None`: a `trunc` result is
+            // ALWAYS within `[0, 2^width)` by construction, regardless of
+            // whether `value` itself is provable at all.
+            Expr::Call { callee, args } if args.len() == 2 && self.is_builtin(*callee, "trunc") => {
+                let inner = self.expr_bound(args[0], state, locals, struct_origins);
+                self.expr_bound(args[1], state, locals, struct_origins);
+                let width = match self.ast.expr(args[1]) {
+                    Expr::Int(v) => *v,
+                    Expr::SizedInt { value, .. } => *value,
+                    _ => return None,
+                };
+                let cap = 1u64.checked_shl(width as u32)?;
+                match inner {
+                    Some((lo, hi)) if hi <= cap => Some((lo, hi)),
+                    _ => Some((0, cap)),
+                }
+            }
             Expr::Call { callee, args } => {
                 // v12: cross-boundary bound propagation. `Bump`'s own
                 // body trusts `i < 10` as its declared precondition
@@ -3173,6 +3398,7 @@ impl<'a> Checker<'a> {
                 // callee's declared bound.
                 let (callee, args) = (*callee, args.clone());
                 let &fn_def = self.res.expr_defs.get(&callee)?;
+                let mut arg_bounds: Vec<Option<(u64, u64)>> = Vec::new();
                 if let Some(params) = self.fn_params.get(&fn_def).cloned() {
                     for (param, arg) in params.iter().zip(&args) {
                         // v14: `expr_bound` is called on EVERY argument
@@ -3199,7 +3425,18 @@ impl<'a> Checker<'a> {
                             let context = format!("argument for parameter `{}`", param.name);
                             self.check_against_bound(computed, *bounded, span, &context);
                         }
+                        arg_bounds.push(computed);
                     }
+                    if let Some(declared) =
+                        self.fn_ret_bound.get(&fn_def).map(|b| (b.lower, b.upper))
+                    {
+                        return Some(declared);
+                    }
+                    // No declared postcondition: fall back to body-
+                    // substitution inlining (see `inline_call_result`'s
+                    // own doc comment) instead of composing to `None`
+                    // unconditionally, the v13 behavior this replaces.
+                    return self.inline_call_result(fn_def, &params, &arg_bounds, state);
                 }
                 self.fn_ret_bound
                     .get(&fn_def)

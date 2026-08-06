@@ -3163,9 +3163,10 @@ v0 restrictions, all deliberate scope cuts:
   binding anywhere in scope to compare against). Kept as
   a SEPARATE map (`fn_ret_bound`, keyed by the fn's own `DefId`) rather
   than folded into the same map a reg/out/param populates, since a
-  return value has no `DefId` of its own to key `self.bounded` by. Opt-
-  in, not blanket inference: a fn with no declared postcondition still
-  composes to `None`, exactly as before v13. **A declared postcondition
+  return value has no `DefId` of its own to key `self.bounded` by.
+  Through v21, a fn with no declared postcondition composed to `None`
+  unconditionally — v22 (below) replaces that with a fallback, not a
+  permanent restriction. **A declared postcondition
   requires at least one `return <expr>` in the fn's own body to check
   it against** — a real user-facing rule, not an implementation detail:
   without it, the postcondition would be trusted at every call site
@@ -3711,6 +3712,211 @@ independently, assuming the invariant held at entry (the declared bound,
 whose own base case is the verified init) — repeated across every item in
 the program, that's the whole proof; no global fixpoint across items is
 needed.
+
+- **Body-substitution inlining for a call with no declared postcondition
+  (v22)**, plus two new composable shapes (`Shl` with a literal shift
+  amount, and `trunc(value, width)`'s 2-argument form) `expr_bound`
+  needed to make it useful (`examples/
+  generic_call_composes_via_body_substitution.tr`). Found via a live
+  user report: `out b : [5] where _ > 1 = 5`, a generic-width helper
+  `Double(x : [n]) : [n + 1] { return x << 1 }` with NO return
+  postcondition (impossible to declare one at all — `ret_width` needs a
+  concretely-known `bits[N]`, which `[n + 1]` doesn't have until a call
+  site substitutes `n`), and `b := Double(trunc(b, 4))` under a guard
+  narrowing `b` to `[2, 15)` — provably safe (`Double`'s result lands in
+  `[4, 29)`, inside `b`'s own declared `[2, 32)`), but rejected: through
+  v21, `trunc`/`<<` weren't recognized shapes at ALL (even bare `b :=
+  trunc(b, 4)` failed), and a call with no declared postcondition
+  composed to `None` unconditionally (v13's deliberate "opt-in, not
+  blanket inference" scope cut).
+
+  A narrower fix (recognizing `trunc`/`Shl` alone) doesn't rescue this
+  program — `Double`'s own call site still needs a composable result,
+  and a flat-constant `fn_ret_bound` can't express "return ≥ 2×
+  argument." The alternative (a parameter-relative return-bound
+  annotation) was scoped via advisor first and found to need MORE
+  machinery than expected — `trunc`/`Shl` as prerequisites, a resolver
+  fix (`resolve.rs`'s return-bound resolution only resolves the bound's
+  `rhs`, so a two-sided bound with a param on the LOWER limit's side
+  would never resolve), per-call-site width threading (`ret_width`
+  rejects any non-literal width, so a generic return type couldn't
+  even be annotated), a new parallel map, and shadow-check parity work
+  — while still being opt-in, annotation-only.
+
+  Lumi picked the alternative: when `expr_bound`'s `Expr::Call` arm
+  finds no declared postcondition, instead of composing to `None`, bind
+  each param's own `DefId` to the call's actual argument range (already
+  computed for the v12 argument check) and recurse into a single-
+  statement `[Stmt::Return(Some(_))]` body directly (`Checker::
+  inline_call_result`) — exactly as if the callee were expanded in
+  place at the call site, which is literally what FIRRTL's own generic-
+  call instantiation already does at emission time. Sound because a
+  call is structurally inlined regardless: the callee body sees the
+  SAME `state` (module-level regs/outs) the caller does, cloned and
+  extended with param bindings, not a fresh one — only `locals`/
+  `struct_origins` are dropped, correctly, since the single-`return`
+  restriction means the callee body can have no `Stmt::Let` of its own
+  to reference. Guarded by a small `inline_depth` counter against
+  direct/mutual recursion (defense in depth only — `<elaborates>`-gated
+  recursion is already rejected earlier in the pipeline, so this path
+  isn't reachable via ordinary recursion in practice). An explicit
+  declared postcondition still takes priority when present — cheaper to
+  re-check than re-derive, and stays authoritative for bodies inlining
+  can't reach (multi-statement, non-return-shaped).
+
+  A real duplicate-error bug was found empirically, not assumed, while
+  running the existing test suite: `check_item`'s own per-item walk
+  already visits every `Item::Fn` body once, unconditionally, checking
+  each nested call's arguments against the callee's OWN declared param
+  bounds — inlining re-evaluates that SAME AST node from a caller's
+  context, re-triggering the identical `check_against_bound` side
+  effect a second time. Fixed by snapshotting/truncating `self.errors`
+  around the inline recursion: the canonical per-item walk's own check
+  (using the callee's OWN declared param bounds, not a specific call's
+  substituted values) is provably at least as strict as any inlining-
+  triggered re-evaluation, so a duplicate is always redundant — never
+  a real finding this discards.
+
+  `trunc`'s own shape (only the 2-argument explicit-width form) is
+  sound in two tiers: identity when the operand's own computed range
+  already fits within `width` bits (the tier that makes `trunc(b, 4)`
+  compose once a guard has narrowed `b` below `2^4`), else the honest
+  `[0, 2^width)` fallback — still real information, not `None`.
+
+  Two more real bugs found via a POST-implementation advisor review
+  (requested specifically because this touches soundness-critical
+  code, not because tests/clippy/the byte-identical diff found
+  anything — they didn't, and couldn't have):
+  1. **`site_ranges` poisoning, the v16/v17 mem-disjointness soundness
+     hole reopened through a new door.** That map's own doc comment
+     states its invariant plainly: "no `ExprId` is ever visited by this
+     pass's forward walk more than once under a different `state`... so
+     a plain `insert` is correct." Body-substitution inlining broke
+     that — a mem-index `ExprId` living inside an inlined callee body is
+     now reachable from EVERY call site, each substituting a DIFFERENT
+     param range, and `insert` has no merge-on-conflict, so the LAST
+     caller's fact silently overwrote an earlier one for the SAME
+     `ExprId` (`Get(i){return m[i]}` called as both `Get(3)` and
+     `Get(7)` would fabricate a whole-program "fact" from whichever
+     call happened to run last, exactly the fabricated-range risk v17's
+     own doc comment already warns about for a DIFFERENT door). Fixed
+     the same way as the duplicate-error bug: snapshot/restore the
+     WHOLE map (not truncate — it's keyed by `ExprId`, not append-only)
+     around the inline recursion. **The regression test's FIRST draft
+     was itself a no-op-fix, green-test false positive** — this
+     session's own recorded lesson ("the same value could result from
+     the fix being a complete no-op") caught live: `x`/`y` started
+     unbounded, which meant `check_item`'s own "nothing to check
+     anywhere in the program" fast path returned before the body walk
+     (and therefore inlining) ever ran at all, so the test passed
+     identically whether the restore line was present or commented out.
+     Caught by literally doing that — commenting out the restore and
+     confirming the test STILL passed — before trusting it; fixed by
+     giving `x`/`y` an unrelated, wide-open `where` bound purely to
+     clear that fast path, then re-verified the disabled-restore run
+     actually fails (`Some((3, 4))` leaking from the OTHER call site)
+     before re-enabling the fix.
+  2. **`Shl`'s own interval arithmetic used `checked_shl` where it
+     needed `checked_mul`.** `u64::checked_shl` only fails when the
+     SHIFT AMOUNT is `>= 64`, not when the shifted VALUE's own high
+     bits would be silently dropped (`(1u64 << 63).checked_shl(1) ==
+     Some(0)`, not `None`) — a real, silent under-report of `hi` that
+     `check_against_bound`'s own width-overflow arm would never catch.
+     Fixed by reusing `Mul`'s own already-correct pattern (`factor =
+     1u64.checked_shl(k)?`, then `checked_mul`/`checked_add` throughout)
+     instead of a separate, subtly-wrong shift-based one.
+
+  A THIRD consequence, found while fixing (2): `smt.rs`'s own `bvshl`
+  port (below) would have made the shadow check STRICTLY MORE willing
+  to answer than the newly-fixed real engine in exactly the corner the
+  real engine's own overflow check exists to refuse (Z3's `bvshl` at a
+  fixed `CALC_WIDTH` always succeeds, silently wrapping) — a genuine
+  Proved/Disproved-vs-`None` disagreement, not the `Skipped`-is-not-
+  disagreement case. Fixed by REMOVING the `Shl` port entirely (falls
+  to `Skipped`, same treatment as call-inlining below). `trunc`'s own
+  port has the identical class of risk in its FALLBACK tier — an exact
+  Z3 translation of `[0, 2^width)` could prove something the real
+  engine's own coarser approximation can't (confirmed constructible:
+  `i` declared `[64, 68)`, `trunc(i, 4)` is EXACTLY `[0, 4)` under the
+  exact semantics, tighter than the real engine's own `[0, 16)`
+  fallback) — so `smt.rs`'s `trunc` arm was narrowed to the IDENTITY
+  case only (a literal no-op, translated as the unchanged inner term,
+  no `extract`/`zero_ext` needed), matching the real engine's own tight
+  tier exactly rather than exceeding it. That arm ALSO requires the
+  value operand be a bare `Expr::Ident` explicitly (`matches!`, not
+  just documented) — `res.expr_defs` maps any resolved `ExprId` to a
+  `DefId`, not only an `Ident`, so without the explicit check a
+  non-`Ident` operand that happened to carry an `expr_defs` entry would
+  validate ONE expression's bound and then translate a DIFFERENT one,
+  silently reintroducing the exact exceeding-precision risk this arm
+  exists to avoid (found the same way, in the same advisor pass).
+
+  `smt.rs`'s shadow check was NOT ported for body-substitution inlining
+  itself, a real, documented (not silent) gap: porting it would need
+  its own param-substitution map and depth guard threaded through
+  `translate_expr`'s whole recursion, and `Skipped` is a sound,
+  established fallback here (not a claimed agreement) — left for a
+  future pass, not attempted in this one.
+
+  One existing test (`unbounded_fn_call_result_is_still_unprovable`,
+  which pinned the OLD "opt-in only" restriction as correct behavior)
+  was rewritten, not just updated, since that restriction is exactly
+  what this feature relaxes — split into a positive case (now composes
+  with zero errors) and a negative control (a multi-statement body,
+  which inlining still can't reach). 9 new tests total (including a
+  dedicated `site_ranges`-non-poisoning regression, pinning the first
+  advisor-caught bug above), zero regressions (all 943 tests), clippy
+  clean, byte-identical `--explain-schedule` across every existing
+  example.
+
+- **`Le` (`<=`) recognized as a guard-narrowing operator (v23)**, a real,
+  pre-existing, independent gap — found via a THIRD live user report the same
+  day, on the exact v22 program above with `b < 0b1111` swapped for `b <=
+  0b1111`. `narrow_for_condition`/`narrow_for_else` recognized `Lt`/`Gt`/
+  `Ge`/`Ne` as bare guard-narrowing operators (both an `if`'s own condition
+  and a bare-comparison guard statement), but never `Le` — unlike `where`-
+  bound DECLARATIONS, which gained `<=` support back at stage 3
+  (`normalize_where_relation`). A `<=` guard fell through both functions' own
+  `match op`'s `_ => {}`/`_ => None` catch-all and narrowed NOTHING, so `b`
+  stayed at its full declared `[2, 32)` instead of `[2, 16)` — confirmed via
+  the PRE-session baseline binary that this reproduces identically without
+  ANY of v22's own inlining/`Shl`/`trunc` work, a real, independent bug, not
+  a regression from that feature.
+
+  Fixed with the same formula shape `Lt`/`Gt` already establish: `narrow_for_
+  condition`'s `Le` arm narrows the upper end to `min(hi, k + 1)` (`i <= k` is
+  `i < k + 1`); `narrow_for_else`'s mirrors it for the negated branch, `max
+  (lo, k + 1)` (else of `i <= k` is `i > k`). Both use `checked_add`,
+  matching `Gt`'s own existing overflow-safe idiom (fails closed, leaving
+  `state` unnarrowed, on `k == u64::MAX` — vacuous anyway, since nothing this
+  engine tracks has a bound that high).
+
+  **Unlike the bare-comparison-narrowing bug earlier this same day, this
+  fix needed no SECOND copy ported**: `narrow_for_condition`/`narrow_for_
+  else` are the actual SHARED functions both the real per-item walk and
+  `shadow_walk_body` (the SMT shadow check's own body reconstruction) call
+  directly — fixing them once fixes both callers identically, no
+  independent-reconstruction drift risk. `smt.rs`'s `translate_guard` IS a
+  genuinely separate mirror, though — its own doc comment states it must
+  stay "a faithful SHADOW" of `narrow_for_condition`'s own recognized shape
+  list — so it needed its own matching `Le` arm (`entry.bvule(&k)`, mirroring
+  `bvult`) in the same commit; `translate_condition` (the DIFFERENT,
+  deliberately-more-general mem-disjointness guard translator) already had
+  `Le` support, needing no change.
+
+  Verified via bug-reintroduction on BOTH new formulas independently (not
+  assumed from the driving repro alone): disabling `narrow_for_condition`'s
+  own `Le` arm made `le_guard_narrows_a_subsequent_write` fail via a REAL
+  shadow-check panic (interval engine says out-of-bound, SMT — via `translate
+  _guard`'s own still-present `Le` arm — says Proved), confirming the fix is
+  load-bearing, not a no-op; same for `narrow_for_else`'s own arm against
+  `else_branch_of_le_is_narrowed_to_gt`. Three stale operator-list doc
+  comments updated (`bounds/mod.rs`'s own module doc, `smt.rs`'s module doc,
+  `check_bound_obligation`'s own doc comment) — all named `Lt`/`Gt`/`Ge`/`Ne`
+  without `Le`, now corrected. 5 new tests (`if`-form and bare-guard-form
+  positive cases, a fencepost negative control mirroring the existing `Lt`
+  one, an else-branch mirror, and the exact user-reported repro), zero
+  regressions (948 tests), clippy clean, byte-identical `--explain-schedule`.
 
 ## Toward a dependent/refinement type system (SMT-backed, planned)
 

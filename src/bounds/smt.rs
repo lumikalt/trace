@@ -26,12 +26,12 @@
 //!   `translate_expr`'s own doc comment for why that generalization is
 //!   sound and needed for mem/struct-field obligations, which have no
 //!   privileged "self" def to begin with).
-//! - An enclosing `if`/`else`'s own condition is a hypothesis when it's
-//!   a bare `<bounded def> <op> <const>` (`Lt`/`Gt`/`Ge`/`Ne`), the same
+//! - An enclosing `if`/`else`'s own condition is a hypothesis when it's a
+//!   bare `<bounded def> <op> <const>` (`Lt`/`Le`/`Gt`/`Ge`/`Ne`), the same
 //!   shape `narrow_for_condition`/`narrow_for_else` recognize -- including
 //!   `Ne`'s own commuted form (`<const> <> <bounded def>`), which `narrow_
 //!   for_condition` also recognizes (see `translate_guard`'s own doc
-//!   comment for why `Ne` alone commutes, not `Lt`/`Gt`/`Ge`). v1 doesn't
+//!   comment for why `Ne` alone commutes, not `Lt`/`Le`/`Gt`/`Ge`). v1 doesn't
 //!   yet attempt `<>`'s own edge-only narrowing rule, so a write that only
 //!   type-checks BECAUSE that finer rule fired correctly reports `Skipped`
 //!   here rather than a false disagreement.
@@ -158,6 +158,16 @@ type StructFieldBoundsByDef = HashMap<(DefId, String), (u64, u64)>;
 /// there, independently of this shadow check).
 type FnRetBoundsByDef = HashMap<DefId, (u64, u64)>;
 
+/// Whether `callee` resolves to the named builtin -- mirrors `Checker::
+/// is_builtin` (bounds/mod.rs) exactly, duplicated here as a free fn
+/// since this module has no `Checker` `self` to hang a method off.
+fn is_builtin(res: &Resolution, callee: ExprId, name: &str) -> bool {
+    res.expr_defs
+        .get(&callee)
+        .map(|&d| res.def(d).kind == crate::resolve::DefKind::Builtin && res.def(d).name == name)
+        .unwrap_or(false)
+}
+
 /// Translate `id` into a `CALC_WIDTH`-bit bitvector term, ONLY when
 /// every sub-expression is one of v1's recognized shapes (a reference
 /// to some def PRESENT in `bounds_by_def`, an int/sized-int literal, or
@@ -212,6 +222,21 @@ type FnRetBoundsByDef = HashMap<DefId, (u64, u64)>;
 /// alongside each entry lets `check_bound_obligation` look its own
 /// declared bound back up when asserting hypotheses, without needing
 /// a second lookup pass over the AST.
+///
+/// **Deliberately NOT ported here: `expr_bound`'s own body-substitution
+/// inlining** (bounds/mod.rs's `Checker::inline_call_result`, the
+/// no-declared-postcondition fallback that binds a callee's params to
+/// the call's own argument terms and recurses into a single-`return`
+/// body). A call with no `fn_ret_bounds` entry still translates to
+/// `None` here -- a real, known gap versus the real engine (not a
+/// silent one: this doc comment names it), left as `Skipped` rather
+/// than ALSO threading param/body substitution through this free-fn
+/// recursion, which would need its own depth guard and a symbolic
+/// substitution map alongside `entries`/`field_entries`/`call_entries`.
+/// Sound to defer: `Skipped` is not a claimed agreement (see this
+/// module's own doc comment), so `bounds.rs` proving strictly more than
+/// this shadow check can independently confirm is expected here, not a
+/// disagreement `check_bound_obligation` would panic on.
 #[allow(clippy::too_many_arguments)]
 fn translate_expr(
     ast: &Ast,
@@ -280,6 +305,78 @@ fn translate_expr(
                     .entry(key)
                     .or_insert_with(|| BV::new_const(format!("field_{}_{}", d.0, name), CALC_WIDTH))
                     .clone(),
+            )
+        }
+        // `x << k` is DELIBERATELY NOT translated here, unlike `expr_
+        // bound`'s own `Shl` arm -- found via advisor review, not
+        // assumed: `expr_bound`'s arm fails closed (`None`) when the
+        // exact product would overflow `u64`, but Z3's own `bvshl` at a
+        // FIXED `CALC_WIDTH` always succeeds, silently wrapping in that
+        // same extreme corner instead of refusing to answer. Translating
+        // it here would make THIS shadow check strictly MORE willing to
+        // answer than the real engine in exactly the case the real
+        // engine's own overflow check exists to refuse -- a genuine
+        // Proved/Disproved-vs-`None` disagreement `check_bound_
+        // obligation` would panic on, not the `Skipped`-is-not-
+        // disagreement case this module's own doc comment describes.
+        // Falls to the catch-all below, same fail-closed default as
+        // every other unrecognized shape.
+        //
+        // `trunc(value, width)` is translated ONLY in the identity
+        // case -- `value` a bare `Ident` already present in `bounds_by_
+        // def` whose OWN declared upper already fits within `width`
+        // bits -- mirroring `expr_bound`'s own tight tier exactly,
+        // NOT its `[0, 2^width)` fallback tier. That fallback is a
+        // real approximation (looser than `trunc`'s true bit-extraction
+        // semantics), and an exact Z3 translation of the FALLBACK case
+        // would be a second, more severe instance of the same
+        // exceeding-precision risk `Shl` has above: a range genuinely
+        // achievable under the exact semantics but NOT captured by the
+        // real engine's own coarser `[0, 2^width)` approximation could
+        // let Z3 PROVE a write the real engine has to REJECT --
+        // confirmed constructible (not just theorized) via an interval
+        // straddling fewer than `2^width` residues while still
+        // exceeding it in absolute terms (e.g. `i` declared `[64, 68)`:
+        // `trunc(i, 4)` is EXACTLY `[0, 4)`, tighter than the real
+        // engine's own `[0, 16)` fallback). The identity case has no
+        // such gap: it's a literal no-op (the value is unchanged, not
+        // approximated), so translating it as the SAME already-
+        // translated term is exact by construction, not a widening of
+        // this shadow check's own power beyond the real engine's.
+        Expr::Call { callee, args } if args.len() == 2 && is_builtin(res, *callee, "trunc") => {
+            // Restricted to a BARE `Ident` value operand -- required,
+            // not just documentation: `bounds_by_def` is keyed by
+            // `DefId`, and `res.expr_defs` maps ANY resolved `ExprId`
+            // (not only an `Ident`) to one. Without this explicit
+            // `matches!` guard, a non-`Ident` `args[0]` that happened to
+            // carry an `expr_defs` entry would validate `d`'s OWN bound
+            // and then translate a DIFFERENT expression below --
+            // approving identity for a value that was never actually
+            // shown to fit `width` bits.
+            if !matches!(ast.expr(args[0]), Expr::Ident(_)) {
+                return None;
+            }
+            let &d = res.expr_defs.get(&args[0])?;
+            let &(_, upper) = bounds_by_def.get(&d)?;
+            let width = match ast.expr(args[1]) {
+                Expr::Int(v) => *v,
+                Expr::SizedInt { value, .. } => *value,
+                _ => return None,
+            };
+            let cap = 1u64.checked_shl(width as u32)?;
+            if upper > cap {
+                return None;
+            }
+            translate_expr(
+                ast,
+                res,
+                bounds_by_def,
+                struct_field_bounds_by_def,
+                fn_ret_bounds,
+                entries,
+                field_entries,
+                call_entries,
+                args[0],
             )
         }
         Expr::Call { callee, .. } => {
@@ -351,6 +448,7 @@ fn translate_guard(
     let k = BV::from_u64(k, CALC_WIDTH);
     let pos = match op {
         BinOp::Lt => entry.bvult(&k),
+        BinOp::Le => entry.bvule(&k),
         BinOp::Gt => entry.bvugt(&k),
         BinOp::Ge => entry.bvuge(&k),
         BinOp::Ne => entry.eq(&k).not(),
@@ -446,7 +544,7 @@ fn translate_condition(
 ///
 /// A `Skipped` verdict here is not itself a disagreement -- it means
 /// this v1 encoding couldn't translate the site at all (an unrecognized
-/// RHS shape, or a guard finer than `Lt`/`Gt`/`Ge`/`Ne` at the exact
+/// RHS shape, or a guard finer than `Lt`/`Le`/`Gt`/`Ge`/`Ne` at the exact
 /// operand order above). The interval engine may still have proved such
 /// a site via a rule this encoding doesn't implement yet (e.g. `<>`'s
 /// edge-only narrowing) -- that's real, out-of-scope-for-now

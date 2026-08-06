@@ -419,6 +419,75 @@ module M {
     assert!(errors[0].message.contains("cannot verify"));
 }
 
+// A real user report, not anticipated: `narrow_for_condition`/`narrow_
+// for_else` recognized `Lt`/`Gt`/`Ge`/`Ne` as bare guard-narrowing
+// operators, but never `Le` -- unlike `where`-bound declarations, which
+// gained `<=` support at stage 3 (`normalize_where_relation`). A `<=`
+// guard silently narrowed NOTHING (fell through the `match op`'s own
+// `_ => {}` catch-all), so `b <= 0b1111` left `b` at its full declared
+// range instead of narrowing its upper bound -- reproduces identically
+// on the pre-fix binary, confirming this predates and is independent of
+// this session's earlier inlining work. `translate_guard` (smt.rs) had
+// the identical gap, its own doc comment stating it must stay a
+// "faithful SHADOW" of `narrow_for_condition` -- fixed in the same
+// commit to avoid the two silently drifting apart.
+
+#[test]
+fn le_guard_narrows_a_subsequent_write() {
+    let src = "\
+module M {
+    reg i : [4] where i < 10 = 0
+    rule bump {
+        if i <= 8 {
+            i := i + 1
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn insufficiently_narrowed_le_guard_is_rejected() {
+    // `if i <= 8` composed with `i`'s own declared `< 9` doesn't narrow
+    // beyond the declared bound at all (`i <= 8` IS `i < 9`) -- the
+    // composed bound (`8 + 1 + 1 = 10`, i.e. `i` could reach 9) still
+    // exceeds `< 9`. Mirrors `insufficiently_narrowed_guard_is_rejected`
+    // above, spelled with `<=` instead of `<`.
+    let src = "\
+module M {
+    reg i : [4] where i < 9 = 0
+    rule bump {
+        if i <= 8 {
+            i := i + 1
+        }
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify"));
+}
+
+#[test]
+fn bare_le_comparison_narrows_subsequent_writes() {
+    // The exact user-reported shape: a BARE `<=` comparison statement
+    // (no `if`, implicitly gating the whole rule) must narrow `b`'s
+    // upper bound just like the bare `<` form already does.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+    rule step {
+        a?
+        b <= 0b1110
+        b := b + 1
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
 // A real user report, not anticipated: DESIGN.md's own "Comparisons:
 // fallible by default" section says a bare comparison statement (no
 // `if`, no explicit `?`) implicitly gates the WHOLE enclosing rule --
@@ -1364,15 +1433,200 @@ module M {
 }
 
 #[test]
-fn unbounded_fn_call_result_is_still_unprovable() {
-    // A fn with NO declared postcondition still composes to `None` --
-    // return-bound propagation is opt-in, not blanket inference. `i`'s
-    // own declared range would make `i + 5` provable if `Bump` composed
-    // its return value automatically, but it must not.
+fn call_with_no_postcondition_composes_via_body_substitution_inlining() {
+    // A fn with NO declared postcondition used to compose to `None`
+    // unconditionally (opt-in propagation only). It now falls back to
+    // body-substitution inlining: `Bump`'s single-statement `return i +
+    // 5` body is evaluated directly with `i` bound to each call's own
+    // argument range, so `Bump(3) + Bump(4)` composes to `(3+5) + (4+5)
+    // = [17, 17]`, well within `total`'s own declared bound.
     let src = "\
 module M {
     reg total : [8] where total < 40 = 0
     Bump(i : [8] where i < 10) : [8] {
+        return i + 5
+    }
+    rule step {
+        total := Bump(3) + Bump(4)
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+}
+
+#[test]
+fn multi_statement_body_with_no_postcondition_is_still_unprovable() {
+    // Body-substitution inlining is restricted to a SINGLE `return`
+    // statement (v1 restriction: a multi-statement body could contain
+    // its own `Stmt::Let`s this walk doesn't track). A fn with no
+    // declared postcondition and a body inlining can't handle still
+    // composes to `None`, same as before this feature existed.
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    Bump(i : [8] where i < 10) : [8] {
+        let extra = 5
+        return i + extra
+    }
+    rule step {
+        total := Bump(3) + Bump(4)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify this write"));
+}
+
+#[test]
+fn generic_call_with_shift_and_trunc_composes_via_inlining() {
+    // Real user-reported false negative: `b`'s own inductive bound
+    // (`_ > 1`, narrowed to `[2, 15)` under the guard `b < 0b1111`)
+    // proves `Double(trunc(b, 4))` stays in range (`[4, 29)`), but
+    // needed THREE capabilities landing together to actually compose:
+    // `trunc`'s own identity-when-it-fits shape, `Double`'s `x << 1`
+    // body composing via `Shl`, and body-substitution inlining letting
+    // `Double`'s own declared-postcondition-free return propagate at
+    // all.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+
+    Double(x : [n]) : [n + 1] { return x << 1 }
+
+    rule step {
+        a?
+        b < 0b1111
+        b := Double(trunc(b, 4))
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+}
+
+#[test]
+fn generic_call_with_shift_and_trunc_composes_under_a_le_guard() {
+    // A second real user report on the same program: swapping `b <
+    // 0b1111` for `b <= 0b1111` (the user's own exact edit) should be
+    // an equivalent-in-spirit guard (both narrow `b` to `[2, 16)`) and
+    // equally provable -- but exposed a SEPARATE, pre-existing,
+    // independent gap: `narrow_for_condition` never recognized `Le` as
+    // a narrowing operator at all, so this guard narrowed nothing and
+    // `b` stayed at its full declared `[2, 32)`, which doesn't fit
+    // `trunc`'s identity tier (`hi <= cap` fails at 32 > 16), falling to
+    // the coarser `[0, 16)` fallback and failing the write's own LOWER
+    // bound (`0 < 2`). Confirmed via the pre-fix binary that this
+    // reproduces identically without ANY of this session's earlier
+    // inlining/Shl/trunc work -- a real, independent bug, not a
+    // regression from that work.
+    let src = "\
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+
+    Double(x : [n]) : [n + 1] { return x << 1 }
+
+    rule step {
+        a?
+        b <= 0b1111
+        b := Double(trunc(b, 4))
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+}
+
+#[test]
+fn shl_with_literal_amount_composes() {
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    reg i : [8] where i < 10 = 0
+    rule step {
+        total := i << 1
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+}
+
+#[test]
+fn shl_with_dynamic_amount_is_still_unprovable() {
+    // Mirrors `Shl`'s own scope cut: a shift amount that isn't a
+    // literal has no fixed scaling factor for the interval engine to
+    // reason about, so it stays deliberately unrecognized.
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    reg i : [8] where i < 10 = 0
+    reg k : [8] where k < 3 = 0
+    rule step {
+        total := i << k
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify this write"));
+}
+
+#[test]
+fn trunc_that_already_fits_composes_as_identity() {
+    let src = "\
+module M {
+    reg total : [8] where total < 40 = 0
+    reg i : [8] where i < 10 = 0
+    rule step {
+        total := trunc(i, 4)
+    }
+}
+";
+    let errors = run(src);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+}
+
+#[test]
+fn trunc_that_might_actually_truncate_falls_back_to_the_declared_width() {
+    // `i`'s own declared range (`[0, 200)`) doesn't fit in 4 bits, so
+    // `trunc`'s identity tier doesn't apply -- the honest fallback
+    // (`[0, 16)`) is still real information, just not tight enough to
+    // fit `total`'s own `< 10` bound.
+    let src = "\
+module M {
+    reg total : [8] where total < 10 = 0
+    reg i : [8] where i < 200 = 0
+    rule step {
+        total := trunc(i, 4)
+    }
+}
+";
+    let errors = run(src);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("cannot verify this write"));
+}
+
+#[test]
+fn declared_postcondition_still_takes_priority_over_inlining() {
+    // When a callee declares an EXPLICIT return postcondition, it stays
+    // authoritative even though the body would also be inline-able.
+    // `Bump`'s declared bound (`_ < 30`, deliberately LOOSER than what
+    // `i + 5` under `i < 10` actually proves, `[5, 15)`) is a real,
+    // independently-checked-at-the-return-site fact, but still wider
+    // than the tight per-call range inlining alone would compute. Two
+    // calls composed via the DECLARED bound give `[0, 59)`, which
+    // exceeds `total`'s own `< 44` bound and must be rejected -- if the
+    // implementation silently preferred the tighter inlined result
+    // instead (`(3+5) + (4+5) = [17, 18)`, well within `< 44`), this
+    // would wrongly pass instead.
+    let src = "\
+module M {
+    reg total : [8] where total < 44 = 0
+    Bump(i : [8] where i < 10) : [8] where _ < 30 {
         return i + 5
     }
     rule step {
@@ -1764,6 +2018,27 @@ module M {
 }
 
 #[test]
+fn else_branch_of_le_is_narrowed_to_gt() {
+    // `else` of `i <= 5` is `i > 5`, i.e. lower bound `6`. Without that
+    // fact, `total := i - 6` can't prove non-negativity (the sub arm
+    // requires the smallest possible `i` to still dominate `6`).
+    let src = "\
+module M {
+    reg total : [8] where total < 4 = 0
+    reg i : [8] where i < 10 = 0
+    rule step {
+        if i <= 5 {
+            total := 0
+        } else {
+            total := i - 6
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
 fn else_branch_of_ne_narrows_to_the_exact_singleton_including_mid_range() {
     // The genuinely new capability: `else` of `i <> 5` is the EXACT
     // singleton `i == 5` -- `total`'s declared bound (`5 <= total < 6`,
@@ -2042,6 +2317,55 @@ module M {
     assert!(errors.is_empty(), "{errors:?}");
     let index = the_only_mem_index(&fx);
     assert_eq!(bounds.site_ranges.get(&index), Some(&(0, 10)));
+}
+
+#[test]
+fn body_substitution_inlining_does_not_poison_site_ranges_across_call_sites() {
+    // Real bug found via advisor review: `Get`'s own body-substitution
+    // inlining (called from `x := Get(3)` AND `y := Get(7)`) used to
+    // reach `expr_bound`'s `Expr::Bracket` arm for `m[i]` TWICE, once
+    // per call site, each time with `i` substituted to that call's OWN
+    // literal argument -- and `site_ranges.insert` has no merge-on-
+    // conflict, so the LAST call site's fact silently overwrote the
+    // first for the SAME `ExprId` (the mem index lives inside `Get`'s
+    // own body, shared textually across every caller). Canonically
+    // (checking `Get`'s body directly, the way `check_item`'s own walk
+    // does), `i` has no declared bound at all, so `site_ranges` should
+    // have NO entry for this index -- any entry at all would be a
+    // fabricated, call-site-specific "fact" reaching `schedule.rs`'s
+    // own mem-disjointness proof as if it were a whole-program one.
+    //
+    // `x`/`y` carry a (deliberately unrelated, wide-open) `where` bound
+    // purely so `check_item`'s own "nothing to check anywhere in the
+    // program" fast path doesn't skip the whole body walk before
+    // `expr_bound` ever runs -- confirmed load-bearing via bug-
+    // reintroduction: an EARLIER version of this test left `x`/`y`
+    // unbounded, which made `check_item` return before inlining was
+    // ever reached at all, so the test passed regardless of whether the
+    // fix was even present -- a no-op-fix, green-test false positive,
+    // caught via advisor review before being trusted.
+    let src = "\
+module M {
+    mem m : [8][16]
+    reg x : [8] where x < 100 = 0
+    reg y : [8] where y < 100 = 0
+    Get(i : [8]) : [8] { return m[i] }
+    rule a {
+        x := Get(3)
+    }
+    rule b {
+        y := Get(7)
+    }
+}
+";
+    let (fx, bounds, _errors) = run_with_bounds(src);
+    // Not asserting on `errors` here: `Get`'s return VALUE composes to
+    // `None` unconditionally (v17's own mem-read restriction — see
+    // `Expr::Bracket`'s own doc comment), so `x`/`y`'s own write
+    // obligation is expected to fail regardless of `site_ranges`. This
+    // test is only about `site_ranges` staying clean.
+    let index = the_only_mem_index(&fx);
+    assert_eq!(bounds.site_ranges.get(&index), None);
 }
 
 #[test]

@@ -1,0 +1,34 @@
+-- Real user-reported false negative: `bounds.rs`'s write-obligation
+-- checker (`Checker::expr_bound`) used to compose an `Expr::Call` to a
+-- provable range ONLY when the callee declared an EXPLICIT `where`
+-- return postcondition (v13, opt-in propagation only) -- a callee with
+-- no such annotation composed to `None` unconditionally, "cannot verify
+-- this write stays within the declared bound," even when the call was
+-- provably safe.
+--
+-- `Double`'s return type (`[n + 1]`) is a generic WIDTH guarantee, not
+-- a value-range refinement -- there was no way to attach a meaningful
+-- postcondition to it at all (a return bound needs a concretely-known
+-- `bits[N]` width, which a generic type doesn't have until a call
+-- site). `b`'s own inductive bound (`_ > 1`, narrowed to `[2, 15)` by
+-- the guard `b < 0b1111`) DOES prove `Double(trunc(b, 4))` stays in
+-- range (`[4, 29)`, well within `[2, 32)`) -- but only once three
+-- capabilities compose: `trunc`'s own identity-when-it-already-fits
+-- shape, `Double`'s `x << 1` body composing via `Shl`, and body-
+-- substitution inlining (binding `Double`'s own param `x` to the call's
+-- actual argument range and recursing into its single-`return` body
+-- directly, exactly as if it were expanded in place at the call site --
+-- which is literally what FIRRTL emission already does for a generic
+-- call).
+module M {
+    in a : [1]
+    out b : [5] where _ > 1 = 5
+
+    Double(x : [n]) : [n + 1] { return x << 1 }
+
+    rule step {
+        a?
+        b < 0b1111
+        b := Double(trunc(b, 4))
+    }
+}
