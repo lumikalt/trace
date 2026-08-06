@@ -783,9 +783,9 @@ impl<'a> Parser<'a> {
             // still works fine under `<sequences>`.
             self.errors.push(ParseError {
                 span: seq.name.span.clone(),
-                message: "`rule foo? <sequences>` isn't supported yet: write the \
-                          enable check by hand instead (`in foo : [1]` plus `foo?` \
-                          as the rule's first statement)"
+                message: "`rule foo? <sequences>` isn't supported yet; use `in foo : [1]` \
+                          plus `foo?` as the rule's first statement to write the \
+                          enable check by hand instead"
                     .to_string(),
             });
             return Vec::new();
@@ -1409,8 +1409,8 @@ impl<'a> Parser<'a> {
             _ => {
                 self.error_here(
                     "a destructuring source must be a plain reference (a reg/local/param \
-                     name), not a call/field access/other expression; bind it with an \
-                     ordinary `let` first, then destructure that"
+                     name), not a call/field access/other expression; use an ordinary \
+                     `let` to bind it first, then destructure that"
                         .to_string(),
                 );
                 self.sync();
@@ -2194,8 +2194,8 @@ impl<'a> Parser<'a> {
                     self.error_here(
                         "`..base` must be a plain reference and the LAST item in a struct \
                          literal -- no field/another `..` may follow it, and `base` can't \
-                         be a call/field access/other expression; bind it with an ordinary \
-                         `let` first, then spread that"
+                         be a call/field access/other expression; use an ordinary `let` \
+                         to bind it first, then spread that"
                             .to_string(),
                     );
                     self.sync();

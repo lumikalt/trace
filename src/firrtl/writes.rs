@@ -680,10 +680,10 @@ impl<'a> Emitter<'a> {
                                 "`{mem_name}` is written here unconditionally, after an \
                                  earlier write to it in this rule; the earlier write \
                                  would be silently discarded (one write port, so only \
-                                 one write can land per cycle) — guard this write with \
-                                 an `if` so it only replaces the earlier one on purpose, \
-                                 or restructure so `{mem_name}` is written at most once \
-                                 unconditionally"
+                                 one write can land per cycle); use an `if` to guard \
+                                 this write so it only replaces the earlier one on \
+                                 purpose, or restructure so `{mem_name}` is written at \
+                                 most once unconditionally"
                             ),
                         );
                         continue;

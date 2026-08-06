@@ -409,8 +409,8 @@ impl<'a> Emitter<'a> {
                 "Deq",
                 &deqs,
                 "every `Deq[]` this cycle reads the same value rather than \
-                 advancing to a new one; bind it to a local once and reuse that \
-                 local",
+                 advancing to a new one; use a local to bind it once, then reuse \
+                 that local",
             ),
         ] {
             let mut fifos: Vec<&String> = map.keys().collect();
@@ -782,8 +782,8 @@ impl<'a> Emitter<'a> {
                 self.error(
                     self.ast.expr_spans[or_expr.0 as usize].clone(),
                     "an `or` chain is not yet supported inside a callee's own body \
-                     (v0 restriction: `or` only works directly in a rule) — write \
-                     it directly in the calling rule instead"
+                     (v0 restriction: `or` only works directly in a rule); use it \
+                     directly in the calling rule instead"
                         .to_string(),
                 );
             }
@@ -901,14 +901,14 @@ impl<'a> Emitter<'a> {
                 self.error(
                     span,
                     if is_and {
-                        "`and`'s call operand must be able to fail (declare \
-                         `<fails>`, or a bare condition/fifo op inside it) — a call \
-                         that always succeeds has nothing for `and` to test"
+                        "`and`'s call operand must be able to fail — a call that \
+                         always succeeds has nothing for `and` to test; use \
+                         `<fails>`, or a bare condition/fifo op, inside it"
                             .to_string()
                     } else {
-                        "`logic`'s call operand must be able to fail (declare \
-                         `<fails>`, or a bare condition/fifo op inside it) — a call \
-                         that always succeeds has nothing for `logic` to test"
+                        "`logic`'s call operand must be able to fail — a call that \
+                         always succeeds has nothing for `logic` to test; use \
+                         `<fails>`, or a bare condition/fifo op, inside it"
                             .to_string()
                     },
                 );
@@ -919,14 +919,14 @@ impl<'a> Emitter<'a> {
                         "`and` cannot test a function that also writes state \
                          (v0 restriction): testing success here would either silently \
                          discard the write or require it to happen regardless of \
-                         whether the result is used — write the call directly instead \
+                         whether the result is used; use the call directly instead \
                          if you need its effect"
                             .to_string()
                     } else {
                         "`logic` cannot test a function that also writes state \
                          (v0 restriction): testing success here would either silently \
                          discard the write or require it to happen regardless of \
-                         whether the result is used — write the call directly instead \
+                         whether the result is used; use the call directly instead \
                          if you need its effect"
                             .to_string()
                     },

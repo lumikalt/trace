@@ -406,8 +406,9 @@ pub(crate) fn emit_module(
                     cx.error(
                         ast.item_spans[id.0 as usize].clone(),
                         format!(
-                            "`{}` is still a <sequences> rule with `tick`; run sequences \
-                             lowering first (lower::plan + render), then emit the result",
+                            "`{}` is still a <sequences> rule with `tick`; use \
+                             `lower::plan` + `render` to run sequences lowering first, \
+                             then emit the result",
                             name.text
                         ),
                     );

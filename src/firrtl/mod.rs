@@ -186,8 +186,8 @@ pub fn emit(
                 message: format!(
                     "FIRRTL emission needs exactly one top module (one that no other \
                      module instantiates); found {} unrelated candidates: {} (v0 \
-                     restriction — instantiate one from another with `inst`, or \
-                     remove the ones you don't need)",
+                     restriction); use `inst` to instantiate one from another, or \
+                     remove the ones you don't need",
                     tops.len(),
                     names.join(", ")
                 ),

@@ -328,9 +328,9 @@ impl<'a> TypeChecker<'a> {
             self.error(
                 self.expr_span(cond),
                 "a comparison combined with another condition (`&`/`|`/`^`, or nested \
-                 inside a larger expression) is not yet supported here (v0 restriction): \
-                 wrap it with `logic` first -- `(logic a > b) & c` -- or, for an `if`, \
-                 use it as the WHOLE condition on its own"
+                 inside a larger expression) is not yet supported here (v0 restriction); \
+                 use it as the WHOLE condition on its own for an `if`, or wrap it with \
+                 `logic` first -- `(logic a > b) & c`"
                     .to_string(),
             );
             return;
@@ -475,8 +475,7 @@ impl<'a> TypeChecker<'a> {
                             self.expr_span(rhs),
                             "a struct-typed write's right-hand side must be a struct \
                              literal (v0 restriction) -- copying one struct value into \
-                             another isn't supported yet; construct a fresh literal \
-                             instead"
+                             another isn't supported yet; use a fresh literal instead"
                                 .to_string(),
                         );
                     }
@@ -590,7 +589,7 @@ impl<'a> TypeChecker<'a> {
                                 self.expr_span(lhs),
                                 format!(
                                     "cannot write `.{name}`: a struct's fields are read-only \
-                                     (v0 restriction) — assign the whole value instead"
+                                     (v0 restriction); use the whole-value assignment instead"
                                 ),
                             );
                         }
@@ -599,7 +598,7 @@ impl<'a> TypeChecker<'a> {
                                 self.expr_span(lhs),
                                 format!(
                                     "cannot write `.{name}`: a `?T` value's fields are \
-                                     read-only — write the whole value instead (`false`, \
+                                     read-only; use the whole value instead (`false`, \
                                      or a plain value of the wrapped type)"
                                 ),
                             );

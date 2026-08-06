@@ -855,8 +855,8 @@ impl<'a> Checker<'a> {
                         span,
                         "`return` is only valid inside a function body; a `rule` has no \
                          return value (this used to compile and silently drop the whole \
-                         statement — if this was meant to gate the rule, write it as an \
-                         ordinary guard or fifo operation instead)"
+                         statement); use an ordinary guard or fifo operation instead if \
+                         this was meant to gate the rule"
                             .to_string(),
                     );
                 }
@@ -968,7 +968,7 @@ impl<'a> Checker<'a> {
                     _ => {
                         self.error(
                             span.clone(),
-                            "`spawn` needs a direct function call, e.g. `spawn Foo(a, b)`"
+                            "`spawn` needs a direct function call; use `spawn Foo(a, b)`"
                                 .to_string(),
                         );
                     }
@@ -1161,8 +1161,8 @@ impl<'a> Checker<'a> {
             span,
             format!(
                 "`{name}` can fail (a guard, a fifo operation, or a call to failing \
-                 code somewhere in its body) but does not declare `<fails>` — add it \
-                 to this item's own effect list"
+                 code somewhere in its body); use `<fails>` in this item's own effect \
+                 list to declare it"
             ),
         );
     }

@@ -213,19 +213,19 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
     // `<decides>` context does not compile there either).
     let (_, _, errors) = run("Classify(x : [8]) : [8] <combines> {\n (x <> 0)?\n return x\n}\n");
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 
     // The implicit (bare, no `?`) case gets the identical requirement.
     let (_, _, errors) = run("Classify(x : [8]) : [8] <combines> {\n x <> 0\n return x\n}\n");
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 
     // A fifo op, same requirement -- one of the three constructs
     // DESIGN.md's own `fails` section lists side by side with a guard.
     let (_, _, errors) =
         run("module M {\n fifo f : [8]\n Drain() : [8] <combines> {\n return f.Deq[]\n }\n}\n");
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 
     // Calling a `<fails>` function and letting its failure propagate,
     // without declaring `<fails>` on the CALLER too -- the third
@@ -238,7 +238,7 @@ fn fails_must_be_declared_wherever_it_ends_up_true() {
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`Wrap`"));
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 
     // Declaring `<fails>` is exactly what's needed to make any of the
     // above legal.
@@ -277,7 +277,7 @@ fn a_comparison_inside_a_logic_wrapped_calls_argument_still_needs_fails_declared
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`Wrap`"));
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 
     // Contrast: `logic`-wrapping the COMPARISON directly (not a call
     // argument) still discharges it fully, same as ever -- this fix
@@ -314,7 +314,7 @@ fn a_comparison_inside_a_logic_wrapped_fifo_ops_argument_still_needs_fails_decla
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`Wrap`"));
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 
     // Contrast: a plain argument (no embedded comparison) still needs no
     // `<fails>` at all — `logic f.Enq[x]` is a pure occupancy test,
@@ -351,7 +351,7 @@ impl PickNonZero(x : [8]) : [8] <combines>
     let (_, _, errors) = run(src);
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`PickNonZero`"));
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 
     let src_ok = "\
 spec AnyNonZero(x : [8]) : [8] <combines, chooses> {
@@ -619,7 +619,7 @@ fn a_bare_comparison_if_condition_does_not_mask_an_unrelated_guard_needing_fails
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`Check`"));
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 }
 
 /// `if let x = opt? { ... }` is branch-scoped and discharged right at
@@ -651,5 +651,5 @@ fn if_let_does_not_mask_an_unrelated_guard_needing_fails() {
     );
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("`Check`"));
-    assert!(errors[0].message.contains("does not declare `<fails>`"));
+    assert!(errors[0].message.contains("use `<fails>` in this item"));
 }

@@ -4946,7 +4946,7 @@ module M {
 }
 ";
     let messages = pipeline_error_messages(without_fails);
-    assert!(messages.iter().any(|m| m.contains("does not declare")));
+    assert!(messages.iter().any(|m| m.contains("use `<fails>`")));
 
     let with_fails = "\
 module M {

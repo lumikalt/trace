@@ -50,8 +50,8 @@ impl<'a> TypeChecker<'a> {
                                 self.expr_span(init),
                                 "`..` isn't supported in a reg init (v0 restriction): a \
                                  reg's reset value must be fully explicit, not composed \
-                                 from an existing value's fields; give every field \
-                                 directly instead"
+                                 from an existing value's fields; use an explicit value \
+                                 for every field instead"
                                     .to_string(),
                             );
                         }
@@ -162,8 +162,8 @@ impl<'a> TypeChecker<'a> {
                                 self.expr_span(init),
                                 "`..` isn't supported in an output init (v0 restriction): \
                                  an output's reset value must be fully explicit, not \
-                                 composed from an existing value's fields; give every \
-                                 field directly instead"
+                                 composed from an existing value's fields; use an \
+                                 explicit value for every field instead"
                                     .to_string(),
                             );
                         }
@@ -301,7 +301,7 @@ impl<'a> TypeChecker<'a> {
                 self.error(
                     group.span.clone(),
                     format!(
-                        "missing field(s): {} -- name them, or add `..` to discard the rest",
+                        "missing field(s): {}; use `..` to discard the rest, or name them",
                         missing.join(", ")
                     ),
                 );
@@ -641,7 +641,7 @@ impl<'a> TypeChecker<'a> {
         let span = self.ast.item_spans[id.0 as usize].clone();
         self.error(
             span,
-            "widths in this body grow without bound; add an explicit `trunc`".to_string(),
+            "widths in this body grow without bound; use an explicit `trunc`".to_string(),
         );
         self.emit = false;
     }

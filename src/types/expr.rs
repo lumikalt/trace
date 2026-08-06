@@ -423,8 +423,9 @@ impl<'a> TypeChecker<'a> {
                             self.error(
                                 self.expr_span(id),
                                 format!(
-                                    "struct `{struct_name}` literal is missing field(s): {} \
-                                     -- give them explicitly, or add `..base`",
+                                    "struct `{struct_name}` literal is missing field(s): {}; \
+                                     use `..base` to fill in the rest, or give each one \
+                                     explicitly",
                                     missing.join(", ")
                                 ),
                             );

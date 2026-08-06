@@ -472,7 +472,7 @@ fn plan_spawn(
     else {
         return Err(vec![LowerError {
             span,
-            message: "`spawn` needs a direct function call, e.g. `spawn Foo(a, b)`".to_string(),
+            message: "`spawn` needs a direct function call; use `spawn Foo(a, b)`".to_string(),
         }]);
     };
     let Some(callee_def) = res.expr_defs.get(&callee).copied() else {

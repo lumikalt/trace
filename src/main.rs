@@ -243,4 +243,26 @@ mod tests {
         );
         assert_eq!(hint, None);
     }
+
+    #[test]
+    fn splits_the_fails_not_declared_hint() {
+        // Regression test: this message originally read "...in its body) \
+        // but does not declare `<fails>` — add it to this item's own \
+        // effect list" — an em-dash clause, not a `"; use "` one — so it
+        // printed twice in full, same class of bug as the `not` hint above.
+        let (main, hint) = split_hint(
+            "`Chk` can fail (a guard, a fifo operation, or a call to failing code \
+             somewhere in its body); use `<fails>` in this item's own effect list \
+             to declare it",
+        );
+        assert_eq!(
+            main,
+            "`Chk` can fail (a guard, a fifo operation, or a call to failing code \
+             somewhere in its body)"
+        );
+        assert_eq!(
+            hint,
+            Some("use `<fails>` in this item's own effect list to declare it")
+        );
+    }
 }

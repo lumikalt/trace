@@ -952,9 +952,9 @@ impl<'a> Emitter<'a> {
                 span,
                 format!(
                     "calling the builtin `{name}` is not yet supported in FIRRTL emission \
-                     when every argument is a compile-time constant (v0 restriction: `{name}` \
-                     is foldable directly inside a type-position width expression instead, \
-                     e.g. `bits[{name}(n, m)]`)"
+                     when every argument is a compile-time constant (v0 restriction); use \
+                     `bits[{name}(n, m)]` instead, since `{name}` is foldable directly \
+                     inside a type-position width expression"
                 ),
             );
             return Err(());

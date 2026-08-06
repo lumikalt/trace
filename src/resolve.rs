@@ -893,8 +893,8 @@ impl<'a> Resolver<'a> {
                                         self.ast.expr_spans[lhs.0 as usize].clone(),
                                         format!(
                                             "cannot assign to `{text}` directly: it is a \
-                                             module instance; write a specific port instead \
-                                             (`{text}.port := ...`)"
+                                             module instance; use `{text}.port := ...` to \
+                                             target a specific port instead"
                                         ),
                                     );
                                 } else if self.res.def(def).kind == DefKind::Builtin {
