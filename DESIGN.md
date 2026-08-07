@@ -5161,17 +5161,62 @@ on an `in` port) to keep "restructure with a guard" from being the ONLY
 answer for code that's actually safe remains open, same as before this
 correction.
 
-**Status: `Sub`'s own check is still not built — the whole-pass gate that
-blocked it is gone, the per-check-site traversal isn't.** `Shl` shipped
-first, alone, in the commit that also drafted this section's original
-finding. `bounds.rs`'s early-return gate shipped next, as its own
-separate, directly-requested change (see the "Update" paragraph above) —
-real progress toward Path A's prerequisite, not a decision to build `Sub`
-itself by inference. What's still open: the obligation-position
-restriction `check_stmt` has everywhere (only a write/return/call-argument
-against something already bounded reaches `expr_bound` at all), and the
-A-vs-B choice itself. Both remain for Lumi to decide, not something this
-document picks on its own.
+**Status: the per-check-site traversal was built and measured, per the
+"measure before shipping" rule this section already set for itself — the
+number is large, and this is where Path A stops without Lumi's call.**
+`Shl` shipped first, alone. `bounds.rs`'s early-return gate shipped next
+(see the "Update" paragraph above), removing the whole-pass obstacle.
+That left exactly the "obligation-position restriction" gap this section
+already named as still open: `check_stmt` only ever calls `expr_bound` at
+a bounded write/return/call-argument, so a `Sub` anywhere else (a `let`,
+a loop condition, a bare statement) was still never visited. Built the
+missing piece — `check_no_underflow_in`, mirroring `check_calls_in`'s own
+generic `sub_exprs` descent (same idiom, not a second one) but recursing
+into BOTH operands regardless of outcome so `(a - b) - c` reports both,
+guarded on `inline_depth == 0` and deduped by `ExprId` per advisor review
+(a `Sub` reachable from more than one traversal — this walker's own
+descent AND `expr_bound`'s `Expr::Call` arm delegating to `check_calls_
+in` on its arguments — must not double-report) — then wired it into
+EVERY `check_stmt` arm with an expression position (`Assign`'s `lhs`/
+`rhs`, `Let`'s `init`, `If`/`While`'s `cond`, `IfLet`/`WhileLet`'s
+`init`, `Expr`'s bare expression, `Return`'s value), each with a
+temporary marker message instead of a real error, exactly the
+measurement discipline the earlier "don't ship an error path this turn"
+call asked for.
+
+**The number: 39 failing tests across five test files, from 29 distinct
+unprovable `Sub` sites — this is the "large" bucket, not the "tens."**
+Not a synthetic worst case: `subleq_emits_and_compiles`/`subleq_boot_
+runs_through_real_ports` (the flagship CPU example) both trip it, as do
+five separate `tests/sim.rs` real-hardware tests, plain `while`-loop
+countdown examples (`while_loop_over_a_register_compiles_to_a_self_
+looping_segment`), and multiple `tests/schedule.rs` mem-disjointness
+proofs that already rely on subtraction-based address arithmetic
+(`mem_disjoint_v2_same_base_minus_offset_is_proven`). As predicted before
+measuring: `expr_bound` returning `None` conflates "underflow is
+possible" with "no range known for either operand at all" (an `in` port,
+an unbounded `reg`), and the second case dominates — most of these are
+ordinary index/counter arithmetic with no `where` bound anywhere near it,
+not code a human would look at and suspect of underflowing. Reverted
+before landing anything (`git checkout -- src/bounds/mod.rs`); no trace
+of the experiment ships.
+
+**Recommendation: don't ship Path A's error as a blanket requirement —
+this needs Lumi's call, not an inferred one.** Forcing `.!` onto most of
+the repo's subtractions (SUBLEQ included) to satisfy a check that's
+mostly reporting "I don't know," not "this actually wraps," would be a
+real ergonomic regression for exactly the reason `Add`'s own design
+avoided applying its growth rule anywhere it wasn't the clean, provably-
+correct case. Real options going forward, none chosen here: narrow the
+check's own scope (e.g. only fire where at least one operand has SOME
+declared range, cutting the "no range at all" majority out entirely);
+teach `bounds.rs` to recognize more shapes so genuinely-safe code
+proves clean instead of falling to `None` (the "no multi-variable...
+bound expressions" v0 restriction is exactly this kind of gap); or
+accept Path B's fallibility instead, which sidesteps the proof-coverage
+problem entirely by making an unguarded underflow a runtime `fails`
+rather than a compile-time unprovability. This document stops here,
+consistent with its own standing policy on A-vs-B.
 
 ## Toward a dependent/refinement type system (SMT-backed, planned)
 
