@@ -23,7 +23,7 @@ module Alu {
         band := a & b
         bor := a | b
         bxor := a ^ b
-        shl3 := a << 3
+        shl3 := (a << 3).!
         shr3 := a >> 3
         nega := -a
         nota := ~a

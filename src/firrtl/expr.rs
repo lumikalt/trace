@@ -677,26 +677,48 @@ impl<'a> Emitter<'a> {
                         | BinOp::BitXor
                 ) =>
             {
+                // `Shl` grows by a known literal shift amount (DESIGN.md's
+                // "Growing `Shl`") — the amount is always `rhs`, not
+                // "whichever side is a literal" the way `Add`/`Mul`'s
+                // absorption below is, so it needs its own branch rather
+                // than the generic `grow` closure, which only has a
+                // resolved WIDTH to work with, not the amount's own VALUE.
+                // Deliberately the SAME narrow bare `Expr::Int`/
+                // `Expr::SizedInt` test `compile_shift`'s own `self.
+                // const_eval` uses (not the fuller `const_eval_expr`) --
+                // this MUST agree with which codegen branch `compile_
+                // shift` actually takes for the SAME expression, or a
+                // generic body could resolve a grown width here that
+                // `compile_shift`'s dynamic `dshl` branch can't actually
+                // deliver, mirroring `types/expr.rs`'s own `shl_grown_
+                // width` exactly, not a second, independently-maintained
+                // copy of that rule. `Shr`/`AShr` stay identity, same as
+                // always.
+                if matches!(op, BinOp::Shl) {
+                    let base = self.resolve_bits_width(*lhs)?;
+                    let n = match self.ast.expr(*rhs) {
+                        Expr::Int(v) => Some(*v),
+                        Expr::SizedInt { value, .. } => Some(*value),
+                        _ => None,
+                    };
+                    return Some(match n {
+                        Some(n) => base + n,
+                        None => base,
+                    });
+                }
+                if matches!(op, BinOp::Shr | BinOp::AShr) {
+                    return self.resolve_bits_width(*lhs);
+                }
                 // A literal operand absorbs its sibling's width, same as
                 // `type_binop`'s own `(Bits, Int)`/`(Int, Bits)` arms
                 // (`types/expr.rs`) — including THEIR growth-rule routing
                 // (`Add`'s carry bit), mirrored here rather than left to
                 // drift, the exact "const_fold`/`const_eval` drift" class
                 // of bug `combine_bits_width`'s own doc comment names.
-                // Shifts keep the shifted value's width unchanged, same
-                // as always.
                 let grow = |w: u64| -> Option<u64> {
-                    if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::AShr) {
-                        Some(w)
-                    } else {
-                        match crate::types::combine_bits_width(
-                            *op,
-                            Width::Known(w),
-                            Width::Known(w),
-                        ) {
-                            Width::Known(w) => Some(w),
-                            Width::Unknown => None,
-                        }
+                    match crate::types::combine_bits_width(*op, Width::Known(w), Width::Known(w)) {
+                        Width::Known(w) => Some(w),
+                        Width::Unknown => None,
                     }
                 };
                 if matches!(self.ast.expr(*lhs), Expr::Int(_)) {
@@ -871,7 +893,7 @@ impl<'a> Emitter<'a> {
         rhs: ExprId,
     ) -> Result<String, ()> {
         if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::AShr) {
-            return self.compile_shift(op, lhs, rhs);
+            return self.compile_shift(id, op, lhs, rhs);
         }
         // For every op below, one side being a bare literal (`Ty::Int`)
         // means the checker typed the whole expression as the *other*
@@ -1030,9 +1052,13 @@ impl<'a> Emitter<'a> {
     /// amount is known at compile time or not.
     ///
     /// Static: `shl` grows the width BY the (literal) shift amount,
-    /// `shr`/`ashr` shrink it by that same amount — brought back to `w`
-    /// by dropping the high bits that fell off (`shl`) or padding back
-    /// up (`shr`/`ashr`).
+    /// `shr`/`ashr` shrink it by that same amount — `shr`/`ashr` are
+    /// brought back to `w` unconditionally (their type never grows, see
+    /// `types/mod.rs`'s `combine_bits_width`); `shl` mirrors `Add`/`Mul`'s
+    /// own already-shipped shape instead (DESIGN.md's "Growing `Shl`"):
+    /// only trimmed back down to the checker's own target width when that
+    /// target is narrower than what `shl` naturally produces (a `.!`/
+    /// `trunc`-narrowed case), left raw otherwise.
     ///
     /// Dynamic: FIRRTL's `dshl(a, b)`/`dshr(a, b)` widths were confirmed
     /// against real firtool, not assumed from the spec text (a `node`,
@@ -1065,6 +1091,7 @@ impl<'a> Emitter<'a> {
     /// none — width already stays `w(a)` regardless of sign.
     pub(crate) fn compile_shift(
         &mut self,
+        id: ExprId,
         op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
@@ -1073,7 +1100,14 @@ impl<'a> Emitter<'a> {
         let l = self.compile_expr_hinted(lhs, Some(w))?;
         if let Some(n) = self.const_eval(rhs) {
             return Ok(match op {
-                BinOp::Shl => format!("tail(shl({l}, {n}), {n})"),
+                BinOp::Shl => {
+                    let natural = w + n;
+                    let target = self.resolve_bits_width(id).unwrap_or(natural);
+                    match natural.checked_sub(target) {
+                        Some(drop) if drop > 0 => format!("tail(shl({l}, {n}), {drop})"),
+                        _ => format!("shl({l}, {n})"),
+                    }
+                }
                 BinOp::Shr => format!("pad(shr({l}, {n}), {w})"),
                 BinOp::AShr => format!("asUInt(pad(shr(asSInt({l}), {n}), {w}))"),
                 _ => unreachable!("compile_shift only called for Shl/Shr/AShr"),

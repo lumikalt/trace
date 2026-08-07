@@ -4638,7 +4638,8 @@ uniformly:**
   than zero" in an unsigned encoding. Catching this needs a genuinely
   different mechanism (an implicit `fails`/`?` obligation the caller must
   discharge, or a `where`-bound proof that `a >= b`), not a width change —
-  a separate design, not started here.
+  a separate design, drafted (not started here) in "`Sub` underflow: a
+  genuinely different shape, not a width fix" below.
 - **`Shl` (and by extension a raw bit-slice write) has an analogous, but
   differently-shaped, silent-data-loss risk** — bits shifted off the top are
   gone, no carry bit involved, and `combine_bits_width`'s `Shl|Shr|AShr => a`
@@ -4646,7 +4647,9 @@ uniformly:**
   here so it isn't silently forgotten, explicitly NOT folded into this
   design — Lumi asked about addition specifically, and shift truncation is a
   different enough shape (which bits are lost, not how many) to warrant its
-  own scoping conversation rather than being bundled in by inference.
+  own scoping conversation, drafted separately in "Growing `Shl`: no silent
+  shifted-off-the-top data loss" below, rather than being bundled in by
+  inference.
 
 **Interaction with the Z3 bounds system — confirmed independent today, and
 this design does NOT change that.** `check_assignable` is a pure, static
@@ -4793,6 +4796,354 @@ edge worth naming, not fixing here: `counter := (counter + 1).!` on a
 has already proven does NOT truncate — a real semantic wart, not just
 verbosity. "Teach `check_assignable` to consult `bounds.rs`" remains
 deliberately deferred, unchanged from the original call.
+
+## Growing `Shl`: no silent shifted-off-the-top data loss (shipped)
+
+Shipped 2026-08-07, the literal-shift-amount case only, exactly as this
+section recommended below. The follow-up growing addition's own text
+flagged and explicitly deferred: "`Shl` has an analogous, but
+differently-shaped, silent-data-loss risk." Prompted by Lumi asking, after
+`Add` shipped, whether the same gap exists for other operators (shifts,
+multiplication). `Mul` turned out to already be sound (see above — its
+width rule was always the exact, non-truncating `n+m`). `Shl` is the real
+remaining case, and unlike `Add` it does not have one clean answer — this
+section works out why, and drafts a recommendation rather than a single
+obvious fix.
+
+**Confirmed by direct probe, not assumed: today's `Shl` has almost no
+data-loss protection at all, weaker than `Add` had before this arc even
+started.** `combine_bits_width`'s `Shl | Shr | AShr => a` arm (`types/
+mod.rs:74`) keeps the shifted value's own width unchanged, ignoring the
+shift amount entirely. Worse, `Shl`'s single most common shape — shifting
+by a literal (`a << 3`) — never even reaches that arm: `type_binop`'s
+`(Ty::Bits(w), Ty::Int)`/`(Ty::Int, Ty::Bits(w))` arms special-case
+`Shl | Shr | AShr` to return `Ty::Bits(w)` directly (`types/expr.rs:
+560-561`), the exact exclusion the growing-addition literal-absorption
+fix names and deliberately preserves ("a shift amount's width must keep
+NOT entering the result"). The only existing guard is `check_shift_amount`
+(`types/stmt.rs:825`), and it catches exactly one degenerate shape — the
+shift amount is a compile-time constant `n >= w`, discarding *every* bit.
+Any shift that discards *some* but not all of the top bits (`a << 3` on
+an `a` that turns out to hold a value needing more than `w - 3` bits) is
+silently truncated today, with zero diagnostic, at both the literal and
+dynamic shift-amount call shapes.
+
+**Emission already knows the exact non-truncating width — it just throws
+it away unconditionally, the identical shape `Add`'s old `tail(add(l, r),
+1)` had.** `firrtl/expr.rs`'s `compile_shift` (confirmed by reading the
+code, not assumed):
+- Literal shift amount: `format!("tail(shl({l}, {n}), {n})")` — FIRRTL's
+  own `shl` primitive natively produces `w(a) + n` bits (the same "the
+  primitive already computes the honest width" fact `Mul`'s `mul` and
+  `Add`'s `add` both already rely on); the `tail(_, n)` unconditionally
+  drops exactly those `n` extra bits back off, every time, whether or not
+  they were actually zero.
+- Dynamic shift amount (`rhs` itself a `Bits` of width `m`): `let grown =
+  (1u64 << rw) - 1; format!("tail(dshl({l}, {r}), {grown})")` — FIRRTL's
+  `dshl` natively produces `w(a) + 2^m - 1` bits (the largest amount `rhs`
+  could statically hold determines the largest possible growth, even
+  though the actual shift *value* is dynamic), truncated back down by
+  that same amount unconditionally.
+
+**The real reason this isn't `Add`'s `+1` copy-pasted onto a different
+operator: `Shl`'s honest width depends on what's doing the shifting, and
+one of the two shapes grows explosively.** Two genuinely different cases,
+matching how this arc has already decided `Add`/`Mul`/`Sub` each need
+their own per-operator call rather than one blanket rule:
+- **Literal shift amount** (`a << 3`): the honest width is `w(a) + n`, a
+  small, fixed, statically-known constant — exactly `Mul`'s `n + m`
+  shape, just with `n` supplied by the shift amount instead of a second
+  operand's width. This is the clean case: growing it the same way `Mul`
+  already works closes a real, currently-completely-silent hole, with the
+  same "reuses `check_assignable`, no new checking machinery" argument
+  `Add`'s own design made.
+- **Dynamic shift amount** (`a << b`, `b : [m]`): the honest width is
+  `w(a) + 2^m - 1` — exponential in `b`'s own WIDTH, not its value. A
+  single `[8]` value shifted by a dynamic `[8]` amount would need `8 +
+  255 = 263` bits to never truncate. Applying this as the default TYPE
+  (not just the emission-time intermediate, which already pays this cost
+  today and immediately un-pays it) would make an ordinary dynamic shift
+  nearly unusable without an immediate `.!`/`trunc` at the point it's
+  first produced — a real, structural difference from `Add`, where growth
+  is cheap (exactly one bit, every time) and the escape hatch is rarely
+  needed right away.
+
+**Recommendation, shipped as drafted: grow the literal case, leave the
+dynamic case alone.** The literal case is `Mul`-shaped and shipped the
+same way — with one correction to how, below. The dynamic case is closer
+in spirit to `Sub`'s scoping-out than to `Add`'s fix: forcing an
+exponential-width intermediate type onto every dynamic shift, most of
+which shift by a small runtime amount out of a wide-but-mostly-unused
+count operand, would be a disproportionate tax for a data-loss shape
+that's real but comparatively rare to hit in practice (most dynamic
+shifts are barrel-shifter-style, by-design-bounded amounts, not
+adversarial worst cases). Left at `a` (today's behavior), `check_shift_
+amount`'s "every bit discarded" guard stays the only protection for that
+shape — a real, named gap, not a silently-forgotten one, the same
+treatment `Sub`'s underflow risk got.
+
+**Correction: `combine_bits_width` genuinely can't carry the literal
+amount `n`, so the growth lives in `type_binop` directly, not in a new
+arm on that function.** This section originally proposed "a new `Shl =>
+Width::Known(x + n)`-style arm" on `combine_bits_width` — not
+implementable as drafted: that function's signature is `(op, a: Width, b:
+Width)`, two ALREADY-RESOLVED widths, with no access to the shift
+amount's own expression to evaluate `n` from. The growth instead lives in
+a new `TypeChecker::shl_grown_width(w, amount)` helper (`types/expr.rs`),
+called directly from `type_binop`'s `(Ty::Bits(w), Ty::Int)` and
+`(Ty::Bits(a), Ty::Bits(b))` arms (the latter for a `Ty::Bits`-typed
+shift amount, e.g. a sized literal `x << 4'd2` — a real, second call site
+this section didn't originally separate out) — `combine_bits_width`
+itself is untouched, and its own doc comment now says so explicitly, the
+same "literal absorption bypasses it entirely" shape `Add`'s own design
+already established for `a + <literal>`.
+
+**Correction: the growth decision uses a NARROWER "is this a literal"
+test than `check_shift_amount`'s own — found necessary, not a stylistic
+choice.** `firrtl/expr.rs`'s `resolve_bits_width` (the emission-time width
+resolver a generic callee body's own expressions need) has its own,
+independent `Shl` recursion, and it MUST agree with `compile_shift`'s own
+static-vs-dynamic codegen branch (`Emitter::const_eval`, `firrtl/mod.rs`
+— bare `Expr::Int`/`Expr::SizedInt` only) or a generic body could resolve
+a grown width here that `compile_shift`'s dynamic `dshl` branch can't
+actually deliver. `check_shift_amount` uses the FULLER `const_eval_expr`
+(handles `let`-bound consts, arithmetic, `env`-solved generic params) —
+using THAT for growth too would let the type grow for an amount emission
+still treats as dynamic, a real checked-width-vs-emitted-width mismatch,
+the exact "const_fold/const_eval drift" class of bug `combine_bits_
+width`'s own doc comment already names. `shl_grown_width` and `resolve_
+bits_width`'s `Shl` arm both use the identical narrow test instead (bare
+`Expr::Int`/`Expr::SizedInt`), by construction rather than caught after
+the fact.
+
+**Correction: `.!` never narrows the checked type, so the emission fix
+isn't "trim when narrower" the way this section assumed — the real
+narrowing rides on `connect`'s own implicit truncation, same as `Add`'s
+already-shipped self-increment case.** `compile_shift`'s literal arm does
+compute `target = resolve_bits_width(id)` against the raw `w(a) + n` `shl`
+naturally produces and only emits `tail(shl(l, n), drop)` when `drop` is
+positive — but `id` here is the SHIFT EXPRESSION's own id, and `.!` marks
+`ast.lossy` without ever touching that expression's STORED type
+(`types.expr_tys`), which stays at the grown width regardless of `.!`. So
+for an ordinary `shifted := (x << 4'd2).!` (`x : [16]`, `shifted : [16]`),
+`target` resolves to the grown `[18]` — equal to `shl`'s own natural
+width — and `drop` is always `0`; the emitted FIRRTL is raw `shl(x, 2)`
+(18 bits), with the actual narrowing down to `shifted`'s declared `[16]`
+happening entirely at the OUTER `connect shifted, shl(x, 2)`'s own
+non-strict, implicit-truncation semantics. Confirmed sound, not just
+assumed: `Add`'s own already-shipped `a := (a + 1).!` self-increment case
+and `Mul`'s generic-callee-body case both ALREADY rely on this exact same
+mechanism (verified by reading their compiled FIRRTL directly, byte for
+byte, before writing any `Shl` code) — this isn't a new pattern `Shl`
+introduces, just the first time this section had to reason about it
+explicitly. Real firtool (via `circt`) and `iverilog` both confirmed this
+sound end to end: `examples/alu.tr`'s `shl3 := (a << 3).!` compiles and
+simulates to the exact testbench-expected value (`sim/alu_tb.v`'s `shl3
+== 8'h18`), not just "firtool accepts the text."
+
+**`Shr`/`AShr` are unaffected, and should stay unaffected — the same
+"already exactly right" shape `Div`/`Rem`/`BitAnd`/`BitOr`/`BitXor`
+already have in the `Add` design above.** A right shift (logical or
+arithmetic) only ever shrinks or preserves a value's magnitude, never
+grows it — `combine_bits_width`'s `a` is already the exact, non-lossy
+width for both. Nothing here changes them.
+
+**Interaction with the Z3 bounds system — same independence `Add`'s
+design already established, and the same new tax.** `bounds.rs`'s
+`expr_bound` already has its own `Shl` arm (literal shift amount only,
+modeled as multiplication by `2^k` via `checked_mul` rather than
+`checked_shl` directly — a real, previously-fixed bug, see the "`Shl`'s
+own interval arithmetic" correction earlier in this document), completely
+independent of `check_assignable`/`combine_bits_width`, exactly as `Add`'s
+own relationship to `bounds.rs` is. Growing `Shl`'s static width the same
+way would reproduce `Add`'s identical ergonomic tax: a `where`-bounded
+write that `bounds.rs` already proves safe against a literal shift (e.g.
+a counter reg shifted and re-masked under a proven range) would newly
+*also* need `.!`/`trunc` to satisfy `check_assignable`'s now-stricter raw
+width — not a soundness gap, the same real-but-minor cost `Add`'s design
+already accepted and re-measured above.
+
+**Correcting a speculative aside in the `Add` section: no live bit-slice
+write exists to extend this to.** That section's parenthetical — "`Shl`
+(and by extension a raw bit-slice write)" — doesn't hold up under a direct
+check: `Expr::Bracket` as a write target (`types/stmt.rs:532`) only
+supports indexing into `Ty::Mem`; there is no `x[hi..lo] := v` partial-
+register write construct in the language today for a similarly-shaped gap
+to apply to. Nothing to scope in or out here — the aside named a
+possibility that isn't actually live.
+
+**Blast radius, now measured: five sites, confirming the "narrower than
+`Add`" guess above.** `examples/alu.tr` (`shl3 := (a << 3).!`, its own
+already-existing real-hardware testbench re-verified below), one
+`tests/bounds.rs` case (`shl_with_literal_amount_composes`, `.!` — `.!`
+doesn't weaken `bounds.rs`'s own independent proof, confirmed by the
+"Interaction with the Z3 bounds system" paragraph above and by this test
+still passing), and three assertion-only updates in `tests/firrtl.rs`/
+`tests/types.rs` (two emitted-FIRRTL-text assertions updated to the new
+un-tail'd shape the "`.!` never narrows" correction above explains; one
+sub-case's declared output width widened from `[8]` to `[16]` so growth
+doesn't ALSO trip `check_assignable` on a test specifically isolating
+`check_shift_amount`'s own message — the exact "`.!` marks the same
+`ExprId` other checks gate on" trap `Add`'s own `an_oversized_literal_
+combined_with_a_bits_value_via_a_binop_is_an_error` fix already
+documented, hit again here as predicted rather than assumed). Whole
+suite (`cargo test`, `cargo clippy --all-targets`, `cargo fmt --check`)
+clean, with `firtool`/`iverilog` both available for this pass (unlike
+`Add`'s own migration) — `tests/firrtl.rs`'s 297 tests all round-tripped
+through real `firtool`, and `alu_runs_through_real_ports` (`tests/
+sim.rs`) re-ran `examples/alu.tr` through real simulation, confirming
+`shl3` still lands on the testbench's expected `8'h18`.
+
+## `Sub` underflow: a genuinely different shape, not a width fix (planned)
+
+The `Add` section named this and stopped: "`Sub` is explicitly OUT of
+scope for this design... Catching this needs a genuinely different
+mechanism... a separate design, not started here." This is that design —
+drafted, like `Shl` above, because Lumi asked what else has an implicit-
+truncation-shaped gap, not because a width tweak will close it the way it
+closed `Add`/`Shl`.
+
+**Confirmed by direct probe: `Sub` has zero protection today, and unlike
+`Add`/`Shl`, no WIDTH change can add any.** `combine_bits_width`'s
+catch-all arm gives `Sub` `max(n, m)`, same as every other non-`Add`
+operator, and that width is already exactly correct for every INPUT
+combination — `a - b` where `a, b : [n]` always fits in `n` bits, by
+construction, in EITHER of the two ways it could be interpreted: as the
+true (possibly negative) mathematical difference reduced mod `2^n`
+(what actually happens: unsigned wraparound), or as a value that's
+simply wrong the moment `b > a`. Growing the width the way `Add`/`Shl`
+do doesn't help either interpretation — there's no `n+1`-bit encoding of
+"a value less than zero" in this language's unsigned-only domain (no
+`Sub`-side companion to the carry bit `Add`'s extra bit captures). The
+bug isn't that the result doesn't fit; it's that the result is the WRONG
+NUMBER whenever `b > a`, silently.
+
+**This makes `Sub` a VALUE-range proof obligation, not a `Ty::Bits`
+width-typing one — closer in shape to `bounds.rs`'s own domain than to
+`check_assignable`'s.** `check_assignable`/`trunc` are about whether a
+*width* is wide enough to hold a value that's known to be correct; they
+have nothing to say about whether the value itself is correct in the
+first place — `trunc` genuinely has no role here, there's nothing to
+narrow into.
+
+**Correction: `.!` is NOT ruled out as the escape hatch the way this
+section first claimed — it already gates a non-width check today, the
+identical shape a Path-A `.!` would need.** `type_binop` (`types/
+expr.rs:515`) computes `lossy` once (`ast.lossy.contains(&at)`) and gates
+BOTH `check_literal_fits` (a width check) AND `check_shift_amount` (a
+COUNT check — "is this shift amount too large," nothing to do with
+whether a width fits) on the same flag. `.!` already means "suppress
+this expression's own static safety check," generically, not "suppress
+specifically a width-truncation check" — `(a - b).!` meaning "I accept
+the possible wraparound" would be consistent with existing precedent, not
+a new use of the marker. This removes the escape-hatch question as Path
+A's blocker; see the architectural finding below for the real one.
+
+**Two real paths, both reusing already-shipped machinery rather than
+inventing from scratch — the same "reuse before inventing" instinct
+`Add`'s own design leaned on with `check_assignable`, applied to two
+DIFFERENT existing mechanisms this time.**
+
+- **Path A — static-proof-only, `Sub` stays total.** `bounds.rs`'s
+  `expr_bound` already has a working, SOUND interval-arithmetic `Sub` arm
+  (confirmed by reading the code): it computes `a - b`'s range only when
+  the smallest possible `a` still dominates the largest possible `b`
+  (`a_lo.checked_sub(b_max)`), and fails closed (returns `None`,
+  "unprovable") otherwise — this is already, quietly, an exact underflow
+  proof. The narrowing a caller needs to discharge it already exists too
+  — `narrow_for_condition` (the same machinery `if i < 8` uses to narrow a
+  `where`-bounded reg's range within a branch) would narrow `a`/`b`'s
+  ranges the identical way under an `if a >= b` guard, so `if a >= b { x
+  := a - b }` should already prove clean once this arm is actually
+  reached. No fallibility is added anywhere; `Sub` stays exactly as total
+  as `Add` is. **What "reached" requires turned out to be the load-
+  bearing question — see the architectural finding below.**
+- **Path B — fallible `Sub`, reusing "comparisons are fallible by
+  default" directly.** "Comparisons: fallible by default" (above) already
+  makes `a > b` yield `a`'s own value on success or fail the enclosing
+  rule/call, matching Verse's `X > 0` and reusing the SAME fails-
+  inference/guard-folding machinery a fifo op or a failing call already
+  has. `a - b` could lower the identical way: fails (folds into the
+  enclosing rule's/callee's `fails`) whenever `b > a` can't be statically
+  excluded, succeeding with the ordinary difference otherwise. This is
+  arguably the more Verse-native answer — "failure as control flow" is
+  this document's own first sentence, and comparisons already treat an
+  unproven inequality as a first-class fail rather than a compile error
+  — but it's a bigger, more pervasive change than Path A: every function/
+  rule containing a bare, unguarded `a - b` would newly need to declare
+  `<fails>` (the same mandatory-declaration rule "`fails`: fallibility"
+  above already enforces for a guard or fifo op), a real ripple through
+  call signatures, not just through expression widths.
+
+**Correction, found while trying to measure Path A's real cost before
+implementing it (advisor-prompted: don't ship a mandatory check without
+knowing what it rejects): Path A is NOT "promote an existing arm from
+opportunistic to mandatory" — it requires making `bounds.rs` a mandatory
+whole-program pass, a genuinely bigger architectural change than this
+section originally scoped.** `bounds.rs`'s own `check_item` (confirmed by
+reading the code) opens with a five-way early-return gate: `if self.
+bounded.is_empty() && self.fn_ret_bound.is_empty() && self.mem_bounds.
+is_empty() && self.struct_field_bounds.is_empty() && self.relational_
+bounds.is_empty() && !self.has_implicit_trunc { return; }` — for a
+program that declares NO `where` bound, bounded mem, struct-field bound,
+fn-return bound, or invariant ANYWHERE, `bounds.rs`'s entire walk never
+runs at all, `expr_bound` is never called on anything, `Sub` included.
+Beyond that gate, the walk that DOES run (`check_body`/`check_stmt`) only
+calls `expr_bound` at specific OBLIGATION positions (a write to a
+bounded def, a return with a declared bound, a call argument against a
+declared param bound) — an ordinary `let y = a - b` whose result never
+reaches one of those positions is never visited even once bounds.rs IS
+running. Confirmed empirically, not just by reading: a temporary local
+edit making `expr_bound`'s `Sub` arm push an error on its own `None`
+(unprovable) path, run across the WHOLE test suite, found failures ONLY
+in `tests/bounds.rs`/`tests/schedule.rs` (the two files that already
+exercise `where`-bounded code) — zero new failures anywhere else,
+including `tests/types.rs`'s `all_examples_type_check` and all 297 of
+`tests/firrtl.rs`'s tests, not because those programs' subtractions are
+safe, but because `bounds.rs` never looked at them at all. That number
+(6 test failures) is NOT a blast-radius estimate for Path A — it measures
+a different, narrower population (code already inside bounds.rs's
+existing walk) than "every `Sub` in the program," which is what Path A as
+drafted actually requires reaching. The change reverted before landing
+anything (`git checkout -- src/bounds/mod.rs`); no trace of the
+experiment ships.
+
+**Recommendation: still Path A over Path B in shape, but Path A now needs
+its own scoping decision before implementation — deleting `check_item`'s
+early-return gate and adding a real "visit every `Sub` regardless of
+what consumes it" traversal, not a small follow-on to the existing
+opportunistic walk.** Path A remains the one that keeps `Sub` total
+(`Add`/`Mul`/`Shl`'s literal case all stay total too) and reuses an
+already-sound interval prover rather than inventing fallibility — that
+reasoning is unchanged. What changed is the cost: turning `bounds.rs`
+from an opt-in feature (silently inert unless a program uses its own
+declarative syntax) into a mandatory whole-program pass is a real
+performance and architecture question on its own, independent of
+`Sub` specifically, and deserves a scoping conversation of its own before
+`Sub`'s design leans on it. Path B is philosophically closer to this
+language's own stated core idea and worth keeping on the table for the
+same reason as before — this correction doesn't resolve the A-vs-B
+choice, it just corrects what A actually costs.
+
+**Path A's escape hatch, corrected above (`.!` already applies) — but
+still gated on the same open question the "no multi-variable... bound
+expressions" v0 restriction already names elsewhere in `bounds.rs`.**
+Once `Sub`'s check is actually mandatory and reachable, an unprovable
+`.!`-marked `a - b` is architecturally consistent with `check_shift_
+amount`'s own precedent; whether `bounds.rs`'s induction can be taught to
+recognize enough invariants (multi-reg relationships, external contracts
+on an `in` port) to keep "restructure with a guard" from being the ONLY
+answer for code that's actually safe remains open, same as before this
+correction.
+
+**Status: Sub's design is blocked on a decision, not a bug fix — this
+commit ships `Shl` alone.** Lumi asked for both `Shl` and `Sub` in one
+commit; `Shl` is complete, tested (including real `firtool`/`iverilog`),
+and shipped above. `Sub` stops here because the real blocker surfaced
+during implementation prep is a language-level architecture choice
+(should `bounds.rs` become a mandatory pass) that this document declines
+to make by inference, the same standing policy this whole section already
+follows for A-vs-B.
 
 ## Toward a dependent/refinement type system (SMT-backed, planned)
 

@@ -1585,9 +1585,18 @@ fn alu_emits_widened_expression_surface() {
     assert!(fir.contains("connect __out_band, and(a, b)"));
     assert!(fir.contains("connect __out_bor, or(a, b)"));
     assert!(fir.contains("connect __out_bxor, xor(a, b)"));
-    // Static shift: `shl` grows width by the shift amount, `shr` shrinks
-    // it; both get brought back to the left operand's own width.
-    assert!(fir.contains("connect __out_shl3, tail(shl(a, 3), 3)"));
+    // Static shift: `shr` shrinks and gets brought back to the left
+    // operand's own width via `pad`. `shl` no longer does the same
+    // unconditional `tail` (DESIGN.md's "Growing `Shl`") — its type now
+    // genuinely grows (`w(a) + 3`), `alu.tr`'s own `.!` accepts the
+    // truncation, and since `.!` never narrows the expression's OWN
+    // stored type, `compile_binop`'s target still equals `shl`'s natural
+    // (grown) width, leaving nothing to trim explicitly; the real
+    // narrowing down to `shl3`'s declared `[8]` happens at the OUTER
+    // `connect`'s own implicit truncation instead (same shape `Add`'s
+    // already-shipped self-increment case and `Mul`'s generic-callee
+    // case both already rely on).
+    assert!(fir.contains("connect __out_shl3, shl(a, 3)"));
     assert!(fir.contains("connect __out_shr3, pad(shr(a, 3), 8)"));
     assert!(fir.contains("connect __out_nega, tail(sub(UInt<8>(0), a), 1)"));
     assert!(fir.contains("connect __out_nota, not(a)"));
@@ -1673,13 +1682,23 @@ module M {
     out shifted : [16] = 0
     rule r {
         bit3 := x[8'd3]
-        shifted := x << 4'd2
+        shifted := (x << 4'd2).!
     }
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
     assert!(fir.contains("connect __out_bit3, bits(x, 3, 3)"));
-    assert!(fir.contains("connect __out_shifted, tail(shl(x, 2), 2)"));
+    // No explicit `tail` anymore (DESIGN.md's "Growing `Shl`"): `x <<
+    // 4'd2` now types `[18]` (`w(x) + 2`, the SizedInt shift amount
+    // recognized by `type_binop`'s `(Bits, Bits)` arm same as a bare
+    // `Ty::Int` one), and `.!` never narrows the expression's OWN stored
+    // type, only silences `check_assignable` at the write — so
+    // `compile_binop`'s target (the checker's still-grown `[18]`) equals
+    // `shl`'s own natural width, leaving nothing to trim. The real
+    // narrowing down to `shifted`'s declared `[16]` happens at the
+    // OUTER `connect`'s own implicit truncation, exactly like `Add`'s
+    // already-shipped `a := (a + 1).!` self-increment case.
+    assert!(fir.contains("connect __out_shifted, shl(x, 2)"));
     run_firtool(&fir, &[]);
 }
 
@@ -2289,7 +2308,17 @@ module M {
 }
 ";
     let fir = emit_from_source(src).expect("emission should succeed");
-    assert!(fir.contains("tail(shl(a, 1), 1)"));
+    // No explicit `tail` (DESIGN.md's "Growing `Shl`"): `resolve_bits_
+    // width`'s own `Expr::Binary` arm resolves `x << 1`'s grown width
+    // (`w(x) + 1` via `Dbl`'s own substituted `x`, not the DECLARED
+    // return type `Dbl` was called with) as `compile_binop`'s target,
+    // matching `shl`'s natural width exactly — leaving the actual
+    // narrowing down to `Dbl`'s declared `[n]` (here `[4]`) to the
+    // OUTER `connect r, Dbl(a)`'s own implicit truncation, same as
+    // `Mul`'s already-shipped, already-accepted behavior for this exact
+    // "generic callee body inlined into a narrower target" shape
+    // (confirmed identical for `x * 1`, unaffected by this change).
+    assert!(fir.contains("shl(a, 1)"));
     run_firtool(&fir, &[]);
 }
 

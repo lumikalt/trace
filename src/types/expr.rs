@@ -475,9 +475,42 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// `Shl`'s own growth rule (DESIGN.md's "Growing `Shl`"): the honest,
+    /// non-truncating width of `a << n` is `w(a) + n` — exactly `Mul`'s
+    /// `n + m` shape, with `n` supplied by the shift amount instead of a
+    /// second operand's width. A genuinely dynamic amount has no fixed
+    /// growth factor to add (its natural FIRRTL `dshl` width is
+    /// exponential in the amount's own WIDTH, `w(a) + 2^w(amount) - 1`,
+    /// deliberately left unmodeled here; see DESIGN.md), so it falls
+    /// through unchanged, same as today.
+    ///
+    /// Deliberately NOT `check_shift_amount`'s own (fuller) `const_eval`
+    /// — matched instead to `firrtl/mod.rs`'s `Emitter::const_eval`
+    /// (bare `Expr::Int`/`Expr::SizedInt` only), the narrower evaluator
+    /// that decides `compile_shift`'s own static-vs-dynamic `shl`/`dshl`
+    /// codegen branch. Growth here MUST agree with THAT decision, not
+    /// with `check_shift_amount`'s: using the fuller evaluator would let
+    /// the type grow for an amount (say, a `let`-bound const) that
+    /// `compile_shift` still treats as dynamic, producing a checked width
+    /// emission can't actually deliver — the exact "const_fold/const_eval
+    /// drift" class of bug `combine_bits_width`'s own doc comment names,
+    /// caught here by construction rather than after the fact.
+    fn shl_grown_width(&self, w: Width, amount: ExprId) -> Width {
+        let n = match self.ast.expr(amount) {
+            Expr::Int(v) => Some(*v),
+            Expr::SizedInt { value, .. } => Some(*value),
+            _ => None,
+        };
+        match (w, n) {
+            (Width::Known(width), Some(n)) => Width::Known(width + n),
+            _ => w,
+        }
+    }
+
     /// Solver-2 width rules. Modular arithmetic: `+`/`-`/bitwise keep the
-    /// max width; `*` sums; shifts keep the left width; comparisons give
-    /// bits[1]. `Int` absorbs into the other side.
+    /// max width; `*` sums; `Shl` grows by a known literal amount
+    /// (`shl_grown_width`), `Shr`/`AShr` keep the left width; comparisons
+    /// give bits[1]. `Int` absorbs into the other side.
     fn type_binop(&mut self, op: BinOp, l: Ty, r: Ty, lhs: ExprId, rhs: ExprId, at: ExprId) -> Ty {
         use BinOp::*;
         let span = self.expr_span(at);
@@ -553,11 +586,17 @@ impl<'a> TypeChecker<'a> {
                 // as it does to the `(Bits, Bits)` arm below, so `a +
                 // 200` (`a : [8]`) is caught the same way `a + b` is, not
                 // silently exempted just because one side is a literal.
-                // Shifts keep their own width unchanged, same as always
-                // — a shift amount's width was never part of the result.
+                // `Shr`/`AShr` keep their own width unchanged, same as
+                // always — a shift amount's width was never part of the
+                // result. `Shl` grows by the literal amount itself
+                // (DESIGN.md's "Growing `Shl`") when it's known, the same
+                // "the checker doesn't get to lie about width" reasoning
+                // `Add`'s own growth already applies.
                 if is_comparison {
                     l_ty
-                } else if matches!(op, Shl | Shr | AShr) {
+                } else if matches!(op, Shl) {
+                    Ty::Bits(self.shl_grown_width(w, rhs))
+                } else if matches!(op, Shr | AShr) {
                     Ty::Bits(w)
                 } else {
                     Ty::Bits(super::combine_bits_width(op, w, w))
@@ -590,7 +629,11 @@ impl<'a> TypeChecker<'a> {
                     if matches!(op, Shl | Shr | AShr) && !lossy {
                         self.check_shift_amount(rhs, &Ty::Bits(a));
                     }
-                    Ty::Bits(super::combine_bits_width(op, a, b))
+                    if matches!(op, Shl) {
+                        Ty::Bits(self.shl_grown_width(a, rhs))
+                    } else {
+                        Ty::Bits(super::combine_bits_width(op, a, b))
+                    }
                 }
             }
             (l, r) => {

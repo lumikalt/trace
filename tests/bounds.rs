@@ -1671,7 +1671,7 @@ module M {
     reg total : [8] where total < 40 = 0
     reg i : [8] where i < 10 = 0
     rule step {
-        total := i << 1
+        total := (i << 1).!
     }
 }
 ";

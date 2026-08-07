@@ -818,9 +818,15 @@ fn shift_amounts_at_or_past_the_operand_width_are_an_error() {
     );
 
     // Left shift and arithmetic-right-shift get the same treatment, not
-    // just plain right shift.
+    // just plain right shift. `b` is `[16]` here, not `[8]` like every
+    // other case in this test — `Shl` (DESIGN.md's "Growing `Shl`") now
+    // ALSO grows `a << 8`'s own type to `[16]` (`w(a) + 8`), which would
+    // trip `check_assignable`'s own, separate truncation error against an
+    // `[8]` target and turn this into a two-error case, muddying the ONE
+    // error this test isolates (`check_shift_amount`'s "discards every
+    // bit", orthogonal to width growth).
     let (_, _, errors) =
-        run("module M {\n in a : [8]\n out b : [8] = 0\n rule r {\n b := a << 8\n }\n}\n");
+        run("module M {\n in a : [8]\n out b : [16] = 0\n rule r {\n b := a << 8\n }\n}\n");
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("discards every bit"));
     let (_, _, errors) =

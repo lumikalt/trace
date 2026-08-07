@@ -6,22 +6,27 @@
 //!
 //! Solver 2 (widths): widths are computed with monotone rules (`-` keeps
 //! max width, `+` keeps max width AND GROWS BY ONE (the carry bit — no
-//! silent wraparound, DESIGN.md's "Growing addition"), `*` sums,
-//! comparisons give 1) and only *checked* where both sides are known.
-//! Rebinding a local widens its width; bodies re-type until the local
-//! table is stable, with a divergence cap.
+//! silent wraparound, DESIGN.md's "Growing addition"), `*` sums, `<<`
+//! grows by a known literal shift amount (DESIGN.md's "Growing `Shl`"; a
+//! dynamic amount keeps the left operand's width, unmodeled), `>>`/`>>>`
+//! keep the left operand's width, comparisons give 1) and only *checked*
+//! where both sides are known. Rebinding a local widens its width; bodies
+//! re-type until the local table is stable, with a divergence cap.
 //!
 //! Generic bodies (widths depending on unsolved implicit params) are
 //! shape-checked only; their widths check numerically at each concrete
 //! call site after instantiation.
 //!
 //! Width rules follow Chisel-style modular arithmetic for every operator
-//! EXCEPT `+` (`a - b`/`a & b`/etc. have width `max(|a|,|b|)`, no growth;
-//! `a + b` has width `max(|a|,|b|)+1`, growing to hold the carry — the
-//! ONE deliberate departure from Chisel's own default `+`), and an
-//! integer literal absorbs into the other operand's width (it must fit).
-//! Writing a wider value into a narrower register is an error that names
-//! `trunc` — no silent truncation, `+`'s own carry bit included.
+//! EXCEPT `+`/`<<` (`a - b`/`a & b`/etc. have width `max(|a|,|b|)`, no
+//! growth; `a + b` has width `max(|a|,|b|)+1`, growing to hold the carry;
+//! `a << n` has width `|a|+n` for a known literal `n`, growing to hold
+//! every shifted-in bit — the two deliberate departures from Chisel's own
+//! default `+`/`<<`), and an integer literal absorbs into the other
+//! operand's width (it must fit). Writing a wider value into a narrower
+//! register is an error that names
+//! `trunc` — no silent truncation, `+`'s own carry bit and `<<`'s own
+//! grown-by-`n` bits included.
 
 use crate::ast::{Ast, BinOp, ExprId, ItemId};
 use crate::lexer::Span;
@@ -40,8 +45,14 @@ pub enum Width {
 /// two; `Add` takes the max and grows by one (the carry bit: `n+1` bits
 /// always, provably, holds the true sum of two `n`-bit unsigned values —
 /// DESIGN.md's "Growing addition: no silent carry-bit truncation");
-/// `Shl`/`Shr`/`AShr` keep the LEFT operand's own width (a shift amount
-/// never widens/narrows the shifted value's own type); everything else
+/// `Shl`/`Shr`/`AShr` keep the LEFT operand's own width here — `Shl`'s
+/// OWN growth by a known literal shift amount (DESIGN.md's "Growing
+/// `Shl`") bypasses this function entirely, the same "literal absorption
+/// bypasses it" shape `Add`'s own design already has for `a + <literal>`;
+/// see `types/expr.rs`'s `shl_grown_width`, called directly from
+/// `type_binop`'s `Shl` handling instead of through this rule. `Shr`/
+/// `AShr` genuinely never grow, and stay covered here unconditionally;
+/// everything else
 /// (`Sub`/`Div`/`Rem`/`BitAnd`/`BitOr`/`BitXor`) takes the max with no
 /// growth — `Sub` deliberately NOT grown alongside `Add` despite the
 /// obvious symmetry: unsigned underflow needs a genuinely different
