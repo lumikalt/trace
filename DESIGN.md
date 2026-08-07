@@ -5108,22 +5108,47 @@ drafted actually requires reaching. The change reverted before landing
 anything (`git checkout -- src/bounds/mod.rs`); no trace of the
 experiment ships.
 
-**Recommendation: still Path A over Path B in shape, but Path A now needs
-its own scoping decision before implementation — deleting `check_item`'s
-early-return gate and adding a real "visit every `Sub` regardless of
-what consumes it" traversal, not a small follow-on to the existing
-opportunistic walk.** Path A remains the one that keeps `Sub` total
-(`Add`/`Mul`/`Shl`'s literal case all stay total too) and reuses an
-already-sound interval prover rather than inventing fallibility — that
-reasoning is unchanged. What changed is the cost: turning `bounds.rs`
-from an opt-in feature (silently inert unless a program uses its own
-declarative syntax) into a mandatory whole-program pass is a real
-performance and architecture question on its own, independent of
-`Sub` specifically, and deserves a scoping conversation of its own before
-`Sub`'s design leans on it. Path B is philosophically closer to this
-language's own stated core idea and worth keeping on the table for the
-same reason as before — this correction doesn't resolve the A-vs-B
-choice, it just corrects what A actually costs.
+**Recommendation: still Path A over Path B in shape.** Path A remains the
+one that keeps `Sub` total (`Add`/`Mul`/`Shl`'s literal case all stay
+total too) and reuses an already-sound interval prover rather than
+inventing fallibility — that reasoning is unchanged. Path B is
+philosophically closer to this language's own stated core idea and worth
+keeping on the table for the same reason as before — this correction
+doesn't resolve the A-vs-B choice, it just corrects what A actually costs.
+
+**Update: the architecture half of Path A's prerequisite has since
+shipped, separately from `Sub` itself — `check_item`'s early-return gate
+is gone.** Lumi asked directly, after this finding, to make the whole
+`bounds.rs` pass not require a `where` clause anywhere — done as its own
+change (not bundled into a `Sub` implementation): `check_item` no longer
+early-returns when `self.bounded`/`fn_ret_bound`/`mem_bounds`/`struct_
+field_bounds`/`relational_bounds` are all empty; the per-item body walk
+now runs unconditionally on every item. Confirmed inert for every program
+that already worked (full suite, zero new failures — with nothing
+bounded, `state`/`locals` are empty maps and `expr_bound` fails closed on
+everything, so there's nothing NEW to reject) and confirmed NOT merely
+cosmetic: three `tests/bounds.rs` tests that used to carry a deliberately
+unrelated `where` bound purely to force the old gate open (`lossy_trunc_
+bypasses_the_implicit_width_losslessness_proof`, `body_substitution_
+inlining_does_not_poison_site_ranges_across_call_sites`) had that bound
+removed and were re-verified via the SAME bug-reintroduction discipline
+their original versions used (temporarily breaking the check under test
+and confirming the now-unbounded source still fails) — both still catch
+the regression they were built for, with no `where` bound anywhere in
+the program. The now-fully-unused `has_implicit_trunc` flag and its
+`collect_implicit_trunc_obligations` scanning pass (the v24-era, narrower
+fix for this exact class of gap) were removed as dead code rather than
+left behind. **What this does NOT do:** `check_body`/`check_stmt` still
+only call `expr_bound` at specific OBLIGATION positions (a write to a
+BOUNDED def, a return with a declared bound, a call argument against a
+declared param bound) — a `let y = a - b` whose result never reaches one
+of those positions is still never visited, gate or no gate. The "visit
+every `Sub` regardless of what consumes it" traversal Path A actually
+needs is still not built; this update removes the WHOLE-PASS obstacle
+found above, not the per-check-site one. Performance is the real
+remaining cost of the gate's removal itself — the walk now runs on every
+item in every program, not only ones using `where` — a deliberate
+tradeoff Lumi asked for directly, not an oversight.
 
 **Path A's escape hatch, corrected above (`.!` already applies) — but
 still gated on the same open question the "no multi-variable... bound
@@ -5136,14 +5161,17 @@ on an `in` port) to keep "restructure with a guard" from being the ONLY
 answer for code that's actually safe remains open, same as before this
 correction.
 
-**Status: Sub's design is blocked on a decision, not a bug fix — this
-commit ships `Shl` alone.** Lumi asked for both `Shl` and `Sub` in one
-commit; `Shl` is complete, tested (including real `firtool`/`iverilog`),
-and shipped above. `Sub` stops here because the real blocker surfaced
-during implementation prep is a language-level architecture choice
-(should `bounds.rs` become a mandatory pass) that this document declines
-to make by inference, the same standing policy this whole section already
-follows for A-vs-B.
+**Status: `Sub`'s own check is still not built — the whole-pass gate that
+blocked it is gone, the per-check-site traversal isn't.** `Shl` shipped
+first, alone, in the commit that also drafted this section's original
+finding. `bounds.rs`'s early-return gate shipped next, as its own
+separate, directly-requested change (see the "Update" paragraph above) —
+real progress toward Path A's prerequisite, not a decision to build `Sub`
+itself by inference. What's still open: the obligation-position
+restriction `check_stmt` has everywhere (only a write/return/call-argument
+against something already bounded reaches `expr_bound` at all), and the
+A-vs-B choice itself. Both remain for Lumi to decide, not something this
+document picks on its own.
 
 ## Toward a dependent/refinement type system (SMT-backed, planned)
 

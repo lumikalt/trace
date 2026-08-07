@@ -1087,9 +1087,12 @@ module M {
 
 #[test]
 fn unbounded_reg_is_unaffected() {
-    // A plain reg with no `where` clause must never be checked at all —
-    // confirms the pass is opt-in, not a blanket restriction on every
-    // reg's writes.
+    // A plain reg with no `where` clause must never be flagged — the
+    // walk itself runs unconditionally now (no `where` bound anywhere in
+    // the program required to reach it, see `check_item`'s own doc
+    // comment), but with nothing bounded to anchor an obligation to,
+    // `expr_bound` fails closed and no check ever fires. Confirms this
+    // stays a blanket restriction on nothing, not on every reg's writes.
     let src = "\
 module M {
     reg i : [4] = 0
@@ -1635,22 +1638,19 @@ fn lossy_trunc_bypasses_the_implicit_width_losslessness_proof() {
     // masking behavior instead, same treatment the explicit 2-arg form
     // has always gotten (the fallback `[0, cap)` range, not an error).
     //
-    // `y`'s own unrelated `where` bound exists ONLY to keep `check_
-    // item`'s five-way "nothing to check" gate open -- a lossy trunc is
-    // deliberately excluded from `has_implicit_trunc` (it can never
-    // raise the error that flag exists to reach), so a program with
-    // ONLY a lossy trunc and no other bounded thing anywhere would
-    // otherwise skip the whole body walk before ever reaching the
-    // `trunc` arm at all, making this test pass identically whether the
-    // `lossy` check works or not -- caught live via bug-reintroduction
-    // (disabling the arm's `lossy` gate alone did NOT fail this test
-    // without `y` present, exactly the no-op-fix trap this arc has hit
-    // before; confirmed it DOES fail once `y` forces the walk to run).
+    // No unrelated `where` bound needed anymore (v26: `check_item`'s own
+    // "nothing to check" gate was removed entirely, see its doc comment
+    // -- the walk always runs now). Re-verified this test still isn't a
+    // no-op-fix trap without one: temporarily forcing `is_implicit = true`
+    // regardless of `lossy` in the `trunc` arm below DOES make this exact
+    // source (no `where` bound anywhere) fail with the expected
+    // losslessness error, confirmed live before trusting it, same
+    // bug-reintroduction discipline the original `y`-workaround version
+    // of this test already established.
     let src = "\
 module M {
     in a : [1]
     out b : [5] = 5
-    reg y : [4] where y < 10 = 0
 
     Double(x : [n]) : [n + 2] { return x << 1 }
 
@@ -2459,20 +2459,22 @@ fn body_substitution_inlining_does_not_poison_site_ranges_across_call_sites() {
     // fabricated, call-site-specific "fact" reaching `schedule.rs`'s
     // own mem-disjointness proof as if it were a whole-program one.
     //
-    // `x`/`y` carry a (deliberately unrelated, wide-open) `where` bound
-    // purely so `check_item`'s own "nothing to check anywhere in the
-    // program" fast path doesn't skip the whole body walk before
-    // `expr_bound` ever runs -- confirmed load-bearing via bug-
-    // reintroduction: an EARLIER version of this test left `x`/`y`
-    // unbounded, which made `check_item` return before inlining was
-    // ever reached at all, so the test passed regardless of whether the
-    // fix was even present -- a no-op-fix, green-test false positive,
-    // caught via advisor review before being trusted.
+    // `x`/`y` no longer need a `where` bound (v26: `check_item`'s own
+    // "nothing to check anywhere in the program" gate was removed
+    // entirely, see its doc comment -- the walk always runs now, and
+    // `Stmt::Assign` already calls `expr_bound` on its RHS unconditionally
+    // regardless of whether the LHS is bounded). Re-verified this test
+    // still isn't a no-op-fix trap without the bound: temporarily
+    // skipping the `site_ranges` restore below DOES leak a poisoned
+    // entry through on this exact (now fully unbounded) source,
+    // confirmed live before trusting it, same bug-reintroduction
+    // discipline the original `where`-workaround version of this test
+    // already established.
     let src = "\
 module M {
     mem m : [8][16]
-    reg x : [8] where x < 100 = 0
-    reg y : [8] where y < 100 = 0
+    reg x : [8] = 0
+    reg y : [8] = 0
     Get(i : [8]) : [8] { return m[i] }
     rule a {
         x := Get(3)

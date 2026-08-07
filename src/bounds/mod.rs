@@ -844,14 +844,12 @@ pub fn check(ast: &Ast, res: &Resolution, fx: &Effects, ty: &Types) -> (Bounds, 
         mem_bound_span: HashMap::new(),
         struct_field_bounds: HashMap::new(),
         relational_bounds: Vec::new(),
-        has_implicit_trunc: false,
         reg_out_inits: HashMap::new(),
         failed_relational: HashSet::new(),
         errors: Vec::new(),
     };
     checker.collect_bounded_defs();
     checker.collect_bounded_params();
-    checker.collect_implicit_trunc_obligations();
     checker.collect_mem_bounds();
     // v18: collect every struct field's own declared bound FIRST, then
     // check every struct-typed reg/out's `= init` against it in a
@@ -1236,21 +1234,6 @@ struct Checker<'a> {
     /// same "collect only what was successfully validated" convention
     /// `self.bounded`/`mem_bounds`/`struct_field_bounds` already follow.
     relational_bounds: Vec<RelationalBound>,
-    /// Whether ANY 1-arg (implicit-width) `trunc(value)` call anywhere
-    /// in the program got a `Width::Known` in `self.ty.expr_tys` --
-    /// i.e. `type_call`'s hint-based backward-fill (v24) resolved a
-    /// width for it. This is its OWN proof obligation (the resolved
-    /// width must be provably lossless, checked in `expr_bound`'s
-    /// `trunc` arm), entirely independent of any `where` bound --
-    /// caught via advisor review: a module with zero `where` bounds
-    /// anywhere still needs `check_item`'s body walk to run so THIS
-    /// check fires, or the walk's existing five-way "nothing to check"
-    /// gate below silently no-ops the whole pass and an unsound
-    /// implicit trunc sails through with no diagnostic at all -- the
-    /// exact "gated the descent on the wrong condition" bug class this
-    /// arc has hit repeatedly (see v17/v18's own doc comments on
-    /// `check_item`).
-    has_implicit_trunc: bool,
     /// Every `reg`/`out`'s own `= init` expression, keyed by `DefId` --
     /// populated by `collect_relational_bounds`'s own walk (piggybacked
     /// onto the same traversal, rather than a separate one) purely so
@@ -1291,34 +1274,6 @@ impl<'a> Checker<'a> {
                     && self.res.def(d).name == name
             })
             .unwrap_or(false)
-    }
-
-    /// Scans every expr in the program for a 1-arg `trunc(value)` call
-    /// that `type_call`'s hint-based backward-fill (v24) resolved a
-    /// `Width::Known` for -- sets `self.has_implicit_trunc` so `check_
-    /// item`'s own "nothing to check" gate can't skip the body walk
-    /// this obligation needs to actually be checked. See `has_implicit_
-    /// trunc`'s own doc comment for why a `where`-blind gate is wrong
-    /// here specifically. A `trunc.!(value)` call (v25, `ast.lossy`) is
-    /// deliberately EXCLUDED here -- it never raises the error this gate
-    /// exists to reach (see the `trunc` arm below), so forcing the whole
-    /// body walk to run on its account alone would be pure overhead, not
-    /// a soundness need -- confirmed via the same byte-identical
-    /// `--explain-schedule` diff this whole arc gates every change on,
-    /// not assumed harmless.
-    fn collect_implicit_trunc_obligations(&mut self) {
-        for i in 0..self.ast.exprs.len() {
-            let id = ExprId(i as u32);
-            if let Expr::Call { callee, args } = self.ast.expr(id)
-                && args.len() == 1
-                && self.is_builtin(*callee, "trunc")
-                && !self.ast.lossy.contains(&id)
-                && matches!(self.ty.expr_tys.get(&id), Some(Ty::Bits(Width::Known(_))))
-            {
-                self.has_implicit_trunc = true;
-                return;
-            }
-        }
     }
 
     /// Every `reg`/`out` with a `where` bound, keyed by its own `DefId`.
@@ -2375,36 +2330,29 @@ impl<'a> Checker<'a> {
     }
 
     fn check_item(&mut self, id: ItemId) {
-        // v17: widened to a three-way check -- a program with ONLY a
-        // bounded mem and no bounded reg/out/param/return anywhere would
-        // otherwise skip this whole body walk, silently letting every
-        // mem write through unchecked (the same "gated the descent on
-        // the wrong condition" class of bug v14 found four times in a
-        // row). v18: widened again to FOUR-way for the identical reason,
-        // now that a program could have ONLY a bounded struct field and
-        // no other bounded reg/out/param/return/mem anywhere -- caught
-        // by advisor review of this feature's own plan before any code
-        // was written, the same bug class flagged (and discriminated
-        // with a dedicated driving example) at v17 above. Widened again
-        // (FIVE-way) for `relational_bounds` -- not actually load-bearing
-        // for that feature's own soundness (its induction, `check_
-        // relational_bound_induction`, is a fully separate pass that
-        // never depends on this per-item walk running at all), but kept
-        // consistent with this arc's own established discipline: the
-        // exact bug class this guard exists to close has been found four
-        // times running, and a module whose only bounded thing is an
-        // `invariant` is precisely the shape that would trip it if this
-        // guard were ever repurposed to gate something that DOES depend
-        // on it.
-        if self.bounded.is_empty()
-            && self.fn_ret_bound.is_empty()
-            && self.mem_bounds.is_empty()
-            && self.struct_field_bounds.is_empty()
-            && self.relational_bounds.is_empty()
-            && !self.has_implicit_trunc
-        {
-            return; // nothing to check anywhere in the program
-        }
+        // v17-v18: this used to open with a "nothing declared anywhere is
+        // bounded, skip the whole body walk" early return, widened FOUR
+        // times as each new kind of bound (mem, struct field, relational,
+        // implicit `trunc`) turned out to need its own extra condition or
+        // silently go unchecked whenever it was the ONLY bounded thing in
+        // the program -- the same "gated the descent on the wrong
+        // condition" class of bug, four times running. Removed entirely
+        // (v26): a program that declares NO `where` bound anywhere used
+        // to make this WHOLE pass inert, which is exactly the gap
+        // DESIGN.md's "`Sub` underflow" section found blocking a
+        // mandatory (not just opportunistic) kind of check that doesn't
+        // need a `where`-bounded anchor to fire at all -- a FIFTH
+        // instance of the identical bug class this gate kept
+        // reintroducing, closed here by removing the gate itself instead
+        // of widening it a fifth time. Purely additive for every program
+        // that already worked: with nothing bounded, `state`/`locals`
+        // below are just empty maps, `expr_bound` fails closed (`None`)
+        // on everything, and no obligation position exists to check
+        // against -- confirmed inert by the full test suite staying
+        // green with zero new failures, not assumed from the reasoning
+        // alone. The real cost is the walk itself now running on every
+        // item unconditionally rather than only on programs using `where`
+        // -- a deliberate tradeoff, not an oversight.
         let body = match self.ast.item(id) {
             Item::Rule { body, .. } => body.clone(),
             Item::Fn { body, .. } => body.clone(),
