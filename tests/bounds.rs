@@ -606,6 +606,67 @@ module M {
 }
 
 #[test]
+fn ne_guarded_subtraction_on_a_plain_undeclared_reg_composes_via_its_own_width() {
+    // `cnt` has NO `where` bound at all -- before `check_item` started
+    // seeding every reg/out's own declared-width-implied default range
+    // (`[0, 256)` for an `[8]`, always true by construction, no `where`
+    // needed), `narrow_for_condition` had nothing to narrow (its own
+    // doc comment: "narrowing only tightens an ALREADY-bounded fact,
+    // never invents one") -- `cnt`'s range composed to `None`
+    // unconditionally, so `while cnt <> 0 { cnt := cnt - 1 }`, an
+    // ordinary, obviously-safe countdown loop (examples/while_countdown.
+    // tr's own shape), was indistinguishable from a genuinely unguarded
+    // subtraction. `Ne`'s own edge-narrowing arm already handled
+    // exactly this case (`k == lo`, `0 == 0`) -- it just needed SOME
+    // entry to narrow. `total`'s own `where` bound is what makes the
+    // composed range OBSERVABLE here: `cnt - 1` feeding an unprovable
+    // write would still error against it, same as `unguarded_
+    // subtraction_that_could_underflow_is_rejected` above.
+    let src = "\
+module M {
+    reg cnt : [8] = 0
+    reg total : [8] where total < 256 = 0
+    rule r <sequences, fails> {
+        cnt := 5
+        while cnt <> 0 {
+            total := cnt - 1
+            cnt := cnt - 1
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
+fn width_default_never_overrides_an_explicit_where_bound() {
+    // Discriminates "the explicit `< 5` bound is what's actually used"
+    // from "the width-implied `[0, 16)` default silently won instead" --
+    // `unguarded_subtraction_that_could_underflow_is_rejected` alone
+    // can't tell these apart (both agree `i`'s floor is 0 there). Here
+    // `i`'s guarded range should narrow to the TIGHT `[1, 5)` (from its
+    // declared `< 5`), making `i - 1` exactly `[0, 4)` -- provable
+    // against `j`'s own `< 4` bound only under the tight declared range;
+    // the wrong (width-default `[0, 16)`) range would instead narrow to
+    // `[1, 16)`, making `i - 1` `[0, 15)`, which does NOT fit `j < 4`
+    // and would wrongly reject a program that's actually sound.
+    let src = "\
+module M {
+    reg i : [4] where i < 5 = 0
+    reg j : [4] where j < 4 = 0
+    rule r {
+        if i > 0 {
+            j := i - 1
+        } else {
+            j := 0
+        }
+    }
+}
+";
+    assert!(run(src).is_empty(), "{:?}", run(src));
+}
+
+#[test]
 fn gt_guarded_subtraction_is_proven() {
     // The actual driving pattern (examples/countdown_bounded.tr): `cnt >
     // 0` narrows the LOWER end to 1 for the `then` branch, making `cnt -

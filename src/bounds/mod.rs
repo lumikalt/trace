@@ -1260,6 +1260,31 @@ impl<'a> Checker<'a> {
         self.errors.push(BoundsError { span, message });
     }
 
+    /// A `reg`/`out`'s own declared-WIDTH-implied range, `[0, 2^w)` --
+    /// always true by construction (an `N`-bit unsigned register can
+    /// only ever hold a value in that range), needing no write-site
+    /// induction the way an explicit `where` bound does. Strictly WEAKER
+    /// than any explicit bound (which is why `check_item`'s own seeding
+    /// below only uses this for a def `self.bounded` has no entry for —
+    /// an explicit bound always wins, never gets widened back out to
+    /// this). Scoped to `Reg`/`Output` only: an `in` port's bits arrive
+    /// over an external wire (this module's own standing "a bound on an
+    /// `in` would be a TRUSTED external contract, not a proof" position,
+    /// named already for mem/struct-field reads), and a `Mem`/`Fifo`
+    /// has no single scalar value of its own for this to describe.
+    fn width_default_range(&self, def: DefId) -> Option<(u64, u64)> {
+        if !matches!(
+            self.res.def(def).kind,
+            crate::resolve::DefKind::Reg | crate::resolve::DefKind::Output
+        ) {
+            return None;
+        }
+        let Ty::Bits(Width::Known(w)) = self.ty.state_tys.get(&def)? else {
+            return None;
+        };
+        Some((0, 1u64.checked_shl(*w as u32).unwrap_or(u64::MAX)))
+    }
+
     /// Whether `callee` resolves to the named builtin -- the same
     /// `DefKind::Builtin` recognition `types/expr.rs`'s own bracket-call
     /// arm uses, reused here so `expr_bound`'s `trunc` arm doesn't need
@@ -2363,6 +2388,22 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|(d, b)| (*d, (b.lower, b.upper)))
             .collect();
+        // Every `reg`/`out` `self.bounded` has no EXPLICIT entry for
+        // still gets its own declared-width-implied default range --
+        // see `width_default_range`'s own doc comment for why this is
+        // always sound. This is what makes a guard like `while cnt <>
+        // 0 { cnt := cnt - 1 }` provable on a plain, unbounded `cnt`:
+        // `narrow_for_condition` already handles the `Ne`-at-the-floor
+        // case, it just needs SOME entry here to narrow in the first
+        // place, which an unbounded reg never had before this.
+        for def in self.ty.state_tys.keys().copied().collect::<Vec<_>>() {
+            if state.contains_key(&def) {
+                continue;
+            }
+            if let Some(default) = self.width_default_range(def) {
+                state.insert(def, default);
+            }
+        }
         let mut locals: HashMap<DefId, Option<(u64, u64)>> = HashMap::new();
         self.current_reassigned_locals = self.collect_reassigned_locals(&body);
         // v18: which expression each struct-typed LOCAL was bound to
@@ -3227,8 +3268,24 @@ impl<'a> Checker<'a> {
                 // declared param bound, not a caller's substituted one)
                 // should ever claim this `ExprId`, so a nested inline
                 // pass here must not overwrite it.
+                //
+                // Also guarded on NOT being an unbounded def's own bare
+                // `width_default_range` -- that default exists purely so
+                // `Sub`/`narrow_for_condition` have SOMETHING to compose
+                // from, not because anything was actually proven about
+                // `def`. Showing "Where 0 <= v < 256" in hover for a
+                // plain, undeclared `[8]` reg is trivially true of any
+                // 8-bit value and tells the user nothing they didn't
+                // already know from the type signature -- confirmed via
+                // `hovering_an_output_ports_write_site_shows_its_type`,
+                // which pins the NO-suffix case and would otherwise
+                // regress the moment the default seeds `state`. A range
+                // NARROWED past the trivial default (e.g. `if v > 5`)
+                // still exports normally -- that IS new information.
                 if self.inline_depth == 0
                     && let Some(b) = b
+                    && !(!self.bounded.contains_key(&def)
+                        && Some(b) == self.width_default_range(def))
                 {
                     self.site_ranges.insert(id, b);
                 }

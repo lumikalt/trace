@@ -1158,6 +1158,28 @@ mod tests {
         );
     }
 
+    const UNBOUNDED_GUARDED_SRC: &str = "module M {\n    reg counter : [8] = 0\n    rule r {\n        if counter > 5 {\n            counter := counter - 1\n        }\n    }\n}\n";
+
+    #[test]
+    fn hovering_a_narrowed_unbounded_variable_still_shows_the_narrowed_range() {
+        // `counter` has no `where` clause -- `check_item` seeds it with
+        // its own declared-width-implied default (`[0, 256)`) purely so
+        // `narrow_for_condition`/`Sub` have something to compose from;
+        // `hovering_an_unbounded_variable_shows_no_bound_suffix` above
+        // pins that the TRIVIAL default itself never shows in hover
+        // (nothing was actually learned). This is the other half: once
+        // `counter > 5` narrows PAST that default to `[6, 256)`, that
+        // real, non-trivial fact must still show -- confirms the
+        // suppression is exact-equality-to-the-default only, not "any
+        // def without a `where` clause stays silent forever."
+        let h =
+            hover_at(UNBOUNDED_GUARDED_SRC, 4, 12).expect("hover over the narrowed write target");
+        assert_eq!(
+            hover_text(&h),
+            "```trace\nreg counter : [8]\n```\n\nA register. Where 6 <= counter < 256."
+        );
+    }
+
     // Mirrors `examples/output_bounded.tr`: an `if`/`else` narrows `cnt`'s
     // flat declared `[0, 100)` per-branch -- `bound`'s original `b.ranges.
     // get(&def_id)` lookup was a whole-program fact, so hovering EITHER

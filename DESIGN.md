@@ -5218,6 +5218,65 @@ problem entirely by making an unguarded underflow a runtime `fails`
 rather than a compile-time unprovability. This document stops here,
 consistent with its own standing policy on A-vs-B.
 
+**Update: shipped the first of the three real options above — a
+register's own declared WIDTH is now a free, always-sound range fact,
+closing the single largest slice of the "no range known at all"
+majority.** Lumi asked, after seeing the categorized breakdown of the 29
+sites (six distinct shapes: SUBLEQ's permanent mem-dependence, test-
+scaffolding noise, an intentionally-still-unprovable negative case, and
+three real, fixable gaps), to implement the width-seeding fix directly.
+`check_item` now seeds `state` with `[0, 2^w)` for every `reg`/`out`
+`self.bounded` has NO explicit entry for (`Checker::width_default_range`,
+`Reg`/`Output` only — an `in` port stays untouched, same "trusted
+external contract, not proven" reasoning this module already applies to
+mem/struct-field reads) — always sound, since it's strictly weaker than
+any explicit bound and needs no write-site induction (an `N`-bit
+register can only ever hold `[0, 2^N)`, by construction). This alone
+makes `while cnt <> 0 { cnt := cnt - 1 }` (the second category, the
+LARGEST single slice — `examples/while_countdown.tr`'s own shape)
+provable on a completely plain, undeclared `cnt`: `narrow_for_condition`'s
+existing `Ne`-at-the-floor arm (`k == lo`) already handled this exact
+case, it only ever needed SOME entry in `state` to narrow, which an
+unbounded reg never had before. Confirmed via the full suite staying
+green (nothing regressed) plus two new, deliberately DISCRIMINATING
+tests (not just "still passes"): `ne_guarded_subtraction_on_a_plain_
+undeclared_reg_composes_via_its_own_width` (`tests/bounds.rs`) proves the
+countdown shape composes now, and `width_default_never_overrides_an_
+explicit_where_bound` proves an EXPLICIT, narrower `where` bound still
+wins over the wider width-implied default — constructed so the WRONG
+(width-default) range would produce an observably different, incorrect
+result, not just happen to also pass.
+
+**A real side effect this surfaced, also fixed: the width default was
+leaking into LSP hover as if it were a proven fact.** `site_ranges` (the
+per-site map hover reads first, before falling back to the whole-program
+`ranges`) is populated by the SAME `expr_bound` `Expr::Ident` arm that
+now sees the width default for every unbounded reg — without a fix,
+hovering ANY plain `[8]` reg would show "Where 0 <= v < 256", trivially
+true of any 8-bit value and not information the user asked for or
+learned anything from (caught by `hovering_an_output_ports_write_site_
+shows_its_type`, an EXISTING test, regressing the moment the seeding
+landed). Fixed by suppressing the export specifically when the exported
+range exactly equals the def's own trivial width default AND the def has
+no explicit `self.bounded` entry — a range narrower than that default
+(real work the checker did, e.g. `if v > 5`) still exports normally,
+confirmed by a new, deliberately paired test (`hovering_a_narrowed_
+unbounded_variable_still_shows_the_narrowed_range`) proving the
+suppression is exact-equality-only, not "any unbounded def stays silent
+forever."
+
+**What this does NOT close, named so it isn't mistaken for done:** the
+`push_count`/`pop_count`-shaped sites (category 3 — an `invariant`
+already proves the subtraction safe, but `expr_bound`'s own `Sub` arm
+doesn't consult that separate proof) and the genuinely-unguarded
+`mem_disjoint`-shaped sites (category 4 — real per-example judgment
+calls, not a pattern) are both still open. SUBLEQ (category 1) stays
+permanently out of reach by construction. The per-check-site traversal
+(`check_no_underflow_in`) built for measurement is still not shipped —
+this update only strengthens `expr_bound`'s own composition, it doesn't
+turn the check mandatory; that decision is unchanged from the "Status"
+paragraph two sections up.
+
 ## Toward a dependent/refinement type system (SMT-backed, planned)
 
 Not built yet — this section is a committed plan, not a shipped feature.
